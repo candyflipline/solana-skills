@@ -20,6 +20,44 @@ fn emit_status_inductive(out: &mut String, name: &str, lifecycle: &[String]) {
     out.push_str("  deriving Repr, DecidableEq, BEq\n\n");
 }
 
+/// Whether to emit a lifecycle discriminator field (and matching `Status`
+/// inductive) on the State struct. Mirrors `rust_codegen_util::has_lifecycle`
+/// — single-state lifecycles carry no information and shouldn't add a runtime
+/// discriminator (and the lone variant produces a `status : Status` field
+/// that downstream code must reference, which is ergonomically pointless).
+/// Issue #43.
+fn should_emit_lifecycle_marker(lifecycle: &[String]) -> bool {
+    lifecycle.len() >= 2
+}
+
+/// Field name for the lifecycle discriminator on a Lean State struct.
+/// Defaults to `status`; falls back to `qed_status` when the user already
+/// declared a field named `status` in the same account, otherwise the
+/// generated `structure State` would emit two `status` fields and fail to
+/// elaborate. Issue #43.
+fn lifecycle_marker_name(user_fields: &[(String, String)]) -> &'static str {
+    if user_fields.iter().any(|(n, _)| n == "status") {
+        "qed_status"
+    } else {
+        "status"
+    }
+}
+
+/// Resolve the lifecycle marker for a particular Lean state type name.
+/// Looks up the matching account in `spec.account_types` (or falls back
+/// to the flat `spec.state_fields` for single-account specs) and returns
+/// the marker name derived from that account's user fields.
+fn lifecycle_marker_for_state_type(spec: &ParsedSpec, state_type: &str) -> &'static str {
+    if let Some(acct) = spec
+        .account_types
+        .iter()
+        .find(|a| lean_state_name(&a.name) == state_type)
+    {
+        return lifecycle_marker_name(&acct.fields);
+    }
+    lifecycle_marker_name(&spec.state_fields)
+}
+
 /// Emit a Lean `structure Foo where field : Type …` block for a state.
 /// Pass `status_name` when the state carries a lifecycle field.
 fn emit_state_struct(
@@ -33,7 +71,7 @@ fn emit_state_struct(
         out.push_str(&format!("  {} : {}\n", safe_name(fname), map_type(ftype)));
     }
     if let Some(sn) = status_name {
-        out.push_str(&format!("  status : {}\n", sn));
+        out.push_str(&format!("  {} : {}\n", lifecycle_marker_name(fields), sn));
     }
     out.push_str("  deriving Repr, DecidableEq, BEq\n\n");
 }
@@ -129,8 +167,13 @@ fn render_single_account(spec: &ParsedSpec) -> String {
         out.push('\n');
     }
 
-    // Status inductive (if lifecycle states exist)
-    let has_lifecycle = !spec.lifecycle_states.is_empty();
+    // Status inductive (if lifecycle states exist).
+    //
+    // A single-state lifecycle carries no discriminator information — match
+    // the Rust codegen's threshold (`>= 2`) so single-variant lifecycles
+    // don't emit a marker that collides with a user-declared `status` field.
+    // Issue #43.
+    let has_lifecycle = should_emit_lifecycle_marker(&spec.lifecycle_states);
     if has_lifecycle {
         emit_status_inductive(&mut out, "Status", &spec.lifecycle_states);
     }
@@ -236,8 +279,9 @@ fn render_multi_account(spec: &ParsedSpec) -> String {
         let status_name = lean_status_name(acct_name);
         let state_name = lean_state_name(acct_name);
 
-        // Status inductive
-        let has_lifecycle = !acct.lifecycle.is_empty();
+        // Status inductive — see `should_emit_lifecycle_marker` for why
+        // we use `>= 2` instead of `is_empty()`. Issue #43.
+        let has_lifecycle = should_emit_lifecycle_marker(&acct.lifecycle);
         if has_lifecycle {
             emit_status_inductive(&mut out, &status_name, &acct.lifecycle);
         }
@@ -375,7 +419,7 @@ fn build_guard_cond_parts(
         // else: alias-only auth; let-binding emitted by the caller.
     }
     if let Some(ref pre) = op.pre_status {
-        cond_parts.push(format!("s.status = .{}", pre));
+        cond_parts.push(format!("s.{} = .{}", lifecycle_marker_name(fields), pre));
     }
     // Auto-guards for sub effects (underflow prevention)
     for (field, op_kind, _value) in &op.effects {
@@ -625,7 +669,7 @@ fn render_transitions(
             }
         }
         if let Some(ref post) = op.post_status {
-            with_parts.push(format!("status := .{}", post));
+            with_parts.push(format!("{} := .{}", lifecycle_marker_name(fields), post));
         }
 
         let then_body = if with_parts.is_empty() {
@@ -1924,9 +1968,10 @@ fn render_liveness(out: &mut String, spec: &ParsedSpec, state_type: &str) {
             "theorem liveness_{} (s : {}) (signer : Pubkey)\n",
             liveness.name, effective_type
         ));
+        let marker = lifecycle_marker_for_state_type(spec, &effective_type);
         out.push_str(&format!(
-            "    (h : s.status = .{}) :\n",
-            liveness.from_state
+            "    (h : s.{} = .{}) :\n",
+            marker, liveness.from_state
         ));
 
         // Find a path through the lifecycle graph using via ops
@@ -1938,16 +1983,25 @@ fn render_liveness(out: &mut String, spec: &ParsedSpec, state_type: &str) {
         );
 
         if let Some(ref ops_path) = path {
+            // Auto-proven path: keep the implication form. The proof script's
+            // success branch (`subst h_apply; rfl`) exhibits a real reachable
+            // state — the implication is non-vacuous in practice because the
+            // proof would not compile if no success path existed.
             let proof = liveness_proof_script(ops_path, &apply_ops_fn, &apply_fn, &spec.handlers);
             out.push_str(&format!(
-                "    \u{2203} ops, ops.length \u{2264} {} \u{2227} \u{2200} s', {} s signer ops = some s' \u{2192} s'.status = .{}{}\n",
-                bound, apply_ops_fn, liveness.leads_to_state, proof
+                "    \u{2203} ops, ops.length \u{2264} {} \u{2227} \u{2200} s', {} s signer ops = some s' \u{2192} s'.{} = .{}{}\n",
+                bound, apply_ops_fn, marker, liveness.leads_to_state, proof
             ));
         } else {
-            // Fallback: can't find path, emit sorry
+            // Issue #38: no mechanical path found. The earlier emission was
+            // `∃ ops, ops.length ≤ N ∧ ∀ s', applyOps … = some s' → P s' := sorry`,
+            // which is *vacuously satisfiable* — `sorry` would discharge a
+            // claim that says nothing about reachability when `applyOps` aborts.
+            // Switch to the existential form so the obligation is non-vacuous:
+            // any future proof must produce a real successful sequence.
             out.push_str(&format!(
-                "    \u{2203} ops, ops.length \u{2264} {} \u{2227} \u{2200} s', {} s signer ops = some s' \u{2192} s'.status = .{} := sorry\n\n",
-                bound, apply_ops_fn, liveness.leads_to_state
+                "    \u{2203} ops s', ops.length \u{2264} {} \u{2227} {} s signer ops = some s' \u{2227} s'.{} = .{} := by sorry\n\n",
+                bound, apply_ops_fn, marker, liveness.leads_to_state
             ));
         }
     }
@@ -3864,8 +3918,11 @@ fn render_indexed_state(spec: &ParsedSpec) -> String {
     }
 
     // -- Status inductive (lifecycle) --
+    // `should_emit_lifecycle_marker` mirrors the Rust threshold (`>= 2`):
+    // single-state lifecycles carry no discriminator information. Issue #43.
     let lifecycle = &spec.lifecycle_states;
-    if !lifecycle.is_empty() {
+    let emit_marker = should_emit_lifecycle_marker(lifecycle);
+    if emit_marker {
         out.push_str("inductive Status where\n");
         for s in lifecycle {
             out.push_str(&format!("  | {}\n", s));
@@ -3900,8 +3957,11 @@ fn render_indexed_state(spec: &ParsedSpec) -> String {
             out.push_str(&format!("  {} : {}\n", safe_name(fname), lean_ty));
         }
     }
-    if !lifecycle.is_empty() {
-        out.push_str("  status : Status\n");
+    let active_marker = active_acct
+        .map(|a| lifecycle_marker_name(&a.fields))
+        .unwrap_or("status");
+    if emit_marker {
+        out.push_str(&format!("  {} : Status\n", active_marker));
     }
     out.push('\n');
 
@@ -3923,7 +3983,7 @@ fn render_indexed_state(spec: &ParsedSpec) -> String {
             // else: alias-only auth; let-binding emitted before the `if`.
         }
         if let Some(ref pre) = op.pre_status {
-            conds.push(format!("s.status = .{}", pre));
+            conds.push(format!("s.{} = .{}", active_marker, pre));
         }
         for req in &op.requires {
             let rewritten = rewrite_subscripts_lean(&req.lean_expr);
@@ -4014,7 +4074,7 @@ fn render_indexed_state(spec: &ParsedSpec) -> String {
             with_parts.push(format!("{} := {}", safe_name(root), update));
         }
         if let Some(ref post) = op.post_status {
-            with_parts.push(format!("status := .{}", post));
+            with_parts.push(format!("{} := .{}", active_marker, post));
         }
 
         let then_body = if with_parts.is_empty() {
@@ -4473,6 +4533,26 @@ liveness proposal_resolves : State.HasProposal ~> State.Active via [execute, can
             "cover witness should keep initializer_token_account at pk, got:\n{}",
             lean
         );
+    }
+
+    /// Dump regenerated Lean for the bundled examples to /tmp so a Lean-
+    /// equipped operator can run `lake build` against them. Ignored in
+    /// normal test runs — invoke explicitly with `cargo test --release
+    /// dump_regen_specs -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn dump_regen_specs() {
+        let cases = [
+            ("/tmp/qed_regen_escrow_spec.lean", ESCROW_SPEC),
+            ("/tmp/qed_regen_multisig_spec.lean", MULTISIG_SPEC),
+            ("/tmp/qed_regen_lending_spec.lean", LENDING_SPEC),
+        ];
+        for (path, src) in &cases {
+            let spec = chumsky_adapter::parse_str(src).expect("parse");
+            let lean = render(&spec);
+            std::fs::write(path, &lean).expect("write");
+            eprintln!("wrote {path} ({} bytes)", lean.len());
+        }
     }
 
     // ========================================================================

@@ -1352,10 +1352,27 @@ fn lifecycle_check_line(
 }
 
 fn find_state_account(handler: &ParsedHandler) -> Option<&crate::check::ParsedHandlerAccount> {
+    // Try writable-only first — matches lifecycle-mutation handlers and is
+    // the original behavior. If the writable-filtered search comes up empty,
+    // fall back to all non-signer/non-program/non-token candidates so
+    // read-only handlers (view-style reads, pre-flight checks, claim
+    // handlers that mutate a sibling account) still get `s.field` rewritten
+    // to `ctx.<acct>.field` in guards.rs. Without the fallback the guard
+    // body emits bare `s.field` references that don't compile.
+    if let Some(found) = find_state_account_filtered(handler, true) {
+        return Some(found);
+    }
+    find_state_account_filtered(handler, false)
+}
+
+fn find_state_account_filtered(
+    handler: &ParsedHandler,
+    require_writable: bool,
+) -> Option<&crate::check::ParsedHandlerAccount> {
     let mut candidates: Vec<&crate::check::ParsedHandlerAccount> = handler
         .accounts
         .iter()
-        .filter(|a| a.is_writable && !a.is_signer && !a.is_program)
+        .filter(|a| (!require_writable || a.is_writable) && !a.is_signer && !a.is_program)
         .filter(|a| {
             // Drop token/mint accounts — they hold balances, not program state.
             !matches!(a.account_type.as_deref(), Some("token") | Some("mint"))

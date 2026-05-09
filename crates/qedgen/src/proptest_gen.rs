@@ -618,63 +618,44 @@ fn emit_state_strategy_inner(
             out.push_str("/// Proptest strategy for generating arbitrary State values.\n");
         }
     }
-    out.push_str(&format!(
-        "fn {}() -> impl Strategy<Value = State> {{\n",
-        fn_name
-    ));
-    out.push_str("    (\n");
-    for (i, (fname, _ftype)) in mutable_fields.iter().enumerate() {
+    // Emit via `prop_compose!`. The earlier inline `(strat1, …, stratN).prop_map(…)`
+    // form fails to compile when the State struct has more than 12 fields
+    // (proptest's `Strategy` impl for tuples caps at 12-arity); `prop_compose!`
+    // has no arity limit and produces the same `impl Strategy<Value = State>`
+    // signature.
+    let emit_status = rust_codegen_util::has_lifecycle(spec)
+        && !mutable_fields.iter().any(|(n, _)| n == "status");
+    out.push_str("prop_compose! {\n");
+    out.push_str(&format!("    fn {}()(\n", fn_name));
+    for (fname, _ftype) in mutable_fields.iter() {
         let dsl_type = all_fields
             .iter()
             .find(|(n, _)| n.as_str() == fname.as_str())
             .map(|(_, t)| t.as_str())
             .unwrap_or("U64");
-        // strategy_for_field dispatches on compound types (Map, record, sum,
-        // alias) and falls through to the primitive strategy tables. Field
-        // bounds only apply to primitive fields (it doesn't make sense to
-        // cap a `[Account; N]` to a numeric bound).
         let bound = field_bounds.get(fname.as_str()).map(|s| s.as_str());
         let strategy = strategy_for_field(dsl_type, spec, mode, bound)?;
-        if i > 0 {
-            out.push_str(",\n");
-        }
-        out.push_str(&format!("        {}", strategy));
+        out.push_str(&format!("        {} in {},\n", fname, strategy));
     }
-    let emit_status = rust_codegen_util::has_lifecycle(spec)
-        && !mutable_fields.iter().any(|(n, _)| n == "status");
     if emit_status {
-        if !mutable_fields.is_empty() {
-            out.push_str(",\n");
-        }
         let variants = spec
             .lifecycle_states
             .iter()
             .map(|s| format!("Just(Status::{})", s))
             .collect::<Vec<_>>()
             .join(", ");
-        out.push_str(&format!("        prop_oneof![{}]", variants));
+        out.push_str(&format!("        status in prop_oneof![{}],\n", variants));
     }
-    out.push_str(",\n    ).prop_map(|(");
-    for (i, (fname, _)) in mutable_fields.iter().enumerate() {
-        if i > 0 {
-            out.push_str(", ");
-        }
-        out.push_str(fname);
-    }
-    if emit_status {
-        if !mutable_fields.is_empty() {
-            out.push_str(", ");
-        }
-        out.push_str("status");
-    }
-    out.push_str(")| State {\n");
+    out.push_str("    ) -> State {\n");
+    out.push_str("        State {\n");
     for (fname, _) in mutable_fields {
-        out.push_str(&format!("        {},\n", fname));
+        out.push_str(&format!("            {},\n", fname));
     }
     if emit_status {
-        out.push_str("        status,\n");
+        out.push_str("            status,\n");
     }
-    out.push_str("    })\n");
+    out.push_str("        }\n");
+    out.push_str("    }\n");
     out.push_str("}\n\n");
     Ok(())
 }

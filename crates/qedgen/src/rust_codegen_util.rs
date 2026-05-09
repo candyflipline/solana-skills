@@ -439,13 +439,16 @@ pub fn check_effect_targets(spec: &ParsedSpec) -> anyhow::Result<()> {
 pub fn collect_full_guard(op: &ParsedHandler, wrapping: bool) -> Option<String> {
     let mut parts = Vec::new();
     if let Some(ref guard) = op.guard_str {
-        parts.push(translate_guard_to_rust(guard, wrapping));
+        parts.push(format!("({})", translate_guard_to_rust(guard, wrapping)));
     }
     for req in &op.requires {
         if mentions_handler_account_pubkey(&req.rust_expr, &op.accounts) {
             continue;
         }
-        parts.push(translate_guard_to_rust(&req.rust_expr, wrapping));
+        parts.push(format!(
+            "({})",
+            translate_guard_to_rust(&req.rust_expr, wrapping)
+        ));
     }
     if parts.is_empty() {
         None
