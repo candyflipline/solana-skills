@@ -163,19 +163,24 @@ fn run_crucible_round(
 ) -> Result<Vec<Finding>> {
     let crash_dir = run_crucible(&ctx.harness_dir, budget, ctx.stateful)
         .with_context(|| format!("crucible run ({label}) failed"))?;
-    let mut findings = Vec::new();
     let crashes = collect_crash_files(&crash_dir).unwrap_or_default();
+    if !crashes.is_empty() {
+        // tmin best-effort: failure is non-fatal — the raw crashes are
+        // still valid reproducers, we just lose minimization. `--all`
+        // does every crash in a single subprocess.
+        let _ = auto_tmin_all(&ctx.harness_dir, ctx.tmin_cap);
+    }
+    // Re-scan after tmin — minimization may rewrite the .meta.json
+    // contents in place. Path list is stable; content is what we read.
+    let mut findings = Vec::new();
     for crash in crashes {
-        // tmin best-effort: failure is non-fatal — the raw crash is
-        // still a reproducer, we just lose minimization on this one.
-        let _ = auto_tmin(&ctx.harness_dir, &crash, ctx.tmin_cap);
         let raw = match std::fs::read(&crash) {
             Ok(bytes) => bytes,
             Err(_) => continue,
         };
         let meta = match parse_crash_metadata(&raw) {
             Ok(m) => m,
-            Err(_) => continue, // skip malformed crashes
+            Err(_) => continue,
         };
         findings.push(finding_from_crash(&ctx.harness_dir, &crash, &meta)?);
     }
@@ -444,9 +449,10 @@ fn run_crucible(harness_dir: &Path, budget: Duration, stateful: bool) -> Result<
     cmd.arg("run")
         .arg(prog)
         .arg(HARNESS_TEST_NAME)
+        .arg("-C")
+        .arg(harness_dir)
         .arg("--timeout")
-        .arg(budget.as_secs().to_string())
-        .current_dir(harness_dir.parent().unwrap_or(Path::new(".")));
+        .arg(budget.as_secs().to_string());
     if stateful {
         cmd.arg("--stateful");
     }
@@ -458,7 +464,18 @@ fn run_crucible(harness_dir: &Path, budget: Duration, stateful: bool) -> Result<
     Ok(harness_dir.join("crashes").join(HARNESS_TEST_NAME))
 }
 
-fn auto_tmin(harness_dir: &Path, crash: &Path, budget: Duration) -> Result<()> {
+/// Minimize every crash for this test in one shot via `crucible tmin --all`.
+/// Replaces the per-crash invocation we had before — Crucible's tmin
+/// expects `<CRASH_FILE>` as a filename relative to the crashes dir,
+/// not a full path, and has no `--timeout` flag at all. The `--all`
+/// form sidesteps both issues and runs in a single subprocess.
+///
+/// `_unused_per_crash_cap` is retained for ABI stability with callers
+/// that pass `TMIN_BUDGET_PER_CRASH` — Crucible's tmin runs to completion
+/// on each crash via forward-pass removal; there is no wall-clock dial
+/// today. If real runs surface a need to cap it, wrap the spawn in a
+/// `tokio::time::timeout` here.
+fn auto_tmin_all(harness_dir: &Path, _unused_per_crash_cap: Duration) -> Result<()> {
     let prog = harness_dir
         .file_name()
         .and_then(|s| s.to_str())
@@ -467,10 +484,9 @@ fn auto_tmin(harness_dir: &Path, crash: &Path, budget: Duration) -> Result<()> {
         .arg("tmin")
         .arg(prog)
         .arg(HARNESS_TEST_NAME)
-        .arg(crash)
-        .arg("--timeout")
-        .arg(budget.as_secs().to_string())
-        .current_dir(harness_dir.parent().unwrap_or(Path::new(".")))
+        .arg("--all")
+        .arg("-C")
+        .arg(harness_dir)
         .status();
     Ok(())
 }
@@ -509,6 +525,42 @@ mod tests {
     use super::*;
     use crate::probe::{CrucibleActionRecord, CrucibleCrashMetadata};
     use serde_json::json;
+
+    /// Real `.meta.json` captured from `crucible run` on Crucible's own
+    /// bundled escrow example (commit 689e63a). Validates that our parser
+    /// + categorize + handler-derive paths handle real crash output, not
+    /// just synthetic test data.
+    const REAL_CRASH_META: &str = include_str!("../test-fixtures/real-crucible-crash.meta.json");
+
+    #[test]
+    fn parses_real_crucible_crash_metadata() {
+        let meta = parse_crash_metadata(REAL_CRASH_META.as_bytes()).expect("parse");
+        assert_eq!(meta.test_name, "invariant_escrow");
+        assert_eq!(meta.actions.len(), 6);
+        // Last action: withdraw(amount=3), success=true → seeded
+        // bug-firing case (post-action assert tripped, no error_code
+        // because the handler returned Ok).
+        let last = meta.actions.last().unwrap();
+        assert_eq!(last.name, "withdraw");
+        assert!(last.success);
+        assert!(last.error_code.is_none());
+    }
+
+    #[test]
+    fn real_crash_categorizes_as_high_invariant_violation() {
+        let meta = parse_crash_metadata(REAL_CRASH_META.as_bytes()).expect("parse");
+        let (sev, tag) = categorize_crash(&meta);
+        assert!(matches!(sev, Severity::High));
+        assert_eq!(tag, "invariant_violation");
+    }
+
+    #[test]
+    fn real_crash_derives_withdraw_as_handler() {
+        let meta = parse_crash_metadata(REAL_CRASH_META.as_bytes()).expect("parse");
+        // Action names in real Crucible output don't carry the `action_`
+        // prefix (we strip it defensively anyway).
+        assert_eq!(derive_handler_for_crash(&meta), "withdraw");
+    }
 
     fn meta_with(actions: Vec<CrucibleActionRecord>) -> CrucibleCrashMetadata {
         CrucibleCrashMetadata {

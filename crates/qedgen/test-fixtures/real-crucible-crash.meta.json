@@ -1,0 +1,50 @@
+{
+  "test_name": "invariant_escrow",
+  "timestamp": "2026-05-13T12:55:25Z",
+  "iteration": 31504,
+  "seed": 1778676908664773000,
+  "actions": [
+    {
+      "name": "advance_slots",
+      "params": {
+        "slots": 0
+      },
+      "success": true
+    },
+    {
+      "name": "deposit",
+      "params": {
+        "amount": 202725
+      },
+      "success": true
+    },
+    {
+      "name": "claim",
+      "params": {},
+      "success": false,
+      "error_code": 6003
+    },
+    {
+      "name": "withdraw",
+      "params": {
+        "amount": 429322
+      },
+      "success": false,
+      "error_code": 6000
+    },
+    {
+      "name": "advance_slots",
+      "params": {
+        "slots": 10
+      },
+      "success": true
+    },
+    {
+      "name": "withdraw",
+      "params": {
+        "amount": 3
+      },
+      "success": true
+    }
+  ]
+}

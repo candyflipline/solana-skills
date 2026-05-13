@@ -448,6 +448,12 @@ fn emit_action_fn(out: &mut String, spec: &ParsedSpec, op: &ParsedHandler) -> Re
     // context comes from the spec's `accounts` block when present; v0
     // emits `todo!()` for the accounts struct (agent-fill) because the
     // Anchor accounts struct field naming is richer than we carry.
+    //
+    // `.send()` returns `Result<TxOutcome, ...>`. TxOutcome is Crucible's
+    // per-tx status (Success / ProgramError / panic). We collapse both
+    // layers into a single bool: transport error from `.send()` itself
+    // counts as a failed action for fuzz purposes, same as a program-
+    // side error.
     let ix_name = pascal_case(&op.name);
     let arg_inits: String = op
         .takes_params
@@ -467,12 +473,15 @@ fn emit_action_fn(out: &mut String, spec: &ParsedSpec, op: &ParsedHandler) -> Re
         out.push_str(&format!("            .signers(&[&self.{who}])\n"));
     }
     out.push_str("            .send();\n");
+    out.push_str(
+        "        let success = outcome.as_ref().map(|o| o.is_success()).unwrap_or(false);\n",
+    );
 
     // Post-call: shadow state sync. v0 emits a structured comment because
     // syncing requires knowing the on-chain account struct shape — also
     // agent-fill once the hook lands.
     if !op.effects.is_empty() {
-        out.push_str("        if outcome.is_success() {\n");
+        out.push_str("        if success {\n");
         out.push_str("            // TODO: sync shadow state from the on-chain account here.\n");
         out.push_str("            // For each effect declared in the spec, copy the post-state\n");
         out.push_str("            // field into the matching self.<field>. Example pattern:\n");
@@ -485,7 +494,7 @@ fn emit_action_fn(out: &mut String, spec: &ParsedSpec, op: &ParsedHandler) -> Re
         out.push_str("        }\n");
     }
 
-    out.push_str("        outcome.is_success()\n");
+    out.push_str("        success\n");
     out.push_str("    }\n");
     Ok(())
 }
