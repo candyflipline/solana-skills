@@ -1,10 +1,11 @@
 # Release v2.15.0
 
-Closes 7 GH issues from `tanmay4l`'s May-1 burst plus folds the v2.15
-external Quasar audit eval (internal + blueshift-gg/quasar examples)
-into the auditor catalog. Spec_hash sealing tightened end-to-end;
-probe runtime detection now correctly classifies hand-written Quasar
-versus qedgen codegen output and discovers handlers in both shapes.
+Closes 7 GH issues from `tanmay4l`'s May-1 burst plus folds new
+auditor-catalog categories that emerged from end-to-end exercises
+on the no-std codegen target. Spec_hash sealing tightened
+end-to-end; probe runtime detection now correctly classifies
+hand-written no-std codegen-target programs versus qedgen codegen
+output and discovers handlers in both shapes.
 
 ## Issues closed
 

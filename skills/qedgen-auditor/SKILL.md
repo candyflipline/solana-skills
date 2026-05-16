@@ -997,12 +997,13 @@ vulnerable.
 - Corpus: "Reentrancy via Token-2022 transfer hook" — first
   Solana-native reentrancy class.
 
-## Quasar / qedgen-codegen runtime
+## qedgen-codegen runtime
 
-When the runtime is **qedgen-codegen** (detected by `quasar-lang`
-dep or `#[qed(verified)]` markers), the program is split into
-codegen-owned and user-owned files. This changes how the catalog
-applies:
+When the runtime is **qedgen-codegen** (detected by the
+`#[qed(verified)]` markers on handler bodies, or the no-std
+codegen-target dep referenced by `qedgen init --target ...`),
+the program is split into codegen-owned and user-owned files.
+This changes how the catalog applies:
 
 - **Codegen-owned** (`Cargo.toml`, `state.rs`, `errors.rs`,
   `events.rs`, `instructions/<h>/guards.rs`, the `lib.rs` Anchor
@@ -1042,7 +1043,7 @@ of which can drift from the spec.
 
 Plus four qedgen-codegen-specific categories below.
 
-### `spec_impl_drift_user_owned` — HIGH (Quasar)
+### `spec_impl_drift_user_owned` — HIGH (qedgen-codegen)
 User-owned handler body deviates from the spec's `effect` block.
 Three flavors:
 
@@ -1066,7 +1067,7 @@ corresponding body assignment (missing).
 Severity: HIGH because the formal-verification artifacts become
 stale silently — `lake build` green ≠ "program correct."
 
-### `generated_guard_bypass` — CRITICAL (Quasar)
+### `generated_guard_bypass` — CRITICAL (qedgen-codegen)
 User-owned handler body skips the codegen-emitted
 `guards::<handler>(self, ...)?;` call (or comments it out, or
 narrows it to a subset). The codegen ships with the guard call
@@ -1080,7 +1081,7 @@ drop it.
   the body now does whatever, with no spec-derived
   authorization.
 
-### `stored_field_never_written` — CRITICAL (Quasar)
+### `stored_field_never_written` — CRITICAL (qedgen-codegen)
 The spec's state struct (or sum-type variant) declares a field
 that **no handler `effect` block writes**, but other handler
 guards or effect RHSes read it. Distinct from
@@ -1098,11 +1099,13 @@ so reads always return the type's zero / default.
   signing as the zero address would pass, depending on guard
   shape). HIGH if it's economic but not authorization. MEDIUM if
   it's only event payload / read-only.
-- Surfaced by Quasar OOD eval — multisig's `create_vault` doesn't
-  write `vault.creator` despite the spec declaring it; downstream
-  guards read it.
+- Common shape: a multisig-style `create_vault` declares
+  `vault.creator` in its state struct but no handler effect writes
+  to it, while downstream auth guards (`signer.key() ==
+  vault.creator`) read it. The zero pubkey then authorises any
+  signer.
 
-### `qed_hash_drift_or_forgery` — HIGH (Quasar)
+### `qed_hash_drift_or_forgery` — HIGH (qedgen-codegen)
 The `#[qed(verified, hash = "...", spec_hash = "...")]` proc-macro
 content-pin can drift (the body changed, the hash didn't update —
 `qedgen check --frozen` catches it) or be forged (a malicious

@@ -2946,7 +2946,7 @@ pub fn check_completeness(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
                         severity: Severity::Warning,
                         priority: 2,
                         message: format!(
-                            "handler '{}' modifies field(s) [{}] used in property '{}' but is excluded from `preserved_by` — the inductive theorem arm will emit `sorry`",
+                            "handler '{}' modifies field(s) [{}] used in property '{}' but is excluded from `preserved_by` — no inductive arm is generated for this handler, so the per-arm proof obligation is silently dropped. Either add the handler to `preserved_by` (and discharge the proof) or refactor the property so this handler doesn't need to preserve it.",
                             op.name,
                             modified_prop_fields.join(", "),
                             prop.name
