@@ -208,12 +208,61 @@ MEDIUM and below: a repro is encouraged but not required.
       style nits) don't have a clean state-corruption witness; ship
       them with the structural narrative.
 
-6. **Scaffold silently** (per the tactile-tooling principle — no consent
-   prompts in the middle of the named operation):
-   - In spec-less mode, sketch a `.qedspec` from observed handlers via
-     `qedgen spec --idl <path>` (Anchor with IDL) or by writing a
-     handler skeleton from source walk (native / sBPF). Write to
-     `<program-name>.qedspec` at project root.
+6. **Scaffold-to-spec interview** (v2.19 — replaces the silent scaffold).
+   For spec-less brownfield audits, drive the user through a markdown
+   interview that ratifies candidate spec clauses before emitting the
+   `.qedspec`. Yields a higher-quality spec than the silent scaffold and
+   captures rejected/bug-flagged decisions for the audit trail.
+
+   a) **Probe with `--emit-spec-candidates`** to materialize the audit
+      working set:
+      ```bash
+      qedgen probe --program <root> --emit-spec-candidates \
+        --audit-dir .qed/audit/<timestamp>
+      ```
+      Writes three files to the audit dir:
+      - `interview.md` — markdown checkboxes, one section per cluster
+      - `clusters.json` — full schema-v3 envelope with cluster metadata
+      - `skeleton.qedspec` — structural skeleton (handler stubs only)
+
+   b) **Surface the interview to the user.** Read `interview.md` and
+      summarize the clusters in the digest — number of clusters,
+      confidence band, target handlers. Pause for the user to edit the
+      file by checking one option per cluster (`[x]`). They can choose
+      `accept` / `narrow` / `reject` / `bug` and optionally add notes.
+
+   c) **Ratify** when the user confirms the interview is complete:
+      ```bash
+      qedgen ratify --audit-dir .qed/audit/<timestamp> \
+        --out <program>.qedspec
+      ```
+      Writes:
+      - `<program>.qedspec` — skeleton + ratified clauses merged into
+        the appropriate handler bodies / top-level invariants
+      - `.qed/plan/scoping.md` — rejected clusters with user rationale
+      - `.qed/findings/scaffold-to-spec-<id>.md` — one file per
+        bug-flagged cluster (the user identified the implicit
+        precondition as a real missing-enforcement bug)
+
+   d) **Confirm the spec parses.** Run `qedgen check --spec
+      <program>.qedspec` after ratification. P1 lints on placeholder
+      handler stubs are expected (handler bodies still need real
+      `requires` / `effect` clauses); zero parse errors is the gate.
+
+   The interview is **harness-agnostic** — it's file-driven (Write +
+   Read), not interactive prompts. Codex/Cursor/Windsurf handle it
+   identically to Claude Code. The user can answer questions across
+   multiple sessions; unchecked clusters stay deferred.
+
+   **When to use the interview vs the legacy silent scaffold:**
+   - Spec-less brownfield + clusters present → run the interview.
+   - Spec-aware mode (`.qedspec` already exists) → skip; the spec
+     drives the audit directly.
+   - Runtimes the extractor doesn't cover yet (sBPF, exotic) → fall
+     back to the legacy silent scaffold (`qedgen spec --idl <path>`
+     for Anchor with IDL, or hand-walk source).
+
+   Other artifact emission (unchanged from earlier versions):
    - Write the full audit report to `.qed/findings/audit-<timestamp>.md`.
    - Write `.qed/probe-suppress.toml` for auto-detected false-positives.
    - Reproducers live under `target/qedgen-repros/audit/<finding-id>.rs`
@@ -699,6 +748,36 @@ verification claim.
   frozen check, forgery is undetectable to downstream consumers.
 - Severity: HIGH if forged (verification claim is a lie); MED if
   drift (out-of-date but caught at the next CI run).
+
+## Cluster taxonomy (scaffold-to-spec interview)
+
+The interview groups probe findings by **cluster kind** — 14 categories
+that map detected site shapes to candidate spec clauses. Each kind has
+a Program-scope and Handler-scope variant; the algorithm promotes
+clusters to Program scope when ≥3 handlers share the kind.
+
+| Cluster kind | Triggers from | Spec-clause target |
+|---|---|---|
+| `account_owner_check` | Pinocchio `_unchecked` loads with owner-claim SAFETY; Anchor `AccountInfo` for token-shaped accounts; Native handlers reading data without `owner ==` check | `invariant owner_locked_writes "..."` or per-handler `requires <acc>.owner == self_program_id` |
+| `account_init_check` | `_unchecked` loads claiming init precondition; Native handlers reading account data without init guard | `invariant accounts_initialized_before_use "..."` or `requires <acc>.is_initialized` |
+| `account_signer_check` | Missing-signer findings across runtimes | `invariant authority_signs_state_change "..."` or `auth <authority>` |
+| `account_type_tag_check` | Discriminator-collision sites; Anchor `AccountInfo` for typed accounts; Pinocchio bytemuck / raw-cast / indexed-access | `invariant account_type_tag_checked "..."` or `requires <acc> is .<Variant>` |
+| `account_distinct` | Aliasing-mutable-borrow; Anchor missing `has_one` constraint pairs | `invariant distinct_account_aliases "..."` or `requires <a> != <b>` |
+| `arithmetic_no_overflow` | Raw `+ - * /` on amounts/lamports outside `checked_*` family; Pinocchio `set_amount(amount() + x)`; Native `**lamports() -= x` | `invariant checked_arithmetic "..."` or per-effect `+=`/`-=` (checked, not `+=?` wrap) |
+| `arithmetic_bound_pre` | Overflow sites with implicit caller-side amount bound | `requires amount <= <bound>` |
+| `pda_canonical_derivation` | `Pubkey::create_program_address` (non-canonical); Anchor missing `bump` keyword | `pda <name> [<seeds>]` with canonical derivation |
+| `pda_seed_uniqueness` | Shared PDA seeds across handler families | seed list includes a distinguishing field |
+| `lifecycle_one_shot` | Init-without-is-initialized; Anchor `init_if_needed` | `handler init : State.Uninit -> State.Init` + `establishes init_is_one_shot` |
+| `lifecycle_monotonic` | Re-init / close-without-zero-discriminator | State ADT + per-handler `pre -> post` annotations |
+| `cpi_program_pin` | Unvalidated `invoke_signed`; Anchor `AccountInfo`-typed program accounts | `transfers { ... }` or `call Interface.handler(...)` (target pinned) |
+| `cpi_account_direction` | From/to swap risk; ambiguous source/destination/authority | `transfers { from <s> to <d> amount <n> authority <a> }` |
+| `dispatch_caller_establishes_callee_requires` | Batch-dispatch handler that doesn't re-check callee preconditions (the cf136e7 p-token shape) | `call Interface.handler(...)` mirroring callee's `requires` |
+
+The interview UI walks these in confidence order (High → Medium → Low),
+with Program-scope clusters before Handler-scope. The user answers each
+with `accept` (emit clause), `narrow` (per-handler instead of program-
+wide), `reject` (drop with rationale), or `bug` (real missing-check
+to file as a finding).
 
 ## Compose-with-what cookbook
 
