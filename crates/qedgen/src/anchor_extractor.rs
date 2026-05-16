@@ -193,7 +193,10 @@ impl AnchorPatterns {
             )
             .unwrap(),
             fn_signature: Regex::new(r"(?m)^\s*(?:pub\s+)?fn\s+(\w+)\s*\(").unwrap(),
-            checked_call: Regex::new(r"\b(?:checked|saturating|wrapping|overflowing)_(?:add|sub|mul|div|rem)\b").unwrap(),
+            checked_call: Regex::new(
+                r"\b(?:checked|saturating|wrapping|overflowing)_(?:add|sub|mul|div|rem)\b",
+            )
+            .unwrap(),
         }
     }
 }
@@ -248,7 +251,8 @@ fn scan_accounts_structs(rs_files: &[PathBuf], pat: &AnchorPatterns) -> Vec<Acco
                 if pat.seeds_attr.is_match(&attr_block.contents)
                     && !pat.bump_keyword.is_match(&attr_block.contents)
                 {
-                    pda_without_bump.push(attr_block.field_name.unwrap_or_else(|| "<unknown>".into()));
+                    pda_without_bump
+                        .push(attr_block.field_name.unwrap_or_else(|| "<unknown>".into()));
                 }
             }
 
@@ -299,6 +303,7 @@ struct AttrBlock {
 fn extract_account_attr_blocks(body: &str) -> Vec<AttrBlock> {
     let mut out = Vec::new();
     let attr_re = Regex::new(r"#\[account\(").unwrap();
+    let field_re = Regex::new(r"(?m)^\s*(?:pub\s+)?(\w+)\s*:").unwrap();
     for m in attr_re.find_iter(body) {
         // Find the matching closing paren.
         let open = m.end() - 1;
@@ -308,12 +313,17 @@ fn extract_account_attr_blocks(body: &str) -> Vec<AttrBlock> {
         }
         let contents = body[m.start()..=close].to_string();
         // The decorated field is the next `name : Type` after the attr's `]`.
-        let after = body[close..].find(']').map(|i| close + i + 1).unwrap_or(close);
-        let field_re = Regex::new(r"(?m)^\s*(?:pub\s+)?(\w+)\s*:").unwrap();
+        let after = body[close..]
+            .find(']')
+            .map(|i| close + i + 1)
+            .unwrap_or(close);
         let field_name = field_re
             .captures(&body[after..])
             .map(|c| c.get(1).unwrap().as_str().to_string());
-        out.push(AttrBlock { contents, field_name });
+        out.push(AttrBlock {
+            contents,
+            field_name,
+        });
     }
     out
 }
@@ -479,7 +489,11 @@ fn contains_assignment(line: &str) -> bool {
     for (i, &b) in bytes.iter().enumerate() {
         if b == b'=' {
             let prev = if i > 0 { bytes[i - 1] } else { b' ' };
-            let next = if i + 1 < bytes.len() { bytes[i + 1] } else { b' ' };
+            let next = if i + 1 < bytes.len() {
+                bytes[i + 1]
+            } else {
+                b' '
+            };
             // Skip `==`, `!=`, `<=`, `>=`. Accept `=`, `+=`, `-=`, `*=`, `/=`.
             if next == b'=' || matches!(prev, b'!' | b'<' | b'>' | b'=') {
                 continue;
@@ -495,7 +509,11 @@ fn has_arith_operator(s: &str) -> bool {
     let bytes = s.as_bytes();
     for (i, &b) in bytes.iter().enumerate() {
         if matches!(b, b'+' | b'-' | b'*' | b'/') {
-            let next = if i + 1 < bytes.len() { bytes[i + 1] } else { b' ' };
+            let next = if i + 1 < bytes.len() {
+                bytes[i + 1]
+            } else {
+                b' '
+            };
             if next == b'=' {
                 continue;
             }
@@ -525,10 +543,7 @@ fn attribute_arith_to_handlers(
     // Pre-compute (fn_name, line_number) pairs in source order.
     let mut fn_lines: Vec<(String, usize)> = Vec::new();
     for caps in pat.fn_signature.captures_iter(source) {
-        let line = source[..caps.get(0).unwrap().start()]
-            .matches('\n')
-            .count()
-            + 1;
+        let line = source[..caps.get(0).unwrap().start()].matches('\n').count() + 1;
         fn_lines.push((caps.get(1).unwrap().as_str().to_string(), line));
     }
 
@@ -537,8 +552,7 @@ fn attribute_arith_to_handlers(
         // Find the most recent fn declaration at or before site_line.
         let attribution = fn_lines
             .iter()
-            .filter(|(_, l)| *l <= site_line)
-            .next_back()
+            .rfind(|(_, l)| *l <= site_line)
             .map(|(name, _)| name.clone());
         if let Some(name) = attribution {
             // Only attribute to handlers we know about (filter out
@@ -585,11 +599,12 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| matches!(n, "target" | ".git" | "node_modules" | "tests" | "fuzz" | "migrations"))
-        {
+        if path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+            matches!(
+                n,
+                "target" | ".git" | "node_modules" | "tests" | "fuzz" | "migrations"
+            )
+        }) {
             continue;
         }
         if path.is_dir() {
@@ -688,8 +703,13 @@ pub struct Vault {}
             .iter()
             .filter(|p| p.kind == ClusterKind::PdaCanonicalDerivation)
             .collect();
-        assert_eq!(pda.len(), 1, "expected 1 PdaCanonicalDerivation, got {:?}", pda);
-    Ok(())
+        assert_eq!(
+            pda.len(),
+            1,
+            "expected 1 PdaCanonicalDerivation, got {:?}",
+            pda
+        );
+        Ok(())
     }
 
     #[test]
@@ -718,7 +738,11 @@ pub struct Vault {}
             .iter()
             .filter(|p| p.kind == ClusterKind::PdaCanonicalDerivation)
             .collect();
-        assert!(pda.is_empty(), "bump present should suppress PdaCanonicalDerivation; got {:?}", pda);
+        assert!(
+            pda.is_empty(),
+            "bump present should suppress PdaCanonicalDerivation; got {:?}",
+            pda
+        );
         Ok(())
     }
 

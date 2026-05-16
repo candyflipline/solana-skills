@@ -84,7 +84,11 @@ pub fn extract_proto_clauses(project_root: &Path) -> Result<Vec<ProtoClause>> {
             // Look back up to 10 lines for a program-ID validation
             // pattern.
             let window_start = line_idx.saturating_sub(10);
-            let window: Vec<&str> = source.lines().skip(window_start).take(line_idx - window_start + 1).collect();
+            let window: Vec<&str> = source
+                .lines()
+                .skip(window_start)
+                .take(line_idx - window_start + 1)
+                .collect();
             let window_str = window.join("\n");
             let validated = pat.program_id_check.is_match(&window_str)
                 || pat.check_program_helper.is_match(&window_str);
@@ -228,10 +232,7 @@ fn nearest_handler(
 ) -> String {
     let mut best: Option<(usize, String)> = None;
     for caps in pat.pub_fn.captures_iter(source) {
-        let line = source[..caps.get(0).unwrap().start()]
-            .matches('\n')
-            .count()
-            + 1;
+        let line = source[..caps.get(0).unwrap().start()].matches('\n').count() + 1;
         if line <= site_line {
             best = Some((line, caps.get(1).unwrap().as_str().to_string()));
         } else {
@@ -274,7 +275,11 @@ fn contains_assignment(line: &str) -> bool {
     for (i, &b) in bytes.iter().enumerate() {
         if b == b'=' {
             let prev = if i > 0 { bytes[i - 1] } else { b' ' };
-            let next = if i + 1 < bytes.len() { bytes[i + 1] } else { b' ' };
+            let next = if i + 1 < bytes.len() {
+                bytes[i + 1]
+            } else {
+                b' '
+            };
             if next == b'=' || matches!(prev, b'!' | b'<' | b'>' | b'=') {
                 continue;
             }
@@ -288,7 +293,11 @@ fn has_arith_operator(s: &str) -> bool {
     let bytes = s.as_bytes();
     for (i, &b) in bytes.iter().enumerate() {
         if matches!(b, b'+' | b'-' | b'*' | b'/') {
-            let next = if i + 1 < bytes.len() { bytes[i + 1] } else { b' ' };
+            let next = if i + 1 < bytes.len() {
+                bytes[i + 1]
+            } else {
+                b' '
+            };
             if next == b'=' {
                 continue;
             }
@@ -318,11 +327,12 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| matches!(n, "target" | ".git" | "node_modules" | "tests" | "fuzz" | "migrations"))
-        {
+        if path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+            matches!(
+                n,
+                "target" | ".git" | "node_modules" | "tests" | "fuzz" | "migrations"
+            )
+        }) {
             continue;
         }
         if path.is_dir() {
@@ -423,7 +433,10 @@ pub fn handler(accounts: &[AccountInfo]) -> ProgramResult {
             .iter()
             .filter(|p| p.kind == ClusterKind::CpiProgramPin)
             .collect();
-        assert!(cpi.is_empty(), "check_<program>_program helper should suppress");
+        assert!(
+            cpi.is_empty(),
+            "check_<program>_program helper should suppress"
+        );
         Ok(())
     }
 
@@ -468,10 +481,17 @@ pub fn close_account(accounts: &[AccountInfo]) -> ProgramResult {
         let protos = extract_proto_clauses(dir.path())?;
         let demot: Vec<_> = protos
             .iter()
-            .filter(|p| p.kind == ClusterKind::ArithmeticNoOverflow
-                && p.finding_id.contains("lamport_demotion"))
+            .filter(|p| {
+                p.kind == ClusterKind::ArithmeticNoOverflow
+                    && p.finding_id.contains("lamport_demotion")
+            })
             .collect();
-        assert_eq!(demot.len(), 2, "expected 2 lamport-demotion clauses, got {:?}", demot);
+        assert_eq!(
+            demot.len(),
+            2,
+            "expected 2 lamport-demotion clauses, got {:?}",
+            demot
+        );
         Ok(())
     }
 
@@ -494,7 +514,11 @@ pub fn increment(accounts: &[AccountInfo], delta: u64) -> ProgramResult {
             .iter()
             .filter(|p| p.kind == ClusterKind::ArithmeticNoOverflow)
             .collect();
-        assert!(!arith.is_empty(), "expected raw-arith clause; got {:?}", arith);
+        assert!(
+            !arith.is_empty(),
+            "expected raw-arith clause; got {:?}",
+            arith
+        );
         Ok(())
     }
 }

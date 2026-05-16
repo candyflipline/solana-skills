@@ -57,11 +57,7 @@ pub fn extract_proto_clauses(findings: &[Finding]) -> Vec<ProtoClause> {
                     ));
                 } else {
                     for kind in kinds {
-                        out.push(make(
-                            kind,
-                            finding,
-                            safety_text.clone().unwrap_or_default(),
-                        ));
+                        out.push(make(kind, finding, safety_text.clone().unwrap_or_default()));
                     }
                 }
             }
@@ -72,8 +68,7 @@ pub fn extract_proto_clauses(findings: &[Finding]) -> Vec<ProtoClause> {
                     safety_text.unwrap_or_else(|| finding.category_tag.clone()),
                 ));
             }
-            Category::PinocchioAccountTypeConfusion
-            | Category::PinocchioPositionWithoutTypeTag => {
+            Category::PinocchioAccountTypeConfusion | Category::PinocchioPositionWithoutTypeTag => {
                 out.push(make(
                     ClusterKind::AccountTypeTagCheck,
                     finding,
@@ -335,11 +330,7 @@ mod tests {
 
     #[test]
     fn offset_overrun_lifts_to_arith_bound_pre() {
-        let f = finding_with(
-            Category::PinocchioOffsetOverrun,
-            "parse_from_bytes",
-            None,
-        );
+        let f = finding_with(Category::PinocchioOffsetOverrun, "parse_from_bytes", None);
         let protos = extract_proto_clauses(&[f]);
         assert_eq!(protos.len(), 1);
         assert_eq!(protos[0].kind, ClusterKind::ArithmeticBoundPre);
@@ -357,11 +348,7 @@ mod tests {
             ("parse_from_bytes", false),
         ];
         for (name, expect_filtered) in cases {
-            let f = finding_with(
-                Category::PinocchioOffsetOverrun,
-                name,
-                None,
-            );
+            let f = finding_with(Category::PinocchioOffsetOverrun, name, None);
             let protos = extract_proto_clauses(&[f]);
             if expect_filtered {
                 assert!(

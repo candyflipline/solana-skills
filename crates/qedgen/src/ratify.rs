@@ -128,7 +128,12 @@ pub fn run(opts: &RatifyOpts) -> Result<RatifyReport> {
     }
 
     // ── Emit spec ──────────────────────────────────────────────────
-    let merged = merge_into_skeleton(&skeleton, &accepted_program, &accepted_by_handler, &narrowed_by_handler);
+    let merged = merge_into_skeleton(
+        &skeleton,
+        &accepted_program,
+        &accepted_by_handler,
+        &narrowed_by_handler,
+    );
     let spec_path = opts
         .spec_out
         .clone()
@@ -314,7 +319,10 @@ fn render_scoping_block(rejected: &[(&Cluster, &Ratification)]) -> String {
             cluster.kind.as_str(),
             cluster.scope.as_key()
         ));
-        s.push_str(&format!("**Proto-clause:** {}\n\n", cluster.proto_clause_text));
+        s.push_str(&format!(
+            "**Proto-clause:** {}\n\n",
+            cluster.proto_clause_text
+        ));
         s.push_str(&format!(
             "**Evidence:** {} finding(s)\n\n",
             cluster.evidence_count
@@ -357,8 +365,14 @@ fn render_bug_finding(cluster: &Cluster, ratification: &Ratification) -> String 
     s.push_str(&format!("**Cluster kind:** `{}`\n", cluster.kind.as_str()));
     s.push_str(&format!("**Scope:** `{}`\n", cluster.scope.as_key()));
     s.push_str(&format!("**Confidence:** {:?}\n", cluster.confidence));
-    s.push_str(&format!("**Evidence:** {} finding(s)\n\n", cluster.evidence_count));
-    s.push_str(&format!("**Proto-clause:** {}\n\n", cluster.proto_clause_text));
+    s.push_str(&format!(
+        "**Evidence:** {} finding(s)\n\n",
+        cluster.evidence_count
+    ));
+    s.push_str(&format!(
+        "**Proto-clause:** {}\n\n",
+        cluster.proto_clause_text
+    ));
     s.push_str(
         "The user flagged this cluster as a **bug** during the interview — \
          i.e., the implicit precondition is real, but the code does NOT \
@@ -473,10 +487,7 @@ mod tests {
         let audit = dir.path().join(".qed/audit/test");
         let clusters = build_test_clusters();
         let cid = clusters[0].id.clone();
-        let interview = format!(
-            "<!-- cluster: {} -->\n- [x] **accept** — emit\n",
-            cid
-        );
+        let interview = format!("<!-- cluster: {} -->\n- [x] **accept** — emit\n", cid);
         let skeleton = render_skeleton_from_handlers(
             &["process_transfer".to_string(), "process_burn".to_string()],
             "ptoken",
@@ -564,13 +575,14 @@ mod tests {
         let audit = dir.path().join(".qed/audit/test");
         // Single handler-scope cluster (only one handler contributes — no
         // Program-scope promotion).
-        let protos = vec![proto(ClusterKind::AccountInitCheck, "process_transfer", "f1")];
+        let protos = vec![proto(
+            ClusterKind::AccountInitCheck,
+            "process_transfer",
+            "f1",
+        )];
         let clusters = cluster_protos(protos);
         let cid = clusters[0].id.clone();
-        let interview = format!(
-            "<!-- cluster: {} -->\n- [x] **accept**\n",
-            cid
-        );
+        let interview = format!("<!-- cluster: {} -->\n- [x] **accept**\n", cid);
         let skeleton = render_skeleton_from_handlers(&["process_transfer".into()], "p");
         write_audit_dir(&audit, &skeleton, &clusters, &interview)?;
 
@@ -616,7 +628,7 @@ mod tests {
         // clusters.json — e.g., from a manual edit.
         let interview = "<!-- cluster: c-bogus-fake -->\n- [x] **accept**\n";
         let skeleton = render_skeleton_from_handlers(&[], "p");
-        write_audit_dir(&audit, &skeleton, &clusters, &interview)?;
+        write_audit_dir(&audit, &skeleton, &clusters, interview)?;
 
         let opts = RatifyOpts {
             audit_dir: audit,
@@ -682,12 +694,14 @@ mod tests {
                 };
                 let clusters = cluster_protos(protos);
                 let cid = clusters[0].id.clone();
-                let interview = format!(
-                    "<!-- cluster: {} -->\n- [x] **accept**\n",
-                    cid
-                );
+                let interview = format!("<!-- cluster: {} -->\n- [x] **accept**\n", cid);
                 let skeleton = render_skeleton_from_handlers(
-                    &["process_test".to_string(), "h1".into(), "h2".into(), "h3".into()],
+                    &[
+                        "process_test".to_string(),
+                        "h1".into(),
+                        "h2".into(),
+                        "h3".into(),
+                    ],
                     "test_prog",
                 );
                 write_audit_dir(&audit, &skeleton, &clusters, &interview)?;
@@ -731,10 +745,8 @@ mod tests {
         let clusters = cluster_protos(protos);
         let cid = clusters[0].id.clone();
         let interview = format!("<!-- cluster: {} -->\n- [x] **accept**\n", cid);
-        let skeleton = render_skeleton_from_handlers(
-            &["h1".into(), "h2".into(), "h3".into()],
-            "test_prog",
-        );
+        let skeleton =
+            render_skeleton_from_handlers(&["h1".into(), "h2".into(), "h3".into()], "test_prog");
         write_audit_dir(&audit, &skeleton, &clusters, &interview)?;
 
         let out1 = dir.path().join("run1.qedspec");
@@ -750,8 +762,7 @@ mod tests {
         let bytes1 = std::fs::read(&out1)?;
         let bytes2 = std::fs::read(&out2)?;
         assert_eq!(
-            bytes1,
-            bytes2,
+            bytes1, bytes2,
             "re-running ratify on identical audit_dir must produce identical spec bytes"
         );
         Ok(())

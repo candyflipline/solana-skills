@@ -506,7 +506,10 @@ fn render_program_template(kind: ClusterKind, meta: &KindMeta, n: usize) -> Temp
             "program-wide invariant",
         ),
         writes_on_accept: "spec.invariants".into(),
-        writes_on_narrow: format!("spec.handlers.*.requires  // narrow to per-handler {}", kind.as_str()),
+        writes_on_narrow: format!(
+            "spec.handlers.*.requires  // narrow to per-handler {}",
+            kind.as_str()
+        ),
     }
 }
 
@@ -656,7 +659,12 @@ mod tests {
         for k in all {
             let s = k.as_str();
             assert!(!s.is_empty(), "{:?} has empty as_str", k);
-            assert!(seen.insert(s), "{:?} collides with another variant's as_str = {}", k, s);
+            assert!(
+                seen.insert(s),
+                "{:?} collides with another variant's as_str = {}",
+                k,
+                s
+            );
         }
         assert_eq!(seen.len(), 14, "expected 14 distinct cluster kinds");
     }
@@ -831,7 +839,10 @@ mod tests {
     fn handler_scope_writes_to_specific_handler_path() {
         let protos = vec![proto(ClusterKind::AccountOwnerCheck, "transfer", "f1")];
         let clusters = cluster_protos(protos);
-        assert_eq!(clusters[0].writes_on_accept, "spec.handlers.transfer.requires");
+        assert_eq!(
+            clusters[0].writes_on_accept,
+            "spec.handlers.transfer.requires"
+        );
     }
 
     #[test]

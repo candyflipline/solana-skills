@@ -737,8 +737,10 @@ handler increment : State.Active -> State.Active {
         // Any spec with `pragma sbpf` should be refused — Crucible v2.18
         // ships Anchor-only. We synthesise a minimal ParsedSpec rather
         // than rely on the parser accepting a stub sBPF spec.
-        let mut spec = ParsedSpec::default();
-        spec.program_name = "SbpfProg".into();
+        let mut spec = ParsedSpec {
+            program_name: "SbpfProg".into(),
+            ..Default::default()
+        };
         spec.pragmas.push("sbpf".into());
         spec.handlers.push(crate::check::ParsedHandler {
             name: "transfer".into(),
@@ -787,8 +789,10 @@ handler increment : State.Active -> State.Active {
 
     #[test]
     fn spec_name_snake_cases() {
-        let mut spec = ParsedSpec::default();
-        spec.program_name = "PercolatorRiskEngine".into();
+        let mut spec = ParsedSpec {
+            program_name: "PercolatorRiskEngine".into(),
+            ..Default::default()
+        };
         assert_eq!(spec_program_name(&spec), "percolator_risk_engine");
         spec.program_name = "escrow-split".into();
         assert_eq!(spec_program_name(&spec), "escrow_split");

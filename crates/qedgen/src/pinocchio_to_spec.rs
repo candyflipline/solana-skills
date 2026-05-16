@@ -44,9 +44,7 @@ pub fn render_skeleton_from_handlers(handlers: &[String], program_name: &str) ->
     let pascal = to_pascal_case(program_name);
     let mut s = String::new();
     s.push_str("// Skeleton emitted by `qedgen probe --emit-spec-candidates` (Pinocchio).\n");
-    s.push_str(
-        "// Empty handler stubs only — semantic clauses (requires / effect / transfers /\n",
-    );
+    s.push_str("// Empty handler stubs only — semantic clauses (requires / effect / transfers /\n");
     s.push_str("// invariants) are written by the interview-ratification step.\n\n");
     s.push_str(&format!("spec {}\n\n", pascal));
 
@@ -91,10 +89,7 @@ pub fn enumerate_handlers(project_root: &Path) -> Result<Vec<String>> {
 /// Variant accepting an arbitrary prefix. Pinocchio convention is
 /// `process_*`; Native programs vary (e.g., `processor::do_thing`,
 /// `entrypoint`, or bare names). Pass `""` to accept every `pub fn`.
-pub fn enumerate_handlers_with_prefix(
-    project_root: &Path,
-    prefix: &str,
-) -> Result<Vec<String>> {
+pub fn enumerate_handlers_with_prefix(project_root: &Path, prefix: &str) -> Result<Vec<String>> {
     let rs_files = collect_rust_files(project_root)?;
     let mut handlers: BTreeSet<String> = BTreeSet::new();
     let pattern = if prefix.is_empty() {
@@ -203,7 +198,7 @@ mod tests {
 
     #[test]
     fn handler_lines_are_sorted_and_deduplicated() {
-        let handlers = vec![
+        let handlers = [
             "process_transfer".to_string(),
             "process_burn".to_string(),
             "process_transfer".to_string(),

@@ -1592,7 +1592,10 @@ async fn main() -> Result<()> {
                 // findings yet — the auditor SKILL.md handles that via
                 // Read+Grep at the agent layer. Clusters come directly
                 // from source patterns.
-                if matches!(runtime_final, probe::Runtime::Anchor | probe::Runtime::Quasar) {
+                if matches!(
+                    runtime_final,
+                    probe::Runtime::Anchor | probe::Runtime::Quasar
+                ) {
                     return run_anchor_probe(
                         prog_root,
                         runtime_final,
@@ -1644,9 +1647,7 @@ async fn main() -> Result<()> {
                 // the full audit working set: interview.md (user prompts),
                 // clusters.json (full envelope for `qedgen ratify`),
                 // skeleton.qedspec (pre-interview structural skeleton).
-                if let (Some(dir), Some(clusters_ref)) =
-                    (audit_dir.as_ref(), clusters.as_ref())
-                {
+                if let (Some(dir), Some(clusters_ref)) = (audit_dir.as_ref(), clusters.as_ref()) {
                     let program_name = prog_root
                         .file_name()
                         .and_then(|n| n.to_str())
@@ -1665,8 +1666,7 @@ async fn main() -> Result<()> {
                     std::fs::write(dir.join("clusters.json"), clusters_json)?;
                     // 3. skeleton.qedspec — pre-interview structural
                     // skeleton (handler stubs only).
-                    let skeleton =
-                        pinocchio_to_spec::render_skeleton(prog_root, &program_name)?;
+                    let skeleton = pinocchio_to_spec::render_skeleton(prog_root, &program_name)?;
                     std::fs::write(dir.join("skeleton.qedspec"), skeleton)?;
                     eprintln!("Wrote audit working set to {}", dir.display());
                 }

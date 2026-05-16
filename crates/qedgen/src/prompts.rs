@@ -17,8 +17,8 @@
 //! M1.6 adds the inverse direction: `read_interview` parses the
 //! user-edited file and returns the ratified choices for each cluster.
 
-use anyhow::{Context, Result};
 use crate::cluster::{Cluster, Confidence};
+use anyhow::{Context, Result};
 use std::path::Path;
 
 /// Render the full interview markdown.
@@ -57,13 +57,21 @@ pub fn render_interview(clusters: &[Cluster], program_name: &str, now_iso: &str)
     }
 
     let band_labels = [
-        ("## High-confidence clusters", "high-confidence", Confidence::High),
+        (
+            "## High-confidence clusters",
+            "high-confidence",
+            Confidence::High,
+        ),
         (
             "## Medium-confidence clusters",
             "medium-confidence",
             Confidence::Medium,
         ),
-        ("## Low-confidence clusters", "low-confidence", Confidence::Low),
+        (
+            "## Low-confidence clusters",
+            "low-confidence",
+            Confidence::Low,
+        ),
     ];
     for (heading, _slug, conf) in &band_labels {
         let band = match conf {
@@ -97,9 +105,7 @@ fn write_header(s: &mut String, program: &str, now_iso: &str, n_clusters: usize)
         if n_clusters == 1 { "" } else { "s" }
     ));
     s.push_str("Options across every cluster:\n\n");
-    s.push_str(
-        "- **accept** — emit the suggested clause into the generated `.qedspec`\n",
-    );
+    s.push_str("- **accept** — emit the suggested clause into the generated `.qedspec`\n");
     s.push_str(
         "- **narrow** (program-scope clusters only) — emit per-handler `requires` \
          clauses instead of a single program invariant\n",
@@ -179,17 +185,6 @@ pub enum Choice {
     Narrow,
     Reject,
     Bug,
-}
-
-impl Choice {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Choice::Accept => "accept",
-            Choice::Narrow => "narrow",
-            Choice::Reject => "reject",
-            Choice::Bug => "bug",
-        }
-    }
 }
 
 /// Parse an interview markdown file (or string content).
@@ -367,11 +362,7 @@ mod tests {
         // (5 evidence ≥ HIGH threshold).
         assert!(md.contains("## High-confidence clusters"));
         // Cluster ID appears as an HTML comment.
-        assert!(
-            md.contains("<!-- cluster: c-"),
-            "no cluster id in {}",
-            md
-        );
+        assert!(md.contains("<!-- cluster: c-"), "no cluster id in {}", md);
         // Suggested syntax block rendered.
         assert!(md.contains("Suggested spec syntax"));
         // Footer rendered.
