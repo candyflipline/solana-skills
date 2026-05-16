@@ -32,9 +32,17 @@ use crate::probe::{Category, Finding, Reproducer};
 
 /// Extract proto-clauses from a Pinocchio finding set. Output feeds M1.4's
 /// `cluster_protos` algorithm.
+///
+/// Filters out findings whose handler name looks like a test fixture
+/// (`test_*`, `*_test_*`, helpers like `create_valid_data`). Tests
+/// aren't the audit surface and would over-fire on byte-slice probes
+/// against round-trip serialization tests.
 pub fn extract_proto_clauses(findings: &[Finding]) -> Vec<ProtoClause> {
     let mut out = Vec::new();
     for finding in findings {
+        if is_test_handler(&finding.handler) {
+            continue;
+        }
         let safety_text = safety_text_from(finding);
         match &finding.category {
             Category::PinocchioUncheckedAccountLoad => {
@@ -96,10 +104,25 @@ pub fn extract_proto_clauses(findings: &[Finding]) -> Vec<ProtoClause> {
                 // primary cluster.
             }
             Category::PinocchioOffsetOverrun => {
-                // Offset overruns don't map cleanly to a precondition
-                // clause — they're bound-check sites. v2.20 may add
-                // an `ArithmeticBoundPre` mapping when we have enough
-                // real-world signal. v1: skip.
+                // Each byte-slice site (`data[OFFSET..OFFSET+N]`,
+                // `_.try_into().unwrap()`) carries an implicit
+                // precondition: the input buffer is at least
+                // `OFFSET + N` bytes. Lift to ArithmeticBoundPre —
+                // ratified as a per-program "input-data length is
+                // adequate for all parsers" invariant (or per-handler
+                // when only one handler is doing the slicing).
+                //
+                // The Solana-Foundation rewards program surfaced 252
+                // such sites (all `data[N..M]` patterns in `state/*`
+                // parsers). Without this lift they'd vanish into
+                // <empty clusters>; with it, they collapse to one
+                // High-confidence Program-scope cluster the auditor
+                // can ratify or refine.
+                out.push(make(
+                    ClusterKind::ArithmeticBoundPre,
+                    finding,
+                    finding.category_tag.clone(),
+                ));
             }
             // Pinocchio-specific categories below are emitted by the
             // probe but don't classify cleanly into the 14-kind taxonomy.
@@ -166,6 +189,19 @@ fn make(kind: ClusterKind, finding: &Finding, evidence_text: String) -> ProtoCla
         finding_id: finding.id.clone(),
         evidence_text,
     }
+}
+
+/// Heuristic test-handler detector. Filters out findings whose handler
+/// name is a unit-test fn (`test_*`, `*_test`) or an obvious test
+/// helper (`create_valid_data`, `mock_*`). Conservative — any false
+/// negatives surface in dogfood and tighten the rule.
+fn is_test_handler(name: &str) -> bool {
+    let n = name.to_lowercase();
+    n.starts_with("test_")
+        || n.ends_with("_test")
+        || n.contains("create_valid_data")
+        || n.starts_with("mock_")
+        || n.starts_with("fixture_")
 }
 
 #[cfg(test)]
@@ -295,6 +331,52 @@ mod tests {
              got {:?}",
             protos
         );
+    }
+
+    #[test]
+    fn offset_overrun_lifts_to_arith_bound_pre() {
+        let f = finding_with(
+            Category::PinocchioOffsetOverrun,
+            "parse_from_bytes",
+            None,
+        );
+        let protos = extract_proto_clauses(&[f]);
+        assert_eq!(protos.len(), 1);
+        assert_eq!(protos[0].kind, ClusterKind::ArithmeticBoundPre);
+    }
+
+    #[test]
+    fn test_handlers_are_filtered_out() {
+        let cases = [
+            ("test_distribution_event_to_bytes", true),
+            ("test_merkle_root_set_event", true),
+            ("create_valid_data", true),
+            ("mock_account", true),
+            ("fixture_setup", true),
+            ("process_transfer", false),
+            ("parse_from_bytes", false),
+        ];
+        for (name, expect_filtered) in cases {
+            let f = finding_with(
+                Category::PinocchioOffsetOverrun,
+                name,
+                None,
+            );
+            let protos = extract_proto_clauses(&[f]);
+            if expect_filtered {
+                assert!(
+                    protos.is_empty(),
+                    "expected `{}` to be filtered as a test handler",
+                    name
+                );
+            } else {
+                assert!(
+                    !protos.is_empty(),
+                    "expected `{}` to pass the test-filter",
+                    name
+                );
+            }
+        }
     }
 
     #[test]

@@ -432,10 +432,10 @@ fn kind_meta(kind: ClusterKind) -> KindMeta {
             target_form: "// Use `+=` / `-=` (checked, v2.7 G3) in effect blocks; not `+=?` (wrap) or `+=!` (saturate)",
         },
         ClusterKind::ArithmeticBoundPre => KindMeta {
-            invariant_name: "amount_within_domain_bound",
-            description: "amount parameters fall within a pre-checked domain (e.g. mint supply)",
-            site_label: "raw arithmetic on caller-supplied amount",
-            target_form: "requires amount <= <bound> else AmountTooLarge",
+            invariant_name: "inputs_within_domain_bound",
+            description: "caller-supplied inputs fall within a pre-checked domain — amount parameters within mint supply, byte slices within instruction-data length, offsets within account-data length",
+            site_label: "caller-supplied bound assumption",
+            target_form: "requires <input>.len() >= <required_length> else InvalidInputLength  // for byte slices; replace with `<amount> <= <bound>` for amount parameters",
         },
         ClusterKind::PdaCanonicalDerivation => KindMeta {
             invariant_name: "canonical_pda_derivation",
