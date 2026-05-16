@@ -381,244 +381,167 @@ struct TemplateRender {
     writes_on_narrow: String,
 }
 
-fn render_template(kind: ClusterKind, scope: &ClusterScope, n: usize) -> TemplateRender {
-    let handler_name = match scope {
-        ClusterScope::Program => None,
-        ClusterScope::Handler(h) => Some(h.as_str()),
-    };
+/// Static cluster-kind metadata: invariant identifier, human description,
+/// site label for prompts, and the recommended target form for the
+/// handler-scope clause the user fills in manually. M2.3: every emitted
+/// clause is either a description-form `invariant N "..."` (parses today)
+/// or a `// TODO ratified: ...` comment (parser-irrelevant).
+struct KindMeta {
+    invariant_name: &'static str,
+    description: &'static str,
+    site_label: &'static str,
+    target_form: &'static str,
+}
+
+fn kind_meta(kind: ClusterKind) -> KindMeta {
     match kind {
-        ClusterKind::AccountOwnerCheck => match scope {
-            ClusterScope::Program => TemplateRender {
-                proto_text: "Accounts whose owner ≠ self_program_id are read-only".into(),
-                syntax: indent_spec(
-                    "invariant owner_locked_writes\n  forall a in accounts: a.owner \
-                     != self_program_id implies preserved(a.data) and preserved(a.lamports)\n",
-                ),
-                question: render_question(
-                    "owner_locked_writes",
-                    "_unchecked load",
-                    n,
-                    scope,
-                    "program-wide invariant",
-                ),
-                writes_on_accept: "spec.invariants".into(),
-                writes_on_narrow: "spec.handlers.*.requires".into(),
-            },
-            ClusterScope::Handler(h) => TemplateRender {
-                proto_text: format!("Handler `{}` expects account.owner == self_program_id", h),
-                syntax: format!(
-                    "  // (added to handler {h}) — owner check on touched accounts\n  \
-                     requires <account>.owner == self_program_id else Unauthorized\n"
-                ),
-                question: render_question(
-                    "owner_check",
-                    "_unchecked load",
-                    n,
-                    scope,
-                    "per-handler precondition",
-                ),
-                writes_on_accept: format!("spec.handlers.{}.requires", h),
-                writes_on_narrow: format!("spec.handlers.{}.requires", h),
-            },
+        ClusterKind::AccountOwnerCheck => KindMeta {
+            invariant_name: "owner_locked_writes",
+            description: "every account whose owner != self_program_id is read-only across the program",
+            site_label: "_unchecked load",
+            target_form: "requires <account>.owner == self_program_id else Unauthorized",
         },
-        ClusterKind::AccountInitCheck => template_with_handler(
-            "accounts_initialized_before_use",
-            "Accounts are initialized before being read or written",
-            "  forall a in accounts: a is initialized\n",
-            "requires <account>.is_initialized else AccountNotInitialized",
-            handler_name,
-            n,
-            "_unchecked load",
-        ),
-        ClusterKind::AccountSignerCheck => template_with_handler(
-            "authority_signs_state_change",
-            "Authority signs every handler that mutates state",
-            "  -- modelled per-handler via `auth <name>`; no top-level invariant emitted\n",
-            "auth <authority>",
-            handler_name,
-            n,
-            "missing-signer",
-        ),
-        ClusterKind::AccountTypeTagCheck => template_with_handler(
-            "account_type_tag_checked",
-            "Accounts are loaded only after their type discriminator is checked",
-            "  forall a in accounts: a is .<ExpectedVariant>\n",
-            "requires <account> is .<ExpectedVariant> else InvalidAccountType",
-            handler_name,
-            n,
-            "type-tag-free deserialization",
-        ),
-        ClusterKind::AccountDistinct => template_with_handler(
-            "distinct_account_aliases",
-            "Distinct account roles bind to distinct AccountInfo references",
-            "  -- emitted per-handler via `requires acc_a != acc_b`\n",
-            "requires <acc_a> != <acc_b> else AliasingAccounts",
-            handler_name,
-            n,
-            "aliasing-borrow",
-        ),
-        ClusterKind::ArithmeticNoOverflow => match scope {
-            ClusterScope::Program => TemplateRender {
-                proto_text: "Token-amount and lamport arithmetic is checked (no wrap, no saturate)"
-                    .into(),
-                syntax: "// (rendered as per-effect `+=` / `-=` checked ops in handlers below)\n"
-                    .into(),
-                question: render_question(
-                    "checked_arithmetic",
-                    "unchecked arithmetic",
-                    n,
-                    scope,
-                    "checked-by-default semantics",
-                ),
-                writes_on_accept: "spec.handlers.*.effects.op".into(),
-                writes_on_narrow: "spec.handlers.<H>.effects.op".into(),
-            },
-            ClusterScope::Handler(h) => TemplateRender {
-                proto_text: format!("Handler `{}` uses checked arithmetic on amounts/lamports", h),
-                syntax: format!(
-                    "  // (added to handler {h}) — use `+=` / `-=` (checked) on amount fields,\n  \
-                     // not `+=?` (wrapping) or `+=!` (saturating). v2.7 G3 semantics.\n"
-                ),
-                question: render_question(
-                    "checked_arithmetic",
-                    "unchecked arithmetic",
-                    n,
-                    scope,
-                    "per-handler checked operators",
-                ),
-                writes_on_accept: format!("spec.handlers.{}.effects.op", h),
-                writes_on_narrow: format!("spec.handlers.{}.effects.op", h),
-            },
+        ClusterKind::AccountInitCheck => KindMeta {
+            invariant_name: "accounts_initialized_before_use",
+            description: "accounts are initialized before being read or written by any handler",
+            site_label: "_unchecked load",
+            target_form: "requires <account>.is_initialized else AccountNotInitialized",
         },
-        ClusterKind::ArithmeticBoundPre => template_with_handler(
-            "amount_within_domain_bound",
-            "Amount parameters fall within a pre-checked domain (e.g. mint supply)",
-            "  -- typically rendered as a per-handler `requires amount <= <bound>`\n",
-            "requires amount <= <bound> else AmountTooLarge",
-            handler_name,
-            n,
-            "raw arithmetic on caller-supplied amount",
-        ),
-        ClusterKind::PdaCanonicalDerivation => template_with_handler(
-            "canonical_pda_derivation",
-            "PDAs use canonical (find_program_address) bumps",
-            "  pda <name> [<seeds>]\n",
-            "pda <name> [<seeds>]  // canonical derivation",
-            handler_name,
-            n,
-            "create_program_address",
-        ),
-        ClusterKind::PdaSeedUniqueness => template_with_handler(
-            "pda_seed_distinguishes_users",
-            "PDA seeds include a caller-distinguishing field",
-            "  pda <name> [<scope>, caller.pubkey]\n",
-            "pda <name> [<scope>, caller.pubkey]",
-            handler_name,
-            n,
-            "shared PDA seeds",
-        ),
-        ClusterKind::LifecycleOneShot => template_with_handler(
-            "init_is_one_shot",
-            "Init-style handlers transition the account from uninitialized to initialized",
-            "  // declared via `handler init : State.Uninit -> State.Init`\n",
-            "/// `init` is a one-shot State.Uninit -> State.Init transition",
-            handler_name,
-            n,
-            "init-without-is-initialized",
-        ),
-        ClusterKind::LifecycleMonotonic => template_with_handler(
-            "lifecycle_progress_monotonic",
-            "Lifecycle states progress monotonically (no replays)",
-            "  // declared via the State ADT + per-handler pre/post\n",
-            "/// State transitions monotone — no handler maps a Closed state back to Open",
-            handler_name,
-            n,
-            "re-init / replay",
-        ),
-        ClusterKind::CpiProgramPin => template_with_handler(
-            "cpi_program_pinned",
-            "CPI program accounts are pinned to expected program IDs",
-            "  // declared via `transfers { … }` or `call Interface.handler(...)`\n",
-            "/// CPI to <program>: declare via `transfers` or `call Interface.handler(...)`",
-            handler_name,
-            n,
-            "invoke_signed",
-        ),
-        ClusterKind::CpiAccountDirection => template_with_handler(
-            "cpi_direction_explicit",
-            "CPI source / destination / authority order is explicit",
-            "  transfers {\n    from <src> to <dst> amount <amount> authority <auth>\n  }\n",
-            "transfers { from <src> to <dst> amount <amount> authority <auth> }",
-            handler_name,
-            n,
-            "CPI argument order",
-        ),
-        ClusterKind::DispatchCallerEstablishesCalleeRequires => template_with_handler(
-            "dispatcher_establishes_callee_preconditions",
-            "Dispatchers establish callee `requires` before dispatching",
-            "  // declared via `call Interface.handler(...)` with explicit `requires` mapping\n",
-            "/// Dispatcher must establish each callee's `requires` (no runtime-gate trust)",
-            handler_name,
-            n,
-            "batch-mode dispatch",
-        ),
+        ClusterKind::AccountSignerCheck => KindMeta {
+            invariant_name: "authority_signs_state_change",
+            description: "every state-mutating handler authenticates via an `auth` clause",
+            site_label: "missing-signer",
+            target_form: "auth <authority_account>",
+        },
+        ClusterKind::AccountTypeTagCheck => KindMeta {
+            invariant_name: "account_type_tag_checked",
+            description: "accounts are loaded only after their type discriminator is verified",
+            site_label: "type-tag-free deserialization",
+            target_form: "requires <account> is .<ExpectedVariant> else InvalidAccountType",
+        },
+        ClusterKind::AccountDistinct => KindMeta {
+            invariant_name: "distinct_account_aliases",
+            description: "distinct account roles in a handler bind to distinct AccountInfo references",
+            site_label: "aliasing-borrow",
+            target_form: "requires <acc_a> != <acc_b> else AliasingAccounts",
+        },
+        ClusterKind::ArithmeticNoOverflow => KindMeta {
+            invariant_name: "checked_arithmetic",
+            description: "token-amount and lamport arithmetic is checked (no silent wrap, no saturate)",
+            site_label: "unchecked arithmetic",
+            target_form: "// Use `+=` / `-=` (checked, v2.7 G3) in effect blocks; not `+=?` (wrap) or `+=!` (saturate)",
+        },
+        ClusterKind::ArithmeticBoundPre => KindMeta {
+            invariant_name: "amount_within_domain_bound",
+            description: "amount parameters fall within a pre-checked domain (e.g. mint supply)",
+            site_label: "raw arithmetic on caller-supplied amount",
+            target_form: "requires amount <= <bound> else AmountTooLarge",
+        },
+        ClusterKind::PdaCanonicalDerivation => KindMeta {
+            invariant_name: "canonical_pda_derivation",
+            description: "PDAs are derived with canonical (find_program_address) bumps, not user-supplied",
+            site_label: "create_program_address",
+            target_form: "// Declare via top-level `pda <name> [<seeds>]` and reference in handler accounts block",
+        },
+        ClusterKind::PdaSeedUniqueness => KindMeta {
+            invariant_name: "pda_seed_distinguishes_users",
+            description: "PDA seeds include a caller-distinguishing field (user pubkey, resource id) so distinct users cannot share state",
+            site_label: "shared PDA seeds",
+            target_form: "// Declare via `pda <name> [<scope>, caller.pubkey]` — include the distinguishing seed",
+        },
+        ClusterKind::LifecycleOneShot => KindMeta {
+            invariant_name: "init_is_one_shot",
+            description: "init-style handlers move the account from Uninit to Init exactly once",
+            site_label: "init-without-is-initialized",
+            target_form: "// Model as `handler init : State.Uninit -> State.Init` + `establishes init_is_one_shot`",
+        },
+        ClusterKind::LifecycleMonotonic => KindMeta {
+            invariant_name: "lifecycle_progress_monotonic",
+            description: "lifecycle states progress monotonically — no handler walks the state machine backwards",
+            site_label: "re-init / replay",
+            target_form: "// Encode via the State ADT's variants + per-handler `: pre -> post` annotations",
+        },
+        ClusterKind::CpiProgramPin => KindMeta {
+            invariant_name: "cpi_program_pinned",
+            description: "CPI program accounts are pinned to their expected program IDs by spec, not caller-supplied",
+            site_label: "invoke_signed",
+            target_form: "// Use `transfers { from … to … }` or `call Interface.handler(...)` (pinned target)",
+        },
+        ClusterKind::CpiAccountDirection => KindMeta {
+            invariant_name: "cpi_direction_explicit",
+            description: "CPI source / destination / authority order is encoded explicitly in the spec",
+            site_label: "CPI argument order",
+            target_form: "transfers { from <src> to <dst> amount <amount> authority <auth> }",
+        },
+        ClusterKind::DispatchCallerEstablishesCalleeRequires => KindMeta {
+            invariant_name: "dispatcher_establishes_callee_preconditions",
+            description: "dispatchers establish every callee's `requires` before invoking — no runtime-gate trust",
+            site_label: "batch-mode dispatch",
+            target_form: "// Use `call Interface.handler(...)` with the callee's `requires` mirrored on the call site",
+        },
     }
 }
 
-fn template_with_handler(
-    invariant_name: &str,
-    proto_text: &str,
-    program_syntax_body: &str,
-    handler_syntax: &str,
-    handler: Option<&str>,
+fn render_template(kind: ClusterKind, scope: &ClusterScope, n: usize) -> TemplateRender {
+    let meta = kind_meta(kind);
+    match scope {
+        ClusterScope::Program => render_program_template(kind, &meta, n),
+        ClusterScope::Handler(h) => render_handler_template(kind, &meta, h, n),
+    }
+}
+
+fn render_program_template(kind: ClusterKind, meta: &KindMeta, n: usize) -> TemplateRender {
+    // Description-form invariant — parses against the current grammar
+    // (escrow uses `invariant conservation "total tokens preserved across …"`).
+    // Escape any embedded quotes; the description otherwise is pure ASCII.
+    let escaped = meta.description.replace('"', "\\\"");
+    TemplateRender {
+        proto_text: meta.description.to_string(),
+        syntax: format!("invariant {} \"{}\"\n", meta.invariant_name, escaped),
+        question: render_question(
+            meta.invariant_name,
+            meta.site_label,
+            n,
+            &ClusterScope::Program,
+            "program-wide invariant",
+        ),
+        writes_on_accept: "spec.invariants".into(),
+        writes_on_narrow: format!("spec.handlers.*.requires  // narrow to per-handler {}", kind.as_str()),
+    }
+}
+
+fn render_handler_template(
+    kind: ClusterKind,
+    meta: &KindMeta,
+    handler: &str,
     n: usize,
-    site_label: &str,
 ) -> TemplateRender {
-    match handler {
-        None => TemplateRender {
-            proto_text: proto_text.to_string(),
-            syntax: format!("invariant {}\n{}", invariant_name, program_syntax_body),
-            question: render_question(
-                invariant_name,
-                site_label,
-                n,
-                &ClusterScope::Program,
-                "program-wide invariant",
-            ),
-            writes_on_accept: "spec.invariants".into(),
-            writes_on_narrow: "spec.handlers.*.requires".into(),
-        },
-        Some(h) => TemplateRender {
-            proto_text: format!("Handler `{}`: {}", h, proto_text),
-            syntax: format!("  // (added to handler {})\n  {}\n", h, handler_syntax),
-            question: render_question(
-                invariant_name,
-                site_label,
-                n,
-                &ClusterScope::Handler(h.to_string()),
-                "per-handler precondition",
-            ),
-            writes_on_accept: format!("spec.handlers.{}.requires", h),
-            writes_on_narrow: format!("spec.handlers.{}.requires", h),
-        },
+    // Handler-scope clauses carry placeholder identifiers we cannot
+    // resolve without source analysis (which account name? which error
+    // variant?). Emit as a TODO comment that the user converts to a real
+    // clause — the comment is parser-irrelevant and the target_form is
+    // included verbatim so the user has the syntactic template in hand.
+    let proto = format!("Handler `{}`: {}", handler, meta.description);
+    let syntax = format!(
+        "  // TODO ratified ({} in {}): {}\n  // Target form: {}\n",
+        kind.as_str(),
+        handler,
+        meta.description,
+        meta.target_form,
+    );
+    TemplateRender {
+        proto_text: proto,
+        syntax,
+        question: render_question(
+            meta.invariant_name,
+            meta.site_label,
+            n,
+            &ClusterScope::Handler(handler.to_string()),
+            "per-handler precondition",
+        ),
+        writes_on_accept: format!("spec.handlers.{}.requires", handler),
+        writes_on_narrow: format!("spec.handlers.{}.requires", handler),
     }
-}
-
-/// Indent each non-empty line by two spaces so the suggested syntax slots
-/// cleanly under a `spec ProgramName` declaration when concatenated by the
-/// M1.8 emitter.
-fn indent_spec(s: &str) -> String {
-    s.lines()
-        .map(|l| {
-            if l.is_empty() {
-                String::new()
-            } else {
-                format!("  {}", l)
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-        + "\n"
 }
 
 /// Render the markdown prompt the user sees in the interview file.
@@ -914,5 +837,81 @@ mod tests {
     #[test]
     fn empty_input_produces_empty_clusters() {
         assert!(cluster_protos(vec![]).is_empty());
+    }
+
+    /// M2.3: every Program-scope template's `suggested_syntax` must
+    /// parse cleanly when wrapped in a minimal spec. Validates that the
+    /// description-form invariant we emit matches the live qedspec
+    /// grammar.
+    #[test]
+    fn every_program_scope_template_parses() {
+        let all_kinds = [
+            ClusterKind::AccountOwnerCheck,
+            ClusterKind::AccountInitCheck,
+            ClusterKind::AccountSignerCheck,
+            ClusterKind::AccountTypeTagCheck,
+            ClusterKind::AccountDistinct,
+            ClusterKind::ArithmeticNoOverflow,
+            ClusterKind::ArithmeticBoundPre,
+            ClusterKind::PdaCanonicalDerivation,
+            ClusterKind::PdaSeedUniqueness,
+            ClusterKind::LifecycleOneShot,
+            ClusterKind::LifecycleMonotonic,
+            ClusterKind::CpiProgramPin,
+            ClusterKind::CpiAccountDirection,
+            ClusterKind::DispatchCallerEstablishesCalleeRequires,
+        ];
+        for kind in all_kinds {
+            let tpl = render_template(kind, &ClusterScope::Program, 5);
+            let spec = format!(
+                "spec TestProgram\n\ntype State | Init | Active\ntype Error | InvalidArgument\n\n{}\n",
+                tpl.syntax
+            );
+            crate::chumsky_adapter::parse_str(&spec).unwrap_or_else(|e| {
+                panic!(
+                    "Program-scope template for {:?} produced unparseable syntax: {}\nspec was:\n{}",
+                    kind, e, spec
+                );
+            });
+        }
+    }
+
+    /// Handler-scope templates emit `// TODO` comments — they should
+    /// also be parser-safe when embedded inside a handler body.
+    #[test]
+    fn every_handler_scope_template_parses() {
+        let all_kinds = [
+            ClusterKind::AccountOwnerCheck,
+            ClusterKind::AccountInitCheck,
+            ClusterKind::AccountSignerCheck,
+            ClusterKind::AccountTypeTagCheck,
+            ClusterKind::AccountDistinct,
+            ClusterKind::ArithmeticNoOverflow,
+            ClusterKind::ArithmeticBoundPre,
+            ClusterKind::PdaCanonicalDerivation,
+            ClusterKind::PdaSeedUniqueness,
+            ClusterKind::LifecycleOneShot,
+            ClusterKind::LifecycleMonotonic,
+            ClusterKind::CpiProgramPin,
+            ClusterKind::CpiAccountDirection,
+            ClusterKind::DispatchCallerEstablishesCalleeRequires,
+        ];
+        for kind in all_kinds {
+            let tpl = render_template(
+                kind,
+                &ClusterScope::Handler("process_transfer".to_string()),
+                3,
+            );
+            let spec = format!(
+                "spec TestProgram\n\ntype State | Init | Active\ntype Error | InvalidArgument\n\nhandler process_transfer : State.Init -> State.Active {{\n{}\n}}\n",
+                tpl.syntax
+            );
+            crate::chumsky_adapter::parse_str(&spec).unwrap_or_else(|e| {
+                panic!(
+                    "Handler-scope template for {:?} produced unparseable syntax: {}\nspec was:\n{}",
+                    kind, e, spec
+                );
+            });
+        }
     }
 }

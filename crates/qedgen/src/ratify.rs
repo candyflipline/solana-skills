@@ -217,12 +217,12 @@ fn merge_into_skeleton(
             if let Some(h) = &current_handler {
                 let merged = collect_handler_clauses(h, handler_clauses, narrowed_handler_clauses);
                 if !merged.is_empty() {
-                    out.push_str(
-                        "  // TODO: ratified clauses below — review placeholders \
-                         (e.g. `<account>`, `<ExpectedVariant>`), then uncomment.\n",
-                    );
+                    // M2.3: handler-scope templates emit ` // TODO ratified`
+                    // comments directly (templates carry their own structure).
+                    // Just stream the suggested_syntax verbatim — no extra
+                    // wrapping.
                     for c in &merged {
-                        out.push_str(&commented(&c.suggested_syntax));
+                        out.push_str(&c.suggested_syntax);
                         if !c.suggested_syntax.ends_with('\n') {
                             out.push('\n');
                         }
@@ -249,17 +249,15 @@ fn merge_into_skeleton(
             out.push('\n');
         }
         out.push_str("// ── Ratified program-wide invariants ──────────────────────────\n");
-        out.push_str("// Surfaced from the scaffold-to-spec interview. The clauses\n");
-        out.push_str("// below are commented out so the spec parses as-is — review\n");
-        out.push_str("// each `forall …` body (substitute concrete field names, refine\n");
-        out.push_str("// the type domain) and uncomment to activate.\n\n");
+        out.push_str("// Surfaced from the scaffold-to-spec interview. Each invariant\n");
+        out.push_str("// below uses the description form (parser-valid). Refine bodies\n");
+        out.push_str("// into expression form (`forall i : T, …`) as the spec matures.\n\n");
         for c in program_clauses {
-            // Suggested syntax for program-scope clauses is already
-            // top-level-formed; wrap each line in `//` so the result
-            // is always parser-valid. M2 (AST round-trip) emits
-            // resolved syntax directly.
-            let body = c.suggested_syntax.trim_start_matches("  ").to_string();
-            out.push_str(&commented(&body));
+            // M2.3: program-scope templates emit valid description-form
+            // invariants (e.g. `invariant N "desc"`). Emit verbatim —
+            // the spec parses, the invariant is active in the document
+            // tree, and the user refines into expression form later.
+            out.push_str(&c.suggested_syntax);
             if !c.suggested_syntax.ends_with('\n') {
                 out.push('\n');
             }
@@ -268,26 +266,6 @@ fn merge_into_skeleton(
     }
 
     out
-}
-
-/// Prefix every non-empty line of `s` with `// `. Empty lines stay empty
-/// so the surrounding markdown / spec retains its paragraph breaks.
-fn commented(s: &str) -> String {
-    s.lines()
-        .map(|l| {
-            if l.is_empty() {
-                String::new()
-            } else if l.trim_start().starts_with("//") {
-                // Already commented (e.g., a `//` line emitted by the
-                // template itself) — leave as is.
-                l.to_string()
-            } else {
-                format!("// {}", l)
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-        + "\n"
 }
 
 fn collect_handler_clauses<'a>(
@@ -605,18 +583,18 @@ mod tests {
             "placeholder should be replaced. spec:\n{}",
             spec
         );
+        // M2.3: handler-scope ratifications emit `// TODO ratified (...)`
+        // markers carrying the cluster kind + the target form the user
+        // should convert to. The emission is parser-irrelevant
+        // (comments only) but the user can read off the intent.
         assert!(
-            spec.contains("requires <account>.is_initialized")
-                || spec.contains("AccountNotInitialized"),
-            "init-check clause must appear in spec (even when commented out). spec:\n{}",
+            spec.contains("TODO ratified (account_init_check"),
+            "expected `// TODO ratified (account_init_check …)` marker. spec:\n{}",
             spec
         );
-        // Per the v1 contract: ratified handler-scope clauses ship
-        // commented-out so the spec always parses; the user uncomments
-        // after refining placeholders.
         assert!(
-            spec.contains("TODO: ratified clauses below"),
-            "expected the TODO banner above ratified handler-scope clauses, spec:\n{}",
+            spec.contains("Target form:"),
+            "expected `// Target form: …` line pointing at the parseable shape. spec:\n{}",
             spec
         );
         Ok(())
@@ -644,6 +622,131 @@ mod tests {
         // Unmatched cluster surfaces as deferred (so the user notices in
         // the digest line) but doesn't abort the run.
         assert_eq!(report.deferred, 1);
+        Ok(())
+    }
+
+    /// M2.4: every emitted spec from ratify must parse cleanly. Builds a
+    /// synthetic audit-dir per cluster kind × scope, runs ratify, parses
+    /// the result. If any combination produces unparseable output, this
+    /// test surfaces it before the user does.
+    #[test]
+    fn every_ratified_spec_parses() -> Result<()> {
+        use crate::cluster::{ClusterKind, ProtoClause};
+        let all_kinds = [
+            ClusterKind::AccountOwnerCheck,
+            ClusterKind::AccountInitCheck,
+            ClusterKind::AccountSignerCheck,
+            ClusterKind::AccountTypeTagCheck,
+            ClusterKind::AccountDistinct,
+            ClusterKind::ArithmeticNoOverflow,
+            ClusterKind::ArithmeticBoundPre,
+            ClusterKind::PdaCanonicalDerivation,
+            ClusterKind::PdaSeedUniqueness,
+            ClusterKind::LifecycleOneShot,
+            ClusterKind::LifecycleMonotonic,
+            ClusterKind::CpiProgramPin,
+            ClusterKind::CpiAccountDirection,
+            ClusterKind::DispatchCallerEstablishesCalleeRequires,
+        ];
+        for kind in all_kinds {
+            for scope_variant in 0..2 {
+                let dir = tempdir()?;
+                let audit = dir.path().join(".qed/audit/test");
+
+                // Build a proto-clause set that exercises this kind at
+                // either Program scope (≥3 handlers) or Handler scope
+                // (single handler).
+                let protos: Vec<_> = if scope_variant == 0 {
+                    (1..=4)
+                        .map(|i| ProtoClause {
+                            kind,
+                            handler: format!("h{}", i),
+                            finding_id: format!("f{}", i),
+                            evidence_text: String::new(),
+                        })
+                        .collect()
+                } else {
+                    vec![ProtoClause {
+                        kind,
+                        handler: "process_test".into(),
+                        finding_id: "f1".into(),
+                        evidence_text: String::new(),
+                    }]
+                };
+                let clusters = cluster_protos(protos);
+                let cid = clusters[0].id.clone();
+                let interview = format!(
+                    "<!-- cluster: {} -->\n- [x] **accept**\n",
+                    cid
+                );
+                let skeleton = render_skeleton_from_handlers(
+                    &["process_test".to_string(), "h1".into(), "h2".into(), "h3".into()],
+                    "test_prog",
+                );
+                write_audit_dir(&audit, &skeleton, &clusters, &interview)?;
+                let out = dir.path().join("test.qedspec");
+                let opts = RatifyOpts {
+                    audit_dir: audit,
+                    spec_out: Some(out.clone()),
+                    scoping_out: Some(dir.path().join("scoping.md")),
+                    findings_dir: Some(dir.path().join("findings")),
+                };
+                run(&opts)?;
+                let content = std::fs::read_to_string(&out)?;
+                crate::chumsky_adapter::parse_str(&content).unwrap_or_else(|e| {
+                    panic!(
+                        "kind={:?} scope_variant={} produced unparseable spec: {}\n\n=== emitted ===\n{}",
+                        kind, scope_variant, e, content
+                    );
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// M2.5: re-running ratify against the same audit dir must produce
+    /// byte-identical output. Without this guarantee, edits the user
+    /// makes between runs (e.g., refining handler bodies) would
+    /// silently regress on the next interview pass.
+    #[test]
+    fn ratify_is_byte_idempotent() -> Result<()> {
+        use crate::cluster::{ClusterKind, ProtoClause};
+        let dir = tempdir()?;
+        let audit = dir.path().join(".qed/audit/test");
+        let protos: Vec<_> = (1..=4)
+            .map(|i| ProtoClause {
+                kind: ClusterKind::AccountOwnerCheck,
+                handler: format!("h{}", i),
+                finding_id: format!("f{}", i),
+                evidence_text: String::new(),
+            })
+            .collect();
+        let clusters = cluster_protos(protos);
+        let cid = clusters[0].id.clone();
+        let interview = format!("<!-- cluster: {} -->\n- [x] **accept**\n", cid);
+        let skeleton = render_skeleton_from_handlers(
+            &["h1".into(), "h2".into(), "h3".into()],
+            "test_prog",
+        );
+        write_audit_dir(&audit, &skeleton, &clusters, &interview)?;
+
+        let out1 = dir.path().join("run1.qedspec");
+        let out2 = dir.path().join("run2.qedspec");
+        let make_opts = |out: PathBuf| RatifyOpts {
+            audit_dir: audit.clone(),
+            spec_out: Some(out),
+            scoping_out: Some(dir.path().join("scoping.md")),
+            findings_dir: Some(dir.path().join("findings")),
+        };
+        run(&make_opts(out1.clone()))?;
+        run(&make_opts(out2.clone()))?;
+        let bytes1 = std::fs::read(&out1)?;
+        let bytes2 = std::fs::read(&out2)?;
+        assert_eq!(
+            bytes1,
+            bytes2,
+            "re-running ratify on identical audit_dir must produce identical spec bytes"
+        );
         Ok(())
     }
 
