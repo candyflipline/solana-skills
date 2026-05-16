@@ -31,6 +31,13 @@ pub fn render_skeleton(project_root: &Path, program_name: &str) -> Result<String
     Ok(render_skeleton_from_handlers(&handlers, program_name))
 }
 
+/// Native variant — accepts any `pub fn` as a candidate handler.
+/// Native programs don't have a canonical naming prefix.
+pub fn render_skeleton_native(project_root: &Path, program_name: &str) -> Result<String> {
+    let handlers = enumerate_handlers_with_prefix(project_root, "")?;
+    Ok(render_skeleton_from_handlers(&handlers, program_name))
+}
+
 /// Hardened variant used by tests: takes handler names directly so the
 /// rendering is exercised independent of the source walker.
 pub fn render_skeleton_from_handlers(handlers: &[String], program_name: &str) -> String {
@@ -78,10 +85,27 @@ pub fn render_skeleton_from_handlers(handlers: &[String], program_name: &str) ->
 /// deduplicated and returned in sorted order so the skeleton is
 /// deterministic.
 pub fn enumerate_handlers(project_root: &Path) -> Result<Vec<String>> {
+    enumerate_handlers_with_prefix(project_root, "process_")
+}
+
+/// Variant accepting an arbitrary prefix. Pinocchio convention is
+/// `process_*`; Native programs vary (e.g., `processor::do_thing`,
+/// `entrypoint`, or bare names). Pass `""` to accept every `pub fn`.
+pub fn enumerate_handlers_with_prefix(
+    project_root: &Path,
+    prefix: &str,
+) -> Result<Vec<String>> {
     let rs_files = collect_rust_files(project_root)?;
     let mut handlers: BTreeSet<String> = BTreeSet::new();
-    let re = regex::Regex::new(r"^\s*pub(?:\([^)]+\))?\s+fn\s+(process_[A-Za-z0-9_]+)\s*\(")
-        .expect("static regex compiles");
+    let pattern = if prefix.is_empty() {
+        r"^\s*pub(?:\([^)]+\))?\s+fn\s+([A-Za-z][A-Za-z0-9_]*)\s*\(".to_string()
+    } else {
+        format!(
+            r"^\s*pub(?:\([^)]+\))?\s+fn\s+({}[A-Za-z0-9_]*)\s*\(",
+            regex::escape(prefix)
+        )
+    };
+    let re = regex::Regex::new(&pattern).expect("static regex compiles");
 
     for file in &rs_files {
         let Ok(source) = std::fs::read_to_string(file) else {

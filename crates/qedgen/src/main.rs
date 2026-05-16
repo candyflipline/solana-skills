@@ -29,6 +29,7 @@ mod interface_gen;
 mod kani;
 mod lean_gen;
 mod miri_verify;
+mod native_extractor;
 mod pinocchio_extractor;
 mod pinocchio_probe;
 mod pinocchio_to_spec;
@@ -1328,6 +1329,60 @@ fn run_anchor_probe(
     Ok(())
 }
 
+/// Native (solana-program) probe path. Same envelope shape as Anchor;
+/// reuses the Pinocchio-style source-walk for the skeleton because
+/// Native has no IDL to drive a richer emitter.
+fn run_native_probe(
+    prog_root: &Path,
+    runtime_final: probe::Runtime,
+    emit_spec_candidates: bool,
+    audit_dir: Option<&Path>,
+) -> Result<()> {
+    let applicable = probe::applicable_categories_public(&runtime_final);
+    let clusters = if emit_spec_candidates {
+        let protos = native_extractor::extract_proto_clauses(prog_root)?;
+        Some(cluster::cluster_protos(protos))
+    } else {
+        None
+    };
+
+    if let (Some(dir), Some(clusters_ref)) = (audit_dir, clusters.as_ref()) {
+        std::fs::create_dir_all(dir)?;
+        let program_name = prog_root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("program")
+            .to_string();
+        let now_iso = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Iso8601::DEFAULT)
+            .unwrap_or_else(|_| "unknown".to_string());
+        let md = prompts::render_interview(clusters_ref, &program_name, &now_iso);
+        std::fs::write(dir.join("interview.md"), md)?;
+        let cj = serde_json::to_string_pretty(clusters_ref)?;
+        std::fs::write(dir.join("clusters.json"), cj)?;
+        // Native skeleton: pinocchio_to_spec::render_skeleton_native
+        // accepts any `pub fn` (Native has no naming convention vs
+        // Pinocchio's `process_*` prefix).
+        let skeleton = pinocchio_to_spec::render_skeleton_native(prog_root, &program_name)?;
+        std::fs::write(dir.join("skeleton.qedspec"), skeleton)?;
+        eprintln!("Wrote audit working set to {}", dir.display());
+    }
+
+    let output = probe::ProbeOutput {
+        version: probe::schema_version(),
+        mode: probe::Mode::SpecLess,
+        spec_path: None,
+        project_root: Some(prog_root.display().to_string()),
+        runtime: Some(runtime_final),
+        handlers: None,
+        applicable_categories: Some(applicable),
+        findings: Vec::new(),
+        clusters,
+    };
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -1539,6 +1594,21 @@ async fn main() -> Result<()> {
                 // from source patterns.
                 if matches!(runtime_final, probe::Runtime::Anchor | probe::Runtime::Quasar) {
                     return run_anchor_probe(
+                        prog_root,
+                        runtime_final,
+                        emit_spec_candidates,
+                        audit_dir.as_deref(),
+                    );
+                }
+
+                // M4 (preview): Native Rust programs (solana-program
+                // dep, no anchor / pinocchio) route through
+                // native_extractor. Pattern coverage is narrower than
+                // Anchor's because Native has no framework conventions
+                // — see native_extractor.rs docs for the v1 detector
+                // set.
+                if matches!(runtime_final, probe::Runtime::Native) {
+                    return run_native_probe(
                         prog_root,
                         runtime_final,
                         emit_spec_candidates,
