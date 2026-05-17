@@ -22,7 +22,7 @@
 
 ---
 
-Write what your Solana program must guarantee in a `.qedspec` file. QEDGen validates the spec, finds bugs your tests miss, then generates the verification artifacts and implementation scaffold needed to keep them fixed: **property tests**, **Kani harnesses**, **Lean 4 proofs**, **agent-fill program scaffolds**, and **CI workflows** — all from a single source of truth. Frameworks: **Anchor** and **Quasar** (greenfield scaffold via `qedgen init --target ...`), plus **sBPF assembly**.
+Write what your Solana program must guarantee in a `.qedspec` file. QEDGen validates the spec, finds bugs your tests miss, then generates the verification artifacts and implementation scaffold needed to keep them fixed: **property tests**, **Kani harnesses**, **Lean 4 proofs**, **agent-fill program scaffolds**, and **CI workflows** — all from a single source of truth. Frameworks: **Anchor** and **Quasar** (greenfield scaffold via `qedgen init --target ...`), plus **sBPF assembly**. Brownfield audit covers **Anchor / Quasar / Pinocchio / native / sBPF** via `qedgen probe` (with Miri-backed UB detection for Pinocchio) and lifts findings into a ratifiable spec.
 
 NOTE: Project is alpha stage, we are constantly shipping. So there would be bugs and breaking API changes.
 
@@ -60,6 +60,7 @@ npx skills add qedgen/solana-skills
 | **Arithmetic safety** | Overflow/underflow for fixed-width integers, U64 bounds |
 | **Input validation** | Account count, duplicates, data length, discriminators, parameter bounds — each guard maps to a specific error exit |
 | **Memory correctness** | Stack/heap disjointness, pointer arithmetic (sBPF) |
+| **Pinocchio soundness** | `unsafe`-serde and arithmetic site catalogue via `qedgen probe --program <root>`; `qedgen verify --miri` runs the generated repros under `cargo +nightly miri test` and surfaces UB / aliasing / overflow plus Miri-fail / Mollusk-pass divergence as Critical findings. |
 | **PDA integrity** | Program-derived address derivation and 4-chunk comparison (sBPF) |
 | **Deploy safety** | On-chain shape for Anchor **and Quasar** programs — version fields, reserved padding, pinned discriminators, signer coverage, PDA seed continuity — via `qedgen readiness` and `qedgen check-upgrade` (ratchet). |
 
@@ -146,6 +147,33 @@ cd formal_verification && lake build
 ```
 
 `qedgen adapt` carries forward what it can read from the source: handler names, argument types, the `Context<X>` accounts struct, and a pointer to the actual handler body in your repo. Lifecycle, requires, effects, and transfers stay as TODOs for you or your agent to fill in. `qedgen spec --idl <path>` is the IDL-only fallback when you don't have source.
+
+### Existing Pinocchio / native / sBPF programs (audit-first brownfield)
+
+For non-Anchor runtimes the entry point is the probe + ratify flow,
+not `adapt`. `qedgen probe --program <root>` runtime-detects from the
+`Cargo.toml` (`pinocchio` dep → Pinocchio mode; otherwise falls back
+to the generic bootstrap envelope). Override with `--runtime
+pinocchio|anchor|quasar|native|sbpf` if detection misses.
+
+```bash
+# Pinocchio: enumerate `unsafe`-serde / arithmetic sites, parse
+# adjacent `// SAFETY:` comments, emit per-site Mollusk + Miri repro
+# prompts the auditor subagent expands into runnable tests.
+qedgen probe --program ./programs/my_pinocchio_program
+
+# Run the generated Miri repros — UB / aliasing / overflow surface as
+# findings; Miri-fail / Mollusk-pass divergence is Critical.
+qedgen verify --miri
+
+# Lift findings into a ratifiable spec (works across runtimes):
+qedgen probe --program ./programs/my_program --emit-spec-candidates \
+  --audit-dir .qed/audit/2026-05-16
+qedgen ratify --audit-dir .qed/audit/2026-05-16 --out my_program.qedspec
+```
+
+Native ships as preview — coverage is narrower than Anchor/Pinocchio
+because there are no framework conventions to anchor extractors on.
 
 Once the spec is filled in, gate CI on it staying in sync with the program:
 

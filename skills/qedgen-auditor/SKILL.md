@@ -74,14 +74,20 @@ Working assumptions when auditing:
   when paired with another small finding. The user pays for kill-chains.
   Always ask "compose with what?"
 - **Refresh assumptions every audit.** Stale heuristics produce stale
-  findings. Read `exploits.md` (57 entries: named incidents, generic
-  primitives, DeFi-shape attacks, audit-firm patterns) before writing
-  the report. For each entry, ask "could the same shape happen here?"
-  Investigate even if the category isn't in the spec-aware probe output.
+  findings. Walk the Category catalog below before writing the
+  report and ask, for each category's Corpus line, "could the same
+  shape happen here?" Investigate even if the category isn't in the
+  spec-aware probe output. For long-form narrative on the named
+  incidents the Corpus lines cite (Wormhole, Cashio, Mango, Saber,
+  Crema, Solend, Nirvana, Loopscale, Jet, King-of-the-SOL) and the
+  operational threat-model context (key-management compromises,
+  supply-chain attacks), see `docs/security-primer.md` in the
+  repository — kept outside the loaded skill surface to preserve
+  the auditor's context budget for live audit work.
 
 If you finish an audit and your worst finding is a generic
 "`AccountInfo` should be `Account`" without a kill-chain, you've
-auditied wrong. Go back to the corpus and compose.
+audited wrong. Go back to the catalog and compose.
 
 ## Reproducer-only contract (v2.16)
 
@@ -132,8 +138,9 @@ MEDIUM and below: a repro is encouraged but not required.
 3. **Investigate.** For each (handler, category):
    - Open the handler's source with Read.
    - Apply the per-runtime predicate from the catalog below.
-   - Walk the relevant `exploits.md` entries for the same primitive —
-     for each one, ask "could this shape happen here?"
+   - Walk the category's Corpus line for same-shape named incidents
+     and recurring audit-firm patterns — for each one, ask "could
+     this shape happen here?"
    - Classify: real-vulnerability / spec-gap / suppressed.
 
    **Three cross-cutting passes MUST run alongside the per-category walk.**
@@ -445,6 +452,9 @@ Spec-less per-runtime:
   authoritative.)
 - **sBPF:** program-ID-comparison pattern (`ldxw` of caller-supplied
   program-ID, compare against constant) before `invoke_signed_c`.
+- Corpus: "CPI without program-id check on Token CPI" — recurring
+  audit-firm shape; the typed-`Program<T>` Anchor wrapper exists
+  specifically to close it.
 
 ### `arithmetic_overflow_wrapping` — HIGH (wrap) / MEDIUM (sat)
 Spec-aware: handler effects use `+=?` / `-=?` (wrapping) or `+=!` /
@@ -464,6 +474,11 @@ Spec-less per-runtime:
   rent / fee / supply math is a documented design choice in many Anza
   programs. Surface as informational only when the field is amount-shaped
   AND the saturation could mask a vulnerability.
+- Corpus: integer overflow / underflow is the most-cited recurring
+  primitive across Solana audit reports — frequently chains with
+  `lifecycle_one_shot_violation` to push state past intended
+  ceilings. See also `rounding_direction_round_trip` for the
+  asymmetric-rounding sub-class on bidirectional conversions.
 
 ### `lifecycle_one_shot_violation` — MEDIUM
 Spec-aware: spec models lifecycle states; handler mutates state but
@@ -516,8 +531,14 @@ shape; downstream reads trust the spoof.
 - **Native:** AccountInfo passed for a sysvar / mint / token
   program without an `==` check on the well-known program ID, or for
   a user account without an `is_initialized` discriminator check.
-- Corpus: Wormhole sysvar spoof (`exploits.md` named-incident #1),
-  Cashio mint trust chain.
+- Corpus: Wormhole sysvar-instructions spoof (2022, $326M; OtterSec /
+  Wormhole joint post-mortem); Cashio fake-account chain (2022,
+  $52.8M; canonical example, mint trust chain); Crema Finance fake
+  tick account (2022, $8.8M — CLMM tick-account sub-shape); Sysvar
+  typed as `AccountInfo` (recurring Anchor variant of the Wormhole
+  shape). For the field-level forgery sub-class where the typed
+  wrapper passes but a stored `Pubkey` field is unanchored, see
+  `field_chain_missing_root_anchor` (Cashio's underlying shape).
 
 ### `missing_owner_check` — CRITICAL
 Spec-less only — handler reads or trusts data from an account
@@ -537,7 +558,11 @@ finding class — see `token_account_role_anchoring` below.
   `Account<TokenAccount>` enforces this; raw AccountInfo doesn't.
 - **Native:** any `account.data.borrow()` or struct deserialize
   without first verifying `account.owner == &expected_program_id`.
-- Corpus: typed-account-with-untyped-owner pattern (Neodyme).
+- Corpus: typed-account-with-untyped-owner pattern (widely-documented
+  Solana-native primitive; named publicly by Neodyme among others).
+  Scope-pair clarifier: this category is about the SOLANA-RUNTIME
+  `account.owner` field; the SPL token-account internal `owner`
+  byte-range is `token_account_role_anchoring` (above).
 
 ### `token_account_role_anchoring` — CRITICAL when authority signs, HIGH when role signs
 For any handler parameter named after a role
@@ -812,8 +837,11 @@ and not validated against an expected wallet (creator, treasury, etc.).
 - **Native:** manual `**from.try_borrow_mut_lamports()? -= x;
   **to.try_borrow_mut_lamports()? += x;` with no destination check.
 - Pair with `missing_signer` or `permissionless` marker → drain rent
-  from any closable PDA. Corpus: "Account close redirected to
-  attacker" pattern.
+  from any closable PDA.
+- Corpus: Jet Protocol C-ratio close-account bypass (2022, $25M
+  near-miss; private disclosure / publicly-discussed post-mortem);
+  token-account close to wrong destination is the Anchor
+  `close = receiver` variant of the same shape.
 
 ### `discriminator_collision` — HIGH
 Two account types with the same first-8-bytes discriminator (Anchor
@@ -827,6 +855,9 @@ state.
 - **Native:** explicit discriminator bytes; check for the same
   collision shape.
 - Pair with `missing_owner_check` → forged-data trust.
+- Corpus: insecure-deserialization (`unpack_unchecked` and similar)
+  is the recurring shape that turns a discriminator collision into
+  a forged-state-trust kill-chain.
 
 ### `pda_seed_collision` — HIGH
 PDA seeds insufficient to discriminate between different domains —
@@ -837,6 +868,9 @@ e.g., user-vault PDA seeded with `["vault"]` instead of
 - **Native:** `find_program_address(&[seeds], &id)` with seeds
   that don't include caller-distinguishing data.
 - Pair with `missing_signer` → take over another user's account.
+- Corpus: "PDA sharing across authority domains" and "authority not
+  stored in PDA seeds" are the two recurring audit-firm sub-shapes
+  of the same root.
 
 ### `unvalidated_remaining_accounts` — HIGH
 Handler iterates `ctx.remaining_accounts` (or
@@ -848,6 +882,10 @@ not the implicit type assumption.
   or explicit checks.
 - **Native:** any per-iteration `account_info_iter.next()` without
   type/owner validation.
+- Corpus: "permissionless account-add via remaining_accounts"
+  (governance-hijack-lite sub-shape) recurs across DeFi audits;
+  watch for iteration that mutates state per-account without first
+  pinning the account to a stored allowlist.
 
 ### `account_not_reloaded_after_cpi` — HIGH
 Handler invokes a CPI that may mutate a passed-in account, then
@@ -858,6 +896,9 @@ that the CPI just changed.
   involved token account without `account.reload()?`.
 - **Native:** repeated `unpack` of the same account before/after
   `invoke_signed`.
+- Corpus: recurring audit-firm primitive; pairs with
+  `token_2022_extension_arithmetic_skew` when the CPI is a
+  fee-on-transfer (recorded `amount` ≠ actual delta).
 
 ### `init_without_is_initialized` — HIGH
 Init-style handler that doesn't check whether the target account
@@ -870,7 +911,9 @@ balance/votes/whatever.
 - **Native:** missing `if account.is_initialized` check at the top
   of init handlers; or the init handler accepts an existing account
   and overwrites in place.
-- Corpus: "Init-without-is-initialized" pattern.
+- Corpus: recurring audit-firm primitive; the canonical
+  Cashio-shape kill-chain pairs init-without-is-initialized with
+  `pda_lifecycle_reuse_after_close` for full account replay.
 
 ### `oracle_staleness` — HIGH (DeFi-specific)
 Spec-less only — handler reads a price/rate-shaped field from an
@@ -880,7 +923,11 @@ confidence (deviation bound).
   immediate use without `get_price_no_older_than` or equivalent.
   Switchboard: `AggregatorAccountData::get_result()` without a
   staleness check on `latest_confirmed_round.round_open_timestamp`.
-- Corpus: Mango / Solend / Nirvana / Loopscale oracle exploits.
+- Corpus: Mango Markets oracle manipulation (2022, $114M); Solend
+  USDH (2022, $1.26M); Nirvana flash-loan oracle pump (2022,
+  $3.5M); Loopscale RateX collateral mispricing (2025, $5.8M). For
+  the short-TWAP-window sub-shape (fresh oracle, gameable in one
+  block) see `twap_gameable_single_block`.
 
 ### `frontrunnable_no_slippage` — HIGH (DeFi-specific)
 Permissionless swap-shape handler accepts no `min_amount_out` /
@@ -891,7 +938,11 @@ Sandwich-bot bait.
   resulting ratio.
 - **Anchor / Native:** `swap`-shape handler signature with no
   `min_*` parameter, or with one that's ignored in the body.
-- Corpus: "Sandwich / MEV against AMM swap" pattern.
+- Corpus: sandwich / MEV against AMM swap is the recurring shape;
+  the Mango perp-market manipulation (2022, $114M) is the same
+  primitive applied to a thin spot oracle rather than to a swap
+  router. "Frontrun the permissionless `claim` / `crank`" is the
+  same primitive on rate-limited cleanup handlers.
 
 ### `lamport_write_demotion` — MEDIUM
 Direct lamport mutation via `**account.try_borrow_mut_lamports()? +=
@@ -900,7 +951,10 @@ or rent-exempt account silently, can also bypass ownership checks
 the runtime would otherwise enforce.
 - **Native / Anchor (rare):** any direct mutation of
   `*account.lamports.borrow_mut()` outside a close path.
-- Corpus: OtterSec "King of the SOL" post.
+- Corpus: "King of the SOL" lamport-transfer freeze
+  (OtterSec public blog post). Same primitive turns up across
+  audit-firm reports as "manual lamport mutation freezes
+  rent-exempt / executable accounts."
 
 ### `init_config_field_unanchored` — CRITICAL (DAMM-v2 shape)
 Spec-less only. The **write-side companion** to
@@ -994,8 +1048,184 @@ vulnerable.
 - **Anchor / Native:** Token-2022 transfer (`transfer_checked` with
   `mint = TOKEN_2022_PROGRAM_ID`) where program state is mutated
   *after* the transfer with the pre-transfer state still trusted.
-- Corpus: "Reentrancy via Token-2022 transfer hook" — first
-  Solana-native reentrancy class.
+- Corpus: first Solana-native reentrancy class; documented across
+  audit-firm Token-2022 advisories. No single famous public
+  incident yet — the extension shipped after the last large
+  exploit window.
+
+### `rounding_direction_round_trip` — HIGH (DeFi-specific)
+Spec-less only. Two-leg conversion pair (`A → B` then `B → A`, or
+`mint` + `redeem`, or `liquidity_to_collateral` + `collateral_to_liquidity`)
+where both legs round in the same direction — favoring the caller on
+each leg. Round-trip is unconditionally profitable; attacker packs many
+swap pairs per transaction and drains the pool over hours.
+
+- **Detect** by reading the two converse conversion functions and
+  asking: does one round up and the other round down? If both use
+  `ceil_div` (or both use `floor_div`) on the same denomination, the
+  asymmetry is missing.
+- **Anchor / Native:** look for paired functions like
+  `liquidity_to_shares` / `shares_to_liquidity`, `mint` / `redeem`,
+  `deposit_to_lp` / `lp_to_deposit`. Verify the deposit-side rounds
+  down (caller gets fewer LP) and the redeem-side rounds down (caller
+  gets fewer underlying) — the asymmetric pair.
+- Compose-with-what: low-fee bulk transactions (Solana's 5000-lamport
+  flat tx cost makes hundreds of round-trip swaps per tx economical).
+- Corpus: Saber / SPL token-swap stable-swap rounding (2022, ~$700M
+  at risk; Neodyme public disclosure pre-exploit). Same-class
+  generalization of bidirectional rounding on any stable-swap or
+  two-leg conversion pair; also recurs as "loss of precision / wrong
+  rounding direction" across audit-firm reports.
+
+### `duplicate_mutable_accounts_aliasing` — HIGH
+Spec-less only. A handler accepts two or more accounts of the same
+type as mutable parameters (e.g. `from_token_account`,
+`to_token_account`). If the program doesn't assert `from.key !=
+to.key`, an attacker can pass the *same account* for both — making the
+transfer a no-op while the program's accounting believes funds moved.
+Often combined with a fee or supply update that fires regardless.
+
+- **Anchor:** look for `#[derive(Accounts)]` with two same-typed mutable
+  fields and no `constraint = from.key() != to.key()`. Also flag if
+  `has_one` constraints could reference both fields and they're not
+  asserted distinct.
+- **Native:** scan handlers that take two `TokenAccountInfo` / two
+  `AccountInfo` of the same role; look for an explicit `from.key !=
+  to.key` or absence thereof.
+- Compose-with-what: any fee accrual that fires on the no-op transfer
+  (the program thinks a swap happened, charges fees, updates pool
+  state — but no atoms moved).
+
+### `twap_gameable_single_block` — HIGH (DeFi-specific)
+Spec-less only. Distinct from `oracle_staleness`: the oracle is fresh,
+but its TWAP window is short enough (typically ≤ 1-2 slots) that a
+single attacker-controlled transaction can move the window-averaged
+price. Common in AMM-based oracles where the TWAP samples the spot
+pool's current `sqrt_price`.
+
+- **Detect** by reading the oracle's window length and comparing to
+  attacker affordability for a one-block price impact. Window ≤ 60
+  slots (~30s) is usually game-able with a flash-loaned position;
+  windows ≥ 5min are typically safe.
+- **Anchor / Native:** look for `latest_confirmed_round`-style reads
+  or `observe(seconds_ago)` where the `seconds_ago` parameter is small.
+  Also flag if the program uses spot-price (no window) and merely
+  labels it "TWAP."
+- Compose-with-what: flash-loan amplifier (attacker doesn't need
+  capital); single-block atomic execution (move-borrow-repay).
+
+### `liquidation_rounding_dust_accumulation` — MEDIUM (DeFi-specific)
+Spec-less only. Liquidation handler rounds collateral seizure down
+("attacker only gets `floor(value)` of collateral") AND rounds debt
+repayment down ("only `floor(value)` of debt cleared"). Each
+liquidation leaves a dust amount of debt outstanding; attacker
+liquidates the same position repeatedly via tiny slices, accumulating
+dust into a self-funding strategy.
+
+- **Detect** by reading the liquidation handler's seize and repay
+  arithmetic side-by-side; both rounding-down is the asymmetry.
+- Compose-with-what: low minimum-liquidation-size (no
+  `min_repay_amount` floor); permissionless liquidation (any caller
+  can fire it).
+- Distinct from `rounding_direction_round_trip` because there's only
+  one "round" — the user calls it multiple times, not two legs in one
+  tx.
+
+### `flash_loan_amplified_governance` — HIGH (DeFi-specific)
+Spec-less only. Composition class: governance handler reads voting
+power from a live source (current LP balance, current staked balance,
+current token holdings) rather than a snapshot at proposal-creation
+time. Flash-loan a large position, vote, repay — vote counted, capital
+returned in same transaction.
+
+- **Detect** by reading the governance handler's voting-power
+  derivation. `vault.amount()` or `staking.user_stake()` read at vote
+  time = vulnerable. `snapshot.balance_at_block(proposal.created_at)`
+  or merkle-proof from snapshot = safe.
+- Compose-with-what: high-leverage flash loan source available on the
+  same chain (Solana has multiple lending protocols routinely used as
+  flash sources); permissionless vote submission.
+- Corpus: same shape as the cross-margin oracle manipulations
+  (Mango 2022) when applied to governance rather than collateral —
+  the live-balance read at decision time is the gap in both.
+
+### `authority_transfer_missing_nominate_accept` — MEDIUM (operational hardening)
+Spec-less only. `set_authority` (or `transfer_admin`) writes the new
+authority directly in one instruction, with no two-step nominate →
+accept handshake. A fat-finger or compromised key writes a wrong /
+attacker pubkey; no chance to revoke before subsequent admin ops are
+attacker-gated. Operational hardening, not a code exploit per se, but
+high-impact when it materializes.
+
+- **Detect:** grep for `set_authority` / `transfer_admin` /
+  `change_authority` writing a single field in one ix. Missing
+  `pending_authority` field on state struct is the giveaway. Missing
+  `accept_authority` ix is the second giveaway.
+- Compose-with-what: no time-lock; single-key admin custody; off-chain
+  key-management mistakes.
+- Corpus: recurring audit-firm pattern across DeFi programs; the
+  two-step handshake is now the default safe form across mature
+  Solana protocols.
+
+### `missing_rent_exemption_check_on_init` — HIGH
+Spec-less only. Account initialization accepts a caller-supplied
+lamports amount and doesn't enforce `lamports >=
+Rent::get()?.minimum_balance(size)`. Account drops below rent minimum
+and gets garbage-collected mid-protocol-operation; subsequent reads
+see a zeroed account; reinitialization possible by an attacker.
+
+- **Anchor:** `space` is set on `#[account(init, ...)]` but `payer` is
+  not constrained on lamport amount, or a manual `system_instruction::
+  create_account(..., lamports, ...)` uses `lamports` from caller
+  input.
+- **Native:** init paths missing `Rent::get()?.minimum_balance(size)`
+  with explicit `assert!(account.lamports() >= minimum)`.
+- Compose-with-what: `init_without_is_initialized` (post-purge
+  reinit); `close_account_redirection` (post-purge takeover).
+
+### `realloc_zero_init_data_leak` — HIGH (Anchor)
+Spec-less only. Anchor `realloc` grows an account's data section
+without zero-initializing the new bytes. The new tail contains
+whatever heap fragment was previously at that address — potentially
+adjacent account data, including secrets.
+
+- **Anchor:** look for `realloc(new_size, false)` calls. The second
+  parameter is `zero_init`; passing `false` skips zeroing. Default to
+  `true` unless the program explicitly initializes the tail in the
+  same instruction.
+- Compose-with-what: account-type confusion at the read site (a
+  downstream handler reads the un-zeroed bytes as if they were a
+  field). Recurs in published audit-firm checklists.
+
+### `sentinel_null_key_array_short_circuit` — MEDIUM
+Spec-less only. Program iterates a fixed-size array of pubkeys (multisig
+signers, validator set, oracle providers) and short-circuits on
+`Pubkey::default()` (all-zeros) as "empty slot." Attacker submits a
+transaction signed by `Pubkey::default()` — if the system ever lets a
+zero-keyed signer through (which it shouldn't, but corner cases exist
+with `AccountInfo`-typed signer params), all the short-circuit checks
+pass.
+
+- **Detect:** grep for `if signer.key == &Pubkey::default()` / `if
+  key == [0u8; 32]`, especially inside an enumerate / fold over a
+  signer array. The pattern is "use default-pubkey as a sentinel."
+- Compose-with-what: weak signer validation (`AccountInfo` instead of
+  `Signer<'info>`).
+
+### `permissionless_instruction_no_rate_limit` — MEDIUM (composition class)
+Spec-less only. A permissionless handler does meaningful state work
+(emits an event, accrues a counter, advances a state machine, writes
+a log) without any rate-limit, cooldown, or proof-of-work gate. An
+attacker invokes it in a tight loop, exhausting the program's
+counter / log capacity / event-buffer headroom for legitimate users.
+DoS via state-bloat or counter-saturation.
+
+- **Detect:** for each `permissionless` handler (no `auth` clause / no
+  signer-key match), ask: what state does it mutate, and is there a
+  per-caller / per-time cap on invocation? If neither, flag.
+- Compose-with-what: any other finding gated by "this never happens in
+  practice" — the permissionless-no-rate-limit handler is the
+  amplifier that makes it happen.
 
 ## qedgen-codegen runtime
 
@@ -1119,6 +1349,10 @@ verification claim.
   frozen check, forgery is undetectable to downstream consumers.
 - Severity: HIGH if forged (verification claim is a lie); MED if
   drift (out-of-date but caught at the next CI run).
+- Corpus: same family as the broader "trusted upstream binary not
+  pinned" pattern — any out-of-band claim that "this code matches
+  what was verified" needs an in-band content pin plus a CI gate
+  that enforces it.
 
 ## Cluster taxonomy (scaffold-to-spec interview)
 
@@ -1323,7 +1557,8 @@ ExternalAccountLamportSpend; finding is structural only.")
 
 ### Corpus reference
 
-`exploits.md` § <named incident or pattern> — same shape.
+Category `<category-name>` Corpus line — name the public incident or
+recurring audit-firm pattern this finding shares a shape with.
 ```
 
 ### Digest (returned to orchestrator)
