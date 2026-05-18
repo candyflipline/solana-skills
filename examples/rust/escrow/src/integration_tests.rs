@@ -50,12 +50,12 @@ fn empty(address: Pubkey) -> Account {
 /// Create a pre-populated EscrowAccount account (program-owned).
 fn state_account(
     address: Pubkey,
-    initializer: Pubkey,
-    initializer_token_account: Pubkey,
-    taker: Pubkey,
+    initializer: [u8; 32],
+    initializer_token_account: [u8; 32],
+    taker: [u8; 32],
     initializer_amount: u64,
     taker_amount: u64,
-    escrow_token_account: Pubkey,
+    escrow_token_account: [u8; 32],
     bump: u8,
 ) -> Account {
     let state = EscrowAccount {

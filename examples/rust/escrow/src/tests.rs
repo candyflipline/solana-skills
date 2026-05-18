@@ -7,12 +7,12 @@ type Address = [u8; 32];
 
 #[derive(Debug, Clone, PartialEq)]
 struct EscrowState {
-    initializer: Address,
-    initializer_token_account: Address,
-    taker: Address,
+    initializer: [u8; 32],
+    initializer_token_account: [u8; 32],
+    taker: [u8; 32],
     initializer_amount: u64,
     taker_amount: u64,
-    escrow_token_account: Address,
+    escrow_token_account: [u8; 32],
 }
 
 impl Default for EscrowState {

@@ -24,9 +24,10 @@ enum Status {
 
 #[derive(Debug, Clone, Copy)]
 struct State {
+    creator: [u8; 32],
     threshold: u8,
     member_count: u8,
-    members: [Address; 32],
+    members: [[u8; 32]; 32],
     voted: [u8; 32],
     approval_count: u8,
     rejection_count: u8,
@@ -36,6 +37,7 @@ struct State {
 /// Proptest strategy for generating arbitrary State values.
 prop_compose! {
     fn arb_state()(
+        creator in prop::array::uniform32(0u8..),
         threshold in 0u8..=255u8,
         member_count in 0u8..=255u8,
         members in prop::collection::vec(prop::array::uniform32(0u8..), 32..=32).prop_map(|v| v.try_into().ok().unwrap()),
@@ -45,6 +47,7 @@ prop_compose! {
         status in prop_oneof![Just(Status::Uninitialized), Just(Status::Active), Just(Status::HasProposal)],
     ) -> State {
         State {
+            creator,
             threshold,
             member_count,
             members,
@@ -59,6 +62,7 @@ prop_compose! {
 /// Boundary-biased strategy for guard rejection tests.
 prop_compose! {
     fn arb_boundary_state()(
+        creator in prop::array::uniform32(0u8..1u8),
         threshold in prop_oneof![0u8..=3u8, 252u8..=255u8],
         member_count in prop_oneof![0u8..=3u8, 252u8..=255u8],
         members in prop::collection::vec(prop::array::uniform32(0u8..1u8), 32..=32).prop_map(|v| v.try_into().ok().unwrap()),
@@ -68,6 +72,7 @@ prop_compose! {
         status in prop_oneof![Just(Status::Uninitialized), Just(Status::Active), Just(Status::HasProposal)],
     ) -> State {
         State {
+            creator,
             threshold,
             member_count,
             members,
@@ -166,7 +171,7 @@ fn cancel_proposal(s: &mut State) -> bool {
     true
 }
 
-fn add_member(s: &mut State, member_index: u8, member_pubkey: Address) -> bool {
+fn add_member(s: &mut State, member_index: u8, member_pubkey: [u8; 32]) -> bool {
     if !((member_index < s.member_count)) {
         return false;
     }
@@ -195,6 +200,7 @@ proptest! {
     #[test]
     fn create_vault_preserves_threshold_bounded(threshold in 0u8..=u8::MAX, member_count in 0u8..=u8::MAX) {
         let mut s = State {
+            creator: [0u8; 32],
             threshold: 0,
             member_count: 0,
             members: [[0u8; 32]; 32],
@@ -284,7 +290,7 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
-    fn add_member_preserves_threshold_bounded(s in arb_state(), member_index in 0u8..=u8::MAX, member_pubkey in 0Address..=Address::MAX) {
+    fn add_member_preserves_threshold_bounded(s in arb_state(), member_index in 0u8..=u8::MAX, member_pubkey in 0[u8; 32]..=[u8; 32]::MAX) {
         let mut s = s;
         prop_assume!(threshold_bounded(&s));
         prop_assume!(votes_bounded(&s));
@@ -314,6 +320,7 @@ proptest! {
     #[test]
     fn create_vault_preserves_votes_bounded(threshold in 0u8..=u8::MAX, member_count in 0u8..=u8::MAX) {
         let mut s = State {
+            creator: [0u8; 32],
             threshold: 0,
             member_count: 0,
             members: [[0u8; 32]; 32],
@@ -502,7 +509,7 @@ enum Op {
     Reject(u8),
     Execute(u8),
     CancelProposal,
-    AddMember(u8, Address),
+    AddMember(u8, [u8; 32]),
     RemoveMember,
 }
 
@@ -514,7 +521,7 @@ fn arb_op() -> impl Strategy<Value = Op> {
         (0u8..=u8::MAX).prop_map(|v| Op::Reject(v)),
         (0u8..=u8::MAX).prop_map(|v| Op::Execute(v)),
         Just(Op::CancelProposal),
-        (0u8..=u8::MAX, 0Address..=Address::MAX).prop_map(|(member_index, member_pubkey)| Op::AddMember(member_index, member_pubkey)),
+        (0u8..=u8::MAX, 0[u8; 32]..=[u8; 32]::MAX).prop_map(|(member_index, member_pubkey)| Op::AddMember(member_index, member_pubkey)),
         Just(Op::RemoveMember),
     ]
 }
@@ -563,6 +570,7 @@ proptest! {
     #[test]
     fn state_machine_sequence(ops in proptest::collection::vec(arb_op(), 1..20)) {
         let mut s = State {
+            creator: [0u8; 32],
             threshold: 0,
             member_count: 0,
             members: [[0u8; 32]; 32],

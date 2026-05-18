@@ -3,10 +3,10 @@ use quasar_lang::prelude::*;
 
 #[account(discriminator = 1)]
 pub struct MultisigAccount {
-    pub creator: Address,
+    pub creator: Pubkey,
     pub threshold: u8,
     pub member_count: u8,
-    pub members: [Address; 32],
+    pub members: [Pubkey; 32],
     pub voted: [u8; 32],
     pub approval_count: u8,
     pub rejection_count: u8,

@@ -46,10 +46,10 @@ fn empty(address: Pubkey) -> Account {
 /// Create a pre-populated MultisigAccount account (program-owned).
 fn state_account(
     address: Pubkey,
-    creator: Pubkey,
+    creator: [u8; 32],
     threshold: u8,
     member_count: u8,
-    members: [Address; 32],
+    members: [[u8; 32]; 32],
     voted: [u8; 32],
     approval_count: u8,
     rejection_count: u8,
@@ -334,7 +334,7 @@ fn test_add_member() {
 
     // Instruction parameters
     let member_index: u8 = 1; // AGENT: set appropriate value
-    let member_pubkey: Address = [0u8; 32]; // AGENT: set appropriate value
+    let member_pubkey: [u8; 32] = todo!(); // AGENT: set appropriate value
 
     let instruction: Instruction = AddMemberInstruction {
         creator,
@@ -542,7 +542,7 @@ fn test_add_member_unauthorized() {
         creator: wrong_creator,
         vault,
         member_index: 1,
-        member_pubkey: [0u8; 32],
+        member_pubkey: todo!(),
     }
     .into();
 

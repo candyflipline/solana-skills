@@ -25,6 +25,7 @@ enum Status {
 
 #[derive(Debug, Clone, Copy)]
 struct State {
+    authority: [u8; 32],
     total_deposits: u64,
     total_borrows: u64,
     interest_rate: u64,
@@ -34,12 +35,14 @@ struct State {
 /// Proptest strategy for generating arbitrary State values.
 prop_compose! {
     fn arb_state()(
+        authority in prop::array::uniform32(0u8..),
         total_deposits in 0u64..=u64::MAX,
         total_borrows in 0u64..=u64::MAX,
         interest_rate in 0u64..=u64::MAX,
         status in prop_oneof![Just(Status::Uninitialized), Just(Status::Active), Just(Status::Paused)],
     ) -> State {
         State {
+            authority,
             total_deposits,
             total_borrows,
             interest_rate,
@@ -51,12 +54,14 @@ prop_compose! {
 /// Boundary-biased strategy for guard rejection tests.
 prop_compose! {
     fn arb_boundary_state()(
+        authority in prop::array::uniform32(0u8..1u8),
         total_deposits in prop_oneof![0u64..=3u64, (u64::MAX - 3)..=u64::MAX],
         total_borrows in prop_oneof![0u64..=3u64, (u64::MAX - 3)..=u64::MAX],
         interest_rate in prop_oneof![0u64..=3u64, (u64::MAX - 3)..=u64::MAX],
         status in prop_oneof![Just(Status::Uninitialized), Just(Status::Active), Just(Status::Paused)],
     ) -> State {
         State {
+            authority,
             total_deposits,
             total_borrows,
             interest_rate,
@@ -101,6 +106,7 @@ proptest! {
     #[test]
     fn init_pool_preserves_pool_solvency(rate in 0u64..=u64::MAX) {
         let mut s = State {
+            authority: [0u8; 32],
             total_deposits: 0,
             total_borrows: 0,
             interest_rate: 0,
@@ -207,6 +213,7 @@ proptest! {
     #[test]
     fn state_machine_sequence(ops in proptest::collection::vec(arb_op(), 1..20)) {
         let mut s = State {
+            authority: [0u8; 32],
             total_deposits: 0,
             total_borrows: 0,
             interest_rate: 0,
@@ -248,6 +255,8 @@ enum Status {
 
 #[derive(Debug, Clone, Copy)]
 struct State {
+    borrower: [u8; 32],
+    pool: [u8; 32],
     amount: u64,
     collateral: u64,
     status: Status,
@@ -256,11 +265,15 @@ struct State {
 /// Proptest strategy for generating arbitrary State values.
 prop_compose! {
     fn arb_state()(
+        borrower in prop::array::uniform32(0u8..),
+        pool in prop::array::uniform32(0u8..),
         amount in 0u64..=u64::MAX,
         collateral in 0u64..=u64::MAX,
         status in prop_oneof![Just(Status::Uninitialized), Just(Status::Active), Just(Status::Paused)],
     ) -> State {
         State {
+            borrower,
+            pool,
             amount,
             collateral,
             status,
@@ -271,11 +284,15 @@ prop_compose! {
 /// Boundary-biased strategy for guard rejection tests.
 prop_compose! {
     fn arb_boundary_state()(
+        borrower in prop::array::uniform32(0u8..1u8),
+        pool in prop::array::uniform32(0u8..1u8),
         amount in prop_oneof![0u64..=3u64, (u64::MAX - 3)..=u64::MAX],
         collateral in prop_oneof![0u64..=3u64, (u64::MAX - 3)..=u64::MAX],
         status in prop_oneof![Just(Status::Uninitialized), Just(Status::Active), Just(Status::Paused)],
     ) -> State {
         State {
+            borrower,
+            pool,
             amount,
             collateral,
             status,

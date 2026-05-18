@@ -50,7 +50,7 @@ fn empty(address: Pubkey) -> Account {
 /// Create a pre-populated LendingAccount account (program-owned).
 fn state_account(
     address: Pubkey,
-    authority: Pubkey,
+    authority: [u8; 32],
     total_deposits: u64,
     total_borrows: u64,
     interest_rate: u64,

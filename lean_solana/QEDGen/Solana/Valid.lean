@@ -61,6 +61,8 @@ abbrev valid_u64_zero := QEDGen.Solana.Valid.valid_u64_zero
 
 -- v2.21 S2.5: export `now` so the unqualified form codegen emits
 -- (`now`) resolves at use sites that `open QEDGen.Solana`.
-abbrev now := QEDGen.Solana.Valid.now
+-- `noncomputable` because `now` is an axiom and Lean's code generator
+-- otherwise refuses to compile an abbrev for it.
+noncomputable abbrev now := QEDGen.Solana.Valid.now
 
 end QEDGen.Solana

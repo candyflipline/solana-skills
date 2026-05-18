@@ -118,7 +118,7 @@ pub fn cancel_proposal<'info>(ctx: &mut CancelProposal<'info>) -> Result<(), Pro
 
 /// Guards for `add_member`.  
 /// Generated from the `requires` clauses of the spec handler block.
-pub fn add_member<'info>(ctx: &mut AddMember<'info>, member_index: u8, member_pubkey: Address) -> Result<(), ProgramError> {
+pub fn add_member<'info>(ctx: &mut AddMember<'info>, member_index: u8, member_pubkey: Pubkey) -> Result<(), ProgramError> {
     // lifecycle: require status == Active
     if ctx.vault.status != Status::Active as u8 { return Err(ProgramError::from(crate::errors::MultisigError::InvalidLifecycle)); }
     // requires: member_index < s.member_count

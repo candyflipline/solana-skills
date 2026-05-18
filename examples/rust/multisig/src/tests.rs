@@ -7,10 +7,10 @@ type Address = [u8; 32];
 
 #[derive(Debug, Clone, PartialEq)]
 struct MultisigState {
-    creator: Address,
+    creator: [u8; 32],
     threshold: u8,
     member_count: u8,
-    members: [Address; 32],
+    members: [[u8; 32]; 32],
     voted: [u8; 32],
     approval_count: u8,
     rejection_count: u8,
@@ -76,7 +76,7 @@ fn apply_cancel_proposal(state: &mut MultisigState) {
 }
 
 /// Apply `add_member` effects to state.
-fn apply_add_member(state: &mut MultisigState, _member_index: u8, member_pubkey: Address) {
+fn apply_add_member(state: &mut MultisigState, _member_index: u8, member_pubkey: [u8; 32]) {
     state.members[member_index] = member_pubkey;
 }
 
@@ -111,7 +111,7 @@ fn guard_cancel_proposal(_state: &MultisigState) -> bool {
 }
 
 /// Guard predicate for `add_member`.
-fn guard_add_member(_state: &MultisigState, member_index: u8, member_pubkey: Address) -> bool {
+fn guard_add_member(_state: &MultisigState, member_index: u8, member_pubkey: [u8; 32]) -> bool {
     true
 }
 
@@ -245,7 +245,7 @@ mod tests {
             rejection_count: 0,
         };
         let member_index: u8 = 0;
-        let member_pubkey: Address = 1;
+        let member_pubkey: [u8; 32] = 1;
         apply_add_member(&mut state, member_index, member_pubkey);
         assert_eq!(state.members[member_index], member_pubkey);
     }
@@ -432,7 +432,7 @@ mod tests {
             rejection_count: 0,
         };
         let member_index: u8 = 0;
-        let member_pubkey: Address = 1;
+        let member_pubkey: [u8; 32] = 1;
         assert!(guard_add_member(&state, member_index, member_pubkey));
     }
 
@@ -448,7 +448,7 @@ mod tests {
             rejection_count: 0,
         };
         let member_index: u8 = 0;
-        let member_pubkey: Address = 1;
+        let member_pubkey: [u8; 32] = 1;
         assert!(!guard_add_member(&state, member_index, member_pubkey));
     }
 
@@ -597,7 +597,7 @@ mod tests {
             rejection_count: 0,
         };
         let member_index: u8 = 0;
-        let member_pubkey: Address = 1;
+        let member_pubkey: [u8; 32] = 1;
         apply_add_member(&mut state, member_index, member_pubkey);
         // Property: threshold bounded must hold after add_member
         assert!(state.threshold <= state.member_count && state.threshold > 0, "threshold_bounded must hold after add_member");
@@ -855,7 +855,7 @@ mod tests {
             rejection_count: 0,
         };
         let member_index: u8 = 0;
-        let member_pubkey: Address = 1;
+        let member_pubkey: [u8; 32] = 1;
         let pre_threshold = state.threshold.clone();
         let pre_member_count = state.member_count.clone();
         let pre_members = state.members.clone();

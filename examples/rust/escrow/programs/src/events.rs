@@ -3,19 +3,19 @@ use quasar_lang::prelude::*;
 
 #[event(discriminator = 1)]
 pub struct EscrowInitialized {
-    pub initializer: Address,
+    pub initializer: Pubkey,
     pub amount: u64,
 }
 
 #[event(discriminator = 2)]
 pub struct EscrowExchanged {
-    pub taker: Address,
+    pub taker: Pubkey,
     pub amount: u64,
 }
 
 #[event(discriminator = 3)]
 pub struct EscrowCancelled {
-    pub initializer: Address,
+    pub initializer: Pubkey,
 }
 
 // ---- END GENERATED ----

@@ -27,6 +27,7 @@ enum Status {
 
 #[derive(Clone, Copy)]
 struct State {
+    authority: [u8; 32],
     total_deposits: u64,
     total_borrows: u64,
     interest_rate: u64,
@@ -122,6 +123,7 @@ fn liquidate(s: &mut State) -> bool {
 #[kani::solver(cadical)]
 fn verify_init_pool_rejects_invalid() {
     let mut s = State {
+        authority: kani::any(),
         total_deposits: kani::any(),
         total_borrows: kani::any(),
         interest_rate: kani::any(),
@@ -139,6 +141,7 @@ fn verify_init_pool_rejects_invalid() {
 #[kani::solver(cadical)]
 fn verify_deposit_rejects_invalid() {
     let mut s = State {
+        authority: kani::any(),
         total_deposits: kani::any(),
         total_borrows: kani::any(),
         interest_rate: kani::any(),
@@ -156,6 +159,7 @@ fn verify_deposit_rejects_invalid() {
 #[kani::solver(cadical)]
 fn verify_borrow_rejects_invalid() {
     let mut s = State {
+        authority: kani::any(),
         total_deposits: kani::any(),
         total_borrows: kani::any(),
         interest_rate: kani::any(),
@@ -174,6 +178,7 @@ fn verify_borrow_rejects_invalid() {
 #[kani::solver(cadical)]
 fn verify_liquidate_rejects_invalid() {
     let mut s = State {
+        authority: kani::any(),
         total_deposits: kani::any(),
         total_borrows: kani::any(),
         interest_rate: kani::any(),
@@ -194,6 +199,7 @@ fn verify_liquidate_rejects_invalid() {
 #[kani::solver(cadical)]
 fn verify_init_pool_preserves_pool_solvency() {
     let mut s = State {
+        authority: 0,
         total_deposits: 0,
         total_borrows: 0,
         interest_rate: 0,
@@ -211,6 +217,7 @@ fn verify_init_pool_preserves_pool_solvency() {
 #[kani::solver(cadical)]
 fn verify_deposit_preserves_pool_solvency() {
     let mut s = State {
+        authority: kani::any(),
         total_deposits: kani::any(),
         total_borrows: kani::any(),
         interest_rate: kani::any(),
@@ -230,6 +237,7 @@ fn verify_deposit_preserves_pool_solvency() {
 #[kani::solver(cadical)]
 fn verify_borrow_preserves_pool_solvency() {
     let mut s = State {
+        authority: kani::any(),
         total_deposits: kani::any(),
         total_borrows: kani::any(),
         interest_rate: kani::any(),
@@ -250,6 +258,7 @@ fn verify_borrow_preserves_pool_solvency() {
 #[kani::solver(cadical)]
 fn verify_repay_preserves_pool_solvency() {
     let mut s = State {
+        authority: kani::any(),
         total_deposits: kani::any(),
         total_borrows: kani::any(),
         interest_rate: kani::any(),
@@ -268,6 +277,7 @@ fn verify_repay_preserves_pool_solvency() {
 #[kani::solver(cadical)]
 fn verify_liquidate_preserves_pool_solvency() {
     let mut s = State {
+        authority: kani::any(),
         total_deposits: kani::any(),
         total_borrows: kani::any(),
         interest_rate: kani::any(),
@@ -293,16 +303,19 @@ fn verify_liquidate_preserves_pool_solvency() {
 #[kani::solver(cadical)]
 fn verify_init_pool_effect_interest_rate() {
     let mut s = State {
+        authority: 0,
         total_deposits: 0,
         total_borrows: 0,
         interest_rate: 0,
         status: Status::Uninitialized,
     };
     let rate: u64 = kani::any();
+    let pre_authority = s.authority;
     let pre_total_deposits = s.total_deposits;
     let pre_total_borrows = s.total_borrows;
     if init_pool(&mut s, rate) {
         assert!(s.interest_rate == rate, "interest_rate must equal rate");
+        assert!(s.authority == pre_authority, "authority must not change");
     }
 }
 
@@ -311,16 +324,19 @@ fn verify_init_pool_effect_interest_rate() {
 #[kani::solver(cadical)]
 fn verify_init_pool_effect_total_deposits() {
     let mut s = State {
+        authority: 0,
         total_deposits: 0,
         total_borrows: 0,
         interest_rate: 0,
         status: Status::Uninitialized,
     };
     let rate: u64 = kani::any();
+    let pre_authority = s.authority;
     let pre_total_borrows = s.total_borrows;
     let pre_interest_rate = s.interest_rate;
     if init_pool(&mut s, rate) {
         assert!(s.total_deposits == 0, "total_deposits must equal 0");
+        assert!(s.authority == pre_authority, "authority must not change");
     }
 }
 
@@ -329,16 +345,19 @@ fn verify_init_pool_effect_total_deposits() {
 #[kani::solver(cadical)]
 fn verify_init_pool_effect_total_borrows() {
     let mut s = State {
+        authority: 0,
         total_deposits: 0,
         total_borrows: 0,
         interest_rate: 0,
         status: Status::Uninitialized,
     };
     let rate: u64 = kani::any();
+    let pre_authority = s.authority;
     let pre_total_deposits = s.total_deposits;
     let pre_interest_rate = s.interest_rate;
     if init_pool(&mut s, rate) {
         assert!(s.total_borrows == 0, "total_borrows must equal 0");
+        assert!(s.authority == pre_authority, "authority must not change");
     }
 }
 
@@ -347,6 +366,7 @@ fn verify_init_pool_effect_total_borrows() {
 #[kani::solver(cadical)]
 fn verify_deposit_effect_total_deposits() {
     let mut s = State {
+        authority: kani::any(),
         total_deposits: kani::any(),
         total_borrows: kani::any(),
         interest_rate: kani::any(),
@@ -354,11 +374,13 @@ fn verify_deposit_effect_total_deposits() {
     };
     kani::assume(s.status == Status::Active);
     let amount: u64 = kani::any();
+    let pre_authority = s.authority;
     let pre_total_deposits = s.total_deposits;
     let pre_total_borrows = s.total_borrows;
     let pre_interest_rate = s.interest_rate;
     if deposit(&mut s, amount) {
         assert!(s.total_deposits == pre_total_deposits.wrapping_add(amount), "total_deposits must increment by amount");
+        assert!(s.authority == pre_authority, "authority must not change");
         assert!(s.total_borrows == pre_total_borrows, "total_borrows must not change");
         assert!(s.interest_rate == pre_interest_rate, "interest_rate must not change");
     }
@@ -373,6 +395,7 @@ fn verify_deposit_effect_total_deposits() {
 #[kani::solver(cadical)]
 fn cover_borrow_repay_cycle() {
     let mut s = State {
+        authority: kani::any(),
         total_deposits: kani::any(),
         total_borrows: kani::any(),
         interest_rate: kani::any(),
@@ -396,6 +419,7 @@ fn cover_borrow_repay_cycle() {
 #[kani::solver(cadical)]
 fn cover_liquidation_path() {
     let mut s = State {
+        authority: kani::any(),
         total_deposits: kani::any(),
         total_borrows: kani::any(),
         interest_rate: kani::any(),
@@ -423,6 +447,7 @@ fn cover_liquidation_path() {
 #[kani::solver(cadical)]
 fn verify_liveness_loan_settles() {
     let mut s = State {
+        authority: kani::any(),
         total_deposits: kani::any(),
         total_borrows: kani::any(),
         interest_rate: kani::any(),
@@ -450,6 +475,7 @@ fn verify_liveness_loan_settles() {
 #[kani::solver(cadical)]
 fn verify_pool_solvency_under_interest_rate_change() {
     let mut s = State {
+        authority: kani::any(),
         total_deposits: kani::any(),
         total_borrows: kani::any(),
         interest_rate: kani::any(),
@@ -471,6 +497,7 @@ fn verify_pool_solvency_under_interest_rate_change() {
 #[kani::solver(cadical)]
 fn verify_deposit_no_overflow() {
     let mut s = State {
+        authority: kani::any(),
         total_deposits: kani::any(),
         total_borrows: kani::any(),
         interest_rate: kani::any(),

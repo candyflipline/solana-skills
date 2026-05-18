@@ -27,8 +27,12 @@ enum Status {
 
 #[derive(Clone, Copy)]
 struct State {
+    initializer: [u8; 32],
+    initializer_token_account: [u8; 32],
+    taker: [u8; 32],
     initializer_amount: u64,
     taker_amount: u64,
+    escrow_token_account: [u8; 32],
     status: Status,
 }
 
@@ -77,8 +81,12 @@ fn cancel(s: &mut State) -> bool {
 #[kani::solver(cadical)]
 fn verify_initialize_rejects_invalid() {
     let mut s = State {
+        initializer: kani::any(),
+        initializer_token_account: kani::any(),
+        taker: kani::any(),
         initializer_amount: kani::any(),
         taker_amount: kani::any(),
+        escrow_token_account: kani::any(),
         status: kani::any(),
     };
     kani::assume(s.status == Status::Uninitialized);
@@ -101,15 +109,26 @@ fn verify_initialize_rejects_invalid() {
 #[kani::solver(cadical)]
 fn verify_initialize_effect_initializer_amount() {
     let mut s = State {
+        initializer: 0,
+        initializer_token_account: 0,
+        taker: 0,
         initializer_amount: 0,
         taker_amount: 0,
+        escrow_token_account: 0,
         status: Status::Uninitialized,
     };
     let deposit_amount: u64 = kani::any();
     let receive_amount: u64 = kani::any();
+    let pre_initializer = s.initializer;
+    let pre_initializer_token_account = s.initializer_token_account;
+    let pre_taker = s.taker;
     let pre_taker_amount = s.taker_amount;
+    let pre_escrow_token_account = s.escrow_token_account;
     if initialize(&mut s, deposit_amount, receive_amount) {
         assert!(s.initializer_amount == deposit_amount, "initializer_amount must equal deposit_amount");
+        assert!(s.initializer == pre_initializer, "initializer must not change");
+        assert!(s.taker == pre_taker, "taker must not change");
+        assert!(s.escrow_token_account == pre_escrow_token_account, "escrow_token_account must not change");
     }
 }
 
@@ -118,15 +137,54 @@ fn verify_initialize_effect_initializer_amount() {
 #[kani::solver(cadical)]
 fn verify_initialize_effect_taker_amount() {
     let mut s = State {
+        initializer: 0,
+        initializer_token_account: 0,
+        taker: 0,
         initializer_amount: 0,
         taker_amount: 0,
+        escrow_token_account: 0,
         status: Status::Uninitialized,
     };
     let deposit_amount: u64 = kani::any();
     let receive_amount: u64 = kani::any();
+    let pre_initializer = s.initializer;
+    let pre_initializer_token_account = s.initializer_token_account;
+    let pre_taker = s.taker;
     let pre_initializer_amount = s.initializer_amount;
+    let pre_escrow_token_account = s.escrow_token_account;
     if initialize(&mut s, deposit_amount, receive_amount) {
         assert!(s.taker_amount == receive_amount, "taker_amount must equal receive_amount");
+        assert!(s.initializer == pre_initializer, "initializer must not change");
+        assert!(s.taker == pre_taker, "taker must not change");
+        assert!(s.escrow_token_account == pre_escrow_token_account, "escrow_token_account must not change");
+    }
+}
+
+#[kani::proof]
+#[kani::unwind(2)]
+#[kani::solver(cadical)]
+fn verify_initialize_effect_initializer_token_account() {
+    let mut s = State {
+        initializer: 0,
+        initializer_token_account: 0,
+        taker: 0,
+        initializer_amount: 0,
+        taker_amount: 0,
+        escrow_token_account: 0,
+        status: Status::Uninitialized,
+    };
+    let deposit_amount: u64 = kani::any();
+    let receive_amount: u64 = kani::any();
+    let pre_initializer = s.initializer;
+    let pre_taker = s.taker;
+    let pre_initializer_amount = s.initializer_amount;
+    let pre_taker_amount = s.taker_amount;
+    let pre_escrow_token_account = s.escrow_token_account;
+    if initialize(&mut s, deposit_amount, receive_amount) {
+        assert!(s.initializer_token_account == initializer_ta.pubkey, "initializer_token_account must equal initializer_ta.pubkey");
+        assert!(s.initializer == pre_initializer, "initializer must not change");
+        assert!(s.taker == pre_taker, "taker must not change");
+        assert!(s.escrow_token_account == pre_escrow_token_account, "escrow_token_account must not change");
     }
 }
 
@@ -139,8 +197,12 @@ fn verify_initialize_effect_taker_amount() {
 #[kani::solver(cadical)]
 fn cover_happy_path() {
     let mut s = State {
+        initializer: kani::any(),
+        initializer_token_account: kani::any(),
+        taker: kani::any(),
         initializer_amount: kani::any(),
         taker_amount: kani::any(),
+        escrow_token_account: kani::any(),
         status: kani::any(),
     };
     let deposit_amount_0: u64 = kani::any();
@@ -155,8 +217,12 @@ fn cover_happy_path() {
 #[kani::solver(cadical)]
 fn cover_cancel_path() {
     let mut s = State {
+        initializer: kani::any(),
+        initializer_token_account: kani::any(),
+        taker: kani::any(),
         initializer_amount: kani::any(),
         taker_amount: kani::any(),
+        escrow_token_account: kani::any(),
         status: kani::any(),
     };
     let deposit_amount_0: u64 = kani::any();
@@ -175,8 +241,12 @@ fn cover_cancel_path() {
 #[kani::solver(cadical)]
 fn verify_liveness_escrow_settles() {
     let mut s = State {
+        initializer: kani::any(),
+        initializer_token_account: kani::any(),
+        taker: kani::any(),
         initializer_amount: kani::any(),
         taker_amount: kani::any(),
+        escrow_token_account: kani::any(),
         status: kani::any(),
     };
     kani::assume(s.status == Status::Open);

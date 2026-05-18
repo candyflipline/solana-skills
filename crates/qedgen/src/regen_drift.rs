@@ -17,14 +17,38 @@ pub enum DriftKind {
     MissingGeneratedCounterpart,
 }
 
+/// v2.21 §"Slice 5": whether `check_examples` only detects drift or
+/// also writes the freshly-regenerated content back into the repo.
+///
+/// `Check` is the v2.20 behavior — comparison only. `Write` copies the
+/// temp-regenerated file to its repo path for every detected
+/// `DriftKind::Changed` entry, then returns the same `drift` list so
+/// the caller can report which files were rewritten. Files reported as
+/// `MissingGeneratedCounterpart` are *not* rewritten — those need
+/// manual attention because the regen pipeline didn't produce a
+/// counterpart at all (e.g. spec lost the relevant declaration).
+///
+/// `Write` is invoked via `qedgen check --regen-drift --write` and is
+/// the maintainer's path for rebasing PR commits across codegen-
+/// touching releases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteMode {
+    Check,
+    Write,
+}
+
 #[derive(Debug, Default)]
 pub struct RegenDriftReport {
     pub checked_examples: usize,
     pub missing_manifests: Vec<PathBuf>,
     pub drift: Vec<DriftEntry>,
+    /// Populated in `WriteMode::Write` — the absolute paths the writer
+    /// rewrote. Empty in `Check` mode.
+    pub wrote: Vec<PathBuf>,
 }
 
 impl RegenDriftReport {
+    #[allow(dead_code)]
     pub fn has_issues(&self) -> bool {
         !self.missing_manifests.is_empty() || !self.drift.is_empty()
     }
@@ -37,7 +61,13 @@ struct Example {
     spec_rel: Option<PathBuf>,
 }
 
+/// Default Check-mode entrypoint kept for test consumers.
+#[allow(dead_code)]
 pub fn check_examples(examples_root: &Path) -> Result<RegenDriftReport> {
+    check_examples_with(examples_root, WriteMode::Check)
+}
+
+pub fn check_examples_with(examples_root: &Path, mode: WriteMode) -> Result<RegenDriftReport> {
     let examples_root = examples_root
         .canonicalize()
         .with_context(|| format!("resolving examples root {}", examples_root.display()))?;
@@ -78,7 +108,7 @@ pub fn check_examples(examples_root: &Path) -> Result<RegenDriftReport> {
 
     for example in examples {
         report.checked_examples += 1;
-        check_example(&example, &mut report)?;
+        check_example(&example, &mut report, mode)?;
     }
 
     Ok(report)
@@ -110,9 +140,20 @@ pub fn print_report(report: &RegenDriftReport) {
             eprintln!("  {}: {} ({})", entry.example, entry.path.display(), kind);
         }
     }
+
+    if !report.wrote.is_empty() {
+        eprintln!(
+            "Rewrote {} file(s) to match current codegen (--write):",
+            report.wrote.len()
+        );
+        for path in &report.wrote {
+            eprintln!("  {}", path.display());
+        }
+        eprintln!("Re-run `qedgen check --regen-drift` to confirm clean.");
+    }
 }
 
-fn check_example(example: &Example, report: &mut RegenDriftReport) -> Result<()> {
+fn check_example(example: &Example, report: &mut RegenDriftReport, mode: WriteMode) -> Result<()> {
     let temp = tempfile::tempdir().context("creating regen-drift tempdir")?;
     let temp_root = temp.path().join("examples/rust").join(&example.name);
     std::fs::create_dir_all(&temp_root)?;
@@ -141,7 +182,7 @@ fn check_example(example: &Example, report: &mut RegenDriftReport) -> Result<()>
         .with_context(|| format!("regenerating verification artifacts for {}", example.name))?;
 
     for rel in comparable_paths(&example.root, &temp_root)? {
-        compare_file(example, &temp_root, &rel, report)?;
+        compare_file(example, &temp_root, &rel, report, mode)?;
     }
 
     Ok(())
@@ -421,6 +462,7 @@ fn compare_file(
     temp_root: &Path,
     rel: &Path,
     report: &mut RegenDriftReport,
+    mode: WriteMode,
 ) -> Result<()> {
     let actual = example.root.join(rel);
     let expected = temp_root.join(rel);
@@ -449,6 +491,15 @@ fn compare_file(
             path: rel.to_path_buf(),
             kind: DriftKind::Changed,
         });
+        if matches!(mode, WriteMode::Write) {
+            std::fs::write(&actual, &expected_bytes).with_context(|| {
+                format!(
+                    "writing regenerated content to {} (regen-drift --write)",
+                    actual.display()
+                )
+            })?;
+            report.wrote.push(actual);
+        }
     }
     Ok(())
 }

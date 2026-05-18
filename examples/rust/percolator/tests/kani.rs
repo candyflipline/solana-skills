@@ -41,6 +41,7 @@ enum Status {
 
 #[derive(Clone, Copy)]
 struct State {
+    authority: [u8; 32],
     V: u128,
     I: u128,
     F: u128,
@@ -322,6 +323,7 @@ fn reset(s: &mut State) -> bool {
 #[kani::solver(cadical)]
 fn verify_add_user_rejects_invalid() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -340,6 +342,7 @@ fn verify_add_user_rejects_invalid() {
 #[kani::solver(cadical)]
 fn verify_add_lp_rejects_invalid() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -358,6 +361,7 @@ fn verify_add_lp_rejects_invalid() {
 #[kani::solver(cadical)]
 fn verify_reclaim_empty_account_rejects_invalid() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -376,6 +380,7 @@ fn verify_reclaim_empty_account_rejects_invalid() {
 #[kani::solver(cadical)]
 fn verify_close_account_rejects_invalid() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -394,6 +399,7 @@ fn verify_close_account_rejects_invalid() {
 #[kani::solver(cadical)]
 fn verify_deposit_rejects_invalid() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -413,6 +419,7 @@ fn verify_deposit_rejects_invalid() {
 #[kani::solver(cadical)]
 fn verify_withdraw_rejects_invalid() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -432,6 +439,7 @@ fn verify_withdraw_rejects_invalid() {
 #[kani::solver(cadical)]
 fn verify_top_up_insurance_rejects_invalid() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -450,6 +458,7 @@ fn verify_top_up_insurance_rejects_invalid() {
 #[kani::solver(cadical)]
 fn verify_deposit_fee_credits_rejects_invalid() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -469,6 +478,7 @@ fn verify_deposit_fee_credits_rejects_invalid() {
 #[kani::solver(cadical)]
 fn verify_convert_released_pnl_rejects_invalid() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -488,6 +498,7 @@ fn verify_convert_released_pnl_rejects_invalid() {
 #[kani::solver(cadical)]
 fn verify_execute_trade_rejects_invalid() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -509,6 +520,7 @@ fn verify_execute_trade_rejects_invalid() {
 #[kani::solver(cadical)]
 fn verify_liquidate_case_0_rejects_invalid() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -527,6 +539,7 @@ fn verify_liquidate_case_0_rejects_invalid() {
 #[kani::solver(cadical)]
 fn verify_liquidate_case_1_rejects_invalid() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -545,6 +558,7 @@ fn verify_liquidate_case_1_rejects_invalid() {
 #[kani::solver(cadical)]
 fn verify_liquidate_otherwise_rejects_invalid() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -563,6 +577,7 @@ fn verify_liquidate_otherwise_rejects_invalid() {
 #[kani::solver(cadical)]
 fn verify_settle_account_rejects_invalid() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -585,6 +600,7 @@ fn verify_settle_account_rejects_invalid() {
 #[kani::solver(cadical)]
 fn verify_add_user_preserves_conservation() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -607,6 +623,7 @@ fn verify_add_user_preserves_conservation() {
 #[kani::solver(cadical)]
 fn verify_add_lp_preserves_conservation() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -629,6 +646,7 @@ fn verify_add_lp_preserves_conservation() {
 #[kani::solver(cadical)]
 fn verify_reclaim_empty_account_preserves_conservation() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -651,6 +669,7 @@ fn verify_reclaim_empty_account_preserves_conservation() {
 #[kani::solver(cadical)]
 fn verify_close_account_preserves_conservation() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -673,6 +692,7 @@ fn verify_close_account_preserves_conservation() {
 #[kani::solver(cadical)]
 fn verify_deposit_preserves_conservation() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -696,6 +716,7 @@ fn verify_deposit_preserves_conservation() {
 #[kani::solver(cadical)]
 fn verify_withdraw_preserves_conservation() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -719,6 +740,7 @@ fn verify_withdraw_preserves_conservation() {
 #[kani::solver(cadical)]
 fn verify_top_up_insurance_preserves_conservation() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -741,6 +763,7 @@ fn verify_top_up_insurance_preserves_conservation() {
 #[kani::solver(cadical)]
 fn verify_deposit_fee_credits_preserves_conservation() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -764,6 +787,7 @@ fn verify_deposit_fee_credits_preserves_conservation() {
 #[kani::solver(cadical)]
 fn verify_convert_released_pnl_preserves_conservation() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -787,6 +811,7 @@ fn verify_convert_released_pnl_preserves_conservation() {
 #[kani::solver(cadical)]
 fn verify_execute_trade_preserves_conservation() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -812,6 +837,7 @@ fn verify_execute_trade_preserves_conservation() {
 #[kani::solver(cadical)]
 fn verify_liquidate_case_0_preserves_conservation() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -834,6 +860,7 @@ fn verify_liquidate_case_0_preserves_conservation() {
 #[kani::solver(cadical)]
 fn verify_liquidate_case_1_preserves_conservation() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -856,6 +883,7 @@ fn verify_liquidate_case_1_preserves_conservation() {
 #[kani::solver(cadical)]
 fn verify_liquidate_otherwise_preserves_conservation() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -878,6 +906,7 @@ fn verify_liquidate_otherwise_preserves_conservation() {
 #[kani::solver(cadical)]
 fn verify_settle_account_preserves_conservation() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -900,6 +929,7 @@ fn verify_settle_account_preserves_conservation() {
 #[kani::solver(cadical)]
 fn verify_trigger_adl_preserves_conservation() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -921,6 +951,7 @@ fn verify_trigger_adl_preserves_conservation() {
 #[kani::solver(cadical)]
 fn verify_complete_drain_preserves_conservation() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -942,6 +973,7 @@ fn verify_complete_drain_preserves_conservation() {
 #[kani::solver(cadical)]
 fn verify_reset_preserves_conservation() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -963,6 +995,7 @@ fn verify_reset_preserves_conservation() {
 #[kani::solver(cadical)]
 fn verify_deposit_preserves_vault_bounded() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -986,6 +1019,7 @@ fn verify_deposit_preserves_vault_bounded() {
 #[kani::solver(cadical)]
 fn verify_top_up_insurance_preserves_vault_bounded() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -1008,6 +1042,7 @@ fn verify_top_up_insurance_preserves_vault_bounded() {
 #[kani::solver(cadical)]
 fn verify_deposit_fee_credits_preserves_vault_bounded() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -1031,6 +1066,7 @@ fn verify_deposit_fee_credits_preserves_vault_bounded() {
 #[kani::solver(cadical)]
 fn verify_add_user_preserves_account_solvent() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -1053,6 +1089,7 @@ fn verify_add_user_preserves_account_solvent() {
 #[kani::solver(cadical)]
 fn verify_add_lp_preserves_account_solvent() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -1075,6 +1112,7 @@ fn verify_add_lp_preserves_account_solvent() {
 #[kani::solver(cadical)]
 fn verify_reclaim_empty_account_preserves_account_solvent() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -1097,6 +1135,7 @@ fn verify_reclaim_empty_account_preserves_account_solvent() {
 #[kani::solver(cadical)]
 fn verify_close_account_preserves_account_solvent() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -1119,6 +1158,7 @@ fn verify_close_account_preserves_account_solvent() {
 #[kani::solver(cadical)]
 fn verify_deposit_preserves_account_solvent() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -1142,6 +1182,7 @@ fn verify_deposit_preserves_account_solvent() {
 #[kani::solver(cadical)]
 fn verify_withdraw_preserves_account_solvent() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -1165,6 +1206,7 @@ fn verify_withdraw_preserves_account_solvent() {
 #[kani::solver(cadical)]
 fn verify_top_up_insurance_preserves_account_solvent() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -1188,6 +1230,7 @@ fn verify_top_up_insurance_preserves_account_solvent() {
 #[kani::solver(cadical)]
 fn verify_deposit_fee_credits_preserves_account_solvent() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -1211,6 +1254,7 @@ fn verify_deposit_fee_credits_preserves_account_solvent() {
 #[kani::solver(cadical)]
 fn verify_convert_released_pnl_preserves_account_solvent() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -1234,6 +1278,7 @@ fn verify_convert_released_pnl_preserves_account_solvent() {
 #[kani::solver(cadical)]
 fn verify_execute_trade_preserves_account_solvent() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -1260,6 +1305,7 @@ fn verify_execute_trade_preserves_account_solvent() {
 #[kani::solver(cadical)]
 fn verify_liquidate_case_0_preserves_account_solvent() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -1282,6 +1328,7 @@ fn verify_liquidate_case_0_preserves_account_solvent() {
 #[kani::solver(cadical)]
 fn verify_liquidate_case_1_preserves_account_solvent() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -1304,6 +1351,7 @@ fn verify_liquidate_case_1_preserves_account_solvent() {
 #[kani::solver(cadical)]
 fn verify_liquidate_otherwise_preserves_account_solvent() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -1326,6 +1374,7 @@ fn verify_liquidate_otherwise_preserves_account_solvent() {
 #[kani::solver(cadical)]
 fn verify_settle_account_preserves_account_solvent() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -1348,6 +1397,7 @@ fn verify_settle_account_preserves_account_solvent() {
 #[kani::solver(cadical)]
 fn verify_trigger_adl_preserves_account_solvent() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -1370,6 +1420,7 @@ fn verify_trigger_adl_preserves_account_solvent() {
 #[kani::solver(cadical)]
 fn verify_complete_drain_preserves_account_solvent() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -1392,6 +1443,7 @@ fn verify_complete_drain_preserves_account_solvent() {
 #[kani::solver(cadical)]
 fn verify_reset_preserves_account_solvent() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -1421,6 +1473,7 @@ fn verify_reset_preserves_account_solvent() {
 #[kani::solver(cadical)]
 fn verify_add_user_effect_accounts_i_active() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -1429,12 +1482,14 @@ fn verify_add_user_effect_accounts_i_active() {
     };
     kani::assume(s.status == Status::Active);
     let i: usize = kani::any();
+    let pre_authority = s.authority;
     let pre_V = s.V;
     let pre_I = s.I;
     let pre_F = s.F;
     let pre_accounts = s.accounts;
     if add_user(&mut s, i) {
         assert!(s.accounts[i].active == 1, "accounts[i].active must equal 1");
+        assert!(s.authority == pre_authority, "authority must not change");
         assert!(s.V == pre_V, "V must not change");
         assert!(s.I == pre_I, "I must not change");
         assert!(s.F == pre_F, "F must not change");
@@ -1447,6 +1502,7 @@ fn verify_add_user_effect_accounts_i_active() {
 #[kani::solver(cadical)]
 fn verify_add_lp_effect_accounts_i_active() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -1455,12 +1511,14 @@ fn verify_add_lp_effect_accounts_i_active() {
     };
     kani::assume(s.status == Status::Active);
     let i: usize = kani::any();
+    let pre_authority = s.authority;
     let pre_V = s.V;
     let pre_I = s.I;
     let pre_F = s.F;
     let pre_accounts = s.accounts;
     if add_lp(&mut s, i) {
         assert!(s.accounts[i].active == 1, "accounts[i].active must equal 1");
+        assert!(s.authority == pre_authority, "authority must not change");
         assert!(s.V == pre_V, "V must not change");
         assert!(s.I == pre_I, "I must not change");
         assert!(s.F == pre_F, "F must not change");
@@ -1473,6 +1531,7 @@ fn verify_add_lp_effect_accounts_i_active() {
 #[kani::solver(cadical)]
 fn verify_reclaim_empty_account_effect_accounts_i_active() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -1481,12 +1540,14 @@ fn verify_reclaim_empty_account_effect_accounts_i_active() {
     };
     kani::assume(s.status == Status::Active);
     let i: usize = kani::any();
+    let pre_authority = s.authority;
     let pre_V = s.V;
     let pre_I = s.I;
     let pre_F = s.F;
     let pre_accounts = s.accounts;
     if reclaim_empty_account(&mut s, i) {
         assert!(s.accounts[i].active == 0, "accounts[i].active must equal 0");
+        assert!(s.authority == pre_authority, "authority must not change");
         assert!(s.V == pre_V, "V must not change");
         assert!(s.I == pre_I, "I must not change");
         assert!(s.F == pre_F, "F must not change");
@@ -1499,6 +1560,7 @@ fn verify_reclaim_empty_account_effect_accounts_i_active() {
 #[kani::solver(cadical)]
 fn verify_close_account_effect_V() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -1507,12 +1569,14 @@ fn verify_close_account_effect_V() {
     };
     kani::assume(s.status == Status::Active);
     let i: usize = kani::any();
+    let pre_authority = s.authority;
     let pre_V = s.V;
     let pre_I = s.I;
     let pre_F = s.F;
     let pre_accounts = s.accounts;
     if close_account(&mut s, i) {
         assert!(s.V == pre_V.wrapping_sub(accounts[i].capital), "V must decrement by accounts[i].capital");
+        assert!(s.authority == pre_authority, "authority must not change");
         assert!(s.I == pre_I, "I must not change");
         assert!(s.F == pre_F, "F must not change");
         assert!(s.accounts == pre_accounts, "accounts must not change");
@@ -1524,6 +1588,7 @@ fn verify_close_account_effect_V() {
 #[kani::solver(cadical)]
 fn verify_close_account_effect_accounts_i_capital() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -1532,12 +1597,14 @@ fn verify_close_account_effect_accounts_i_capital() {
     };
     kani::assume(s.status == Status::Active);
     let i: usize = kani::any();
+    let pre_authority = s.authority;
     let pre_V = s.V;
     let pre_I = s.I;
     let pre_F = s.F;
     let pre_accounts = s.accounts;
     if close_account(&mut s, i) {
         assert!(s.accounts[i].capital == 0, "accounts[i].capital must equal 0");
+        assert!(s.authority == pre_authority, "authority must not change");
         assert!(s.I == pre_I, "I must not change");
         assert!(s.F == pre_F, "F must not change");
         assert!(s.accounts == pre_accounts, "accounts must not change");
@@ -1549,6 +1616,7 @@ fn verify_close_account_effect_accounts_i_capital() {
 #[kani::solver(cadical)]
 fn verify_close_account_effect_accounts_i_active() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -1557,12 +1625,14 @@ fn verify_close_account_effect_accounts_i_active() {
     };
     kani::assume(s.status == Status::Active);
     let i: usize = kani::any();
+    let pre_authority = s.authority;
     let pre_V = s.V;
     let pre_I = s.I;
     let pre_F = s.F;
     let pre_accounts = s.accounts;
     if close_account(&mut s, i) {
         assert!(s.accounts[i].active == 0, "accounts[i].active must equal 0");
+        assert!(s.authority == pre_authority, "authority must not change");
         assert!(s.I == pre_I, "I must not change");
         assert!(s.F == pre_F, "F must not change");
         assert!(s.accounts == pre_accounts, "accounts must not change");
@@ -1574,6 +1644,7 @@ fn verify_close_account_effect_accounts_i_active() {
 #[kani::solver(cadical)]
 fn verify_deposit_effect_V() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -1583,12 +1654,14 @@ fn verify_deposit_effect_V() {
     kani::assume(s.status == Status::Active);
     let i: usize = kani::any();
     let amount: u128 = kani::any();
+    let pre_authority = s.authority;
     let pre_V = s.V;
     let pre_I = s.I;
     let pre_F = s.F;
     let pre_accounts = s.accounts;
     if deposit(&mut s, i, amount) {
         assert!(s.V == pre_V.wrapping_add(amount), "V must increment by amount");
+        assert!(s.authority == pre_authority, "authority must not change");
         assert!(s.I == pre_I, "I must not change");
         assert!(s.F == pre_F, "F must not change");
         assert!(s.accounts == pre_accounts, "accounts must not change");
@@ -1600,6 +1673,7 @@ fn verify_deposit_effect_V() {
 #[kani::solver(cadical)]
 fn verify_deposit_effect_accounts_i_capital() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -1609,12 +1683,14 @@ fn verify_deposit_effect_accounts_i_capital() {
     kani::assume(s.status == Status::Active);
     let i: usize = kani::any();
     let amount: u128 = kani::any();
+    let pre_authority = s.authority;
     let pre_V = s.V;
     let pre_I = s.I;
     let pre_F = s.F;
     let pre_accounts = s.accounts;
     if deposit(&mut s, i, amount) {
         assert!(s.accounts[i].capital == pre_accounts[i].capital.wrapping_add(amount), "accounts[i].capital must increment by amount");
+        assert!(s.authority == pre_authority, "authority must not change");
         assert!(s.I == pre_I, "I must not change");
         assert!(s.F == pre_F, "F must not change");
         assert!(s.accounts == pre_accounts, "accounts must not change");
@@ -1626,6 +1702,7 @@ fn verify_deposit_effect_accounts_i_capital() {
 #[kani::solver(cadical)]
 fn verify_withdraw_effect_V() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -1635,12 +1712,14 @@ fn verify_withdraw_effect_V() {
     kani::assume(s.status == Status::Active);
     let i: usize = kani::any();
     let amount: u128 = kani::any();
+    let pre_authority = s.authority;
     let pre_V = s.V;
     let pre_I = s.I;
     let pre_F = s.F;
     let pre_accounts = s.accounts;
     if withdraw(&mut s, i, amount) {
         assert!(s.V == pre_V.wrapping_sub(amount), "V must decrement by amount");
+        assert!(s.authority == pre_authority, "authority must not change");
         assert!(s.I == pre_I, "I must not change");
         assert!(s.F == pre_F, "F must not change");
         assert!(s.accounts == pre_accounts, "accounts must not change");
@@ -1652,6 +1731,7 @@ fn verify_withdraw_effect_V() {
 #[kani::solver(cadical)]
 fn verify_withdraw_effect_accounts_i_capital() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -1661,12 +1741,14 @@ fn verify_withdraw_effect_accounts_i_capital() {
     kani::assume(s.status == Status::Active);
     let i: usize = kani::any();
     let amount: u128 = kani::any();
+    let pre_authority = s.authority;
     let pre_V = s.V;
     let pre_I = s.I;
     let pre_F = s.F;
     let pre_accounts = s.accounts;
     if withdraw(&mut s, i, amount) {
         assert!(s.accounts[i].capital == pre_accounts[i].capital.wrapping_sub(amount), "accounts[i].capital must decrement by amount");
+        assert!(s.authority == pre_authority, "authority must not change");
         assert!(s.I == pre_I, "I must not change");
         assert!(s.F == pre_F, "F must not change");
         assert!(s.accounts == pre_accounts, "accounts must not change");
@@ -1678,6 +1760,7 @@ fn verify_withdraw_effect_accounts_i_capital() {
 #[kani::solver(cadical)]
 fn verify_top_up_insurance_effect_V() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -1686,12 +1769,14 @@ fn verify_top_up_insurance_effect_V() {
     };
     kani::assume(s.status == Status::Active);
     let amount: u128 = kani::any();
+    let pre_authority = s.authority;
     let pre_V = s.V;
     let pre_I = s.I;
     let pre_F = s.F;
     let pre_accounts = s.accounts;
     if top_up_insurance(&mut s, amount) {
         assert!(s.V == pre_V.wrapping_add(amount), "V must increment by amount");
+        assert!(s.authority == pre_authority, "authority must not change");
         assert!(s.F == pre_F, "F must not change");
         assert!(s.accounts == pre_accounts, "accounts must not change");
     }
@@ -1702,6 +1787,7 @@ fn verify_top_up_insurance_effect_V() {
 #[kani::solver(cadical)]
 fn verify_top_up_insurance_effect_I() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -1710,12 +1796,14 @@ fn verify_top_up_insurance_effect_I() {
     };
     kani::assume(s.status == Status::Active);
     let amount: u128 = kani::any();
+    let pre_authority = s.authority;
     let pre_V = s.V;
     let pre_I = s.I;
     let pre_F = s.F;
     let pre_accounts = s.accounts;
     if top_up_insurance(&mut s, amount) {
         assert!(s.I == pre_I.wrapping_add(amount), "I must increment by amount");
+        assert!(s.authority == pre_authority, "authority must not change");
         assert!(s.F == pre_F, "F must not change");
         assert!(s.accounts == pre_accounts, "accounts must not change");
     }
@@ -1726,6 +1814,7 @@ fn verify_top_up_insurance_effect_I() {
 #[kani::solver(cadical)]
 fn verify_deposit_fee_credits_effect_V() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -1735,12 +1824,14 @@ fn verify_deposit_fee_credits_effect_V() {
     kani::assume(s.status == Status::Active);
     let i: usize = kani::any();
     let amount: u128 = kani::any();
+    let pre_authority = s.authority;
     let pre_V = s.V;
     let pre_I = s.I;
     let pre_F = s.F;
     let pre_accounts = s.accounts;
     if deposit_fee_credits(&mut s, i, amount) {
         assert!(s.V == pre_V.wrapping_add(amount), "V must increment by amount");
+        assert!(s.authority == pre_authority, "authority must not change");
         assert!(s.I == pre_I, "I must not change");
         assert!(s.accounts == pre_accounts, "accounts must not change");
     }
@@ -1751,6 +1842,7 @@ fn verify_deposit_fee_credits_effect_V() {
 #[kani::solver(cadical)]
 fn verify_deposit_fee_credits_effect_F() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -1760,12 +1852,14 @@ fn verify_deposit_fee_credits_effect_F() {
     kani::assume(s.status == Status::Active);
     let i: usize = kani::any();
     let amount: u128 = kani::any();
+    let pre_authority = s.authority;
     let pre_V = s.V;
     let pre_I = s.I;
     let pre_F = s.F;
     let pre_accounts = s.accounts;
     if deposit_fee_credits(&mut s, i, amount) {
         assert!(s.F == pre_F.wrapping_add(amount), "F must increment by amount");
+        assert!(s.authority == pre_authority, "authority must not change");
         assert!(s.I == pre_I, "I must not change");
         assert!(s.accounts == pre_accounts, "accounts must not change");
     }
@@ -1776,6 +1870,7 @@ fn verify_deposit_fee_credits_effect_F() {
 #[kani::solver(cadical)]
 fn verify_deposit_fee_credits_effect_accounts_i_fee_credits() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -1785,12 +1880,14 @@ fn verify_deposit_fee_credits_effect_accounts_i_fee_credits() {
     kani::assume(s.status == Status::Active);
     let i: usize = kani::any();
     let amount: u128 = kani::any();
+    let pre_authority = s.authority;
     let pre_V = s.V;
     let pre_I = s.I;
     let pre_F = s.F;
     let pre_accounts = s.accounts;
     if deposit_fee_credits(&mut s, i, amount) {
         assert!(s.accounts[i].fee_credits == pre_accounts[i].fee_credits.wrapping_add(amount), "accounts[i].fee_credits must increment by amount");
+        assert!(s.authority == pre_authority, "authority must not change");
         assert!(s.I == pre_I, "I must not change");
         assert!(s.accounts == pre_accounts, "accounts must not change");
     }
@@ -1801,6 +1898,7 @@ fn verify_deposit_fee_credits_effect_accounts_i_fee_credits() {
 #[kani::solver(cadical)]
 fn verify_convert_released_pnl_effect_V() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -1810,12 +1908,14 @@ fn verify_convert_released_pnl_effect_V() {
     kani::assume(s.status == Status::Active);
     let i: usize = kani::any();
     let x: u128 = kani::any();
+    let pre_authority = s.authority;
     let pre_V = s.V;
     let pre_I = s.I;
     let pre_F = s.F;
     let pre_accounts = s.accounts;
     if convert_released_pnl(&mut s, i, x) {
         assert!(s.V == pre_V.wrapping_sub(x), "V must decrement by x");
+        assert!(s.authority == pre_authority, "authority must not change");
         assert!(s.I == pre_I, "I must not change");
         assert!(s.F == pre_F, "F must not change");
         assert!(s.accounts == pre_accounts, "accounts must not change");
@@ -1827,6 +1927,7 @@ fn verify_convert_released_pnl_effect_V() {
 #[kani::solver(cadical)]
 fn verify_convert_released_pnl_effect_accounts_i_reserved_pnl() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -1836,12 +1937,14 @@ fn verify_convert_released_pnl_effect_accounts_i_reserved_pnl() {
     kani::assume(s.status == Status::Active);
     let i: usize = kani::any();
     let x: u128 = kani::any();
+    let pre_authority = s.authority;
     let pre_V = s.V;
     let pre_I = s.I;
     let pre_F = s.F;
     let pre_accounts = s.accounts;
     if convert_released_pnl(&mut s, i, x) {
         assert!(s.accounts[i].reserved_pnl == pre_accounts[i].reserved_pnl.wrapping_sub(x), "accounts[i].reserved_pnl must decrement by x");
+        assert!(s.authority == pre_authority, "authority must not change");
         assert!(s.I == pre_I, "I must not change");
         assert!(s.F == pre_F, "F must not change");
         assert!(s.accounts == pre_accounts, "accounts must not change");
@@ -1853,6 +1956,7 @@ fn verify_convert_released_pnl_effect_accounts_i_reserved_pnl() {
 #[kani::solver(cadical)]
 fn verify_liquidate_case_1_effect_accounts_i_active() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -1861,12 +1965,14 @@ fn verify_liquidate_case_1_effect_accounts_i_active() {
     };
     kani::assume(s.status == Status::Active);
     let i: usize = kani::any();
+    let pre_authority = s.authority;
     let pre_V = s.V;
     let pre_I = s.I;
     let pre_F = s.F;
     let pre_accounts = s.accounts;
     if liquidate_case_1(&mut s, i) {
         assert!(s.accounts[i].active == 0, "accounts[i].active must equal 0");
+        assert!(s.authority == pre_authority, "authority must not change");
         assert!(s.V == pre_V, "V must not change");
         assert!(s.I == pre_I, "I must not change");
         assert!(s.F == pre_F, "F must not change");
@@ -1883,6 +1989,7 @@ fn verify_liquidate_case_1_effect_accounts_i_active() {
 #[kani::solver(cadical)]
 fn cover_happy_path() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -1909,6 +2016,7 @@ fn cover_happy_path() {
 #[kani::solver(cadical)]
 fn cover_trading() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -1941,6 +2049,7 @@ fn cover_trading() {
 #[kani::solver(cadical)]
 fn verify_liveness_drain_completes() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -1972,6 +2081,7 @@ fn verify_liveness_drain_completes() {
 #[kani::solver(cadical)]
 fn verify_deposit_no_overflow() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -1989,6 +2099,7 @@ fn verify_deposit_no_overflow() {
 #[kani::solver(cadical)]
 fn verify_top_up_insurance_no_overflow() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),
@@ -2005,6 +2116,7 @@ fn verify_top_up_insurance_no_overflow() {
 #[kani::solver(cadical)]
 fn verify_deposit_fee_credits_no_overflow() {
     let mut s = State {
+        authority: kani::any(),
         V: kani::any(),
         I: kani::any(),
         F: kani::any(),

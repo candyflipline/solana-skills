@@ -29,9 +29,10 @@ enum Status {
 
 #[derive(Clone, Copy)]
 struct State {
+    creator: [u8; 32],
     threshold: u8,
     member_count: u8,
-    members: [Address; 32],
+    members: [[u8; 32]; 32],
     voted: [u8; 32],
     approval_count: u8,
     rejection_count: u8,
@@ -142,7 +143,7 @@ fn cancel_proposal(s: &mut State) -> bool {
     true
 }
 
-fn add_member(s: &mut State, member_index: u8, member_pubkey: Address) -> bool {
+fn add_member(s: &mut State, member_index: u8, member_pubkey: [u8; 32]) -> bool {
     if !((member_index < s.member_count)) {
         return false;
     }
@@ -178,6 +179,7 @@ fn remove_member(s: &mut State) -> bool {
 #[kani::solver(cadical)]
 fn verify_create_vault_rejects_invalid() {
     let mut s = State {
+        creator: kani::any(),
         threshold: kani::any(),
         member_count: kani::any(),
         members: kani::any(),
@@ -199,6 +201,7 @@ fn verify_create_vault_rejects_invalid() {
 #[kani::solver(cadical)]
 fn verify_approve_rejects_invalid() {
     let mut s = State {
+        creator: kani::any(),
         threshold: kani::any(),
         member_count: kani::any(),
         members: kani::any(),
@@ -219,6 +222,7 @@ fn verify_approve_rejects_invalid() {
 #[kani::solver(cadical)]
 fn verify_reject_rejects_invalid() {
     let mut s = State {
+        creator: kani::any(),
         threshold: kani::any(),
         member_count: kani::any(),
         members: kani::any(),
@@ -239,6 +243,7 @@ fn verify_reject_rejects_invalid() {
 #[kani::solver(cadical)]
 fn verify_execute_rejects_invalid() {
     let mut s = State {
+        creator: kani::any(),
         threshold: kani::any(),
         member_count: kani::any(),
         members: kani::any(),
@@ -259,6 +264,7 @@ fn verify_execute_rejects_invalid() {
 #[kani::solver(cadical)]
 fn verify_cancel_proposal_rejects_invalid() {
     let mut s = State {
+        creator: kani::any(),
         threshold: kani::any(),
         member_count: kani::any(),
         members: kani::any(),
@@ -278,6 +284,7 @@ fn verify_cancel_proposal_rejects_invalid() {
 #[kani::solver(cadical)]
 fn verify_add_member_rejects_invalid() {
     let mut s = State {
+        creator: kani::any(),
         threshold: kani::any(),
         member_count: kani::any(),
         members: kani::any(),
@@ -288,7 +295,7 @@ fn verify_add_member_rejects_invalid() {
     };
     kani::assume(s.status == Status::Active);
     let member_index: u8 = kani::any();
-    let member_pubkey: Address = kani::any();
+    let member_pubkey: [u8; 32] = kani::any();
     kani::assume(!((member_index < s.member_count)));
     assert!(!add_member(&mut s, member_index, member_pubkey),
         "add_member must reject when guard is violated");
@@ -299,6 +306,7 @@ fn verify_add_member_rejects_invalid() {
 #[kani::solver(cadical)]
 fn verify_remove_member_rejects_invalid() {
     let mut s = State {
+        creator: kani::any(),
         threshold: kani::any(),
         member_count: kani::any(),
         members: kani::any(),
@@ -322,6 +330,7 @@ fn verify_remove_member_rejects_invalid() {
 #[kani::solver(cadical)]
 fn verify_create_vault_preserves_threshold_bounded() {
     let mut s = State {
+        creator: 0,
         threshold: 0,
         member_count: 0,
         members: 0,
@@ -343,6 +352,7 @@ fn verify_create_vault_preserves_threshold_bounded() {
 #[kani::solver(cadical)]
 fn verify_propose_preserves_threshold_bounded() {
     let mut s = State {
+        creator: kani::any(),
         threshold: kani::any(),
         member_count: kani::any(),
         members: kani::any(),
@@ -366,6 +376,7 @@ fn verify_propose_preserves_threshold_bounded() {
 #[kani::solver(cadical)]
 fn verify_approve_preserves_threshold_bounded() {
     let mut s = State {
+        creator: kani::any(),
         threshold: kani::any(),
         member_count: kani::any(),
         members: kani::any(),
@@ -390,6 +401,7 @@ fn verify_approve_preserves_threshold_bounded() {
 #[kani::solver(cadical)]
 fn verify_reject_preserves_threshold_bounded() {
     let mut s = State {
+        creator: kani::any(),
         threshold: kani::any(),
         member_count: kani::any(),
         members: kani::any(),
@@ -415,6 +427,7 @@ fn verify_reject_preserves_threshold_bounded() {
 #[kani::solver(cadical)]
 fn verify_execute_preserves_threshold_bounded() {
     let mut s = State {
+        creator: kani::any(),
         threshold: kani::any(),
         member_count: kani::any(),
         members: kani::any(),
@@ -439,6 +452,7 @@ fn verify_execute_preserves_threshold_bounded() {
 #[kani::solver(cadical)]
 fn verify_cancel_proposal_preserves_threshold_bounded() {
     let mut s = State {
+        creator: kani::any(),
         threshold: kani::any(),
         member_count: kani::any(),
         members: kani::any(),
@@ -462,6 +476,7 @@ fn verify_cancel_proposal_preserves_threshold_bounded() {
 #[kani::solver(cadical)]
 fn verify_add_member_preserves_threshold_bounded() {
     let mut s = State {
+        creator: kani::any(),
         threshold: kani::any(),
         member_count: kani::any(),
         members: kani::any(),
@@ -475,7 +490,7 @@ fn verify_add_member_preserves_threshold_bounded() {
     kani::assume(votes_bounded(&s));
     kani::assume(s.member_count <= MAX_MEMBERS);
     let member_index: u8 = kani::any();
-    let member_pubkey: Address = kani::any();
+    let member_pubkey: [u8; 32] = kani::any();
     if add_member(&mut s, member_index, member_pubkey) {
         assert!(threshold_bounded(&s),
             "threshold_bounded must hold after add_member");
@@ -487,6 +502,7 @@ fn verify_add_member_preserves_threshold_bounded() {
 #[kani::solver(cadical)]
 fn verify_remove_member_preserves_threshold_bounded() {
     let mut s = State {
+        creator: kani::any(),
         threshold: kani::any(),
         member_count: kani::any(),
         members: kani::any(),
@@ -510,6 +526,7 @@ fn verify_remove_member_preserves_threshold_bounded() {
 #[kani::solver(cadical)]
 fn verify_create_vault_preserves_votes_bounded() {
     let mut s = State {
+        creator: 0,
         threshold: 0,
         member_count: 0,
         members: 0,
@@ -531,6 +548,7 @@ fn verify_create_vault_preserves_votes_bounded() {
 #[kani::solver(cadical)]
 fn verify_propose_preserves_votes_bounded() {
     let mut s = State {
+        creator: kani::any(),
         threshold: kani::any(),
         member_count: kani::any(),
         members: kani::any(),
@@ -554,6 +572,7 @@ fn verify_propose_preserves_votes_bounded() {
 #[kani::solver(cadical)]
 fn verify_execute_preserves_votes_bounded() {
     let mut s = State {
+        creator: kani::any(),
         threshold: kani::any(),
         member_count: kani::any(),
         members: kani::any(),
@@ -578,6 +597,7 @@ fn verify_execute_preserves_votes_bounded() {
 #[kani::solver(cadical)]
 fn verify_cancel_proposal_preserves_votes_bounded() {
     let mut s = State {
+        creator: kani::any(),
         threshold: kani::any(),
         member_count: kani::any(),
         members: kani::any(),
@@ -601,6 +621,7 @@ fn verify_cancel_proposal_preserves_votes_bounded() {
 #[kani::solver(cadical)]
 fn verify_remove_member_preserves_votes_bounded() {
     let mut s = State {
+        creator: kani::any(),
         threshold: kani::any(),
         member_count: kani::any(),
         members: kani::any(),
@@ -631,6 +652,7 @@ fn verify_remove_member_preserves_votes_bounded() {
 #[kani::solver(cadical)]
 fn verify_create_vault_effect_threshold() {
     let mut s = State {
+        creator: 0,
         threshold: 0,
         member_count: 0,
         members: 0,
@@ -641,6 +663,7 @@ fn verify_create_vault_effect_threshold() {
     };
     let threshold: u8 = kani::any();
     let member_count: u8 = kani::any();
+    let pre_creator = s.creator;
     let pre_member_count = s.member_count;
     let pre_members = s.members;
     let pre_voted = s.voted;
@@ -648,6 +671,7 @@ fn verify_create_vault_effect_threshold() {
     let pre_rejection_count = s.rejection_count;
     if create_vault(&mut s, threshold, member_count) {
         assert!(s.threshold == threshold, "threshold must equal threshold");
+        assert!(s.creator == pre_creator, "creator must not change");
         assert!(s.members == pre_members, "members must not change");
         assert!(s.voted == pre_voted, "voted must not change");
     }
@@ -658,6 +682,7 @@ fn verify_create_vault_effect_threshold() {
 #[kani::solver(cadical)]
 fn verify_create_vault_effect_member_count() {
     let mut s = State {
+        creator: 0,
         threshold: 0,
         member_count: 0,
         members: 0,
@@ -668,6 +693,7 @@ fn verify_create_vault_effect_member_count() {
     };
     let threshold: u8 = kani::any();
     let member_count: u8 = kani::any();
+    let pre_creator = s.creator;
     let pre_threshold = s.threshold;
     let pre_members = s.members;
     let pre_voted = s.voted;
@@ -675,6 +701,7 @@ fn verify_create_vault_effect_member_count() {
     let pre_rejection_count = s.rejection_count;
     if create_vault(&mut s, threshold, member_count) {
         assert!(s.member_count == member_count, "member_count must equal member_count");
+        assert!(s.creator == pre_creator, "creator must not change");
         assert!(s.members == pre_members, "members must not change");
         assert!(s.voted == pre_voted, "voted must not change");
     }
@@ -685,6 +712,7 @@ fn verify_create_vault_effect_member_count() {
 #[kani::solver(cadical)]
 fn verify_create_vault_effect_approval_count() {
     let mut s = State {
+        creator: 0,
         threshold: 0,
         member_count: 0,
         members: 0,
@@ -695,6 +723,7 @@ fn verify_create_vault_effect_approval_count() {
     };
     let threshold: u8 = kani::any();
     let member_count: u8 = kani::any();
+    let pre_creator = s.creator;
     let pre_threshold = s.threshold;
     let pre_member_count = s.member_count;
     let pre_members = s.members;
@@ -702,6 +731,7 @@ fn verify_create_vault_effect_approval_count() {
     let pre_rejection_count = s.rejection_count;
     if create_vault(&mut s, threshold, member_count) {
         assert!(s.approval_count == 0, "approval_count must equal 0");
+        assert!(s.creator == pre_creator, "creator must not change");
         assert!(s.members == pre_members, "members must not change");
         assert!(s.voted == pre_voted, "voted must not change");
     }
@@ -712,6 +742,7 @@ fn verify_create_vault_effect_approval_count() {
 #[kani::solver(cadical)]
 fn verify_create_vault_effect_rejection_count() {
     let mut s = State {
+        creator: 0,
         threshold: 0,
         member_count: 0,
         members: 0,
@@ -722,6 +753,7 @@ fn verify_create_vault_effect_rejection_count() {
     };
     let threshold: u8 = kani::any();
     let member_count: u8 = kani::any();
+    let pre_creator = s.creator;
     let pre_threshold = s.threshold;
     let pre_member_count = s.member_count;
     let pre_members = s.members;
@@ -729,6 +761,7 @@ fn verify_create_vault_effect_rejection_count() {
     let pre_approval_count = s.approval_count;
     if create_vault(&mut s, threshold, member_count) {
         assert!(s.rejection_count == 0, "rejection_count must equal 0");
+        assert!(s.creator == pre_creator, "creator must not change");
         assert!(s.members == pre_members, "members must not change");
         assert!(s.voted == pre_voted, "voted must not change");
     }
@@ -739,6 +772,7 @@ fn verify_create_vault_effect_rejection_count() {
 #[kani::solver(cadical)]
 fn verify_propose_effect_approval_count() {
     let mut s = State {
+        creator: kani::any(),
         threshold: kani::any(),
         member_count: kani::any(),
         members: kani::any(),
@@ -749,6 +783,7 @@ fn verify_propose_effect_approval_count() {
     };
     kani::assume(s.status == Status::Active);
     kani::assume(s.member_count <= MAX_MEMBERS);
+    let pre_creator = s.creator;
     let pre_threshold = s.threshold;
     let pre_member_count = s.member_count;
     let pre_members = s.members;
@@ -756,6 +791,7 @@ fn verify_propose_effect_approval_count() {
     let pre_rejection_count = s.rejection_count;
     if propose(&mut s) {
         assert!(s.approval_count == 0, "approval_count must equal 0");
+        assert!(s.creator == pre_creator, "creator must not change");
         assert!(s.threshold == pre_threshold, "threshold must not change");
         assert!(s.member_count == pre_member_count, "member_count must not change");
         assert!(s.members == pre_members, "members must not change");
@@ -768,6 +804,7 @@ fn verify_propose_effect_approval_count() {
 #[kani::solver(cadical)]
 fn verify_propose_effect_rejection_count() {
     let mut s = State {
+        creator: kani::any(),
         threshold: kani::any(),
         member_count: kani::any(),
         members: kani::any(),
@@ -778,6 +815,7 @@ fn verify_propose_effect_rejection_count() {
     };
     kani::assume(s.status == Status::Active);
     kani::assume(s.member_count <= MAX_MEMBERS);
+    let pre_creator = s.creator;
     let pre_threshold = s.threshold;
     let pre_member_count = s.member_count;
     let pre_members = s.members;
@@ -785,6 +823,7 @@ fn verify_propose_effect_rejection_count() {
     let pre_approval_count = s.approval_count;
     if propose(&mut s) {
         assert!(s.rejection_count == 0, "rejection_count must equal 0");
+        assert!(s.creator == pre_creator, "creator must not change");
         assert!(s.threshold == pre_threshold, "threshold must not change");
         assert!(s.member_count == pre_member_count, "member_count must not change");
         assert!(s.members == pre_members, "members must not change");
@@ -797,6 +836,7 @@ fn verify_propose_effect_rejection_count() {
 #[kani::solver(cadical)]
 fn verify_approve_effect_approval_count() {
     let mut s = State {
+        creator: kani::any(),
         threshold: kani::any(),
         member_count: kani::any(),
         members: kani::any(),
@@ -808,6 +848,7 @@ fn verify_approve_effect_approval_count() {
     kani::assume(s.status == Status::HasProposal);
     let member_index: u8 = kani::any();
     kani::assume(s.member_count <= MAX_MEMBERS);
+    let pre_creator = s.creator;
     let pre_threshold = s.threshold;
     let pre_member_count = s.member_count;
     let pre_members = s.members;
@@ -816,6 +857,7 @@ fn verify_approve_effect_approval_count() {
     let pre_rejection_count = s.rejection_count;
     if approve(&mut s, member_index) {
         assert!(s.approval_count == pre_approval_count.wrapping_add(1), "approval_count must increment by 1");
+        assert!(s.creator == pre_creator, "creator must not change");
         assert!(s.threshold == pre_threshold, "threshold must not change");
         assert!(s.member_count == pre_member_count, "member_count must not change");
         assert!(s.members == pre_members, "members must not change");
@@ -829,6 +871,7 @@ fn verify_approve_effect_approval_count() {
 #[kani::solver(cadical)]
 fn verify_approve_effect_voted_member_index() {
     let mut s = State {
+        creator: kani::any(),
         threshold: kani::any(),
         member_count: kani::any(),
         members: kani::any(),
@@ -840,6 +883,7 @@ fn verify_approve_effect_voted_member_index() {
     kani::assume(s.status == Status::HasProposal);
     let member_index: u8 = kani::any();
     kani::assume(s.member_count <= MAX_MEMBERS);
+    let pre_creator = s.creator;
     let pre_threshold = s.threshold;
     let pre_member_count = s.member_count;
     let pre_members = s.members;
@@ -848,6 +892,7 @@ fn verify_approve_effect_voted_member_index() {
     let pre_rejection_count = s.rejection_count;
     if approve(&mut s, member_index) {
         assert!(s.voted[member_index] == 1, "voted[member_index] must equal 1");
+        assert!(s.creator == pre_creator, "creator must not change");
         assert!(s.threshold == pre_threshold, "threshold must not change");
         assert!(s.member_count == pre_member_count, "member_count must not change");
         assert!(s.members == pre_members, "members must not change");
@@ -861,6 +906,7 @@ fn verify_approve_effect_voted_member_index() {
 #[kani::solver(cadical)]
 fn verify_reject_effect_rejection_count() {
     let mut s = State {
+        creator: kani::any(),
         threshold: kani::any(),
         member_count: kani::any(),
         members: kani::any(),
@@ -873,6 +919,7 @@ fn verify_reject_effect_rejection_count() {
     let member_index: u8 = kani::any();
     kani::assume(s.member_count <= MAX_MEMBERS);
     kani::assume(s.rejection_count < s.member_count); // strict bound: rejection_count increments
+    let pre_creator = s.creator;
     let pre_threshold = s.threshold;
     let pre_member_count = s.member_count;
     let pre_members = s.members;
@@ -881,6 +928,7 @@ fn verify_reject_effect_rejection_count() {
     let pre_rejection_count = s.rejection_count;
     if reject(&mut s, member_index) {
         assert!(s.rejection_count == pre_rejection_count.wrapping_add(1), "rejection_count must increment by 1");
+        assert!(s.creator == pre_creator, "creator must not change");
         assert!(s.threshold == pre_threshold, "threshold must not change");
         assert!(s.member_count == pre_member_count, "member_count must not change");
         assert!(s.members == pre_members, "members must not change");
@@ -894,6 +942,7 @@ fn verify_reject_effect_rejection_count() {
 #[kani::solver(cadical)]
 fn verify_reject_effect_voted_member_index() {
     let mut s = State {
+        creator: kani::any(),
         threshold: kani::any(),
         member_count: kani::any(),
         members: kani::any(),
@@ -906,6 +955,7 @@ fn verify_reject_effect_voted_member_index() {
     let member_index: u8 = kani::any();
     kani::assume(s.member_count <= MAX_MEMBERS);
     kani::assume(s.rejection_count < s.member_count); // strict bound: rejection_count increments
+    let pre_creator = s.creator;
     let pre_threshold = s.threshold;
     let pre_member_count = s.member_count;
     let pre_members = s.members;
@@ -914,6 +964,7 @@ fn verify_reject_effect_voted_member_index() {
     let pre_rejection_count = s.rejection_count;
     if reject(&mut s, member_index) {
         assert!(s.voted[member_index] == 1, "voted[member_index] must equal 1");
+        assert!(s.creator == pre_creator, "creator must not change");
         assert!(s.threshold == pre_threshold, "threshold must not change");
         assert!(s.member_count == pre_member_count, "member_count must not change");
         assert!(s.members == pre_members, "members must not change");
@@ -927,6 +978,7 @@ fn verify_reject_effect_voted_member_index() {
 #[kani::solver(cadical)]
 fn verify_execute_effect_approval_count() {
     let mut s = State {
+        creator: kani::any(),
         threshold: kani::any(),
         member_count: kani::any(),
         members: kani::any(),
@@ -938,6 +990,7 @@ fn verify_execute_effect_approval_count() {
     kani::assume(s.status == Status::HasProposal);
     let member_index: u8 = kani::any();
     kani::assume(s.member_count <= MAX_MEMBERS);
+    let pre_creator = s.creator;
     let pre_threshold = s.threshold;
     let pre_member_count = s.member_count;
     let pre_members = s.members;
@@ -945,6 +998,7 @@ fn verify_execute_effect_approval_count() {
     let pre_rejection_count = s.rejection_count;
     if execute(&mut s, member_index) {
         assert!(s.approval_count == 0, "approval_count must equal 0");
+        assert!(s.creator == pre_creator, "creator must not change");
         assert!(s.threshold == pre_threshold, "threshold must not change");
         assert!(s.member_count == pre_member_count, "member_count must not change");
         assert!(s.members == pre_members, "members must not change");
@@ -957,6 +1011,7 @@ fn verify_execute_effect_approval_count() {
 #[kani::solver(cadical)]
 fn verify_execute_effect_rejection_count() {
     let mut s = State {
+        creator: kani::any(),
         threshold: kani::any(),
         member_count: kani::any(),
         members: kani::any(),
@@ -968,6 +1023,7 @@ fn verify_execute_effect_rejection_count() {
     kani::assume(s.status == Status::HasProposal);
     let member_index: u8 = kani::any();
     kani::assume(s.member_count <= MAX_MEMBERS);
+    let pre_creator = s.creator;
     let pre_threshold = s.threshold;
     let pre_member_count = s.member_count;
     let pre_members = s.members;
@@ -975,6 +1031,7 @@ fn verify_execute_effect_rejection_count() {
     let pre_approval_count = s.approval_count;
     if execute(&mut s, member_index) {
         assert!(s.rejection_count == 0, "rejection_count must equal 0");
+        assert!(s.creator == pre_creator, "creator must not change");
         assert!(s.threshold == pre_threshold, "threshold must not change");
         assert!(s.member_count == pre_member_count, "member_count must not change");
         assert!(s.members == pre_members, "members must not change");
@@ -987,6 +1044,7 @@ fn verify_execute_effect_rejection_count() {
 #[kani::solver(cadical)]
 fn verify_cancel_proposal_effect_approval_count() {
     let mut s = State {
+        creator: kani::any(),
         threshold: kani::any(),
         member_count: kani::any(),
         members: kani::any(),
@@ -997,6 +1055,7 @@ fn verify_cancel_proposal_effect_approval_count() {
     };
     kani::assume(s.status == Status::HasProposal);
     kani::assume(s.member_count <= MAX_MEMBERS);
+    let pre_creator = s.creator;
     let pre_threshold = s.threshold;
     let pre_member_count = s.member_count;
     let pre_members = s.members;
@@ -1004,6 +1063,7 @@ fn verify_cancel_proposal_effect_approval_count() {
     let pre_rejection_count = s.rejection_count;
     if cancel_proposal(&mut s) {
         assert!(s.approval_count == 0, "approval_count must equal 0");
+        assert!(s.creator == pre_creator, "creator must not change");
         assert!(s.threshold == pre_threshold, "threshold must not change");
         assert!(s.member_count == pre_member_count, "member_count must not change");
         assert!(s.members == pre_members, "members must not change");
@@ -1016,6 +1076,7 @@ fn verify_cancel_proposal_effect_approval_count() {
 #[kani::solver(cadical)]
 fn verify_cancel_proposal_effect_rejection_count() {
     let mut s = State {
+        creator: kani::any(),
         threshold: kani::any(),
         member_count: kani::any(),
         members: kani::any(),
@@ -1026,6 +1087,7 @@ fn verify_cancel_proposal_effect_rejection_count() {
     };
     kani::assume(s.status == Status::HasProposal);
     kani::assume(s.member_count <= MAX_MEMBERS);
+    let pre_creator = s.creator;
     let pre_threshold = s.threshold;
     let pre_member_count = s.member_count;
     let pre_members = s.members;
@@ -1033,6 +1095,7 @@ fn verify_cancel_proposal_effect_rejection_count() {
     let pre_approval_count = s.approval_count;
     if cancel_proposal(&mut s) {
         assert!(s.rejection_count == 0, "rejection_count must equal 0");
+        assert!(s.creator == pre_creator, "creator must not change");
         assert!(s.threshold == pre_threshold, "threshold must not change");
         assert!(s.member_count == pre_member_count, "member_count must not change");
         assert!(s.members == pre_members, "members must not change");
@@ -1045,6 +1108,7 @@ fn verify_cancel_proposal_effect_rejection_count() {
 #[kani::solver(cadical)]
 fn verify_add_member_effect_members_member_index() {
     let mut s = State {
+        creator: kani::any(),
         threshold: kani::any(),
         member_count: kani::any(),
         members: kani::any(),
@@ -1055,8 +1119,9 @@ fn verify_add_member_effect_members_member_index() {
     };
     kani::assume(s.status == Status::Active);
     let member_index: u8 = kani::any();
-    let member_pubkey: Address = kani::any();
+    let member_pubkey: [u8; 32] = kani::any();
     kani::assume(s.member_count <= MAX_MEMBERS);
+    let pre_creator = s.creator;
     let pre_threshold = s.threshold;
     let pre_member_count = s.member_count;
     let pre_members = s.members;
@@ -1065,6 +1130,7 @@ fn verify_add_member_effect_members_member_index() {
     let pre_rejection_count = s.rejection_count;
     if add_member(&mut s, member_index, member_pubkey) {
         assert!(s.members[member_index] == member_pubkey, "members[member_index] must equal member_pubkey");
+        assert!(s.creator == pre_creator, "creator must not change");
         assert!(s.threshold == pre_threshold, "threshold must not change");
         assert!(s.member_count == pre_member_count, "member_count must not change");
         assert!(s.members == pre_members, "members must not change");
@@ -1079,6 +1145,7 @@ fn verify_add_member_effect_members_member_index() {
 #[kani::solver(cadical)]
 fn verify_remove_member_effect_member_count() {
     let mut s = State {
+        creator: kani::any(),
         threshold: kani::any(),
         member_count: kani::any(),
         members: kani::any(),
@@ -1089,6 +1156,7 @@ fn verify_remove_member_effect_member_count() {
     };
     kani::assume(s.status == Status::Active);
     kani::assume(s.member_count <= MAX_MEMBERS);
+    let pre_creator = s.creator;
     let pre_threshold = s.threshold;
     let pre_member_count = s.member_count;
     let pre_members = s.members;
@@ -1097,6 +1165,7 @@ fn verify_remove_member_effect_member_count() {
     let pre_rejection_count = s.rejection_count;
     if remove_member(&mut s) {
         assert!(s.member_count == pre_member_count.wrapping_sub(1), "member_count must decrement by 1");
+        assert!(s.creator == pre_creator, "creator must not change");
         assert!(s.threshold == pre_threshold, "threshold must not change");
         assert!(s.members == pre_members, "members must not change");
         assert!(s.voted == pre_voted, "voted must not change");
@@ -1114,6 +1183,7 @@ fn verify_remove_member_effect_member_count() {
 #[kani::solver(cadical)]
 fn cover_proposal_lifecycle() {
     let mut s = State {
+        creator: kani::any(),
         threshold: kani::any(),
         member_count: kani::any(),
         members: kani::any(),
@@ -1140,6 +1210,7 @@ fn cover_proposal_lifecycle() {
 #[kani::solver(cadical)]
 fn cover_rejection_flow() {
     let mut s = State {
+        creator: kani::any(),
         threshold: kani::any(),
         member_count: kani::any(),
         members: kani::any(),
@@ -1169,6 +1240,7 @@ fn cover_rejection_flow() {
 #[kani::solver(cadical)]
 fn verify_liveness_proposal_resolves() {
     let mut s = State {
+        creator: kani::any(),
         threshold: kani::any(),
         member_count: kani::any(),
         members: kani::any(),
@@ -1203,6 +1275,7 @@ fn verify_liveness_proposal_resolves() {
 #[kani::solver(cadical)]
 fn verify_approve_no_overflow() {
     let mut s = State {
+        creator: kani::any(),
         threshold: kani::any(),
         member_count: kani::any(),
         members: kani::any(),
@@ -1221,6 +1294,7 @@ fn verify_approve_no_overflow() {
 #[kani::solver(cadical)]
 fn verify_reject_no_overflow() {
     let mut s = State {
+        creator: kani::any(),
         threshold: kani::any(),
         member_count: kani::any(),
         members: kani::any(),

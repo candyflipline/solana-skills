@@ -7,7 +7,7 @@ type Address = [u8; 32];
 
 #[derive(Debug, Clone, PartialEq)]
 struct PoolState {
-    authority: Address,
+    authority: [u8; 32],
     total_deposits: u64,
     total_borrows: u64,
     interest_rate: u64,
@@ -33,8 +33,8 @@ enum PoolStatus {
 
 #[derive(Debug, Clone, PartialEq)]
 struct LoanState {
-    borrower: Address,
-    pool: Address,
+    borrower: [u8; 32],
+    pool: [u8; 32],
     amount: u64,
     collateral: u64,
 }

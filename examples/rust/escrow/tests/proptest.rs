@@ -22,21 +22,33 @@ enum Status {
 
 #[derive(Debug, Clone, Copy)]
 struct State {
+    initializer: [u8; 32],
+    initializer_token_account: [u8; 32],
+    taker: [u8; 32],
     initializer_amount: u64,
     taker_amount: u64,
+    escrow_token_account: [u8; 32],
     status: Status,
 }
 
 /// Proptest strategy for generating arbitrary State values.
 prop_compose! {
     fn arb_state()(
+        initializer in prop::array::uniform32(0u8..),
+        initializer_token_account in prop::array::uniform32(0u8..),
+        taker in prop::array::uniform32(0u8..),
         initializer_amount in 0u64..=u64::MAX,
         taker_amount in 0u64..=u64::MAX,
+        escrow_token_account in prop::array::uniform32(0u8..),
         status in prop_oneof![Just(Status::Uninitialized), Just(Status::Open), Just(Status::Closed)],
     ) -> State {
         State {
+            initializer,
+            initializer_token_account,
+            taker,
             initializer_amount,
             taker_amount,
+            escrow_token_account,
             status,
         }
     }
@@ -45,13 +57,21 @@ prop_compose! {
 /// Boundary-biased strategy for guard rejection tests.
 prop_compose! {
     fn arb_boundary_state()(
+        initializer in prop::array::uniform32(0u8..1u8),
+        initializer_token_account in prop::array::uniform32(0u8..1u8),
+        taker in prop::array::uniform32(0u8..1u8),
         initializer_amount in prop_oneof![0u64..=3u64, (u64::MAX - 3)..=u64::MAX],
         taker_amount in prop_oneof![0u64..=3u64, (u64::MAX - 3)..=u64::MAX],
+        escrow_token_account in prop::array::uniform32(0u8..1u8),
         status in prop_oneof![Just(Status::Uninitialized), Just(Status::Open), Just(Status::Closed)],
     ) -> State {
         State {
+            initializer,
+            initializer_token_account,
+            taker,
             initializer_amount,
             taker_amount,
+            escrow_token_account,
             status,
         }
     }

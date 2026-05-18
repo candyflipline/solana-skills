@@ -13,7 +13,7 @@ pub struct Account {
 
 #[account(discriminator = 1)]
 pub struct PercolatorAccount {
-    pub authority: Address,
+    pub authority: Pubkey,
     pub V: u128,
     pub I: u128,
     pub F: u128,

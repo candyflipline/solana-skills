@@ -63,6 +63,7 @@ prop_compose! {
 
 #[derive(Debug, Clone, Copy)]
 struct State {
+    authority: [u8; 32],
     V: u128,
     I: u128,
     F: u128,
@@ -73,6 +74,7 @@ struct State {
 /// Proptest strategy for generating arbitrary State values.
 prop_compose! {
     fn arb_state()(
+        authority in prop::array::uniform32(0u8..),
         V in 0u128..=10000000000000000u128,
         I in 0u128..=10000000000000000u128,
         F in 0u128..=10000000000000000u128,
@@ -80,6 +82,7 @@ prop_compose! {
         status in prop_oneof![Just(Status::Active), Just(Status::Draining), Just(Status::Resetting)],
     ) -> State {
         State {
+            authority,
             V,
             I,
             F,
@@ -92,6 +95,7 @@ prop_compose! {
 /// Boundary-biased strategy for guard rejection tests.
 prop_compose! {
     fn arb_boundary_state()(
+        authority in prop::array::uniform32(0u8..1u8),
         V in prop_oneof![0u128..=3u128, (10000000000000000 - 3)..=10000000000000000u128],
         I in prop_oneof![0u128..=3u128, (10000000000000000 - 3)..=10000000000000000u128],
         F in prop_oneof![0u128..=3u128, (10000000000000000 - 3)..=10000000000000000u128],
@@ -99,6 +103,7 @@ prop_compose! {
         status in prop_oneof![Just(Status::Active), Just(Status::Draining), Just(Status::Resetting)],
     ) -> State {
         State {
+            authority,
             V,
             I,
             F,
@@ -1259,6 +1264,7 @@ proptest! {
     #[test]
     fn state_machine_sequence(ops in proptest::collection::vec(arb_op(), 1..20)) {
         let mut s = State {
+            authority: [0u8; 32],
             V: 0,
             I: 0,
             F: 0,

@@ -548,6 +548,15 @@ enum Commands {
         /// Root containing bundled Rust examples for --regen-drift.
         #[arg(long, default_value = "examples/rust", requires = "regen_drift")]
         examples_root: PathBuf,
+
+        /// v2.21 §"Slice 5": with `--regen-drift`, also write the
+        /// regenerated content into the repo so the committed example
+        /// outputs match current codegen. Useful for rebasing PRs across
+        /// codegen-touching releases. Does NOT touch user-owned files
+        /// (handler bodies, Spec.lean proofs) — only the codegen-owned
+        /// set that `--regen-drift` already compares.
+        #[arg(long, requires = "regen_drift")]
+        write: bool,
     },
 
     /// Run the generated harnesses against the generated implementation.
@@ -2112,6 +2121,7 @@ async fn main() -> Result<()> {
             no_cache,
             regen_drift,
             examples_root,
+            write,
         } => {
             require_git_repo()?;
             let cwd = std::env::current_dir()?;
@@ -2122,9 +2132,27 @@ async fn main() -> Result<()> {
                 } else {
                     cwd.join(examples_root)
                 };
-                let report = regen_drift::check_examples(&examples_root)?;
+                let mode = if write {
+                    regen_drift::WriteMode::Write
+                } else {
+                    regen_drift::WriteMode::Check
+                };
+                let report = regen_drift::check_examples_with(&examples_root, mode)?;
                 regen_drift::print_report(&report);
-                if report.has_issues() {
+                // In Write mode, drift entries are expected (the writer
+                // resolved them). Only error if anything's still unresolved:
+                // missing manifests always, MissingGeneratedCounterpart
+                // always (writer can't synthesize a file the regen
+                // pipeline didn't produce), and Changed entries when
+                // running in Check mode.
+                let unresolved = !report.missing_manifests.is_empty()
+                    || report.drift.iter().any(|d| match d.kind {
+                        regen_drift::DriftKind::MissingGeneratedCounterpart => true,
+                        regen_drift::DriftKind::Changed => {
+                            !matches!(mode, regen_drift::WriteMode::Write)
+                        }
+                    });
+                if unresolved {
                     std::process::exit(1);
                 }
                 return Ok(());
