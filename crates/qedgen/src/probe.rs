@@ -383,6 +383,24 @@ pub struct BootstrapHandler {
     /// dispatcher only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub line: Option<u32>,
+    /// v2.20 §S2.2: per-handler narrowing of the global
+    /// `applicable_categories` list, computed from intent-tag
+    /// classification of the handler body (see `handler_intent.rs`).
+    /// Absent means the global list applies — the auditor must walk
+    /// every category for this handler. Present means "walk only these
+    /// categories for this handler". Set only when Shank discovery
+    /// successfully resolves the handler body AND the classifier
+    /// emits a non-trivial narrowing; otherwise the global list still
+    /// applies and we omit the field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applicable_categories: Option<Vec<String>>,
+    /// v2.20 §S2.2: intent tag the classifier derived
+    /// (`authority_gated` / `trader_gated` / `permissionless`). Absent
+    /// when no rule matched. Surfaced for auditor explainability — the
+    /// agent uses it to phrase findings ("this authority-gated
+    /// handler …").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub intent_tag: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -535,17 +553,26 @@ pub fn run_bootstrap(project_root: &Path) -> Result<ProbeOutput> {
         // top-level `process_instruction` central match. Try the
         // Shank-shape detector first; on no-match, fall back to an
         // empty handler list (auditor walks source directly, as before).
+        // v2.20 §S2.2: also classify each handler body and emit a
+        // narrowed `applicable_categories` per entry.
         Runtime::Native => match crate::shank_probe::detect_shank_dispatcher(project_root) {
             Ok(Some(cat)) => {
+                let global = applicable_categories(&runtime);
                 let h: Vec<BootstrapHandler> = cat
                     .handlers
                     .into_iter()
-                    .map(|sh| BootstrapHandler {
-                        name: sh.name,
-                        source_file: sh.file,
-                        enum_variant: Some(sh.enum_variant),
-                        entry_fn: Some(sh.entry_fn),
-                        line: Some(sh.line),
+                    .map(|sh| {
+                        let (intent_tag, narrowed) =
+                            classify_shank_handler(&sh.name, &sh.entry_fn, project_root, &global);
+                        BootstrapHandler {
+                            name: sh.name,
+                            source_file: sh.file,
+                            enum_variant: Some(sh.enum_variant),
+                            entry_fn: Some(sh.entry_fn),
+                            line: Some(sh.line),
+                            applicable_categories: narrowed,
+                            intent_tag,
+                        }
                     })
                     .collect();
                 (h, Some("shank_central_match".to_string()))
@@ -746,6 +773,8 @@ fn single_crate_handlers(crate_root: &Path, project_root: &Path) -> Result<Vec<B
             enum_variant: None,
             entry_fn: None,
             line: None,
+            applicable_categories: None,
+            intent_tag: None,
         })
         .collect())
 }
@@ -794,6 +823,14 @@ fn applicable_categories(runtime: &Runtime) -> Vec<String> {
         "creator_admin_outside_quorum",
         "signer_set_pinned_to_creator_pda_only",
     ];
+    // v2.20 §S2.2 + §S3.1: permissionless-shape categories. Spec-less
+    // mode surfaces these so the auditor walks the relevant handler
+    // bodies. Per-handler narrowing (handler_intent classifier) filters
+    // them back out when the handler is `authority_gated`.
+    let permissionless_shapes = [
+        "permissionless_state_writer",
+        "permissionless_create_account_dos",
+    ];
     // Pinocchio surface — every Anchor-framework-discharged obligation
     // is now author-side. See references/probes/pinocchio/*.md for the
     // full catalog.
@@ -813,6 +850,7 @@ fn applicable_categories(runtime: &Runtime) -> Vec<String> {
         Runtime::Anchor | Runtime::Native => universal
             .iter()
             .chain(anchor_native.iter())
+            .chain(permissionless_shapes.iter())
             .chain(multi_actor.iter())
             .map(|s| s.to_string())
             .collect(),
@@ -823,6 +861,7 @@ fn applicable_categories(runtime: &Runtime) -> Vec<String> {
         Runtime::Quasar => universal
             .iter()
             .chain(anchor_native.iter())
+            .chain(permissionless_shapes.iter())
             .chain(quasar_specific.iter())
             .chain(multi_actor.iter())
             .map(|s| s.to_string())
@@ -841,6 +880,41 @@ fn applicable_categories(runtime: &Runtime) -> Vec<String> {
             .collect(),
         Runtime::Unknown => universal.iter().map(|s| s.to_string()).collect(),
     }
+}
+
+/// v2.20 §S2.2: resolve a Shank handler's source body, run the intent
+/// classifier, and return `(intent_tag_str, narrowed_categories)`. The
+/// narrowed list is only emitted when the classifier actually narrows
+/// the global list (i.e. drops at least one category) — otherwise we
+/// omit it and the caller's global `applicable_categories` field stays
+/// authoritative.
+///
+/// Both fields are `None` when the handler body can't be located or
+/// the classifier emits no tag. Failure modes:
+/// - `resolve_handler_body` returns `None` (handler defined outside `src/`,
+///   or unparseable file): both `None`.
+/// - Classifier returns `None` (body too trivial / no shape match):
+///   both `None`.
+/// - Filter doesn't drop anything (e.g. `TraderGated` with the current
+///   exclusion table): we still emit the tag but no narrowing.
+fn classify_shank_handler(
+    handler_name: &str,
+    entry_fn: &str,
+    project_root: &Path,
+    global: &[String],
+) -> (Option<String>, Option<Vec<String>>) {
+    let Some((_path, body)) = crate::handler_intent::resolve_handler_body(entry_fn, project_root)
+    else {
+        return (None, None);
+    };
+    let tag = crate::handler_intent::classify_handler_body(handler_name, &body);
+    let tag_str = tag.map(|t| t.as_str().to_string());
+    let narrowed = crate::handler_intent::filter_categories(global, tag);
+    if narrowed.len() == global.len() {
+        // Filter was a no-op — don't bother emitting a duplicate list.
+        return (tag_str, None);
+    }
+    (tag_str, Some(narrowed))
 }
 
 /// Spec-aware predicate: handler has no `auth X` clause and is not marked
@@ -2133,5 +2207,77 @@ solana-program = "1.18"
         );
         // Universal categories should still be present.
         assert!(cats.iter().any(|c| c == "missing_signer"));
+    }
+
+    #[test]
+    fn applicable_categories_for_native_includes_permissionless_shapes() {
+        // v2.20 §S2.2 — the per-handler filter only does useful work
+        // when these categories are in the global list to begin with.
+        let cats = applicable_categories(&Runtime::Native);
+        assert!(
+            cats.iter().any(|c| c == "permissionless_state_writer"),
+            "Native applicable_categories must include permissionless_state_writer: {:?}",
+            cats
+        );
+        assert!(
+            cats.iter()
+                .any(|c| c == "permissionless_create_account_dos"),
+            "Native applicable_categories must include permissionless_create_account_dos: {:?}",
+            cats
+        );
+    }
+
+    #[test]
+    fn run_bootstrap_against_shank_fixture_emits_per_handler_narrowing() {
+        // End-to-end: the committed fixture exercises three intent
+        // shapes (authority_gated / permissionless / trader_gated)
+        // across three dispatcher arms. We assert each handler ends
+        // up with the right intent tag and that the narrowing filter
+        // actually narrows where it should.
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/native-fixtures/shank-dispatcher");
+        let out = run_bootstrap(&root).expect("bootstrap must succeed");
+        let handlers = out.handlers.expect("expected populated handlers list");
+        assert_eq!(handlers.len(), 3, "fixture defines three handlers");
+
+        // 1. InitializeWidget — authority_gated → drops permissionless shapes.
+        let init = &handlers[0];
+        assert_eq!(init.name, "InitializeWidget");
+        assert_eq!(init.intent_tag.as_deref(), Some("authority_gated"));
+        let init_cats = init
+            .applicable_categories
+            .as_ref()
+            .expect("authority_gated must narrow");
+        assert!(
+            !init_cats.iter().any(|c| c == "permissionless_state_writer"),
+            "authority_gated must drop permissionless_state_writer: {:?}",
+            init_cats
+        );
+        assert!(
+            !init_cats
+                .iter()
+                .any(|c| c == "permissionless_create_account_dos"),
+            "authority_gated must drop permissionless_create_account_dos: {:?}",
+            init_cats
+        );
+
+        // 2. Tick — permissionless → drops missing_signer.
+        let tick = &handlers[1];
+        assert_eq!(tick.name, "Tick");
+        assert_eq!(tick.intent_tag.as_deref(), Some("permissionless"));
+        let tick_cats = tick
+            .applicable_categories
+            .as_ref()
+            .expect("permissionless must narrow");
+        assert!(
+            !tick_cats.iter().any(|c| c == "missing_signer"),
+            "permissionless must drop missing_signer: {:?}",
+            tick_cats
+        );
+
+        // 3. Close — trader_gated → no narrowing today, but tag still emitted.
+        let close = &handlers[2];
+        assert_eq!(close.name, "Close");
+        assert_eq!(close.intent_tag.as_deref(), Some("trader_gated"));
     }
 }

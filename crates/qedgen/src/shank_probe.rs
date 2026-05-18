@@ -717,6 +717,23 @@ pub fn process_instruction(
     }
 
     #[test]
+    fn fixture_shank_dispatcher_resolves_to_three_handlers() {
+        // The committed fixture exercises the v2.20 §S2.1 / §S2.2
+        // surface: three handlers with distinct intent shapes. We
+        // assert the dispatcher discovery half here; per-handler
+        // intent classification is tested via the end-to-end
+        // `run_bootstrap` path in `probe`.
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/native-fixtures/shank-dispatcher");
+        let cat = detect_shank_dispatcher(&root)
+            .expect("fixture must parse")
+            .expect("fixture must match Shank shape");
+        assert_eq!(cat.handlers.len(), 3);
+        let names: Vec<&str> = cat.handlers.iter().map(|h| h.name.as_str()).collect();
+        assert_eq!(names, vec!["InitializeWidget", "Tick", "Close"]);
+    }
+
+    #[test]
     fn matched_ident_must_come_from_instruction_data() {
         // The fn has a top-level match, but the scrutinee `kind` is
         // bound from accounts[0].key, not instruction_data. Don't

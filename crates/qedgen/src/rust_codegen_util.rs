@@ -644,7 +644,36 @@ pub fn emit_invariant_predicates(out: &mut String, invariants: &[&crate::check::
     }
 }
 
+/// Legacy entry point kept for callers that don't need the per-slot binder
+/// type mapping (e.g. tests, third-party tools). All internal callers route
+/// through `emit_property_predicates_with` so binder types resolve against
+/// the active target's `map_type`. Slated for removal in v3.0.
+#[allow(dead_code)]
 pub fn emit_property_predicates(out: &mut String, properties: &[ParsedProperty], wrapping: bool) {
+    emit_property_predicates_with(out, properties, wrapping, |t| Ok(t.to_string()))
+}
+
+/// Like `emit_property_predicates`, but threads a `map_type` closure so the
+/// per-slot `<prop>_at(s, <binder>)` predicate (v2.20 §S1.1) can render a
+/// target-specific binder type — Quasar Pod vs native Rust differ for
+/// non-primitive binders.
+///
+/// v2.20 emission shape:
+///   - Always emit `fn <prop>(s: &State) -> bool` — body is the real
+///     expression when there's no quantifier (legacy path), or `true` when
+///     the body has a quantifier (the harness layer now drives the check
+///     via `<prop>_at` instead).
+///   - When `prop.per_slot` is Some, additionally emit
+///     `fn <prop>_at(s: &State, <binder>: <ty>) -> bool` — body is the
+///     `forall` inner expression with the binder kept free. Harnesses
+///     declare `<binder>` symbolically and call this predicate, giving the
+///     non-vacuous check that was missing pre-v2.20.
+pub fn emit_property_predicates_with(
+    out: &mut String,
+    properties: &[ParsedProperty],
+    wrapping: bool,
+    map_type_fn: impl Fn(&str) -> anyhow::Result<String>,
+) {
     for prop in properties {
         // Prefer the AST-rendered Rust form (handles implies/forall correctly,
         // embeds the `QEDGEN_UNSUPPORTED_QUANTIFIER` marker when a body can't
@@ -677,6 +706,27 @@ pub fn emit_property_predicates(out: &mut String, properties: &[ParsedProperty],
         } else {
             out.push_str(&format!("fn {}(s: &State) -> bool {{\n", prop.name));
             out.push_str(&format!("    {}\n", rust_expr));
+            out.push_str("}\n\n");
+        }
+        // v2.20 §S1.1: per-slot predicate. The chumsky_adapter populates
+        // `per_slot` whenever the property is `forall <binder> : <ty>, body`
+        // and the binder type is mechanically lowerable. The harness layer
+        // binds `<binder>` symbolically (kani::any / proptest any) and calls
+        // `<prop>_at(&s, <binder>)` — sidestepping the "predicate must be
+        // bool-valued" constraint that produced the silent `true` stub.
+        if let Some(slot) = &prop.per_slot {
+            let rust_ty =
+                map_type_fn(&slot.binder_type).unwrap_or_else(|_| slot.binder_type.clone());
+            out.push_str(&format!(
+                "/// {}: per-slot check at `{}: {}` (v2.20 forall lowering)\n",
+                prop.name, slot.binder_name, slot.binder_type
+            ));
+            out.push_str("#[allow(unused_variables)]\n");
+            out.push_str(&format!(
+                "fn {}_at(s: &State, {}: {}) -> bool {{\n",
+                prop.name, slot.binder_name, rust_ty
+            ));
+            out.push_str(&format!("    {}\n", slot.rust_body));
             out.push_str("}\n\n");
         }
     }

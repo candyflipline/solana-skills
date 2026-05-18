@@ -2103,6 +2103,35 @@ pub fn adapt(spec: &a::Spec) -> ParsedSpec {
                     }
                     _ => None,
                 };
+                // v2.20 §S1.1: classify the property's quantifier shape so
+                // `check.rs::check_completeness` can lint unsupported shapes
+                // (nested forall, exists, unbounded `Vec<T>` binder, ...).
+                // Supported shapes (no quantifier, single-binder forall) get
+                // `None`; the per_slot field above already carries the data
+                // codegen needs for the lowered harness.
+                let quantifier_lint = match crate::quantifier::supported_shape(p) {
+                    Ok(_) => None,
+                    Err(reason) => {
+                        let kind = match &reason {
+                            crate::quantifier::Reason::NestedQuantifier { .. } => {
+                                "nested_quantifier"
+                            }
+                            crate::quantifier::Reason::UnboundedBinderType { .. } => {
+                                "unbounded_binder"
+                            }
+                            crate::quantifier::Reason::ExistsQuantifier { .. } => {
+                                "exists_quantifier"
+                            }
+                        };
+                        let span = reason.span();
+                        Some(crate::check::QuantifierLint {
+                            kind: kind.to_string(),
+                            message: reason.message(),
+                            span_start: span.start,
+                            span_end: span.end,
+                        })
+                    }
+                };
                 out.properties.push(ParsedProperty {
                     name: p.name.clone(),
                     expression: Some(lean),
@@ -2110,6 +2139,7 @@ pub fn adapt(spec: &a::Spec) -> ParsedSpec {
                     rust_expression_pod: Some(rust_pod),
                     preserved_by: preserved,
                     per_slot,
+                    quantifier_lint,
                 });
             }
             TopItem::Cover(c) => {

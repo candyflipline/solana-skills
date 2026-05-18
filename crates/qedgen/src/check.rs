@@ -238,6 +238,14 @@ pub struct ParsedProperty {
     /// rest). The bare `{prop}(&s)` predicate stays as the harness-level
     /// "true" stub for prop_assume sites.
     pub per_slot: Option<PerSlotForm>,
+    /// v2.20 §S1.1: when the property body has a quantifier shape codegen
+    /// can't mechanically lower (nested forall, exists, unbounded `Vec<T>`
+    /// binder, ...), the chumsky_adapter records *why* here so
+    /// `check.rs::check_completeness` can emit the P5
+    /// `unsupported_quantifier_shape` lint with file:line precision.
+    /// `None` means the shape is supported (no quantifier, or a single-
+    /// binder forall lowered to `per_slot`).
+    pub quantifier_lint: Option<QuantifierLint>,
 }
 
 /// Per-slot rendering of a `forall <binder> : <T>, body` property. See
@@ -249,6 +257,23 @@ pub struct PerSlotForm {
     pub binder_name: String,
     pub binder_type: String,
     pub rust_body: String,
+}
+
+/// v2.20 §S1.1: information about an unsupported quantifier shape that the
+/// chumsky_adapter recorded so `check.rs` can emit a precise P5 lint.
+/// Mirrors `crate::quantifier::Reason` without depending on its enum (keeps
+/// `ParsedProperty` AST-free for callers that construct it in tests).
+#[derive(Debug, Clone)]
+pub struct QuantifierLint {
+    /// Stable rule discriminant: `nested_quantifier`, `unbounded_binder`,
+    /// `exists_quantifier`. Used to key into `docs/limitations.md`.
+    pub kind: String,
+    /// Human-readable message; copied verbatim into the lint output.
+    pub message: String,
+    /// Byte range of the offending quantifier inside the source spec —
+    /// fed to the `subject` field so `qedgen check` can render a span.
+    pub span_start: usize,
+    pub span_end: usize,
 }
 
 /// Sentinel marker embedded by `chumsky_adapter::expr_to_rust` when a
@@ -2321,6 +2346,13 @@ pub fn check_completeness(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
         if prop.per_slot.is_some() {
             continue;
         }
+        // v2.20 §S1.1: when the new P5 `unsupported_quantifier_shape` lint
+        // fires for this property, skip the legacy `unchecked_quantifier`
+        // — P5 carries strictly more precise information (kind + span) so
+        // double-reporting just clutters the output.
+        if prop.quantifier_lint.is_some() {
+            continue;
+        }
         if let Some(ref rust_expr) = prop.rust_expression {
             if rust_expr_is_unsupported(rust_expr) {
                 // Extract the quantifier kind and binder type from the sentinel
@@ -2386,6 +2418,55 @@ pub fn check_completeness(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
                 });
             }
         }
+    }
+
+    // P5 (v2.20 §S1.1): quantifier shape unsupported by current codegen.
+    // The chumsky_adapter classifies every property body via
+    // `quantifier::supported_shape`; shapes that can't lower (nested forall,
+    // exists, unbounded `Vec<T>` binder) get a precise reason. We surface
+    // each as a P5 lint so the user sees the exact construct that breaks
+    // codegen instead of finding out via a silent `true` stub later.
+    //
+    // P5 supersedes the legacy `unchecked_quantifier` lint for the shapes
+    // it covers — `unchecked_quantifier` only fires when per_slot is None
+    // (legacy path), so a property with `quantifier_lint = Some(...)` won't
+    // collide with it (per_slot is also None for these unsupported shapes,
+    // but the P5 message is strictly more precise).
+    for prop in &spec.properties {
+        let Some(qlint) = &prop.quantifier_lint else {
+            continue;
+        };
+        let workaround = match qlint.kind.as_str() {
+            "nested_quantifier" => {
+                "Split into two single-binder properties — one per quantifier — \
+                 so each lowers to a bool-valued harness independently."
+            }
+            "unbounded_binder" => {
+                "Use a primitive (U8…U128) or a declared record type as the binder. \
+                 `Vec<T>` / `List<T>` aren't enumerable by Kani / proptest in v2.20."
+            }
+            "exists_quantifier" => {
+                "v2.20 only lowers `forall`. Rephrase as `forall <binder> : <T>, \
+                 P(<binder>) ⟹ Q(<binder>)` if the property is really about a \
+                 witnessed case."
+            }
+            _ => "See docs/limitations.md#unsupported-quantifier-shapes for the workaround.",
+        };
+        warnings.push(CompletenessWarning {
+            rule: "unsupported_quantifier_shape".to_string(),
+            severity: Severity::Warning,
+            priority: 1,
+            message: format!(
+                "property '{}' has a quantifier shape qedgen v2.20 can't lower to a \
+                 non-vacuous harness — {} (bytes {}..{})",
+                prop.name, qlint.message, qlint.span_start, qlint.span_end,
+            ),
+            subject: Some(prop.name.clone()),
+            fix: workaround.to_string(),
+            example: None,
+            counterexample: None,
+            fix_options: vec![],
+        });
     }
 
     // Rule 7: takes params (U64) with no guard — suggest input validation
@@ -4886,6 +4967,7 @@ mod tests {
                 rust_expression_pod: Some("s.balance >= 0".to_string()),
                 preserved_by: vec!["deposit".to_string()],
                 per_slot: None,
+                quantifier_lint: None,
             }],
             lifecycle_states: vec!["Active".to_string()],
             ..empty_spec()
@@ -5361,6 +5443,7 @@ handler liquidate : State.Active -> State.Liquidated {
                 rust_expression_pod: Some("s.balance >= 0".to_string()),
                 preserved_by: vec!["deposit".to_string()], // only covers deposit
                 per_slot: None,
+                quantifier_lint: None,
             }],
             lifecycle_states: vec!["Active".to_string()],
             ..empty_spec()
@@ -5392,6 +5475,7 @@ handler liquidate : State.Active -> State.Liquidated {
                 rust_expression_pod: Some("s.balance >= 0".to_string()),
                 preserved_by: vec!["deposit".to_string()],
                 per_slot: None,
+                quantifier_lint: None,
             }],
             lifecycle_states: vec!["Active".to_string()],
             ..empty_spec()
@@ -5925,6 +6009,7 @@ interface Token {
                 rust_expression_pod: None,
                 preserved_by: vec![],
                 per_slot: None,
+                quantifier_lint: None,
             }],
             ..empty_spec()
         };
@@ -5956,6 +6041,7 @@ interface Token {
                 rust_expression_pod: None,
                 preserved_by: vec![],
                 per_slot: None,
+                quantifier_lint: None,
             }],
             ..empty_spec()
         };

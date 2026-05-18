@@ -20,6 +20,7 @@ mod deps;
 mod drift;
 mod fill;
 mod fingerprint;
+mod handler_intent;
 mod idl;
 mod idl2spec;
 mod import_resolver;
@@ -41,6 +42,7 @@ mod proofs_bootstrap;
 mod proptest_gen;
 mod qed_lock;
 mod qed_manifest;
+mod quantifier;
 mod ratchet;
 mod ratify;
 mod reconcile;
@@ -1374,6 +1376,8 @@ fn run_native_probe(
     // the native `--program` path. The richer envelope (handlers +
     // dispatcher_kind) is purely additive; absent detection leaves the
     // path unchanged.
+    // v2.20 §S2.2: also classify each handler body and emit narrowed
+    // `applicable_categories` per entry.
     let (handlers, dispatcher_kind) = match shank_probe::detect_shank_dispatcher(prog_root)
         .ok()
         .flatten()
@@ -1382,12 +1386,18 @@ fn run_native_probe(
             let hs: Vec<probe::BootstrapHandler> = cat
                 .handlers
                 .into_iter()
-                .map(|sh| probe::BootstrapHandler {
-                    name: sh.name,
-                    source_file: sh.file,
-                    enum_variant: Some(sh.enum_variant),
-                    entry_fn: Some(sh.entry_fn),
-                    line: Some(sh.line),
+                .map(|sh| {
+                    let (intent_tag, narrowed) =
+                        narrow_shank_handler(&sh.name, &sh.entry_fn, prog_root, &applicable);
+                    probe::BootstrapHandler {
+                        name: sh.name,
+                        source_file: sh.file,
+                        enum_variant: Some(sh.enum_variant),
+                        entry_fn: Some(sh.entry_fn),
+                        line: Some(sh.line),
+                        applicable_categories: narrowed,
+                        intent_tag,
+                    }
                 })
                 .collect();
             (Some(hs), Some("shank_central_match".to_string()))
@@ -1409,6 +1419,30 @@ fn run_native_probe(
     };
     println!("{}", serde_json::to_string_pretty(&output)?);
     Ok(())
+}
+
+/// v2.20 §S2.2 helper for the `--program` native flow. Mirrors the
+/// `probe::run_bootstrap` path: resolves the handler body, classifies
+/// intent, and returns `(intent_tag_str, narrowed_categories)`. The
+/// narrowed list is only emitted when the classifier actually drops
+/// at least one category; an unchanged list is reported as `None`
+/// so the global `applicable_categories` field stays authoritative.
+fn narrow_shank_handler(
+    handler_name: &str,
+    entry_fn: &str,
+    project_root: &Path,
+    global: &[String],
+) -> (Option<String>, Option<Vec<String>>) {
+    let Some((_path, body)) = handler_intent::resolve_handler_body(entry_fn, project_root) else {
+        return (None, None);
+    };
+    let tag = handler_intent::classify_handler_body(handler_name, &body);
+    let tag_str = tag.map(|t| t.as_str().to_string());
+    let narrowed = handler_intent::filter_categories(global, tag);
+    if narrowed.len() == global.len() {
+        return (tag_str, None);
+    }
+    (tag_str, Some(narrowed))
 }
 
 #[tokio::main]

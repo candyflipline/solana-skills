@@ -730,6 +730,22 @@ fn emit_preservation_tests_for(
                 .map(|o| o.pre_status.as_deref() == Some("Uninitialized"))
                 .unwrap_or(false);
 
+            // v2.20 §S1.1: when the property is `forall <binder> : <T>, body`
+            // and the handler does NOT take a same-named param, bind
+            // <binder> via a fresh proptest variable so the post-assert
+            // exercises a real value (not the silent `true` stub).
+            let handler_takes_binder = match (&prop.per_slot, op) {
+                (Some(slot), Some(op)) => op
+                    .takes_params
+                    .iter()
+                    .any(|(n, t)| n == &slot.binder_name && t == &slot.binder_type),
+                _ => false,
+            };
+            let local_binder = match &prop.per_slot {
+                Some(slot) if !handler_takes_binder => Some(slot.clone()),
+                _ => None,
+            };
+
             out.push_str("proptest! {\n");
             // High reject limit: prop_assume on multiple invariants filters aggressively
             out.push_str("    #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]\n");
@@ -747,6 +763,14 @@ fn emit_preservation_tests_for(
                     let rust_type = map_type(ptype, spec)?;
                     param_parts.push(format!("{} in 0{}..={}::MAX", pname, rust_type, rust_type));
                 }
+            }
+            // Bind the forall <binder> when no handler param shadows it.
+            // Reuse strategy_for_field so the binder's type drives the
+            // strategy (records → arb_<Name>(), primitives → range).
+            if let Some(slot) = &local_binder {
+                let strategy =
+                    strategy_for_field(&slot.binder_type, spec, StrategyMode::Full, None)?;
+                param_parts.push(format!("{} in {}", slot.binder_name, strategy));
             }
 
             if param_parts.is_empty() && is_init {
@@ -769,10 +793,27 @@ fn emit_preservation_tests_for(
                 out.push_str("        };\n");
             } else {
                 out.push_str("        let mut s = s;\n");
-                // Assume all declared properties hold before transition
+                // Assume all declared properties hold before transition.
+                // For the property we're preserving (and any other forall
+                // property), use the per-slot form against the already-bound
+                // <binder> so pre and post share the same value.
                 for pre_prop in properties {
-                    if pre_prop.expression.is_some() {
-                        out.push_str(&format!("        prop_assume!({}(&s));\n", pre_prop.name));
+                    if pre_prop.expression.is_none() {
+                        continue;
+                    }
+                    match &pre_prop.per_slot {
+                        Some(slot) if pre_prop.name == prop.name => {
+                            out.push_str(&format!(
+                                "        prop_assume!({}_at(&s, {}));\n",
+                                pre_prop.name, slot.binder_name
+                            ));
+                        }
+                        _ => {
+                            out.push_str(&format!(
+                                "        prop_assume!({}(&s));\n",
+                                pre_prop.name
+                            ));
+                        }
                     }
                 }
             }
@@ -797,22 +838,14 @@ fn emit_preservation_tests_for(
                 })
                 .unwrap_or_default();
             out.push_str(&format!("        if {}(&mut s{}) {{\n", op_name, args));
-            // Pick the property predicate to assert. When the property has a
-            // per-slot form and this handler takes the matching binder as a
-            // param, call `{prop}_at(&s, <binder>)` to check at the modified
-            // slot — proptest can't exhaust the wide binder type, but the
-            // local check at the touched slot is what inductive preservation
-            // actually needs (frame condition handles other slots).
-            let assert_call = match (&prop.per_slot, op) {
-                (Some(slot), Some(op))
-                    if op
-                        .takes_params
-                        .iter()
-                        .any(|(n, t)| n == &slot.binder_name && t == &slot.binder_type) =>
-                {
-                    format!("{}_at(&s, {})", prop.name, slot.binder_name)
-                }
-                _ => format!("{}(&s)", prop.name),
+            // v2.20: drive the assertion via `<prop>_at` when per_slot is
+            // populated. The <binder> was bound either by the handler param
+            // (handler_takes_binder case) or by the fresh proptest input
+            // (local_binder case); both sidestep the legacy `<prop>(&s) ⟶
+            // true` stub that made every forall harness verify vacuously.
+            let assert_call = match &prop.per_slot {
+                Some(slot) => format!("{}_at(&s, {})", prop.name, slot.binder_name),
+                None => format!("{}(&s)", prop.name),
             };
             out.push_str(&format!("            prop_assert!({},\n", assert_call));
             out.push_str(&format!(
