@@ -526,6 +526,16 @@ fn expr_to_lean(e: &Expr, ctx: Ctx, consts: ConstTable, env: &TypeEnv) -> String
             )
         }
         Expr::App { func, args } => {
+            // v2.21 S2.5: `now()` is an axiomatized symbolic timestamp.
+            // The Lean support library (lean_solana/QEDGen/Solana/Valid.lean)
+            // declares `axiom now : Nat`; spec authors can compare `now()`
+            // against bounds but proofs about specific values discharge by
+            // axiom — same shape as any other oracle-derived value. The
+            // axiom must already be in scope wherever the spec's Lean form
+            // is elaborated; lean_gen.rs imports QEDGen.Solana so it is.
+            if func == "now" && args.is_empty() {
+                return "now".to_string();
+            }
             // Lean function application: `f a b c` (space-separated, parenthesized
             // args). Leaves `func` as the raw name — downstream users declare
             // these as uninterpreted helpers (axioms or defs) in a support module.
@@ -884,6 +894,18 @@ fn expr_to_rust(e: &Expr, ctx: Ctx, consts: ConstTable, opts: RustOpts<'_, '_>) 
             format!("matches!({}, {}::{}(..))", sc, "/* ty */", variant)
         }
         Expr::App { func, args } => {
+            // v2.21 S2.5: `now()` lowers to the on-chain clock read.
+            // `unwrap()` rather than `?` so the expression is valid in
+            // assertion / property bodies (where the surrounding fn may
+            // not return Result). Inside a Result-returning handler the
+            // unwrap-on-Ok is a no-op; outside, it panics — but Clock
+            // is a system var that always succeeds in practice. The
+            // returned i64 cast to u64 is a sign-bit-preserving copy;
+            // negative unix_timestamp doesn't happen on chain.
+            if func == "now" && args.is_empty() {
+                return "(solana_program::clock::Clock::get().unwrap().unix_timestamp as u64)"
+                    .to_string();
+            }
             let args_str: Vec<String> = args
                 .iter()
                 .map(|n| expr_to_rust(&n.node, ctx, consts, opts))
@@ -1577,6 +1599,14 @@ fn walk_apps(
 ) {
     match expr {
         Expr::App { func, args } => {
+            // v2.21 S2.5: skip the `now()` builtin — it resolves via
+            // the support-library axiom `QEDGen.Solana.Valid.now : Nat`,
+            // not via a per-spec uninterpreted helper. Without this guard
+            // walk_apps emits `axiom now : Bool` which collides with the
+            // support-library declaration at elaboration.
+            if func == "now" && args.is_empty() {
+                return;
+            }
             let key = (func.clone(), args.len());
             if seen.insert(key) {
                 let arg_types: Vec<String> = args
@@ -3284,6 +3314,63 @@ property if_branch :
             rust.contains("if s.x > 0 { s.y == s.x } else { s.y == 0 }"),
             "expected Rust block-form if-else; got: {}",
             rust
+        );
+    }
+
+    // v2.21 S2.5 — `now()` builtin.
+
+    #[test]
+    fn now_builtin_parses_in_effect() {
+        let src = r#"spec NowTest
+type State | Active of { last_update : U64 }
+handler refresh : State.Active -> State.Active {
+  permissionless
+  effect { last_update := now() }
+}
+"#;
+        let spec = parse_str(src).expect("parse");
+        let h = spec.handlers.iter().find(|h| h.name == "refresh").unwrap();
+        // Effect RHS for complex expressions is captured in Lean form
+        // (consumed by lean_gen). `now()` lowers to the bare `now` symbol
+        // which resolves at elaboration via QEDGen.Solana.Valid.now.
+        let (_field, _kind, rhs) = h
+            .effects
+            .iter()
+            .find(|(f, _, _)| f == "last_update")
+            .expect("last_update effect");
+        assert_eq!(
+            rhs.trim(),
+            "now",
+            "Lean rendering of now() should be the bare ident `now`; got: {rhs}"
+        );
+    }
+
+    #[test]
+    fn now_builtin_parses_in_requires() {
+        let src = r#"spec NowReq
+type State | Active of { last_update : U64 }
+type Error | TooSoon
+handler refresh : State.Active -> State.Active {
+  permissionless
+  requires state.last_update + 60 <= now() else TooSoon
+  effect { last_update := state.last_update + 1 }
+}
+"#;
+        let spec = parse_str(src).expect("parse");
+        let h = spec.handlers.iter().find(|h| h.name == "refresh").unwrap();
+        let req = h.requires.first().expect("requires clause");
+        // Lean form references the support-library axiom by its
+        // unqualified name; v2.21 axiom export at QEDGen.Solana.Valid.now
+        // resolves it after `open QEDGen.Solana`.
+        assert!(
+            req.lean_expr.contains("now"),
+            "lean expr should mention now; got: {}",
+            req.lean_expr
+        );
+        assert!(
+            req.rust_expr.contains("Clock::get"),
+            "rust expr should mention Clock::get; got: {}",
+            req.rust_expr
         );
     }
 }

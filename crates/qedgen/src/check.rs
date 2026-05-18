@@ -2578,6 +2578,134 @@ pub fn check_completeness(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
         }
     }
 
+    // P7 (v2.21 §S2.7): effect references an undeclared state field. The
+    // failure shape rewards-feedback issue #9 hit was a `state.foo` reference
+    // on the RHS of an effect whose `foo` wasn't declared anywhere in the
+    // spec — codegen emits the access verbatim, Rust then fails at
+    // `cargo test` with `no field "foo" on type "State"` 1000 lines into
+    // the generated harness. P7 catches it at `qedgen check` with a
+    // precise spec-side message.
+    //
+    // The check has two paths:
+    //   (a) LHS — `effect { undeclared := ... }`. The LHS path can be a
+    //       bare field, a nested field, or an indexed field. P7 splits
+    //       on `.`/`[` and checks the root only; nested fields under a
+    //       declared record-typed field elaborate fine downstream.
+    //   (b) RHS — `effect { x := state.undeclared }`. We scan the
+    //       rendered Lean form (the third tuple element) for
+    //       `state.<word>` and check each captured word.
+    {
+        // All field names declared anywhere as state. This is permissive
+        // (a field that exists in any account variant clears P7 even if
+        // the handler's specific lifecycle transition doesn't carry it)
+        // — false negatives are preferable to a noisy lint that fires
+        // on legitimate cross-variant references at this stage.
+        let mut declared: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for acct in &spec.account_types {
+            for (fname, _) in &acct.fields {
+                declared.insert(fname.clone());
+            }
+        }
+        for sum in &spec.sum_types {
+            for variant in &sum.variants {
+                for (fname, _) in &variant.fields {
+                    declared.insert(fname.clone());
+                }
+            }
+        }
+        for rec in &spec.records {
+            for (fname, _) in &rec.fields {
+                declared.insert(fname.clone());
+            }
+        }
+        for (fname, _) in &spec.state_fields {
+            declared.insert(fname.clone());
+        }
+
+        let push_p7 =
+            |warnings: &mut Vec<CompletenessWarning>, handler: &str, side: &str, name: &str| {
+                warnings.push(CompletenessWarning {
+                    rule: "undeclared_state_field_in_effect".to_string(),
+                    severity: Severity::Warning,
+                    priority: 1,
+                    message: format!(
+                        "P7: handler '{}' references undeclared state field \
+                         '{}' on the {} of an effect — codegen will emit the \
+                         reference verbatim and `cargo test` will fail with \
+                         'no field' downstream",
+                        handler, name, side,
+                    ),
+                    subject: Some(format!("{}.{}", handler, name)),
+                    fix: format!(
+                        "Declare `{}` in your state schema (an account_type \
+                         field, a sum-variant payload field, or a record \
+                         field), or rename the effect reference to match an \
+                         existing field.",
+                        name
+                    ),
+                    example: Some(format!(
+                        "  type State\n    | Active of {{ {} : U64, ... }}\n",
+                        name
+                    )),
+                    counterexample: None,
+                    fix_options: vec![],
+                });
+            };
+
+        let strip_root = |path: &str| -> String {
+            // Take the segment before the first `.` or `[`. Handles bare
+            // (`foo`), nested (`foo.bar`), and indexed (`foo[i]`) forms.
+            let mut end = path.len();
+            for (i, c) in path.char_indices() {
+                if c == '.' || c == '[' {
+                    end = i;
+                    break;
+                }
+            }
+            path[..end].to_string()
+        };
+
+        // (a) LHS check
+        for op in &spec.handlers {
+            for (lhs, _kind, _rhs) in &op.effects {
+                let root = strip_root(lhs);
+                if root.is_empty() || declared.contains(&root) {
+                    continue;
+                }
+                // Synthetic handlers (`_case_N`, `_otherwise`) inherit
+                // their parent's effects; flagging twice would be noisy.
+                if op.name.contains("_case_") || op.name.ends_with("_otherwise") {
+                    continue;
+                }
+                push_p7(&mut warnings, &op.name, "LHS", &root);
+            }
+        }
+
+        // (b) RHS check — scan rendered Lean form for state-path
+        // references. `expr_to_lean` renders `state.X` as `s.X` (the
+        // standard Lean binder for the current state), so we match that
+        // form. The leading `\b` keeps `xs.foo` / `as.bar` from
+        // triggering — only bare `s.` token boundaries match.
+        let state_path_re =
+            regex::Regex::new(r"\bs\.([A-Za-z_][A-Za-z0-9_]*)").expect("static regex");
+        for op in &spec.handlers {
+            let mut seen_rhs: std::collections::BTreeSet<String> =
+                std::collections::BTreeSet::new();
+            for (_lhs, _kind, rhs) in &op.effects {
+                for caps in state_path_re.captures_iter(rhs) {
+                    let name = caps.get(1).unwrap().as_str().to_string();
+                    if declared.contains(&name) || !seen_rhs.insert(name.clone()) {
+                        continue;
+                    }
+                    if op.name.contains("_case_") || op.name.ends_with("_otherwise") {
+                        continue;
+                    }
+                    push_p7(&mut warnings, &op.name, "RHS", &name);
+                }
+            }
+        }
+    }
+
     // Rule 7: takes params (U64) with no guard — suggest input validation
     for op in &spec.handlers {
         if op.has_guard() {
@@ -7009,5 +7137,139 @@ handler h : State.Active -> State.Active {
             !subjects.iter().any(|s| s.ends_with(".balance")),
             "must NOT name balance: {subjects:?}"
         );
+    }
+
+    // ── P7: undeclared_state_field_in_effect (v2.21 §S2.7) ────────────────
+
+    #[test]
+    fn p7_fires_on_lhs_undeclared_field() {
+        let spec = crate::chumsky_adapter::parse_str(
+            r#"spec P7Lhs
+type State | Active of { balance : U64 }
+handler bump : State.Active -> State.Active {
+  permissionless
+  effect { undeclared += 1 }
+}
+"#,
+        )
+        .expect("fixture should parse");
+        let warnings = check_completeness(&spec);
+        let hits: Vec<_> = warnings
+            .iter()
+            .filter(|w| w.rule == "undeclared_state_field_in_effect")
+            .collect();
+        assert!(
+            hits.iter()
+                .any(|w| w.message.contains("LHS") && w.message.contains("'undeclared'")),
+            "expected LHS hit naming `undeclared`; got: {hits:#?}"
+        );
+    }
+
+    #[test]
+    fn p7_fires_on_rhs_undeclared_state_reference() {
+        // RHS check catches `state.<field>` references inside complex
+        // expressions. A bare `state.X` RHS goes through render_effect's
+        // path-stripping shortcut (it ends up as just `X`), which is
+        // indistinguishable from a param reference at lint time — that
+        // case is caught downstream by codegen unless the user wrote
+        // any composition. We pin the composition case here.
+        let spec = crate::chumsky_adapter::parse_str(
+            r#"spec P7Rhs
+type State | Active of { balance : U64 }
+handler bump : State.Active -> State.Active {
+  permissionless
+  effect { balance := state.missing + 1 }
+}
+"#,
+        )
+        .expect("fixture should parse");
+        let warnings = check_completeness(&spec);
+        let hits: Vec<_> = warnings
+            .iter()
+            .filter(|w| w.rule == "undeclared_state_field_in_effect")
+            .collect();
+        assert!(
+            hits.iter()
+                .any(|w| w.message.contains("RHS") && w.message.contains("'missing'")),
+            "expected RHS hit naming `missing`; got: {hits:#?}"
+        );
+    }
+
+    #[test]
+    fn p7_silent_when_all_fields_declared() {
+        let spec = crate::chumsky_adapter::parse_str(
+            r#"spec P7Clean
+type State | Active of { balance : U64, total : U64 }
+handler add : State.Active -> State.Active {
+  permissionless
+  effect { total := state.balance }
+}
+"#,
+        )
+        .expect("fixture should parse");
+        let warnings = check_completeness(&spec);
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.rule == "undeclared_state_field_in_effect"),
+            "clean spec must not fire P7, got: {warnings:#?}"
+        );
+    }
+
+    #[test]
+    fn p7_ignores_synthetic_match_arm_handlers() {
+        // `_case_N` / `_otherwise` synthetic handlers inherit their
+        // parent's effects — they don't get a second P7 hit because
+        // the parent already covers it.
+        let mut spec = ParsedSpec::default();
+        spec.account_types.push(ParsedAccountType {
+            name: "State".into(),
+            fields: vec![("balance".into(), "U64".into())],
+            lifecycle: vec![],
+            pda_ref: None,
+        });
+        spec.handlers.push(ParsedHandler {
+            name: "outer_case_0".into(),
+            permissionless: true,
+            effects: vec![("undeclared".into(), "set".into(), "0".into())],
+            ..synthetic_handler_default("outer_case_0")
+        });
+        let warnings = check_completeness(&spec);
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.rule == "undeclared_state_field_in_effect"),
+            "P7 must not fire on `_case_N` synthetic handlers: {warnings:#?}"
+        );
+    }
+
+    fn synthetic_handler_default(name: &str) -> ParsedHandler {
+        ParsedHandler {
+            name: name.into(),
+            doc: None,
+            who: None,
+            on_account: None,
+            pre_status: None,
+            post_status: None,
+            takes_params: vec![],
+            guard_str: None,
+            guard_str_rust: None,
+            aborts_if: vec![],
+            requires: vec![],
+            ensures: vec![],
+            modifies: None,
+            let_bindings: vec![],
+            aborts_total: false,
+            permissionless: false,
+            effects: vec![],
+            accounts: vec![],
+            transfers: vec![],
+            emits: vec![],
+            invariants: vec![],
+            establishes: vec![],
+            properties: vec![],
+            calls: vec![],
+            effect_branches: None,
+        }
     }
 }

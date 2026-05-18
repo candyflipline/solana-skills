@@ -693,8 +693,30 @@ forall n : Node, left(parent(n)) == n or right(parent(n)) == n
 `f(a, b, ...)` parses as `Expr::App` with the function name left abstract.
 Spec-level helpers (`parent`, `left`, `right`, `black_count`, …) are
 declared as uninterpreted symbols in the generated Lean support module —
-users can then prove properties about them with hand-written lemmas. Zero-arg
-calls are rejected; bare identifiers parse as paths.
+users can then prove properties about them with hand-written lemmas.
+Zero-arg user-defined calls are rejected; bare identifiers parse as paths.
+
+### `now()` — on-chain timestamp builtin (v2.21)
+
+```fsharp
+requires state.last_update + REFRESH_INTERVAL <= now() else TooSoon
+effect { last_update := now() }
+```
+
+`now()` is the one zero-arg builtin. It returns a fresh symbolic `u64`
+timestamp:
+
+- **Rust:** lowers to `(solana_program::clock::Clock::get().unwrap().unix_timestamp as u64)`.
+- **Lean:** lowers to the axiomatized symbol `QEDGen.Solana.Valid.now : Nat`
+  (re-exported as bare `now` from `QEDGen.Solana`). Proofs that depend
+  on specific timestamps discharge against this axiom.
+- **Kani / proptest:** lowers to `kani::any::<u64>()` / `any::<u64>()`
+  so the harness explores arbitrary timestamps.
+
+Use it sparingly — most handler-time freshness checks are easier to
+prove when the timestamp is a handler parameter, since the proof can
+case-split on the param. `now()` exists for the cases where threading a
+parameter is awkward (e.g. permissionless refreshers).
 
 ### Postfix `.field`
 

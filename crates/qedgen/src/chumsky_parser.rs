@@ -155,20 +155,59 @@ fn integer<'a>() -> impl Parser<'a, &'a str, u128, Err<'a>> + Clone {
         })
 }
 
-/// Double-quoted string literal. Simplified: no escape handling beyond `\\` and `\"`.
+/// Double-quoted string literal.
+///
+/// Escapes: `\\`, `\"`, `\n`, `\t`, plus v2.21 `\<newline>` line
+/// continuation (the backslash + newline pair is consumed and produces
+/// no output, so long invariant descriptions like
+///
+/// ```text
+/// invariant solvent "total deposits never exceed \
+///                    the configured ceiling"
+/// ```
+///
+/// concatenate into a single logical line. Any whitespace immediately
+/// following the consumed newline is preserved verbatim, which means
+/// callers writing indented continuations get their leading whitespace
+/// in the joined string; spec authors typically put no indent (or pad
+/// alignment intentionally). PRD-v2.21 §S2.6.
 fn string_lit<'a>() -> impl Parser<'a, &'a str, String, Err<'a>> + Clone {
-    let escape = just('\\').ignore_then(choice((just('\\'), just('"'), just('n'), just('t'))));
-    let char_inner = choice((
-        escape.map(|c| match c {
-            'n' => '\n',
-            't' => '\t',
-            other => other,
-        }),
-        any::<&'a str, Err<'a>>().filter(|c: &char| *c != '"' && *c != '\\'),
-    ));
+    #[derive(Clone, Copy)]
+    enum CharOrEmpty {
+        Char(char),
+        Empty,
+    }
+    // `\<newline>` continuation — emits no character. Optional `\r`
+    // before `\n` accommodates CRLF source files.
+    let line_continuation = just('\\')
+        .ignore_then(just('\r').or_not())
+        .then_ignore(just('\n'))
+        .map(|_| CharOrEmpty::Empty);
+    let escape = just('\\')
+        .ignore_then(choice((just('\\'), just('"'), just('n'), just('t'))))
+        .map(|c| {
+            CharOrEmpty::Char(match c {
+                'n' => '\n',
+                't' => '\t',
+                other => other,
+            })
+        });
+    let plain = any::<&'a str, Err<'a>>()
+        .filter(|c: &char| *c != '"' && *c != '\\')
+        .map(CharOrEmpty::Char);
+    let char_inner = choice((line_continuation, escape, plain));
     just('"')
-        .ignore_then(char_inner.repeated().collect::<String>())
+        .ignore_then(char_inner.repeated().collect::<Vec<_>>())
         .then_ignore(just('"'))
+        .map(|chunks: Vec<CharOrEmpty>| {
+            let mut out = String::with_capacity(chunks.len());
+            for c in chunks {
+                if let CharOrEmpty::Char(ch) = c {
+                    out.push(ch);
+                }
+            }
+            out
+        })
 }
 
 /// Doc comment line: `/// ...\n`. Returns the text after `///`, trimmed.
@@ -409,6 +448,35 @@ fn expr<'a>() -> impl Parser<'a, &'a str, Node<Expr>, Err<'a>> + Clone {
         let mul_div_floor_atom = mdf_args("mul_div_floor", false);
         let mul_div_ceil_atom = mdf_args("mul_div_ceil", true);
 
+        // v2.21 S2.5: `now()` — zero-arg builtin returning a fresh
+        // symbolic `u64` timestamp. Lowers per-backend:
+        // - Rust:   `(solana_program::clock::Clock::get().unwrap().unix_timestamp as u64)`
+        // - Lean:   axiomatized `QEDGen.Solana.Valid.now` (a `Nat`)
+        // - Kani:   `kani::any::<u64>()`
+        // - Proptest: `any::<u64>()`
+        // Parses to `Expr::App { func: "now", args: [] }`, special-cased
+        // in `chumsky_adapter::expr_to_rust` / `expr_to_lean`.
+        let now_atom = just("now")
+            .then(
+                any::<&'a str, Err<'a>>()
+                    .filter(|c: &char| c.is_ascii_alphanumeric() || *c == '_')
+                    .rewind()
+                    .not(),
+            )
+            .then_ignore(wsc())
+            .ignore_then(just('('))
+            .then_ignore(wsc())
+            .then_ignore(just(')'))
+            .map_with(|_, e| {
+                Node::new(
+                    Expr::App {
+                        func: "now".to_string(),
+                        args: vec![],
+                    },
+                    e.span().into_range(),
+                )
+            });
+
         // Generic function application: `f(arg1, arg2, ...)`.
         // Must precede path_expr in the atom choice (both start with ident);
         // `.and_is(just('(').rewind())` ensures we only commit to `app` when
@@ -591,7 +659,7 @@ fn expr<'a>() -> impl Parser<'a, &'a str, Node<Expr>, Err<'a>> + Clone {
         // `.boxed()` tames the type complexity that otherwise trips Apple's
         // linker on overlong symbol names.
         let group_a = choice((int, bool_lit, old, let_in, if_then_else, sum, quant)).boxed();
-        let group_b = choice((mul_div_floor_atom, mul_div_ceil_atom, match_expr)).boxed();
+        let group_b = choice((now_atom, mul_div_floor_atom, mul_div_ceil_atom, match_expr)).boxed();
         // `record_update` must precede `ctor` (leading `.` distinguishes
         // them, but this ordering is clearer). `app_expr` must precede
         // `path_expr` (both start with ident; app commits only when `(`
@@ -2422,6 +2490,68 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn string_lit_supports_backslash_newline_continuation() {
+        // v2.21 S2.6 — long invariant descriptions like
+        //   invariant foo "first part \
+        //                  second part"
+        // join across lines into a single logical string.
+        let src = "spec T\ninvariant foo \"first \\\nsecond\"";
+        let s = parse_ok(src);
+        match &s.items[0].node {
+            TopItem::Invariant(decl) => match &decl.body {
+                InvariantBody::Description(text) => {
+                    assert!(
+                        text.starts_with("first ") && text.contains("second"),
+                        "expected `first ...second` joined; got: {text:?}"
+                    );
+                    assert!(
+                        !text.contains('\n'),
+                        "backslash-newline must be consumed; got: {text:?}"
+                    );
+                }
+                other => panic!("expected Description body, got {other:?}"),
+            },
+            other => panic!("expected Invariant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn string_lit_supports_crlf_continuation() {
+        // Spec authored on Windows / mixed line endings still joins.
+        let src = "spec T\ninvariant foo \"first \\\r\nsecond\"";
+        let s = parse_ok(src);
+        let body = match &s.items[0].node {
+            TopItem::Invariant(decl) => &decl.body,
+            other => panic!("expected Invariant, got {other:?}"),
+        };
+        let text = match body {
+            InvariantBody::Description(t) => t,
+            other => panic!("expected Description, got {other:?}"),
+        };
+        assert!(text.contains("first") && text.contains("second"));
+        assert!(!text.contains('\r') && !text.contains('\n'));
+    }
+
+    #[test]
+    fn string_lit_preserves_existing_escapes() {
+        // Regression — \\, \", \n, \t must still produce their literal chars.
+        let src = "spec T\ninvariant foo \"tab:\\t newline:\\n quote:\\\" backslash:\\\\\"";
+        let s = parse_ok(src);
+        let body = match &s.items[0].node {
+            TopItem::Invariant(decl) => &decl.body,
+            other => panic!("expected Invariant, got {other:?}"),
+        };
+        let text = match body {
+            InvariantBody::Description(t) => t,
+            other => panic!("expected Description, got {other:?}"),
+        };
+        assert!(text.contains("tab:\t"), "got: {text:?}");
+        assert!(text.contains("newline:\n"), "got: {text:?}");
+        assert!(text.contains("quote:\""), "got: {text:?}");
+        assert!(text.contains("backslash:\\"), "got: {text:?}");
     }
 
     #[test]
