@@ -1102,9 +1102,13 @@ fn render_properties_multi(out: &mut String, spec: &ParsedSpec) {
     // Group properties by target account, then delegate to render_properties_inner.
     // Heuristic: look at the expression's `s.field` references and match against account fields.
 
-    // Collect properties by target account
-    let mut groups: std::collections::HashMap<String, Vec<&crate::check::ParsedProperty>> =
-        std::collections::HashMap::new();
+    // Collect properties by target account. BTreeMap (not HashMap) so
+    // iteration order at `for (acct_name, props) in &groups` below is
+    // deterministic across processes — Rust's HashMap is seeded per
+    // process, which would otherwise make committed example outputs
+    // drift between two same-binary runs. See PRD-v2.21 §"Slice 6".
+    let mut groups: std::collections::BTreeMap<String, Vec<&crate::check::ParsedProperty>> =
+        std::collections::BTreeMap::new();
     let mut acct_for_prop: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
 
