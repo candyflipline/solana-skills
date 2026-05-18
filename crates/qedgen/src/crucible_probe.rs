@@ -43,6 +43,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+use crate::crucible_gen::InvariantMode;
 use crate::probe::{Category, CrucibleCrashMetadata, Finding, Reproducer, Severity};
 
 /// Per-crash `crucible tmin` cap. Auto-minimization is implicit (PRD
@@ -95,6 +96,11 @@ pub struct FuzzProbeContext<'a> {
     /// Stateful mode flag (default false). Crucible's same harness
     /// compiles for either; `--stateful` is a runtime switch.
     pub stateful: bool,
+    /// Which invariant family the emitted harness was built against.
+    /// Carried through to per-finding context so triage can label
+    /// protocol-only crashes distinctly from spec violations.
+    /// Default `InvariantMode::Spec` matches v2.20 callers.
+    pub invariant_mode: InvariantMode,
 }
 
 impl<'a> FuzzProbeContext<'a> {
@@ -108,6 +114,7 @@ impl<'a> FuzzProbeContext<'a> {
             smoke_budget: SMOKE_BUDGET,
             fuzz_budget: DEFAULT_FUZZ_BUDGET,
             stateful: false,
+            invariant_mode: InvariantMode::Spec,
         }
     }
 }

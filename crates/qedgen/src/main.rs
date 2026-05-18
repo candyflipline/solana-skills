@@ -14,6 +14,7 @@ mod chumsky_parser;
 mod cluster;
 mod codegen;
 mod consolidate;
+mod crucible_brownfield;
 mod crucible_gen;
 mod crucible_probe;
 mod deps;
@@ -235,13 +236,20 @@ enum Commands {
     /// Probe a `.qedspec` for category-coverage gaps. Emits JSON consumed
     /// by the auditor subagent (or readable directly).
     ///
-    /// Two modes:
+    /// Modes:
     /// - **Spec-aware** (`--spec <path>`): runs runtime-agnostic predicates
     ///   against the parsed `.qedspec`, emits per-handler findings.
     /// - **Spec-less** (`--bootstrap --root <path>`): walks a brownfield
     ///   project, detects runtime, discovers handlers, emits the work-list
     ///   envelope (handlers + applicable categories) for the auditor to
     ///   investigate via Read/Grep on the impl source.
+    /// - **Fuzz, spec-driven** (`--fuzz <budget> --spec <path>`): builds
+    ///   the spec-driven Crucible harness and surfaces crashes as Findings.
+    /// - **Fuzz, brownfield** (`--fuzz <budget> --root <path>`, v2.21):
+    ///   synthesises a minimal handler list from the project, emits a
+    ///   protocol-only Crucible harness under `<root>/.qed/fuzz/`, and
+    ///   surfaces panics / unwrap-on-None / BorrowMutError / overflow
+    ///   as crashes. No `.qedspec` required.
     Probe {
         /// Path to `.qedspec` file (spec-aware mode)
         #[arg(long, conflicts_with = "bootstrap")]
@@ -251,8 +259,13 @@ enum Commands {
         #[arg(long, requires = "root")]
         bootstrap: bool,
 
-        /// Project root for spec-less mode (the program crate dir, e.g.
-        /// `programs/lending` for an Anchor project)
+        /// Project root for spec-less mode. Used by:
+        /// - `--bootstrap` (emits auditor work list)
+        /// - `--fuzz` without `--spec` (v2.21 brownfield protocol-mode
+        ///   Crucible — emits a harness at `<root>/.qed/fuzz/<prog>/`
+        ///   and surfaces panic / unwrap / overflow crashes).
+        ///
+        /// Typically the program crate dir, e.g. `programs/lending`.
         #[arg(long)]
         root: Option<PathBuf>,
 
@@ -277,6 +290,14 @@ enum Commands {
         /// into a Finding with `Reproducer::Crucible`. Different engine
         /// from the pattern-match predicates above — both can run; both
         /// emit into the same `findings[]`.
+        ///
+        /// Pair with either `--spec <path>` (spec-driven harness,
+        /// asserts spec invariants) or `--root <project-path>` (v2.21
+        /// brownfield protocol-mode — emits a harness with an empty
+        /// `invariant_test()` body and surfaces only intrinsic
+        /// Crucible crashes: panic / unwrap-on-None / BorrowMutError /
+        /// arithmetic overflow). Passing both layers spec invariants on
+        /// top of protocol crashes.
         ///
         /// Budget is wall-clock seconds (e.g. `300` for 5 min). Pass `0`
         /// to disable.
@@ -1767,21 +1788,64 @@ async fn main() -> Result<()> {
             // a user wanting both should run probe twice (once with,
             // once without) and merge JSON. v2.18.1 may merge them in a
             // single invocation if real eval data warrants it.
+            //
+            // v2.21 Slice 1: --fuzz now accepts EITHER --spec (existing
+            // spec-driven path) OR --root (brownfield protocol-mode).
+            // The two modes share the build → smoke → run → triage
+            // pipeline in `crucible_probe::run_fuzz_probe`; they differ
+            // only in (a) which `.qedspec` is loaded (real vs.
+            // synthesised) and (b) which invariant family
+            // `crucible_gen::generate` emits. See PRD-v2.21 §"Slice 1".
             if let Some(budget_secs) = fuzz {
-                let spec_path = spec.clone().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "--fuzz requires --spec <path> (spec-less fuzz isn't supported yet)"
-                    )
-                })?;
-                let project_root = spec_path
-                    .parent()
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or_else(|| std::path::PathBuf::from("."));
-                let parsed = check::parse_spec_file(&spec_path)?;
-                let prog = if parsed.program_name.is_empty() {
+                let (synthesised_spec, spec_path_for_ctx, project_root_for_idl, mode) =
+                    match (spec.clone(), root.clone()) {
+                        (Some(spec_path), maybe_root) => {
+                            let parsed = check::parse_spec_file(&spec_path)?;
+                            let spec_parent = spec_path
+                                .parent()
+                                .map(|p| p.to_path_buf())
+                                .unwrap_or_else(|| std::path::PathBuf::from("."));
+                            // --spec + --root layers spec invariants on
+                            // top of protocol-mode crash detection.
+                            let mode = if maybe_root.is_some() {
+                                crucible_gen::InvariantMode::Both
+                            } else {
+                                crucible_gen::InvariantMode::Spec
+                            };
+                            (parsed, spec_path, spec_parent, mode)
+                        }
+                        (None, Some(root_path)) => {
+                            let resolved = crucible_brownfield::resolve_program_root(&root_path)?;
+                            let detected = probe::detect_runtime_public(&resolved);
+                            let runtime_final = match runtime {
+                                Some(RuntimeOverride::Anchor) => probe::Runtime::Anchor,
+                                Some(RuntimeOverride::Quasar) => probe::Runtime::Quasar,
+                                Some(RuntimeOverride::Pinocchio) => probe::Runtime::Pinocchio,
+                                Some(RuntimeOverride::Native) => probe::Runtime::Native,
+                                Some(RuntimeOverride::Sbpf) => probe::Runtime::Sbpf,
+                                None => detected,
+                            };
+                            let parsed =
+                                crucible_brownfield::synthesize_spec(&resolved, runtime_final)?;
+                            (
+                                parsed,
+                                resolved.clone(),
+                                resolved,
+                                crucible_gen::InvariantMode::Protocol,
+                            )
+                        }
+                        (None, None) => {
+                            return Err(anyhow::anyhow!(
+                                "--fuzz requires either --spec <path> (spec-driven) \
+                                 or --root <project-path> (brownfield protocol-mode). \
+                                 See `qedgen probe --help` for details."
+                            ));
+                        }
+                    };
+                let prog = if synthesised_spec.program_name.is_empty() {
                     "program".to_string()
                 } else {
-                    parsed
+                    synthesised_spec
                         .program_name
                         .chars()
                         .map(|c| {
@@ -1795,22 +1859,72 @@ async fn main() -> Result<()> {
                         .trim_start_matches('_')
                         .to_string()
                 };
+                let harness_parent = if matches!(mode, crucible_gen::InvariantMode::Protocol) {
+                    crucible_brownfield::brownfield_harness_parent(&project_root_for_idl)
+                } else {
+                    project_root_for_idl.join("fuzz")
+                };
                 let harness = harness_dir
                     .clone()
-                    .unwrap_or_else(|| project_root.join("fuzz").join(&prog));
-                let mut ctx =
-                    crucible_probe::FuzzProbeContext::new(&spec_path, project_root, harness);
+                    .unwrap_or_else(|| harness_parent.join(&prog));
+                // Brownfield mode: emit the harness scaffold under
+                // `.qed/fuzz/<prog>/` if it isn't there yet. Spec mode
+                // expects the user has already run
+                // `qedgen codegen --crucible`; we don't auto-regen.
+                if matches!(mode, crucible_gen::InvariantMode::Protocol) && !harness.exists() {
+                    std::fs::create_dir_all(&harness_parent)?;
+                    crucible_gen::generate(&synthesised_spec, &harness_parent, mode)?;
+                }
+                // Budget-0 emit-and-exit: lets users preview the
+                // harness without paying the Crucible build cost. The
+                // existing spec-mode UX implicitly did smoke + a 0-len
+                // full run; v2.21 short-circuits to skip both. Same
+                // shape as a "dry-run" without adding a new flag.
+                if budget_secs == 0 {
+                    let output = probe::ProbeOutput {
+                        version: 1,
+                        mode: if matches!(mode, crucible_gen::InvariantMode::Protocol) {
+                            probe::Mode::SpecLess
+                        } else {
+                            probe::Mode::SpecAware
+                        },
+                        spec_path: spec.as_ref().map(|p| p.display().to_string()),
+                        project_root: root.as_ref().map(|p| p.display().to_string()),
+                        runtime: None,
+                        handlers: None,
+                        applicable_categories: None,
+                        findings: Vec::new(),
+                        clusters: None,
+                        dispatcher_kind: None,
+                    };
+                    eprintln!(
+                        "Budget = 0: harness ready at {}; skipping build + fuzz run.",
+                        harness.display()
+                    );
+                    println!("{}", serde_json::to_string_pretty(&output)?);
+                    return Ok(());
+                }
+                let mut ctx = crucible_probe::FuzzProbeContext::new(
+                    &spec_path_for_ctx,
+                    project_root_for_idl,
+                    harness,
+                );
                 ctx.fuzz_budget = std::time::Duration::from_secs(budget_secs);
                 if no_smoke {
                     ctx.smoke_budget = std::time::Duration::ZERO;
                 }
                 ctx.stateful = stateful;
+                ctx.invariant_mode = mode;
                 let findings = crucible_probe::run_fuzz_probe(&ctx)?;
                 let output = probe::ProbeOutput {
                     version: 1,
-                    mode: probe::Mode::SpecAware,
-                    spec_path: Some(spec_path.display().to_string()),
-                    project_root: None,
+                    mode: if matches!(mode, crucible_gen::InvariantMode::Protocol) {
+                        probe::Mode::SpecLess
+                    } else {
+                        probe::Mode::SpecAware
+                    },
+                    spec_path: spec.as_ref().map(|p| p.display().to_string()),
+                    project_root: root.as_ref().map(|p| p.display().to_string()),
                     runtime: None,
                     handlers: None,
                     applicable_categories: None,
@@ -2562,7 +2676,11 @@ async fn main() -> Result<()> {
             }
             if crucible || all {
                 let parsed = check::parse_spec_file(&spec)?;
-                crucible_gen::generate(&parsed, &crucible_output)?;
+                crucible_gen::generate(
+                    &parsed,
+                    &crucible_output,
+                    crucible_gen::InvariantMode::Spec,
+                )?;
             }
             if integration || all {
                 integration_test::generate(&spec, &integration_output)?;

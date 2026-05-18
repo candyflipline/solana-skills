@@ -1,0 +1,22 @@
+# Deliberately *not* part of the qedgen workspace. To build this
+# crate, copy it out of the repo first (see ../README.md).
+[package]
+name = "buggy_anchor"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[features]
+default = []
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+idl-build = ["anchor-lang/idl-build"]
+
+[dependencies]
+anchor-lang = "0.30"
+
+[workspace]
