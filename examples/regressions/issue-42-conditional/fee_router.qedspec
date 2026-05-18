@@ -1,0 +1,56 @@
+// v2.20 §S1.2 regression — conditional `match`-shape effects inside an
+// `effect { … }` block.
+//
+// Source signal: GitHub issue #42 (saicharanpogul, 2026-05-02). Programs
+// with one-instruction-N-branches (fee routing by recipient type;
+// dispatch on instruction-data discriminant; etc.) previously had to
+// split into N spec handlers, breaking the 1:1 drift-detection invariant
+// between spec handler and program function.
+//
+// Target syntax (this fixture exercises):
+//
+//   handler collect_fees (fee_type : U8) (amount : U64) ... {
+//     effect {
+//       match fee_type {
+//         0 => fees_a_withdrawn +=! amount,
+//         1 => fees_b_withdrawn +=! amount,
+//         _ => fees_d_accumulated := 0,
+//       }
+//     }
+//   }
+//
+// Expected codegen output:
+//   - `fn collect_fees(s, fee_type, amount) -> bool` in proptest/Kani
+//     emits a Rust `match fee_type { 0 => …, 1 => …, _ => … }` block.
+//   - Drift fingerprint includes per-arm structure: swapping `0 => …`
+//     and `1 => …` bodies bumps the spec hash even though the *union*
+//     of effects is unchanged.
+//   - One spec handler still maps 1:1 to one program function (the
+//     drift-detection invariant the issue requested).
+
+spec FeeRouter
+program_id "11111111111111111111111111111111"
+
+type State
+  | Active of {
+      fees_a_withdrawn : U64,
+      fees_b_withdrawn : U64,
+      fees_c_accumulated : U64,
+      fees_d_accumulated : U64,
+    }
+
+type Error
+  | InvalidAmount = 6000 "amount must be positive"
+
+handler collect_fees (fee_type : U8) (amount : U64) : State.Active -> State.Active {
+  permissionless
+  requires amount > 0 else InvalidAmount
+  effect {
+    match fee_type {
+      0 => fees_a_withdrawn +=! amount,
+      1 => fees_b_withdrawn +=! amount,
+      2 => fees_c_accumulated +=! amount,
+      _ => fees_d_accumulated := 0,
+    }
+  }
+}

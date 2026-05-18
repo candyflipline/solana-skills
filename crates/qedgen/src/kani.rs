@@ -159,7 +159,9 @@ pub fn generate(spec_path: &Path, output_path: &Path) -> Result<()> {
             "// ============================================================================\n\n",
         );
 
-        rust_codegen_util::emit_property_predicates(&mut out, &spec.properties, false);
+        rust_codegen_util::emit_property_predicates_with(&mut out, &spec.properties, false, |t| {
+            map_type(t, &spec)
+        });
     }
 
     // ── Invariant predicates ─────────────────────────────────────────────
@@ -358,6 +360,21 @@ pub fn generate(spec_path: &Path, output_path: &Path) -> Result<()> {
                     .map(|o| o.pre_status.as_deref() == Some("Uninitialized"))
                     .unwrap_or(false);
 
+                // v2.20 §S1.1: for `forall <binder> : <ty>, body preserved_by
+                // <op>`, bind <binder> symbolically and drive the check via
+                // `<prop>_at(&s, <binder>)`. When the handler already takes a
+                // matching `<binder>` as a param, skip the local binding —
+                // the symbolic param binding below shadows it and unifies
+                // the value pre and post.
+                let handler_takes_binder = match (&prop.per_slot, op) {
+                    (Some(slot), Some(op)) => op
+                        .takes_params
+                        .iter()
+                        .any(|(n, t)| n == &slot.binder_name && t == &slot.binder_type),
+                    _ => false,
+                };
+                let needs_local_binder = prop.per_slot.is_some() && !handler_takes_binder;
+
                 if is_init {
                     emit_state_init_zeroed(&mut out, &mutable_fields, &spec);
                 } else {
@@ -366,10 +383,40 @@ pub fn generate(spec_path: &Path, output_path: &Path) -> Result<()> {
                         emit_pre_status_assume(&mut out, op, &spec);
                     }
 
-                    // Assume all declared properties hold before transition
+                    // Bind <binder> symbolically up front so the pre-state
+                    // assume and the post-state assert reference the same
+                    // value. Same binder pre & post = preservation.
+                    if needs_local_binder {
+                        if let Some(slot) = &prop.per_slot {
+                            let rust_ty = map_type(&slot.binder_type, &spec)?;
+                            out.push_str(&format!(
+                                "    let {}: {} = kani::any();\n",
+                                slot.binder_name, rust_ty
+                            ));
+                        }
+                    }
+
+                    // Assume all declared properties hold before transition.
+                    // For the property we're preserving (and any other forall
+                    // property), use the per-slot form against the already-
+                    // bound <binder> so pre and post share the same value.
                     for pre_prop in &spec.properties {
-                        if pre_prop.expression.is_some() {
-                            out.push_str(&format!("    kani::assume({}(&s));\n", pre_prop.name));
+                        if pre_prop.expression.is_none() {
+                            continue;
+                        }
+                        match &pre_prop.per_slot {
+                            Some(slot) if pre_prop.name == prop.name => {
+                                out.push_str(&format!(
+                                    "    kani::assume({}_at(&s, {}));\n",
+                                    pre_prop.name, slot.binder_name
+                                ));
+                            }
+                            _ => {
+                                out.push_str(&format!(
+                                    "    kani::assume({}(&s));\n",
+                                    pre_prop.name
+                                ));
+                            }
                         }
                     }
 
@@ -409,7 +456,9 @@ pub fn generate(spec_path: &Path, output_path: &Path) -> Result<()> {
                     rust_codegen_util::emit_add_strict_bounds(&mut out, op, &spec.properties, "    kani::assume(s.{field} < s.{bound}); // strict bound: {field} increments\n");
                 }
 
-                // Call transition and assert property
+                // Call transition and assert property. For forall properties,
+                // assert at the bound <binder> via `<prop>_at` — same binder
+                // pre and post = preservation, not a fresh-witness check.
                 let args: String = op
                     .map(|o| {
                         o.takes_params
@@ -419,11 +468,25 @@ pub fn generate(spec_path: &Path, output_path: &Path) -> Result<()> {
                     })
                     .unwrap_or_default();
                 out.push_str(&format!("    if {}(&mut s{}) {{\n", op_name, args));
-                out.push_str(&format!("        assert!({}(&s),\n", prop.name));
-                out.push_str(&format!(
-                    "            \"{} must hold after {}\");\n",
-                    prop.name, op_name
-                ));
+                match &prop.per_slot {
+                    Some(slot) => {
+                        out.push_str(&format!(
+                            "        assert!({}_at(&s, {}),\n",
+                            prop.name, slot.binder_name
+                        ));
+                        out.push_str(&format!(
+                            "            \"{} must hold after {} (forall {} : {})\");\n",
+                            prop.name, op_name, slot.binder_name, slot.binder_type
+                        ));
+                    }
+                    None => {
+                        out.push_str(&format!("        assert!({}(&s),\n", prop.name));
+                        out.push_str(&format!(
+                            "            \"{} must hold after {}\");\n",
+                            prop.name, op_name
+                        ));
+                    }
+                }
                 out.push_str("    }\n");
                 out.push_str("}\n\n");
             }

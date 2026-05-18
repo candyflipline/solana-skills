@@ -1,0 +1,56 @@
+// v2.20 §S1.1 regression — `forall d : T, P(d)` must emit a non-vacuous
+// Kani / proptest harness.
+//
+// Source signal: v2.19 external audit feedback issue #1 — 88 of 106 Kani
+// harnesses verified vacuously because the forall-shape lowered to a
+// `true` stub at the property-predicate level.
+//
+// Expected codegen output after v2.20:
+//   - `fn distribution_solvent_at(s: &State, d: Distribution) -> bool` —
+//     real body referencing both `d` and `s`.
+//   - `verify_<op>_preserves_distribution_solvent` Kani harness binds
+//     `let d: Distribution = kani::any()`, assumes the per-slot predicate
+//     pre-transition, runs the handler, and asserts the per-slot predicate
+//     post-transition.
+//   - Matching proptest harness with `d in arb_Distribution()` and
+//     `prop_assert!(distribution_solvent_at(&s, d), ...)`.
+//
+// Bug surface (pre-v2.20):
+//   - `fn distribution_solvent(_s: &State) -> bool { true }` (the stub).
+//   - Kani harness asserted `distribution_solvent(&s)` → tautologically true.
+//   - Verified pass: 100%. Verified bugs caught: 0%.
+
+spec ForallDistribution
+program_id "11111111111111111111111111111111"
+
+const MAX_BALANCE_LIMIT = 1000000000
+
+type Distribution = {
+  balance : U64,
+  cap : U64,
+}
+
+type State
+  | Active of {
+      total_paid : U64,
+      cap_remaining : U64,
+    }
+
+type Error
+  | InsufficientCap = 6000 "withdraw exceeds remaining cap"
+
+// Non-trivial forall: every Distribution must be solvent w.r.t. the
+// program-wide cap. The body genuinely depends on both `d` and `s`, so a
+// vacuous `true` lowering would hide real preservation bugs.
+property distribution_solvent :
+  forall d : Distribution, d.balance <= state.cap_remaining
+  preserved_by [pay_distribution]
+
+handler pay_distribution (amount : U64) : State.Active -> State.Active {
+  permissionless
+  requires amount > 0 else InsufficientCap
+  effect {
+    total_paid += amount
+    cap_remaining -=! amount
+  }
+}

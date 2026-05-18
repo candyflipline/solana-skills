@@ -1001,6 +1001,56 @@ fn effect_stmt<'a>() -> impl Parser<'a, &'a str, EffectStmt, Err<'a>> + Clone {
         .map(|((lhs, op), rhs)| EffectStmt { lhs, op, rhs })
 }
 
+/// v2.20 §S1.2 — one item inside an `effect { … }` body: either a leaf
+/// statement (`x += y`) or a `match`-shape branch.
+fn effect_block<'a>() -> impl Parser<'a, &'a str, EffectBlock, Err<'a>> + Clone {
+    recursive(|effect_block| {
+        let wildcard_pat = just('_')
+            .then(
+                any::<&'a str, Err<'a>>()
+                    .filter(|c: &char| c.is_ascii_alphanumeric() || *c == '_')
+                    .rewind()
+                    .not(),
+            )
+            .to(EffectPattern::Wildcard);
+        let literal_pat = integer().map(EffectPattern::Literal);
+        let pattern = choice((wildcard_pat, literal_pat));
+
+        // Note: building Node<EffectBlock> via a regular .map (no
+        // span tracking on the inner item) — chumsky 0.12's type
+        // inference fails to instantiate `map_with` over the recursive
+        // self-reference; using `.map` keeps inference straightforward
+        // and the inner span isn't read by downstream consumers.
+        let arm = pattern
+            .then_ignore(wsc())
+            .then_ignore(just("=>"))
+            .then_ignore(wsc())
+            .then(effect_block.clone().map(|b| Node::new(b, 0..0)))
+            .map(|(pattern, nested)| EffectMatchArm {
+                pattern,
+                body: vec![nested],
+            });
+
+        let match_block = just("match")
+            .then_ignore(wsc())
+            .ignore_then(expr())
+            .then_ignore(wsc())
+            .then_ignore(just('{'))
+            .then_ignore(wsc())
+            .then(
+                arm.then_ignore(wsc())
+                    .separated_by(just(',').then_ignore(wsc()))
+                    .allow_trailing()
+                    .collect::<Vec<EffectMatchArm>>(),
+            )
+            .then_ignore(wsc())
+            .then_ignore(just('}'))
+            .map(|(scrutinee, arms)| EffectBlock::Match { scrutinee, arms });
+
+        choice((match_block, effect_stmt().map(EffectBlock::Stmt)))
+    })
+}
+
 fn handler_clause<'a>() -> impl Parser<'a, &'a str, HandlerClause, Err<'a>> + Clone {
     let auth = just("auth")
         .then_ignore(wsc())
@@ -1063,15 +1113,19 @@ fn handler_clause<'a>() -> impl Parser<'a, &'a str, HandlerClause, Err<'a>> + Cl
         .then(expr())
         .map(|(name, value)| HandlerClause::Let { name, value });
 
+    // v2.20 §S1.2 — `effect { … }` admits leaf stmts and `match` blocks.
     let effect = just("effect")
         .then_ignore(wsc())
         .ignore_then(just('{'))
         .then_ignore(wsc())
         .ignore_then(
-            effect_stmt()
-                .map_with(|s, e| Node::new(s, e.span().into_range()))
+            effect_block()
+                .map_with(|b, e| Node::new(b, e.span().into_range()))
+                .then_ignore(wsc())
+                .then_ignore(just(',').or_not())
+                .then_ignore(wsc())
                 .repeated()
-                .collect::<Vec<Node<EffectStmt>>>(),
+                .collect::<Vec<Node<EffectBlock>>>(),
         )
         .then_ignore(wsc())
         .then_ignore(just('}'))
@@ -2534,20 +2588,22 @@ handler deposit (i : AccountIdx) (amount : U128) : State.Active -> State.Active 
         assert_eq!(handler.params[0].name, "i");
         assert!(handler.pre.is_some());
 
-        // One effect clause with two stmts
+        // One effect clause with two stmts (v2.20: effect items are
+        // EffectBlock — drill into the leaf via collect_leaves).
         let effect_clauses: Vec<_> = handler
             .clauses
             .iter()
             .filter_map(|c| match &c.node {
-                HandlerClause::Effect(stmts) => Some(stmts),
+                HandlerClause::Effect(blocks) => Some(blocks),
                 _ => None,
             })
             .collect();
         assert_eq!(effect_clauses.len(), 1);
-        let stmts = effect_clauses[0];
+        let blocks = effect_clauses[0];
+        let stmts = flatten_effect_blocks(blocks);
         assert_eq!(stmts.len(), 2);
         // Second stmt: accounts[i].capital += amount
-        let s2 = &stmts[1].node;
+        let s2 = stmts[1];
         assert_eq!(s2.lhs.root, "accounts");
         assert_eq!(s2.lhs.segments.len(), 2);
         match &s2.lhs.segments[0] {
@@ -2696,7 +2752,7 @@ handler h (i : U16) (amount : U128) : State.Active -> State.Active {
             o => panic!("expected IsVariant, got {:?}", o),
         }
         // effect RHS: Match containing RecordUpdate on the Active arm
-        let eff = h
+        let eff_blocks = h
             .clauses
             .iter()
             .find_map(|c| match &c.node {
@@ -2704,7 +2760,8 @@ handler h (i : U16) (amount : U128) : State.Active -> State.Active {
                 _ => None,
             })
             .unwrap();
-        match &eff[0].node.rhs.node {
+        let eff = flatten_effect_blocks(eff_blocks);
+        match &eff[0].rhs.node {
             Expr::Match { arms, .. } => match &arms[0].body.node {
                 Expr::Ctor {
                     variant: v,
@@ -2764,15 +2821,16 @@ handler init_slot (i : U16) : State.Active -> State.Active {
                 _ => None,
             })
             .unwrap();
-        let reset_effect = reset
+        let reset_effect_blocks = reset
             .clauses
             .iter()
             .find_map(|c| match &c.node {
-                HandlerClause::Effect(stmts) => Some(stmts),
+                HandlerClause::Effect(blocks) => Some(blocks),
                 _ => None,
             })
             .unwrap();
-        match &reset_effect[0].node.rhs.node {
+        let reset_effect = flatten_effect_blocks(reset_effect_blocks);
+        match &reset_effect[0].rhs.node {
             Expr::Ctor { variant, payload } => {
                 assert_eq!(variant, "Inactive");
                 assert!(payload.is_none());
@@ -2788,15 +2846,16 @@ handler init_slot (i : U16) : State.Active -> State.Active {
                 _ => None,
             })
             .unwrap();
-        let init_effect = init
+        let init_effect_blocks = init
             .clauses
             .iter()
             .find_map(|c| match &c.node {
-                HandlerClause::Effect(stmts) => Some(stmts),
+                HandlerClause::Effect(blocks) => Some(blocks),
                 _ => None,
             })
             .unwrap();
-        match &init_effect[0].node.rhs.node {
+        let init_effect = flatten_effect_blocks(init_effect_blocks);
+        match &init_effect[0].rhs.node {
             Expr::Ctor { variant, payload } => {
                 assert_eq!(variant, "Active");
                 let p = payload.as_ref().expect("payload");
@@ -2927,6 +2986,62 @@ type Size = U128
             TypeRef::Named(n) => assert_eq!(n, "U128"),
             o => panic!("expected Named, got {:?}", o),
         }
+    }
+
+    #[test]
+    fn parses_effect_block_match_v220() {
+        // v2.20 §S1.2 — `match` inside `effect { … }` (not the handler-
+        // level `match` clause). Issue #42 wedge case.
+        let src = r#"spec T
+type State | Active of { a : U64, b : U64, c : U64, }
+type Error | E
+handler route (k : U8) (amount : U64) : State.Active -> State.Active {
+  permissionless
+  requires amount > 0 else E
+  effect {
+    match k {
+      0 => a += amount,
+      1 => b += amount,
+      _ => c := 0,
+    }
+  }
+}
+"#;
+        let s = parse_ok(src);
+        let h = s
+            .items
+            .iter()
+            .find_map(|i| match &i.node {
+                TopItem::Handler(h) => Some(h),
+                _ => None,
+            })
+            .expect("handler");
+        let blocks = h
+            .clauses
+            .iter()
+            .find_map(|c| match &c.node {
+                HandlerClause::Effect(b) => Some(b),
+                _ => None,
+            })
+            .expect("effect clause");
+        assert_eq!(blocks.len(), 1, "one top-level effect item");
+        match &blocks[0].node {
+            EffectBlock::Match { arms, .. } => {
+                assert_eq!(arms.len(), 3, "three arms (0, 1, _)");
+                match &arms[0].pattern {
+                    EffectPattern::Literal(v) => assert_eq!(*v, 0),
+                    o => panic!("expected Literal(0), got {:?}", o),
+                }
+                match &arms[2].pattern {
+                    EffectPattern::Wildcard => {}
+                    o => panic!("expected Wildcard, got {:?}", o),
+                }
+            }
+            o => panic!("expected EffectBlock::Match, got {:?}", o),
+        }
+        // Flattened leaves: 3 stmts (a += amount, b += amount, c := 0).
+        let leaves = flatten_effect_blocks(blocks);
+        assert_eq!(leaves.len(), 3);
     }
 
     #[test]

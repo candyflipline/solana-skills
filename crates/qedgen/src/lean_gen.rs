@@ -1150,6 +1150,7 @@ fn render_properties_multi(out: &mut String, spec: &ParsedSpec) {
                 rust_expression_pod: p.rust_expression_pod.clone(),
                 preserved_by: p.preserved_by.clone(),
                 per_slot: p.per_slot.clone(),
+                quantifier_lint: p.quantifier_lint.clone(),
             })
             .collect();
 
@@ -5499,6 +5500,7 @@ handler noop : State -> State {
             establishes: vec![],
             properties: vec![],
             calls: vec![],
+            effect_branches: None,
         };
         let constants = vec![("ZERO".to_string(), "0".to_string())];
         ws.apply(&handler, &[], &constants);

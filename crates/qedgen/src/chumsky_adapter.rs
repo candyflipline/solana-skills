@@ -1533,10 +1533,11 @@ fn collect_uninterpreted_helpers(
                         a::HandlerClause::Ensures(e) => {
                             walk_apps(&e.node, &field_types, &param_types, &mut out, &mut seen);
                         }
-                        a::HandlerClause::Effect(stmts) => {
-                            for Node { node: s, .. } in stmts {
+                        a::HandlerClause::Effect(blocks) => {
+                            // v2.20 §S1.2 — flatten through `match` arms.
+                            for stmt in a::flatten_effect_blocks(blocks) {
                                 walk_apps(
-                                    &s.rhs.node,
+                                    &stmt.rhs.node,
                                     &field_types,
                                     &param_types,
                                     &mut out,
@@ -1730,8 +1731,9 @@ fn typecheck_handler(
 ) -> anyhow::Result<()> {
     for Node { node, .. } in &h.clauses {
         match node {
-            a::HandlerClause::Effect(stmts) => {
-                for Node { node: stmt, .. } in stmts {
+            a::HandlerClause::Effect(blocks) => {
+                // v2.20 §S1.2 — typecheck every leaf, including under match.
+                for stmt in a::flatten_effect_blocks(blocks) {
                     check_effect_typed(&h.name, stmt, field_types, param_types, const_literals)?;
                 }
             }
@@ -2103,6 +2105,35 @@ pub fn adapt(spec: &a::Spec) -> ParsedSpec {
                     }
                     _ => None,
                 };
+                // v2.20 §S1.1: classify the property's quantifier shape so
+                // `check.rs::check_completeness` can lint unsupported shapes
+                // (nested forall, exists, unbounded `Vec<T>` binder, ...).
+                // Supported shapes (no quantifier, single-binder forall) get
+                // `None`; the per_slot field above already carries the data
+                // codegen needs for the lowered harness.
+                let quantifier_lint = match crate::quantifier::supported_shape(p) {
+                    Ok(_) => None,
+                    Err(reason) => {
+                        let kind = match &reason {
+                            crate::quantifier::Reason::NestedQuantifier { .. } => {
+                                "nested_quantifier"
+                            }
+                            crate::quantifier::Reason::UnboundedBinderType { .. } => {
+                                "unbounded_binder"
+                            }
+                            crate::quantifier::Reason::ExistsQuantifier { .. } => {
+                                "exists_quantifier"
+                            }
+                        };
+                        let span = reason.span();
+                        Some(crate::check::QuantifierLint {
+                            kind: kind.to_string(),
+                            message: reason.message(),
+                            span_start: span.start,
+                            span_end: span.end,
+                        })
+                    }
+                };
                 out.properties.push(ParsedProperty {
                     name: p.name.clone(),
                     expression: Some(lean),
@@ -2110,6 +2141,7 @@ pub fn adapt(spec: &a::Spec) -> ParsedSpec {
                     rust_expression_pod: Some(rust_pod),
                     preserved_by: preserved,
                     per_slot,
+                    quantifier_lint,
                 });
             }
             TopItem::Cover(c) => {
@@ -2481,6 +2513,7 @@ fn adapt_handler(h: &a::HandlerDecl, consts: ConstTable, env: &TypeEnv) -> Parse
         establishes: Vec::new(),
         properties: Vec::new(),
         calls: Vec::new(),
+        effect_branches: None,
     };
 
     for Node { node: clause, .. } in &h.clauses {
@@ -2539,9 +2572,75 @@ fn adapt_handler(h: &a::HandlerDecl, consts: ConstTable, env: &TypeEnv) -> Parse
                     expr_to_rust(&value.node, Ctx::Guard, consts, opts_native(env)),
                 ));
             }
-            a::HandlerClause::Effect(stmts) => {
-                for Node { node: stmt, .. } in stmts {
-                    handler.effects.push(render_effect(stmt, &params, consts));
+            a::HandlerClause::Effect(blocks) => {
+                // v2.20 §S1.2 — `effect { … }` may contain a top-level
+                // `match` block alongside leaf statements. Two outputs:
+                //   1. `handler.effects` — flat union of all leaves.
+                //   2. `handler.effect_branches` — `Some` iff the spec
+                //      uses `match`. Carries arm structure for branched
+                //      emission in the Rust/Kani/proptest backends.
+                let mut branches: Option<crate::check::ParsedEffectBranches> = None;
+                for Node { node: block, .. } in blocks {
+                    match block {
+                        a::EffectBlock::Stmt(stmt) => {
+                            handler.effects.push(render_effect(stmt, &params, consts));
+                        }
+                        a::EffectBlock::Match { scrutinee, arms } => {
+                            let mut parsed_arms: Vec<crate::check::ParsedEffectArm> = Vec::new();
+                            for arm in arms {
+                                let mut arm_effects = Vec::new();
+                                for nested in &arm.body {
+                                    let mut leaves = Vec::new();
+                                    nested.node.collect_leaves(&mut leaves);
+                                    for stmt in leaves {
+                                        let rendered = render_effect(stmt, &params, consts);
+                                        // Mirror into union so flat readers
+                                        // see this potential write.
+                                        handler.effects.push(rendered.clone());
+                                        arm_effects.push(rendered);
+                                    }
+                                }
+                                let (pattern_rust, pattern_lean, is_wildcard) = match &arm.pattern {
+                                    a::EffectPattern::Literal(v) => {
+                                        (v.to_string(), v.to_string(), false)
+                                    }
+                                    a::EffectPattern::Wildcard => {
+                                        ("_".to_string(), "_".to_string(), true)
+                                    }
+                                };
+                                parsed_arms.push(crate::check::ParsedEffectArm {
+                                    pattern_rust,
+                                    pattern_lean,
+                                    is_wildcard,
+                                    effects: arm_effects,
+                                });
+                            }
+                            branches = Some(crate::check::ParsedEffectBranches {
+                                scrutinee_rust: expr_to_rust(
+                                    &scrutinee.node,
+                                    Ctx::Guard,
+                                    consts,
+                                    opts_native(env),
+                                ),
+                                scrutinee_rust_pod: expr_to_rust(
+                                    &scrutinee.node,
+                                    Ctx::Guard,
+                                    consts,
+                                    opts_pod(env),
+                                ),
+                                scrutinee_lean: expr_to_lean(
+                                    &scrutinee.node,
+                                    Ctx::Guard,
+                                    consts,
+                                    env,
+                                ),
+                                arms: parsed_arms,
+                            });
+                        }
+                    }
+                }
+                if branches.is_some() {
+                    handler.effect_branches = branches;
                 }
             }
             a::HandlerClause::Takes(fields) => {

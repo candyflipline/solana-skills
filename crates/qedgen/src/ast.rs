@@ -314,7 +314,9 @@ pub enum HandlerClause {
         name: String,
         value: Node<Expr>,
     },
-    Effect(Vec<Node<EffectStmt>>),
+    /// v2.20 §S1.2 — effect body items can be unconditional statements
+    /// or `match` blocks.
+    Effect(Vec<Node<EffectBlock>>),
     /// `transfers { from A to B amount X authority Y; ... }` — token transfer intents.
     Transfers(Vec<TransferClause>),
     /// Legacy sugar: `takes x : Type` or `takes { x : T, y : U }` —
@@ -490,6 +492,62 @@ pub struct EffectStmt {
     pub lhs: Path,
     pub op: EffectOp,
     pub rhs: Node<Expr>,
+}
+
+/// v2.20 §S1.2 — a single statement inside `effect { … }`. Either a leaf
+/// `EffectStmt` (the historical unconditional form, `x += y`) or a
+/// `match`-shape conditional that branches over a scrutinee expression.
+#[derive(Debug, Clone)]
+pub enum EffectBlock {
+    /// Unconditional effect statement — the only form pre-v2.20.
+    Stmt(EffectStmt),
+    /// `match <scrutinee> { 0 => <effect>, 1 => <effect>, _ => <effect> }`.
+    Match {
+        scrutinee: Node<Expr>,
+        arms: Vec<EffectMatchArm>,
+    },
+}
+
+/// One arm of an effect-level `match`. v2.20 supports literal-integer
+/// patterns and a `_` wildcard.
+#[derive(Debug, Clone)]
+pub struct EffectMatchArm {
+    pub pattern: EffectPattern,
+    pub body: Vec<Node<EffectBlock>>,
+}
+
+/// Patterns accepted by effect-block `match` arms.
+#[derive(Debug, Clone)]
+pub enum EffectPattern {
+    Literal(u128),
+    Wildcard,
+}
+
+impl EffectBlock {
+    /// Walk the block tree and yield every leaf `EffectStmt` in source
+    /// order. Used by consumers that don't care about conditional
+    /// structure — typechecking, the cross-handler expr walker.
+    pub fn collect_leaves<'a>(&'a self, out: &mut Vec<&'a EffectStmt>) {
+        match self {
+            EffectBlock::Stmt(s) => out.push(s),
+            EffectBlock::Match { arms, .. } => {
+                for arm in arms {
+                    for nested in &arm.body {
+                        nested.node.collect_leaves(out);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Collect leaf `EffectStmt`s from a `Vec<Node<EffectBlock>>`.
+pub fn flatten_effect_blocks(blocks: &[Node<EffectBlock>]) -> Vec<&EffectStmt> {
+    let mut out = Vec::new();
+    for b in blocks {
+        b.node.collect_leaves(&mut out);
+    }
+    out
 }
 
 /// Per-effect arithmetic semantics. v2.7 G3 introduced the distinction —

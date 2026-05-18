@@ -10,6 +10,23 @@ the user has with QEDGen's verification toolchain on a brownfield repo —
 your job is to surface a real vulnerability they missed, fast, with no
 setup required.
 
+## Recommended model + reasoning budget
+
+The auditor's §3c trust-surface walk and authority-side intent-drift
+sweep require sustained multi-step reasoning across the program's
+dependency graph and documented invariants. Use one of:
+
+- **Claude Opus 4.7 with extended thinking** (Claude Code — this
+  skill auto-injects `ultrathink` via a UserPromptSubmit hook
+  installed alongside the skill; see `hooks/README.md`).
+- **GPT-5.5 in high-reasoning mode** (Codex / Cursor / other
+  agent-skills harnesses — set the harness's reasoning budget
+  manually; no auto-injection on those harnesses).
+
+On smaller models or default budgets, expect surface-level pattern
+matching only; the catalog's edge (cross-cutting and intent-drift
+findings) collapses.
+
 ## When to use
 
 Invoke this skill when the user asks to:
@@ -84,6 +101,15 @@ Working assumptions when auditing:
   supply-chain attacks), see `docs/security-primer.md` in the
   repository — kept outside the loaded skill surface to preserve
   the auditor's context budget for live audit work.
+- **Authority-side intent-drift is the catalog's edge.** Hand audits
+  implicitly model an unprivileged attacker; *"the authority is
+  trusted"* dismisses most authority-side findings as out-of-scope.
+  But a documented invariant the program fails to enforce against its
+  own authority is still a real finding — users count on documented
+  behavior even when they trust the operator. Walk every privileged
+  action against every documented invariant in source comments / README
+  / docstrings. Phoenix's empirical study (5 catalog hits both prior
+  audits missed) is the corpus.
 
 If you finish an audit and your worst finding is a generic
 "`AccountInfo` should be `Account`" without a kill-chain, you've
@@ -213,7 +239,16 @@ MEDIUM and below: a repro is encouraged but not required.
    like `sign`, `verify`, `prove`, `commit`, `recover_pubkey`,
    `derive_pubkey`, `verify_proof`, `aggregate`, `decommit` and trusts
    the return value for authorization, state transition, or fund
-   movement. Recognition signals:
+   movement.
+
+   Or: any time the program leans on a small / niche data-structure or
+   algorithmic dep for state-machine correctness — zero-copy data
+   structures, custom collections, iteration / traversal primitives
+   used in hot paths where memory safety + invariant preservation
+   matter for fund movement. See also: [Data-structure dep invariant
+   checklist](references/data_structure_dep_invariants.md).
+
+   Recognition signals:
 
    - `Cargo.toml` has a small / niche dep whose API includes
      verb-shaped names above.
@@ -345,68 +380,101 @@ MEDIUM and below: a repro is encouraged but not required.
       style nits) don't have a clean state-corruption witness; ship
       them with the structural narrative.
 
-6. **Scaffold-to-spec interview** (v2.19 — replaces the silent scaffold).
-   For spec-less brownfield audits, drive the user through a markdown
-   interview that ratifies candidate spec clauses before emitting the
-   `.qedspec`. Yields a higher-quality spec than the silent scaffold and
-   captures rejected/bug-flagged decisions for the audit trail.
+6. **Run the audit as Phase 1 → Phase 2 → Phase 3, with no consent walls
+   until value has been delivered.** (v2.20 — replaces the v2.19
+   file-driven scaffold-to-spec interview.)
 
-   a) **Probe with `--emit-spec-candidates`** to materialize the audit
-      working set:
-      ```bash
-      qedgen probe --program <root> --emit-spec-candidates \
-        --audit-dir .qed/audit/<timestamp>
-      ```
-      Writes three files to the audit dir:
-      - `interview.md` — markdown checkboxes, one section per cluster
-      - `clusters.json` — full schema-v3 envelope with cluster metadata
-      - `skeleton.qedspec` — structural skeleton (handler stubs only)
+   The operational metric is **time-to-first-reproducible MED+ finding**.
+   The first fired repro is the value-transfer event that buys the agent
+   more user time. Race to it; surface findings event-driven as they
+   fire; never batch.
 
-   b) **Surface the interview to the user.** Read `interview.md` and
-      summarize the clusters in the digest — number of clusters,
-      confidence band, target handlers. Pause for the user to edit the
-      file by checking one option per cluster (`[x]`). They can choose
-      `accept` / `narrow` / `reject` / `bug` and optionally add notes.
+   ### Phase 1 — autonomous discovery (no user prompts)
 
-   c) **Ratify** when the user confirms the interview is complete:
-      ```bash
-      qedgen ratify --audit-dir .qed/audit/<timestamp> \
-        --out <program>.qedspec
-      ```
-      Writes:
-      - `<program>.qedspec` — skeleton + ratified clauses merged into
-        the appropriate handler bodies / top-level invariants
-      - `.qed/plan/scoping.md` — rejected clusters with user rationale
-      - `.qed/findings/scaffold-to-spec-<id>.md` — one file per
-        bug-flagged cluster (the user identified the implicit
-        precondition as a real missing-enforcement bug)
+   Two concurrent producers + one event-driven presentation rule:
 
-   d) **Confirm the spec parses.** Run `qedgen check --spec
-      <program>.qedspec` after ratification. P1 lints on placeholder
-      handler stubs are expected (handler bodies still need real
-      `requires` / `effect` clauses); zero parse errors is the gate.
+   - **Producer A — probe-driven discovery.** `qedgen probe` enumerates
+     sites on every supported runtime adapter (Pinocchio, Anchor,
+     native-Shank). Agent emits repros in parallel (multiple structured-
+     prompt outputs per message; multiple `cargo test` invocations
+     under one `run_in_background` Bash call). Internal ordering by
+     time-to-fire: Mollusk (≈30s, parallel) → Miri (3-5 min, background)
+     → Crucible (minutes to hours, background, requires skeleton spec).
+     See [probe orchestration runbook](references/probe_orchestration.md).
 
-   The interview is **harness-agnostic** — it's file-driven (Write +
-   Read), not interactive prompts. Codex/Cursor/Windsurf handle it
-   identically to Claude Code. The user can answer questions across
-   multiple sessions; unchecked clusters stay deferred.
+   - **Producer B — read-driven discovery.** §3c trust-surface walk,
+     intent-drift sweep, authority × invariant matrix. Producer B also
+     hypothesizes internal intent (invariants / state machine /
+     authority graph / threat model) from code + comments + docstrings
+     *without* prompting the user — these hypotheses feed Phase 2.
+     Long-running probe phases go to background; B continues foreground.
 
-   **When to use the interview vs the legacy silent scaffold:**
-   - Spec-less brownfield + clusters present → run the interview.
-   - Spec-aware mode (`.qedspec` already exists) → skip; the spec
-     drives the audit directly.
-   - Runtimes the extractor doesn't cover yet (sBPF, exotic) → fall
-     back to the legacy silent scaffold (`qedgen spec --idl <path>`
-     for Anchor with IDL, or hand-walk source).
+   - **Event-driven surface.** The instant any MED+ repro fires:
+     surface immediately ("Found <category>: <one-line>. Repro at
+     <path>. Continuing."). No batching. No draft report.
 
-   Other artifact emission (unchanged from earlier versions):
+   The probe→skeleton→Crucible auto-chain (closes the gap that v2.19
+   couldn't fire Crucible on brownfield audits) lives in the
+   orchestration runbook — agent auto-ratifies *high-confidence*
+   clusters into a skeleton spec without user interaction, then
+   invokes `qedgen probe --fuzz <budget> --spec <skeleton>`.
+
+   See [workflow walkthrough](references/workflow_walkthrough.md) for
+   a timestamped end-to-end example.
+
+   ### Phase 2 — post-first-finding interview (Claude Code TUI primary)
+
+   Triggered automatically by the first MED+ surface, OR by Phase 1
+   completing dry (framed: "Phase 1 didn't find a fired vuln; deepening
+   needs your input on intent.").
+
+   Four `AskUserQuestion` batches present Phase 1's internal
+   hypotheses as ratification candidates:
+
+   1. **Invariants** (multi-select, agent-derived candidates + Other,
+      `preview` field per option showing the inferred-from code excerpt)
+   2. **State machine shape** (single-select archetype, preview shows
+      struct + handler signatures)
+   3. **Authority graph** (multi-select role candidates from Signer
+      constraints / handler names)
+   4. **Threat scenarios + intentional gaps** (mixed single + multi-select)
+
+   See [interview examples](references/interview_examples.md) for
+   three worked transcripts.
+
+   **Harness fallback.** Harnesses without an `AskUserQuestion`-
+   equivalent fall back to the legacy v2.19 file-driven path
+   (`qedgen probe --emit-spec-candidates` → user edits `interview.md`
+   → `qedgen ratify`). Claude Code uses TUI; other harnesses use file.
+
+   ### Phase 3 — refined second wave
+
+   Producer A re-prioritizes probes against ratified invariants.
+   Producer B deepens intent-drift / authority sweeps with ratified
+   authority graph. Same event-driven surfacing. Stop on user signal,
+   budget exhaustion, or N consecutive units of work without a new
+   finding.
+
+   ### Spec-aware mode (when `.qedspec` already exists)
+
+   Skip Phase 2's interview — the spec is the ratified intent. Phase
+   1's Producer B uses the spec for invariants directly; auto-chain
+   step skipped (use the existing spec, not a synthesized skeleton).
+   Phase 3 continues.
+
+   ### Runtimes the extractor doesn't cover yet (sBPF, exotic)
+
+   Fall back to the legacy silent scaffold or hand-walk the source
+   (`qedgen spec --idl <path>` for Anchor with IDL).
+
+   ### Artifact emission
+
    - Write the full audit report to `.qed/findings/audit-<timestamp>.md`.
-   - Write `.qed/probe-suppress.toml` for auto-detected false-positives.
+   - Write `.qed/probe-suppress.toml` for auto-detected false positives.
    - Reproducers live under `target/qedgen-repros/audit/<finding-id>.rs`
-     (ephemeral). Don't commit them.
+     (ephemeral; don't commit).
    - **Don't** silently generate Lean / Kani / proptest. Those are
-     opt-in heavy artifacts that the user invokes explicitly via
-     `qedgen codegen`.
+     opt-in heavy artifacts the user invokes via `qedgen codegen`.
 
 7. **Return a vulnerability-first digest.** Real findings first
    (CRIT → HIGH → MED), then spec-gap suggestions, then suppressed
@@ -479,6 +547,24 @@ Spec-less per-runtime:
   `lifecycle_one_shot_violation` to push state past intended
   ceilings. See also `rounding_direction_round_trip` for the
   asymmetric-rounding sub-class on bidirectional conversions.
+
+**Sub-rule — safe-wrapper-inner-unchecked arithmetic.** A
+`saturating_*` / `checked_*` / `wrapping_*` wrapper whose *argument*
+is itself a raw `*` / `+` / `-` chain of width-equal operands. The
+wrapper does not protect its argument's evaluation; with `overflow-
+checks = true` the inner expression panics before the wrapper sees a
+value.
+
+Detection cue: pattern-match on `.saturating_sub(<expr with raw * or
++>)`, `.checked_add(<expr with raw mul>)`, etc.
+
+- Corpus: pre-audit `phoenix-v1` (commit `85b9158`,
+  `src/state/markets/fifo.rs::match_order` lines 1041-1046) —
+  `inflight_order.adjusted_quote_lot_budget.saturating_sub(
+  self.tick_size * order_id.price_in_ticks *
+  num_base_lots_quoted)`. The three-way `u64` multiplication panics on
+  extreme parameters; `saturating_sub` only catches subtraction
+  underflow.
 
 ### `lifecycle_one_shot_violation` — MEDIUM
 Spec-aware: spec models lifecycle states; handler mutates state but
@@ -1227,6 +1313,63 @@ DoS via state-bloat or counter-saturation.
   practice" — the permissionless-no-rate-limit handler is the
   amplifier that makes it happen.
 
+### `permissionless_create_account_dos` — MEDIUM
+Spec-less only. Handler creates an account at a deterministically-
+derivable PDA address using `system_instruction::create_account`
+(rather than the safer transfer+allocate+assign pattern). Any caller
+can grief the future creation by pre-funding the PDA address with
+1 lamport — `create_account` errors when target has non-zero lamports.
+
+- **Anchor:** `init` constraint internally uses transfer+allocate+
+  assign; raw `system_instruction::create_account` in a `#[program]`
+  handler is the unsafe form.
+- **Native:** look for `invoke_signed(&system_instruction::create_account(...), ...)`
+  with seeds derived from caller-supplied or deterministically-public
+  inputs (e.g. `[b"seat", market_key, trader_key]`).
+- Corpus: pre-audit `phoenix-v1` (commit `85b9158`,
+  `src/program/processor/manage_seat.rs:75-85` for seat PDAs and
+  `src/program/processor/initialize.rs:170-189` for market vault PDAs)
+  used raw `system_instruction::create_account` against deterministic
+  PDA addresses. Subsequently fixed via a `system_utils::create_account`
+  helper that does transfer+allocate+assign.
+
+### `execution_order_state_before_check` — MEDIUM
+Spec-less only. A handler mutates state field X in an early branch,
+then a later branch reads X to make a decision. If the early branch
+always precedes the later one (no conditional gate), the check reads
+post-mutation state — rarely the author's intent.
+
+Detection cue: an early-return / early-mutation arm of an `if let` /
+`match` that zeroes / freezes a field that a later condition tests
+for being nonzero / unmodified.
+
+- Corpus: pre-audit `phoenix-v1` (commit `85b9158`,
+  `src/state/markets/fifo.rs::place_order_inner`) — the no-deposit-mode
+  branch (lines 782-796) zeroes `num_*_lots_out` and moves the matched
+  amount into trader free funds. The later FOK check (line 819)
+  compares those fields against `min_*_to_fill` — but they were just
+  zeroed, so FOK in no-deposit mode always fails the minimum-fill
+  check. Subsequently fixed by reordering the branches.
+
+### `flag_branch_no_op` — MEDIUM
+Spec-less only. A `match` / `if-else` arm distinguishes two variants
+A and B, but the body's primary effect is identical for both — only
+secondary bookkeeping (a counter increment, a log line) differs. The
+variant is effectively decorative.
+
+Detection cue: `A | B => { primary_effect(); if variant == B {
+secondary(); } }` where `primary_effect` is load-bearing and
+`secondary` is local-only.
+
+- Corpus: pre-audit `phoenix-v1` (commit `85b9158`,
+  `src/state/markets/fifo.rs::match_order` lines 1019-1051) — the
+  `SelfTradeBehavior::CancelProvide | DecrementTake` arm calls the
+  same `reduce_order_inner(..., None, ...)` (which removes the full
+  resting order) for both variants. The post-branch only adjusts the
+  inflight budget bookkeeping, never reduces the cancellation amount.
+  `DecrementTake` is documented as a *partial* reduction but is
+  implemented identically to `CancelProvide`.
+
 ## qedgen-codegen runtime
 
 When the runtime is **qedgen-codegen** (detected by the
@@ -1355,6 +1498,13 @@ verification claim.
   that enforces it.
 
 ## Cluster taxonomy (scaffold-to-spec interview)
+
+*In v2.20, this taxonomy is a **Phase-2 fallback only** — surfaced as
+cluster cards for sites whose intent the four-question ratification
+didn't already classify. Most sites collapse automatically once
+invariants / state machine / authority graph are ratified. See
+[interview examples](references/interview_examples.md) for the
+primary TUI-based flow.*
 
 The interview groups probe findings by **cluster kind** — 14 categories
 that map detected site shapes to candidate spec clauses. Each kind has

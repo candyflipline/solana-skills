@@ -1,0 +1,40 @@
+// v2.20 §S1.1 — P5 lint coverage for nested-forall shape.
+//
+// `forall d : Distribution, forall c : Claim, …` can't lower to a single
+// `_at` predicate in v2.20 (the harness model binds only one symbolic
+// value per property). `qedgen check` must emit a precise P5 lint so the
+// user sees the unsupported construct instead of getting a silent `true`
+// stub at the predicate level.
+//
+// Expected `qedgen check` output:
+//   property 'distributions_match_claims' has a quantifier shape qedgen
+//   v2.20 can't lower to a non-vacuous harness — nested quantifier — split
+//   into two single-binder properties (bytes <N>..<M>)
+
+spec NestedForallUnsupported
+program_id "11111111111111111111111111111111"
+
+type Distribution = {
+  balance : U64,
+}
+
+type Claim = {
+  amount : U64,
+}
+
+type State
+  | Active of {
+      cap : U64,
+    }
+
+type Error
+  | E
+
+property distributions_match_claims :
+  forall d : Distribution, forall c : Claim, d.balance >= c.amount
+  preserved_by [noop]
+
+handler noop : State.Active -> State.Active {
+  permissionless
+  effect { cap := cap }
+}
