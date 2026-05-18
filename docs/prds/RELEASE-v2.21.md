@@ -1,5 +1,14 @@
 # Release v2.21.0 — Crucible crash-first + spec-mode codegen quality + tooling ergonomics
 
+> **Release status (2026-05-18):** paused on `feat/v2.21` at commit
+> `7f6b94e` pending fold-in of deferred v2.21.1 items per
+> `docs/prds/PLAN-v2.21-finish.md`. The pre-release gates below were
+> green at `7f6b94e`; they'll be re-run after the fold completes.
+> Branch is feature-complete for the PRD's blocking slices but the
+> user explicitly chose to land S2.1 + S2.2 + S1.2 lamport + S1.2
+> discriminator into the same release rather than ship them as
+> v2.21.1.
+
 v2.21 ships the bear-hug reposition of Crucible alongside the v2.20.x
 backlog of codegen-quality fixes that real users (`rewards-feedback`)
 hit on the spec-mode path. The headline is the Crucible reframe:
