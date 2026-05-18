@@ -2528,19 +2528,23 @@ pub fn check_completeness(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
                 priority: 1,
                 message: format!(
                     "P6: Pubkey field '{}' in {} not supported by codegen — \
-                     replace with `[u8; 32]` or model authority as a parameter \
+                     model the value as a handler parameter instead of state \
                      (see docs/limitations.md#pubkey-state-fields)",
                     field, holder,
                 ),
                 subject: Some(format!("{}.{}", holder, field)),
                 fix: format!(
-                    "Replace `{} : Pubkey` with `{} : [u8; 32]` (Pubkey's actual representation), \
-                     or move the value to a handler parameter so it never lives in state.",
-                    field, field,
+                    "Move `{} : Pubkey` out of state and into the handlers \
+                     that consume it as a parameter. The spec grammar has no \
+                     fixed-size byte-array type in v2.20, so an in-state \
+                     workaround isn't yet expressible (v2.21 follow-up).",
+                    field,
                 ),
                 example: Some(format!(
                     "  // instead of: type {0} of {{ {1} : Pubkey, ... }}\n  \
-                     type {0} of {{ {1} : [u8; 32], ... }}",
+                     // pass {1} into each handler that needs it:\n  \
+                     handler do_thing ({1} : Pubkey) (... : ...) : {0} -> {0} {{ \
+                     ... }}",
                     holder, field
                 )),
                 counterexample: None,

@@ -110,41 +110,38 @@ lowering for `Pubkey` in the current pipeline), while handler bodies still
 emit `s.authority = authority`. Net effect: a generated `tests/proptest.rs`
 that doesn't compile (`no field 'authority' on State`).
 
-**Workaround — two options.** Pick whichever fits the property you're
-trying to verify:
+**Workaround — model the value as a handler parameter** instead of
+storing it in state. If the pubkey doesn't need to persist across calls
+— e.g. a one-shot admin check at handler entry — pass it as a parameter
+rather than declaring it as a state field.
 
-1. **Replace with `[u8; 32]`** — `Pubkey`'s on-chain representation. Kani
-   and proptest can both enumerate symbolic 32-byte arrays, so the field
-   stays in state and downstream `s.authority == admin` comparisons work
-   unchanged.
+```
+handler set_admin (new_admin : Pubkey) : State.Active -> State.Active {
+  // Pubkey-as-parameter is supported; the elision bug is state-only.
+  // No state field needed.
+}
+```
 
-   ```
-   type State
-     | Active of {
-         authority : [u8; 32],
-         balance   : U64,
-       }
-   ```
+`Pubkey`-typed handler parameters are accepted by `qedgen check` and
+codegen; the constraint is specifically on `field : Pubkey` inside
+declared state.
 
-2. **Model the value as a handler parameter** instead of state. If the
-   pubkey doesn't need to persist across calls — e.g. a one-shot admin
-   check at handler entry — pass it as a parameter rather than storing
-   it.
+**Important — no in-state workaround in v2.20.** A natural reflex is to
+replace `field : Pubkey` with a 32-byte array (`Pubkey`'s on-chain
+representation), but the spec grammar in v2.20 has **no array type**.
+`[u8; 32]` doesn't parse. If the value genuinely must persist in state
+(e.g. it's the identity of an open escrow, not a one-shot input), the
+only honest answer for v2.20 is that the spec can't express it cleanly
+— either lift the state to a sum-typed lifecycle that closes when the
+identity becomes irrelevant, or wait for v2.21.
 
-   ```
-   handler set_admin (new_admin : Pubkey) : State.Active -> State.Active {
-     // Pubkey-as-parameter is supported; the elision bug is state-only.
-     // No state field needed.
-   }
-   ```
-
-   `Pubkey`-typed handler parameters are accepted by `qedgen check` and
-   codegen; the constraint is specifically on `field : Pubkey` inside
-   declared state.
-
-**What v2.21 may change:** Option B of the S1.3 ADR — lower `Pubkey` state
-fields to `[u8; 32]` in the generated structs automatically — is the
-follow-up. Until then, P6 is the user-visible gate.
+**What v2.21 may change:** two paths under consideration. (a) Add a
+fixed-size byte array type (`Bytes32` / `[u8; N]`) to the spec
+grammar so the in-state workaround actually parses. (b) Option B of
+the S1.3 ADR — lower `Pubkey` state fields to `[u8; 32]` in the
+generated Rust structs automatically. Either lifts the lint
+materially; until one ships, P6 is the user-visible gate and "move
+to handler parameter" is the only working in-spec answer.
 
 ---
 

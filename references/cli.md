@@ -351,7 +351,13 @@ without a confirmed reproducer are silently dropped — see
 `feedback_probes_reproducible_only.md`). v2.19 schema bumps to
 `version: 3` when `--emit-spec-candidates` is set, adding a
 `clusters[]` array that the auditor subagent surfaces through the
-scaffold-to-spec interview.
+scaffold-to-spec interview. v2.20 extends the bootstrap envelope
+with `dispatcher_kind: "shank_central_match"` for native programs
+where `qedgen probe --bootstrap` detects a central-match dispatcher
+in `lib.rs` (S2.1 Shank adapter), and each `handlers[]` entry now
+carries per-handler `applicable_categories` + `intent_tag`
+narrowed by handler-body heuristic (S2.2 — authority-gated /
+trader-gated / permissionless).
 
 ```bash
 # Spec-aware
