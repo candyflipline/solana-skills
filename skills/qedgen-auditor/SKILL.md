@@ -10,6 +10,23 @@ the user has with QEDGen's verification toolchain on a brownfield repo —
 your job is to surface a real vulnerability they missed, fast, with no
 setup required.
 
+## Recommended model + reasoning budget
+
+The auditor's §3c trust-surface walk and authority-side intent-drift
+sweep require sustained multi-step reasoning across the program's
+dependency graph and documented invariants. Use one of:
+
+- **Claude Opus 4.7 with extended thinking** (Claude Code — this
+  skill auto-injects `ultrathink` via a UserPromptSubmit hook
+  installed alongside the skill; see `hooks/README.md`).
+- **GPT-5.5 in high-reasoning mode** (Codex / Cursor / other
+  agent-skills harnesses — set the harness's reasoning budget
+  manually; no auto-injection on those harnesses).
+
+On smaller models or default budgets, expect surface-level pattern
+matching only; the catalog's edge (cross-cutting and intent-drift
+findings) collapses.
+
 ## When to use
 
 Invoke this skill when the user asks to:
@@ -84,6 +101,15 @@ Working assumptions when auditing:
   supply-chain attacks), see `docs/security-primer.md` in the
   repository — kept outside the loaded skill surface to preserve
   the auditor's context budget for live audit work.
+- **Authority-side intent-drift is the catalog's edge.** Hand audits
+  implicitly model an unprivileged attacker; *"the authority is
+  trusted"* dismisses most authority-side findings as out-of-scope.
+  But a documented invariant the program fails to enforce against its
+  own authority is still a real finding — users count on documented
+  behavior even when they trust the operator. Walk every privileged
+  action against every documented invariant in source comments / README
+  / docstrings. Phoenix's empirical study (5 catalog hits both prior
+  audits missed) is the corpus.
 
 If you finish an audit and your worst finding is a generic
 "`AccountInfo` should be `Account`" without a kill-chain, you've
@@ -213,7 +239,16 @@ MEDIUM and below: a repro is encouraged but not required.
    like `sign`, `verify`, `prove`, `commit`, `recover_pubkey`,
    `derive_pubkey`, `verify_proof`, `aggregate`, `decommit` and trusts
    the return value for authorization, state transition, or fund
-   movement. Recognition signals:
+   movement.
+
+   Or: any time the program leans on a small / niche data-structure or
+   algorithmic dep for state-machine correctness — zero-copy data
+   structures, custom collections, iteration / traversal primitives
+   used in hot paths where memory safety + invariant preservation
+   matter for fund movement. See also: [Data-structure dep invariant
+   checklist](references/data_structure_dep_invariants.md).
+
+   Recognition signals:
 
    - `Cargo.toml` has a small / niche dep whose API includes
      verb-shaped names above.
@@ -479,6 +514,24 @@ Spec-less per-runtime:
   `lifecycle_one_shot_violation` to push state past intended
   ceilings. See also `rounding_direction_round_trip` for the
   asymmetric-rounding sub-class on bidirectional conversions.
+
+**Sub-rule — safe-wrapper-inner-unchecked arithmetic.** A
+`saturating_*` / `checked_*` / `wrapping_*` wrapper whose *argument*
+is itself a raw `*` / `+` / `-` chain of width-equal operands. The
+wrapper does not protect its argument's evaluation; with `overflow-
+checks = true` the inner expression panics before the wrapper sees a
+value.
+
+Detection cue: pattern-match on `.saturating_sub(<expr with raw * or
++>)`, `.checked_add(<expr with raw mul>)`, etc.
+
+- Corpus: pre-audit `phoenix-v1` (commit `85b9158`,
+  `src/state/markets/fifo.rs::match_order` lines 1041-1046) —
+  `inflight_order.adjusted_quote_lot_budget.saturating_sub(
+  self.tick_size * order_id.price_in_ticks *
+  num_base_lots_quoted)`. The three-way `u64` multiplication panics on
+  extreme parameters; `saturating_sub` only catches subtraction
+  underflow.
 
 ### `lifecycle_one_shot_violation` — MEDIUM
 Spec-aware: spec models lifecycle states; handler mutates state but
@@ -1226,6 +1279,63 @@ DoS via state-bloat or counter-saturation.
 - Compose-with-what: any other finding gated by "this never happens in
   practice" — the permissionless-no-rate-limit handler is the
   amplifier that makes it happen.
+
+### `permissionless_create_account_dos` — MEDIUM
+Spec-less only. Handler creates an account at a deterministically-
+derivable PDA address using `system_instruction::create_account`
+(rather than the safer transfer+allocate+assign pattern). Any caller
+can grief the future creation by pre-funding the PDA address with
+1 lamport — `create_account` errors when target has non-zero lamports.
+
+- **Anchor:** `init` constraint internally uses transfer+allocate+
+  assign; raw `system_instruction::create_account` in a `#[program]`
+  handler is the unsafe form.
+- **Native:** look for `invoke_signed(&system_instruction::create_account(...), ...)`
+  with seeds derived from caller-supplied or deterministically-public
+  inputs (e.g. `[b"seat", market_key, trader_key]`).
+- Corpus: pre-audit `phoenix-v1` (commit `85b9158`,
+  `src/program/processor/manage_seat.rs:75-85` for seat PDAs and
+  `src/program/processor/initialize.rs:170-189` for market vault PDAs)
+  used raw `system_instruction::create_account` against deterministic
+  PDA addresses. Subsequently fixed via a `system_utils::create_account`
+  helper that does transfer+allocate+assign.
+
+### `execution_order_state_before_check` — MEDIUM
+Spec-less only. A handler mutates state field X in an early branch,
+then a later branch reads X to make a decision. If the early branch
+always precedes the later one (no conditional gate), the check reads
+post-mutation state — rarely the author's intent.
+
+Detection cue: an early-return / early-mutation arm of an `if let` /
+`match` that zeroes / freezes a field that a later condition tests
+for being nonzero / unmodified.
+
+- Corpus: pre-audit `phoenix-v1` (commit `85b9158`,
+  `src/state/markets/fifo.rs::place_order_inner`) — the no-deposit-mode
+  branch (lines 782-796) zeroes `num_*_lots_out` and moves the matched
+  amount into trader free funds. The later FOK check (line 819)
+  compares those fields against `min_*_to_fill` — but they were just
+  zeroed, so FOK in no-deposit mode always fails the minimum-fill
+  check. Subsequently fixed by reordering the branches.
+
+### `flag_branch_no_op` — MEDIUM
+Spec-less only. A `match` / `if-else` arm distinguishes two variants
+A and B, but the body's primary effect is identical for both — only
+secondary bookkeeping (a counter increment, a log line) differs. The
+variant is effectively decorative.
+
+Detection cue: `A | B => { primary_effect(); if variant == B {
+secondary(); } }` where `primary_effect` is load-bearing and
+`secondary` is local-only.
+
+- Corpus: pre-audit `phoenix-v1` (commit `85b9158`,
+  `src/state/markets/fifo.rs::match_order` lines 1019-1051) — the
+  `SelfTradeBehavior::CancelProvide | DecrementTake` arm calls the
+  same `reduce_order_inner(..., None, ...)` (which removes the full
+  resting order) for both variants. The post-branch only adjusts the
+  inflight budget bookkeeping, never reduces the cancellation amount.
+  `DecrementTake` is documented as a *partial* reduction but is
+  implemented identically to `CancelProvide`.
 
 ## qedgen-codegen runtime
 

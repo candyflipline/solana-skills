@@ -1,0 +1,271 @@
+# Probe orchestration — operating Producer A
+
+Operational runbook for Producer A (the probe-driven discovery loop).
+Read this when you're about to fan out repro emissions, choose
+foreground vs background execution, or wire up the
+probe→skeleton→Crucible auto-chain.
+
+The companion document `workflow_walkthrough.md` shows the *shape* of
+an end-to-end audit. This file is the engine room: which probe tier
+runs when, in what mode, with what budget, and what to do when it
+hangs.
+
+---
+
+## Time-to-fire ordering
+
+The audit's operational metric is **time-to-first-reproducible MED+**.
+Fast-fire first, slow-fire queued behind. Three tiers.
+
+### Tier 1 — Mollusk (≈30s compile per repro, parallel)
+
+In-process SVM driver. Each repro is a Rust integration test that
+loads the program, builds an attack instruction, asserts the bug is
+observable. Agent writes test files directly to
+`target/qedgen-repros/audit/<finding-id>.rs` (no `--fill` verb — per
+`feedback_repros_agent_authored`), then `cargo test` fans them.
+
+~30s per test cold, but cargo parallelizes within one invocation. 14
+repros warm-cache compile in ~45-60s; first fires land ~T+0:08 from
+cold start including the parallel-write block.
+
+In repro semantics, `test … ok` *is* fired (the attack assertion
+held). `FAILED` is silent.
+
+```
+test qedgen_repros_F15 ... ok      <-- fired (bug observable)
+test qedgen_repros_F4  ... FAILED  <-- silent (couldn't reproduce)
+```
+
+**Default tier — always run.**
+
+### Tier 2 — Miri (3-5 min per repro, single-threaded)
+
+Rust's MIR interpreter. Catches UB / aliasing / overflow that
+survived Mollusk's coarse-grained execution (transmute soundness,
+raw-pointer escape, write-through-`&` UB). Dual-execution divergence
+(Miri-fail / Mollusk-pass) is itself a `Category::ExecutionDivergence`
+critical finding.
+
+```
+Bash (run_in_background=true): cargo +nightly miri test \
+    --release --test 'qedgen_repros_*' -- --test-threads=1 \
+    2>&1 | tee .qed/audit/<ts>/miri.log
+```
+
+3-5 min per repro, single-threaded (miri isn't internally parallel).
+Run on the *unsafe-touching* subset only — Pinocchio sites tagged
+`BorrowUnchecked`, `BytemuckCall`, `RawPtrCastFromAccount`,
+`SetLamportsArith` with raw-pointer math.
+
+Fired output: `Undefined Behavior`, `Stacked Borrow violation`, `would
+overflow`, plus the `SAFETY claim STALE` marker when a `// SAFETY:`
+comment contradicts Miri's analysis. `miri_verify` parses these into
+`MiriDiagnostic`s.
+
+**Default tier — unsafe-touching subset only.**
+
+### Tier 3 — Crucible (`--fuzz`, minutes to hours, background)
+
+Coverage-guided fuzzing against the harness from the spec (or
+auto-ratified skeleton, per the auto-chain below). Each crash →
+`Reproducer::Crucible` finding.
+
+```
+Bash (run_in_background=true): qedgen probe \
+    --fuzz 300 --spec .qed/audit/<ts>/skeleton.qedspec --no-smoke \
+    --json > .qed/audit/<ts>/crucible.json
+```
+
+Budget tuning: 300s first pass; 1800s (30 min) if depth is wanted;
+3600s+ overnight if the user explicitly asks.
+
+Fired output: `findings[]` in JSON. Each has `Reproducer::Crucible`
+with input bytes + reproducing call sequence.
+
+**Default tier — gated on the auto-chain (brownfield needs a skeleton
+spec first).**
+
+---
+
+## Parallel emission pattern
+
+When the probe enumerates N sites, emit N repro prompts in a **single
+message** so they fan in parallel. Then run them through one `cargo
+test` invocation that cargo concurrency-fans internally.
+
+### Repro emission (parallel Writes, one block)
+
+```
+Write: target/qedgen-repros/audit/F1.rs
+Write: target/qedgen-repros/audit/F2.rs
+Write: target/qedgen-repros/audit/F3.rs
+… (one Write per site, all in the same <function_calls> block)
+```
+
+For 14 sites the agent's message contains 14 parallel `Write` calls.
+Each is a complete Mollusk test (SKILL.md step 5 template). The
+`Bash` invocation comes *after* the Writes return.
+
+### Cargo fan (one invocation, all repros)
+
+```
+Bash (run_in_background=true): cargo test --release \
+    --test 'qedgen_repros_*' \
+    -- --test-threads=$(nproc) \
+    2>&1 | tee .qed/audit/<ts>/mollusk.log
+```
+
+Cargo's internal concurrency saturates the box. Don't fan multiple
+`cargo test` calls — they fight for the build lock and serialize
+compilation.
+
+**Anti-patterns:** one repro per message (kills the fan, ×N wait); one
+`cargo test` per file (serializes compile, cache-busts); awaiting the
+fan in foreground (B should be reading code while it compiles).
+
+---
+
+## Background choreography
+
+Long-running phases run under Bash `run_in_background=true`. Producer
+B continues foreground; notifications fire on completion.
+
+**Background:** `cargo test` expected to take >10s (cold Mollusk
+fans, Miri); `qedgen probe --fuzz` (always); `cargo +nightly miri
+test` (always).
+
+**Foreground:** `qedgen probe` without `--fuzz` (~6s pattern-match);
+`qedgen probe --emit-spec-candidates` (fast); all `Read` / `Write` /
+sub-5s `Bash` (grep, single-file `cargo check`).
+
+### Hang handling
+
+If a background job hasn't notified within 2× its expected budget:
+
+1. **Don't kill blindly.** Foreground inspect:
+   `ps -o pid,etime,cmd -p $(pgrep -f "qedgen_repros_")` or
+   `tail -30 .qed/audit/<ts>/mollusk.log`.
+2. **Cargo lock contention** — another `cargo` holds the build lock.
+   Cargo block-waits; correct behavior, not a hang.
+3. **Miri OOM** — heap grows on tight loops. Kill the PID, shorten
+   the repro's loop bound, re-run.
+4. **Crucible budget overrun** — by definition. `--fuzz 300` takes
+   300s + setup + shutdown (~315-330s). Wait full budget + 30s.
+5. **Genuinely stuck:** kill the PID, surface inconclusive for that
+   tier, continue. Don't block the audit on one tier.
+
+---
+
+## Probe → skeleton → Crucible auto-chain
+
+The v2.20 deliverable that closes the brownfield-to-Crucible gap.
+Without this chain, `qedgen probe --fuzz` errors with `--fuzz requires
+--spec` on brownfield projects, so the audit never reaches
+coverage-guided fuzzing.
+
+### Step 1 — emit spec candidates
+
+```
+Bash: qedgen probe --program <root> \
+        --emit-spec-candidates \
+        --audit-dir .qed/audit/<ts>/
+```
+
+Writes three files to the audit dir:
+- `interview.md` — markdown checkboxes, one section per cluster.
+- `clusters.json` — full schema-v3 envelope.
+- `skeleton.qedspec` — pre-interview structural skeleton (handler
+  stubs, no `requires` / `effect` bodies yet).
+
+### Step 2 — auto-ratify *high-confidence* clusters
+
+Agent edits `skeleton.qedspec` in place, merging only high-confidence
+clusters into handler bodies / top-level invariants. **Do not prompt
+the user here** — Phase 2 hasn't fired yet.
+
+**High-confidence = the cluster has an explicit code anchor.**
+Specifically:
+
+- `account_signer_check` — cluster names a specific account binding
+  AND handler reads `<binding>.is_signer` (or `assert!(…is_signer)`)
+  in source. Signer name is *literal* in code, not inferred.
+- `account_owner_check` — cluster names a specific account AND handler
+  reads `<binding>.owner == <PROGRAM_ID>` (or Pinocchio equivalent).
+  Owner check is literal.
+- `arithmetic_no_overflow` on `checked_*` / `saturating_*` — call name
+  is literal and the cluster matches it exactly.
+- `lifecycle_one_shot` — source contains a literal `is_initialized`
+  field read + write, and the cluster's claim is monotonicity.
+
+**Deferred to Phase 2** (low-confidence):
+
+- Conservation invariants — require a *sum* across accounts; informed
+  but not literally anchored.
+- Authority-graph clauses beyond signer/owner — admin rotation,
+  multi-role handoff.
+- Threat model — entirely user-intent.
+- Anything probe-classified `confidence: low` or `confidence: medium`.
+
+**The check:** if you can point at a specific line of source code and
+say "this line is the cluster's anchor," it's high-confidence. If
+you're inferring from context, it's not.
+
+### Step 3 — fire Crucible against the auto-ratified skeleton
+
+```
+Bash (run_in_background=true): qedgen probe \
+        --fuzz 300 \
+        --spec .qed/audit/<ts>/skeleton.qedspec \
+        --json > .qed/audit/<ts>/crucible.json
+```
+
+Crucible reads the high-confidence invariants and fuzzes for
+counterexamples. Each crash streams into Producer A's surface as a
+fired finding — same event-driven rule as Mollusk:
+
+> Found `<category>` [SEV]: <one-line>. Repro at <crucible.json#fN>.
+> Continuing.
+
+### Step 4 — risk and mitigation
+
+**The risk:** auto-ratification encodes wrong invariants → Crucible
+fires on wrong properties. User sees a "fired" finding that actually
+tests an invariant they never agreed to.
+
+**The mitigation:** the literal-anchor bar in step 2. Every
+auto-ratified clause has a source-code anchor the agent can cite on
+the surface line:
+
+> Found `account_signer_check` [CRITICAL]: `update_fee_rate` accepts
+> non-admin signers. **Auto-ratified invariant** (anchored at
+> `update_fee_rate.rs:9` — `assert!(admin.is_signer)`). Repro at
+> `crucible.json#f3`. Continuing.
+
+If the citation looks wrong on the surface line, the user
+correctness-checks the ratification immediately. The literal-anchor
+requirement is what keeps the false-positive rate low.
+
+**When in doubt, defer.** A cluster that doesn't meet the bar goes to
+Phase 2's interview, where the user ratifies it directly. Phase 3
+re-runs Crucible with the user-ratified skeleton.
+
+---
+
+## What NOT to do
+
+- **Don't serialize the producers.** A and B run concurrently. B's
+  reads don't wait for A's probe to complete.
+- **Don't wait for all probes to complete before reading.** B's
+  intent extraction starts as soon as the files load.
+- **Don't batch findings into a final report during Phase 1.** Surface
+  each fired MED+ the instant it fires.
+- **Don't run `cargo test` per repro.** One invocation, parallel fan.
+- **Don't run Crucible synchronously.** Always
+  `run_in_background=true`.
+- **Don't prompt the user during Phase 1.** No `AskUserQuestion`. The
+  first fired MED+ is the implicit "keep going."
+- **Don't auto-ratify low-confidence clusters.** Literal anchor only;
+  defer to Phase 2 when in doubt.
+- **Don't read this file end-to-end during an audit.** Read the
+  tier-or-step section you're about to invoke.
