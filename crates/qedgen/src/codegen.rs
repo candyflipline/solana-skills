@@ -552,9 +552,25 @@ fn primitive_pod_map(dsl_type: &str) -> Option<&'static str> {
 /// base case can share it.
 fn primitive_map(dsl_type: &str, context: TypeMapContext) -> Option<&'static str> {
     Some(match dsl_type {
+        // v2.21 Slice 3: lower Pubkey to `[u8; 32]` for Standalone
+        // harnesses (proptest, kani, unit tests). This is "Option B"
+        // from PRD-v2.20 §S1.3 / PRD-v2.21 §"Slice 3" — the in-state
+        // workaround the P6 lint used to recommend, now applied
+        // automatically. The 32-byte array is structurally compatible
+        // with Solana's Pubkey (which is a `[u8; 32]` newtype), and
+        // proptest's existing `prop::array::uniform32(0u8..)` strategy
+        // already produces this shape.
+        //
+        // The Anchor user-facing program target keeps the real
+        // `solana_program::Pubkey` so on-chain accounts work normally.
+        // Quasar uses `Pubkey` from `quasar-lang::prelude` for the same
+        // reason — both are 32-byte newtypes downstream of `[u8; 32]`.
+        // The `Address` alias that v2.20 emitted for Quasar/Standalone
+        // contexts is retired; unit-test scaffolds drop the
+        // `type Address = [u8; 32];` line.
         "Pubkey" => match context {
-            TypeMapContext::Anchor => "Pubkey",
-            TypeMapContext::Standalone | TypeMapContext::Quasar => "Address",
+            TypeMapContext::Anchor | TypeMapContext::Quasar => "Pubkey",
+            TypeMapContext::Standalone => "[u8; 32]",
         },
         "U8" => "u8",
         "U16" => "u16",
@@ -3142,7 +3158,9 @@ mod tests {
 
         // Non-integer primitives
         assert_eq!(map_type("Bool", &spec).unwrap(), "bool");
-        assert_eq!(map_type("Pubkey", &spec).unwrap(), "Address");
+        // v2.21 Slice 3: Standalone Pubkey lowers to [u8; 32] (was
+        // "Address" pre-v2.21; the alias is retired).
+        assert_eq!(map_type("Pubkey", &spec).unwrap(), "[u8; 32]");
     }
 
     #[test]
@@ -3218,7 +3236,8 @@ mod tests {
         let spec = empty_spec();
         assert_eq!(map_type("Map[4] U64", &spec).unwrap(), "[u64; 4]");
         assert_eq!(map_type("Map[16] U8", &spec).unwrap(), "[u8; 16]");
-        assert_eq!(map_type("Map[32] Pubkey", &spec).unwrap(), "[Address; 32]");
+        // v2.21 Slice 3: nested Pubkey lowers through `[u8; 32]` too.
+        assert_eq!(map_type("Map[32] Pubkey", &spec).unwrap(), "[[u8; 32]; 32]");
     }
 
     #[test]

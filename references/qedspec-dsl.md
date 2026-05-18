@@ -281,6 +281,14 @@ accounts : Map[MAX_ACCOUNTS] Account
 slots    : Map[16] (Option Pubkey)
 ```
 
+**Pubkey lowering (v2.21):** the user-facing Anchor / Quasar program
+target keeps `Pubkey` (Solana's 32-byte newtype) so on-chain accounts
+work normally. In the generated proptest / Kani harnesses, `Pubkey`
+state fields lower to `[u8; 32]` automatically — the structurally-
+equivalent byte array that proptest's `prop::array::uniform32(0u8..)`
+strategy already generates. P6 fires at `Info` severity as a note,
+not as a `Warning`; no spec-side action is required.
+
 ### `state` (sugar)
 
 Shorthand for a single unnamed account record. Equivalent to a one-variant

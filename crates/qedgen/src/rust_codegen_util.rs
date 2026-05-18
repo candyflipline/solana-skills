@@ -378,9 +378,16 @@ pub fn resolve_state_fields(spec: &ParsedSpec) -> &[(String, String)] {
     }
 }
 
-/// Filter state fields to mutable-only (skip Pubkey identity fields).
+/// Filter state fields to mutable-only.
+///
+/// v2.21 Slice 3: Pubkey fields used to be filtered out (the v2.20 P6
+/// workaround) because the proptest / Kani State struct couldn't carry
+/// them. With Standalone context now lowering `Pubkey → [u8; 32]`, the
+/// fields are first-class and stay in the mutable set — proptest's
+/// existing 32-byte-array strategy generates them. The "mutable" naming
+/// is historical; today every declared state field flows through here.
 pub fn mutable_fields(fields: &[(String, String)]) -> Vec<&(String, String)> {
-    fields.iter().filter(|(_, t)| t != "Pubkey").collect()
+    fields.iter().collect()
 }
 
 /// True when the named field's declared type is `Pubkey`. Looks in the
@@ -725,22 +732,10 @@ pub fn emit_state_struct(
     map_type_fn: impl Fn(&str) -> anyhow::Result<String>,
     spec: &crate::check::ParsedSpec,
 ) -> anyhow::Result<()> {
-    // v2.20 §S1.3 belt-and-suspenders: the P6
-    // `pubkey_state_field_unsupported` lint at `check.rs` is the user-facing
-    // gate; if a Pubkey field reaches this emitter, that lint was bypassed
-    // (e.g. `--no-check` or a buggy adapter path) and we'd otherwise produce
-    // a State struct that silently drops the field while handler bodies still
-    // reference it. Fail loud instead of generating broken Rust. Option B
-    // (lower Pubkey to `[u8; 32]`) is v2.21 work; until then this branch is
-    // unreachable through the normal pipeline.
-    if let Some((fname, _)) = fields.iter().find(|(_, t)| t == "Pubkey") {
-        return Err(anyhow::anyhow!(
-            "emit_state_struct: Pubkey field '{}' reached the emitter — \
-             P6 lint should have caught this at `qedgen check` time. \
-             See docs/limitations.md#pubkey-state-fields for the workaround.",
-            fname
-        ));
-    }
+    // v2.21 Slice 3: Pubkey state fields are now lowered to `[u8; 32]`
+    // by `primitive_map` (Standalone context). The v2.20 belt-and-
+    // suspenders bail is gone; the field flows through `map_type_fn`
+    // and lands as a 32-byte array in the emitted struct.
     out.push_str(&format!("#[derive({})]\n", derives));
     out.push_str("struct State {\n");
     for (fname, ftype) in fields {

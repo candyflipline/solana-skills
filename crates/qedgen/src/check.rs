@@ -2499,17 +2499,14 @@ pub fn check_completeness(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
         });
     }
 
-    // P6 (v2.20 §S1.3): `Pubkey` state fields are silently elided from the
-    // generated `tests/proptest.rs`'s `struct State { … }` because
-    // `rust_codegen_util::mutable_fields` filters them out, while the
-    // handler bodies still reference them (`s.authority = authority`).
-    // The result: 13 compile errors on first `cargo test --test proptest`
-    // (rewards-feedback issue #2).
-    //
-    // Option A (PRD §S1.3 decision): lint-reject the shape with a pointer
-    // to the workaround. Option B (emit Pubkey as `[u8; 32]`) is v2.21
-    // work; until then P6 fires the moment a Pubkey field reaches the
-    // state schema.
+    // P6 (v2.20 §S1.3 / v2.21 Slice 3): `Pubkey` state fields used to
+    // crash the proptest / Kani harness because the State struct
+    // dropped them while handler bodies still wrote to them. v2.21
+    // ships Option B from the PRD: `primitive_map(Pubkey, Standalone)`
+    // lowers to `[u8; 32]`, the State struct carries the field, and
+    // proptest's existing 32-byte-array strategy generates it. P6 stays
+    // as an *informational* note so users reading generated code see
+    // the structural lowering documented in the spec.
     //
     // Scope: every place a Pubkey field can land as state —
     //   - `account_types[*].fields`        (multi-account, structured)
@@ -2524,29 +2521,21 @@ pub fn check_completeness(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
         let push_p6 = |warnings: &mut Vec<CompletenessWarning>, holder: &str, field: &str| {
             warnings.push(CompletenessWarning {
                 rule: "pubkey_state_field_unsupported".to_string(),
-                severity: Severity::Warning,
-                priority: 1,
+                severity: Severity::Info,
+                priority: 3,
                 message: format!(
-                    "P6: Pubkey field '{}' in {} not supported by codegen — \
-                     model the value as a handler parameter instead of state \
-                     (see docs/limitations.md#pubkey-state-fields)",
+                    "P6: Pubkey field '{}' in {} is lowered to `[u8; 32]` in \
+                     the generated proptest / Kani harness. The user-facing \
+                     Anchor program target keeps the `Pubkey` type.",
                     field, holder,
                 ),
                 subject: Some(format!("{}.{}", holder, field)),
                 fix: format!(
-                    "Move `{} : Pubkey` out of state and into the handlers \
-                     that consume it as a parameter. The spec grammar has no \
-                     fixed-size byte-array type in v2.20, so an in-state \
-                     workaround isn't yet expressible (v2.21 follow-up).",
+                    "No action required. To compare against an Anchor `Pubkey` \
+                     param, convert at the call site: `s.{} == pk.to_bytes()`.",
                     field,
                 ),
-                example: Some(format!(
-                    "  // instead of: type {0} of {{ {1} : Pubkey, ... }}\n  \
-                     // pass {1} into each handler that needs it:\n  \
-                     handler do_thing ({1} : Pubkey) (... : ...) : {0} -> {0} {{ \
-                     ... }}",
-                    holder, field
-                )),
+                example: None,
                 counterexample: None,
                 fix_options: vec![],
             });
@@ -5444,22 +5433,18 @@ mod tests {
         let spec =
             crate::chumsky_adapter::parse_str(spec_content).expect("escrow.qedspec should parse");
         let warnings = check_completeness(&spec);
-        // A well-formed spec should have zero warnings — modulo
-        // `pubkey_state_field_unsupported` (v2.20 §S1.3 P6 lint). The
-        // escrow example's State.Open variant has 4 Pubkey identity
-        // fields that codegen silently elides today; the lint correctly
-        // flags them. Migrating escrow to a Bytes32-shaped type is
-        // grammar-blocked (no array type in qedspec today) — both the
-        // lint workaround and the example migration are v2.21 work.
+        // A well-formed spec should have zero `Warning`-severity findings.
+        // v2.21 Slice 3 reverts the P6 filter — Pubkey state fields now
+        // lower to `[u8; 32]` in proptest / Kani harnesses, so the lint
+        // fires at `Info` severity only and doesn't appear in this set.
         let warning_rules: Vec<&str> = warnings
             .iter()
             .filter(|w| w.severity == Severity::Warning)
-            .filter(|w| w.rule != "pubkey_state_field_unsupported")
             .map(|w| w.rule.as_str())
             .collect();
         assert!(
             warning_rules.is_empty(),
-            "escrow.qedspec should be clean (modulo known P6) but got warnings: {:?}",
+            "escrow.qedspec should be Warning-clean but got: {:?}",
             warning_rules
         );
     }
@@ -7062,14 +7047,16 @@ handler h : State.Active -> State.Active {
             "message must cite P6 and name the field: {}",
             w.message
         );
+        // v2.21 Slice 3: P6 downgraded from Warning to Info because
+        // Pubkey state fields now lower to `[u8; 32]` automatically;
+        // the lint remains as an informational note about the lowering.
         assert!(
-            w.message
-                .contains("docs/limitations.md#pubkey-state-fields"),
-            "message must point at the workaround doc: {}",
+            w.message.contains("lowered to `[u8; 32]`"),
+            "message must describe the lowering: {}",
             w.message
         );
-        assert_eq!(w.priority, 1, "P6 is a P1 lint");
-        assert_eq!(w.severity, Severity::Warning);
+        assert_eq!(w.priority, 3, "P6 is now a P3 informational");
+        assert_eq!(w.severity, Severity::Info);
     }
 
     #[test]
