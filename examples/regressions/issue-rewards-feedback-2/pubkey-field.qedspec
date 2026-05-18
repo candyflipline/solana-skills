@@ -1,0 +1,38 @@
+// v2.20 §S1.3 regression — `Pubkey` state fields must be lint-rejected
+// instead of silently dropped from the proptest harness.
+//
+// Source signal: v2.19 external audit feedback issue #2 — `State` types
+// declaring `authority : Pubkey`, `mint : Pubkey`, `seed : Pubkey` had
+// those fields elided from `tests/proptest.rs`'s `struct State { ... }`,
+// while handler bodies still referenced them via `s.authority = …`,
+// producing 13 compile errors on first `cargo test --test proptest`.
+//
+// Decision (PRD §S1.3 Option A): emit P6 with a workaround pointer
+// (`[u8; 32]` or model-as-parameter); Option B (lower Pubkey to
+// `[u8; 32]` in generated structs) is reserved for v2.21.
+//
+// Expected after v2.20:
+//   - `qedgen check --spec pubkey-field.qedspec` exits with a P6 lint
+//     naming `authority` specifically.
+//   - The non-Pubkey field `balance` does NOT trigger P6 (field-scoped,
+//     not whole-state).
+
+spec PubkeyFieldFixture
+program_id "11111111111111111111111111111111"
+
+type State
+  | Active of {
+      authority : Pubkey,
+      balance : U64,
+    }
+
+type Error
+  | Unauthorized = 6000 "caller is not the authority"
+
+handler initialize (admin : Pubkey) (opening_balance : U64) : State.Active -> State.Active {
+  permissionless
+  effect {
+    authority := admin
+    balance := opening_balance
+  }
+}

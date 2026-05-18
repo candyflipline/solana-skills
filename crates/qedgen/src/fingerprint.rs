@@ -182,6 +182,22 @@ fn canonical_handler(handler: &crate::check::ParsedHandler) -> String {
     for (field, kind, val) in &handler.effects {
         c.push_str(&format!("effect={} {} {}\n", field, kind, val));
     }
+    // v2.20 §S1.2 — fold the conditional-effect structure into the
+    // fingerprint so swapping arms in a `match` block is detected by
+    // `qedgen check --frozen`. The flat `effects` line above is the
+    // union and would be identical under arm-reordering.
+    if let Some(branches) = &handler.effect_branches {
+        c.push_str(&format!("effect_match_on={}\n", branches.scrutinee_lean));
+        for (idx, arm) in branches.arms.iter().enumerate() {
+            c.push_str(&format!("effect_arm[{}]={}\n", idx, arm.pattern_lean));
+            for (field, kind, val) in &arm.effects {
+                c.push_str(&format!(
+                    "effect_arm[{}]_eff={} {} {}\n",
+                    idx, field, kind, val
+                ));
+            }
+        }
+    }
     for emit in &handler.emits {
         c.push_str(&format!("emits={}\n", emit));
     }

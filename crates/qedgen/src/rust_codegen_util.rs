@@ -370,6 +370,82 @@ pub fn effect_target_base(path: &str) -> &str {
     &path[..end]
 }
 
+/// Render a single `(field, op_kind, value)` triple into Rust at the given
+/// indent. Shared between unconditional effect lowering and v2.20's
+/// match-arm lowering. The helper writes the trailing newline; the caller
+/// controls where the statement sits relative to its surrounding block.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_one_effect(
+    out: &mut String,
+    op: &ParsedHandler,
+    spec: &ParsedSpec,
+    wrapping: bool,
+    field: &str,
+    op_kind: &str,
+    value: &str,
+    indent: &str,
+) {
+    let rust_value = resolve_value(value, op, spec);
+    match op_kind {
+        "set" => {
+            out.push_str(&format!("{indent}s.{field} = {rust_value};\n"));
+        }
+        "add" => {
+            if wrapping {
+                out.push_str(&format!(
+                    "{indent}s.{field} = s.{field}.wrapping_add({rust_value});\n"
+                ));
+            } else {
+                out.push_str(&format!(
+                    "{indent}match s.{field}.checked_add({rust_value}) {{\n\
+                     {indent}    Some(__v) => s.{field} = __v,\n\
+                     {indent}    None => return false,\n\
+                     {indent}}}\n"
+                ));
+            }
+        }
+        "add_sat" => {
+            out.push_str(&format!(
+                "{indent}s.{field} = s.{field}.saturating_add({rust_value});\n"
+            ));
+        }
+        "add_wrap" => {
+            out.push_str(&format!(
+                "{indent}s.{field} = s.{field}.wrapping_add({rust_value});\n"
+            ));
+        }
+        "sub" => {
+            if wrapping {
+                out.push_str(&format!(
+                    "{indent}s.{field} = s.{field}.wrapping_sub({rust_value});\n"
+                ));
+            } else {
+                out.push_str(&format!(
+                    "{indent}match s.{field}.checked_sub({rust_value}) {{\n\
+                     {indent}    Some(__v) => s.{field} = __v,\n\
+                     {indent}    None => return false,\n\
+                     {indent}}}\n"
+                ));
+            }
+        }
+        "sub_sat" => {
+            out.push_str(&format!(
+                "{indent}s.{field} = s.{field}.saturating_sub({rust_value});\n"
+            ));
+        }
+        "sub_wrap" => {
+            out.push_str(&format!(
+                "{indent}s.{field} = s.{field}.wrapping_sub({rust_value});\n"
+            ));
+        }
+        _ => {
+            out.push_str(&format!(
+                "{indent}// unknown effect: {field} {op_kind} {value}\n"
+            ));
+        }
+    }
+}
+
 /// Verify that every field referenced as an effect target in any handler is
 /// declared somewhere in the state schema — either `state_fields` (flat) or
 /// one of the per-account `account_types[*].fields` (multi-account) or any
@@ -602,6 +678,22 @@ pub fn emit_state_struct(
     map_type_fn: impl Fn(&str) -> anyhow::Result<String>,
     spec: &crate::check::ParsedSpec,
 ) -> anyhow::Result<()> {
+    // v2.20 §S1.3 belt-and-suspenders: the P6
+    // `pubkey_state_field_unsupported` lint at `check.rs` is the user-facing
+    // gate; if a Pubkey field reaches this emitter, that lint was bypassed
+    // (e.g. `--no-check` or a buggy adapter path) and we'd otherwise produce
+    // a State struct that silently drops the field while handler bodies still
+    // reference it. Fail loud instead of generating broken Rust. Option B
+    // (lower Pubkey to `[u8; 32]`) is v2.21 work; until then this branch is
+    // unreachable through the normal pipeline.
+    if let Some((fname, _)) = fields.iter().find(|(_, t)| t == "Pubkey") {
+        return Err(anyhow::anyhow!(
+            "emit_state_struct: Pubkey field '{}' reached the emitter — \
+             P6 lint should have caught this at `qedgen check` time. \
+             See docs/limitations.md#pubkey-state-fields for the workaround.",
+            fname
+        ));
+    }
     out.push_str(&format!("#[derive({})]\n", derives));
     out.push_str("struct State {\n");
     for (fname, ftype) in fields {
@@ -809,71 +901,48 @@ pub fn emit_transition_fn(
     // identity is validated by the Anchor accounts struct at handler
     // entry, not in the random-state machine. Matches v2.11 brownfield
     // findings on token-fundraiser.
-    for (field, op_kind, value) in &op.effects {
-        if field_type_is_pubkey(field, op, spec) {
-            continue;
+    // v2.20 §S1.2: when the spec uses `match` inside `effect { … }`, the
+    // adapter populates `op.effect_branches` and `op.effects` carries the
+    // *union* of every arm's effects (for back-compat with pre-v2.20
+    // readers). Emit a real Rust `match` block from `effect_branches`
+    // when present; otherwise fall through to the flat list as before.
+    if let Some(branches) = &op.effect_branches {
+        out.push_str(&format!("    match {} {{\n", branches.scrutinee_rust));
+        let has_wildcard = branches.arms.iter().any(|a| a.is_wildcard);
+        for arm in &branches.arms {
+            out.push_str(&format!("        {} => {{\n", arm.pattern_rust));
+            for (field, op_kind, value) in &arm.effects {
+                if field_type_is_pubkey(field, op, spec) {
+                    continue;
+                }
+                emit_one_effect(
+                    out,
+                    op,
+                    spec,
+                    wrapping,
+                    field,
+                    op_kind,
+                    value,
+                    "            ",
+                );
+            }
+            out.push_str("        }\n");
         }
-        let rust_value = resolve_value(value, op, spec);
-        match op_kind.as_str() {
-            "set" => {
-                out.push_str(&format!("    s.{} = {};\n", field, rust_value));
+        if !has_wildcard {
+            // Without a `_` arm Rust requires exhaustive match. Spec
+            // patterns are literal-only in v2.20, so we synthesize a
+            // wildcard that no-ops — codegen guarantees the harness
+            // compiles even if the spec author forgot the catch-all.
+            // The drift hash still records the spec's actual arms.
+            out.push_str("        _ => {}\n");
+        }
+        out.push_str("    }\n");
+    } else {
+        for (field, op_kind, value) in &op.effects {
+            if field_type_is_pubkey(field, op, spec) {
+                continue;
             }
-            "add" => {
-                if wrapping {
-                    out.push_str(&format!(
-                        "    s.{} = s.{}.wrapping_add({});\n",
-                        field, field, rust_value
-                    ));
-                } else {
-                    out.push_str(&format!(
-                        "    match s.{}.checked_add({}) {{\n        Some(__v) => s.{} = __v,\n        None => return false,\n    }}\n",
-                        field, rust_value, field
-                    ));
-                }
-            }
-            "add_sat" => {
-                out.push_str(&format!(
-                    "    s.{} = s.{}.saturating_add({});\n",
-                    field, field, rust_value
-                ));
-            }
-            "add_wrap" => {
-                out.push_str(&format!(
-                    "    s.{} = s.{}.wrapping_add({});\n",
-                    field, field, rust_value
-                ));
-            }
-            "sub" => {
-                if wrapping {
-                    out.push_str(&format!(
-                        "    s.{} = s.{}.wrapping_sub({});\n",
-                        field, field, rust_value
-                    ));
-                } else {
-                    out.push_str(&format!(
-                        "    match s.{}.checked_sub({}) {{\n        Some(__v) => s.{} = __v,\n        None => return false,\n    }}\n",
-                        field, rust_value, field
-                    ));
-                }
-            }
-            "sub_sat" => {
-                out.push_str(&format!(
-                    "    s.{} = s.{}.saturating_sub({});\n",
-                    field, field, rust_value
-                ));
-            }
-            "sub_wrap" => {
-                out.push_str(&format!(
-                    "    s.{} = s.{}.wrapping_sub({});\n",
-                    field, field, rust_value
-                ));
-            }
-            _ => {
-                out.push_str(&format!(
-                    "    // unknown effect: {} {} {}\n",
-                    field, op_kind, value
-                ));
-            }
+            emit_one_effect(out, op, spec, wrapping, field, op_kind, value, "    ");
         }
     }
 

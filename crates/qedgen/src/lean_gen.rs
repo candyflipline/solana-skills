@@ -5500,6 +5500,7 @@ handler noop : State -> State {
             establishes: vec![],
             properties: vec![],
             calls: vec![],
+            effect_branches: None,
         };
         let constants = vec![("ZERO".to_string(), "0".to_string())];
         ws.apply(&handler, &[], &constants);

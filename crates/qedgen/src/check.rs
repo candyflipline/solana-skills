@@ -498,6 +498,36 @@ pub struct ParsedHandler {
     /// `[shape_only_cpi]` lint (slice 4).
     #[allow(dead_code)]
     pub calls: Vec<ParsedCall>,
+    /// v2.20 §S1.2 — structured conditional-effect tree. `None` for
+    /// unconditional handlers; `Some` when the spec uses `match` inside
+    /// `effect { … }`. The flat `effects` field still holds the union of
+    /// every arm's effects (for back-compat); this carries arm grouping.
+    pub effect_branches: Option<ParsedEffectBranches>,
+}
+
+/// v2.20 §S1.2 — IR form of a top-level `match` block inside `effect { … }`.
+#[derive(Debug, Clone)]
+pub struct ParsedEffectBranches {
+    /// Scrutinee expression rendered for Rust codegen.
+    pub scrutinee_rust: String,
+    /// Scrutinee expression rendered for Quasar/Pod targets. Held for
+    /// future consumers; the shared `emit_transition_fn` reads
+    /// `scrutinee_rust`. Pod codegen paths will swap to this.
+    #[allow(dead_code)]
+    pub scrutinee_rust_pod: String,
+    /// Scrutinee expression rendered for Lean.
+    pub scrutinee_lean: String,
+    pub arms: Vec<ParsedEffectArm>,
+}
+
+/// One arm of a `ParsedEffectBranches`.
+#[derive(Debug, Clone)]
+pub struct ParsedEffectArm {
+    pub pattern_rust: String,
+    pub pattern_lean: String,
+    /// `true` for a wildcard arm.
+    pub is_wildcard: bool,
+    pub effects: Vec<(String, String, String)>,
 }
 
 /// A resolved `call Target.handler(...)` site inside a handler body. The
@@ -2467,6 +2497,81 @@ pub fn check_completeness(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
             counterexample: None,
             fix_options: vec![],
         });
+    }
+
+    // P6 (v2.20 §S1.3): `Pubkey` state fields are silently elided from the
+    // generated `tests/proptest.rs`'s `struct State { … }` because
+    // `rust_codegen_util::mutable_fields` filters them out, while the
+    // handler bodies still reference them (`s.authority = authority`).
+    // The result: 13 compile errors on first `cargo test --test proptest`
+    // (rewards-feedback issue #2).
+    //
+    // Option A (PRD §S1.3 decision): lint-reject the shape with a pointer
+    // to the workaround. Option B (emit Pubkey as `[u8; 32]`) is v2.21
+    // work; until then P6 fires the moment a Pubkey field reaches the
+    // state schema.
+    //
+    // Scope: every place a Pubkey field can land as state —
+    //   - `account_types[*].fields`        (multi-account, structured)
+    //   - `sum_types[*].variants[*].fields`(ADT-as-state payload)
+    //   - `records[*].fields`              (record types referenced from
+    //                                       state; emitted into proptest
+    //                                       via the same map_type pipeline)
+    //
+    // `state_fields` is a flat mirror of the first account type's fields
+    // and is intentionally not scanned here to avoid double-firing.
+    {
+        let push_p6 = |warnings: &mut Vec<CompletenessWarning>, holder: &str, field: &str| {
+            warnings.push(CompletenessWarning {
+                rule: "pubkey_state_field_unsupported".to_string(),
+                severity: Severity::Warning,
+                priority: 1,
+                message: format!(
+                    "P6: Pubkey field '{}' in {} not supported by codegen — \
+                     replace with `[u8; 32]` or model authority as a parameter \
+                     (see docs/limitations.md#pubkey-state-fields)",
+                    field, holder,
+                ),
+                subject: Some(format!("{}.{}", holder, field)),
+                fix: format!(
+                    "Replace `{} : Pubkey` with `{} : [u8; 32]` (Pubkey's actual representation), \
+                     or move the value to a handler parameter so it never lives in state.",
+                    field, field,
+                ),
+                example: Some(format!(
+                    "  // instead of: type {0} of {{ {1} : Pubkey, ... }}\n  \
+                     type {0} of {{ {1} : [u8; 32], ... }}",
+                    holder, field
+                )),
+                counterexample: None,
+                fix_options: vec![],
+            });
+        };
+
+        for acct in &spec.account_types {
+            for (fname, ftype) in &acct.fields {
+                if ftype == "Pubkey" {
+                    push_p6(&mut warnings, &acct.name, fname);
+                }
+            }
+        }
+        for sum in &spec.sum_types {
+            for variant in &sum.variants {
+                for (fname, ftype) in &variant.fields {
+                    if ftype == "Pubkey" {
+                        let holder = format!("{}.{}", sum.name, variant.name);
+                        push_p6(&mut warnings, &holder, fname);
+                    }
+                }
+            }
+        }
+        for rec in &spec.records {
+            for (fname, ftype) in &rec.fields {
+                if ftype == "Pubkey" {
+                    push_p6(&mut warnings, &rec.name, fname);
+                }
+            }
+        }
     }
 
     // Rule 7: takes params (U64) with no guard — suggest input validation
@@ -4728,6 +4833,7 @@ mod tests {
             establishes: vec![],
             properties: vec![],
             calls: vec![],
+            effect_branches: None,
         }
     }
 
@@ -5206,15 +5312,22 @@ mod tests {
         let spec =
             crate::chumsky_adapter::parse_str(spec_content).expect("escrow.qedspec should parse");
         let warnings = check_completeness(&spec);
-        // A well-formed spec should have zero warnings
+        // A well-formed spec should have zero warnings — modulo
+        // `pubkey_state_field_unsupported` (v2.20 §S1.3 P6 lint). The
+        // escrow example's State.Open variant has 4 Pubkey identity
+        // fields that codegen silently elides today; the lint correctly
+        // flags them. Migrating escrow to a Bytes32-shaped type is
+        // grammar-blocked (no array type in qedspec today) — both the
+        // lint workaround and the example migration are v2.21 work.
         let warning_rules: Vec<&str> = warnings
             .iter()
             .filter(|w| w.severity == Severity::Warning)
+            .filter(|w| w.rule != "pubkey_state_field_unsupported")
             .map(|w| w.rule.as_str())
             .collect();
         assert!(
             warning_rules.is_empty(),
-            "escrow.qedspec should be clean but got warnings: {:?}",
+            "escrow.qedspec should be clean (modulo known P6) but got warnings: {:?}",
             warning_rules
         );
     }
@@ -6777,6 +6890,120 @@ handler bump : State.Active -> State.Active {
         assert!(
             !warnings.iter().any(|w| w.rule == "invariant_no_body"),
             "real expr body should suppress: {warnings:#?}"
+        );
+    }
+
+    // ── P6: pubkey_state_field_unsupported (v2.20 §S1.3) ─────────────────
+    //
+    // The bug: pre-v2.20, a State carrying `authority : Pubkey` had that
+    // field silently dropped from the proptest struct while handler bodies
+    // still referenced it — 13 compile errors on `cargo test --test
+    // proptest`. P6 lint-rejects the shape with a workaround pointer so
+    // the user sees the constraint at `qedgen check` time, not at compile
+    // time. Option B (`Pubkey` → `[u8; 32]` lowering) is v2.21.
+
+    #[test]
+    fn pubkey_state_field_lint_fires_on_account_type() {
+        let spec = crate::chumsky_adapter::parse_str(
+            r#"spec PubkeyState
+type State
+  | Active of {
+      authority : Pubkey,
+      balance : U64,
+    }
+handler h : State.Active -> State.Active {
+  permissionless
+  effect { balance += 1 }
+}
+"#,
+        )
+        .expect("fixture should parse");
+        let warnings = check_completeness(&spec);
+        let hits: Vec<_> = warnings
+            .iter()
+            .filter(|w| w.rule == "pubkey_state_field_unsupported")
+            .collect();
+        assert_eq!(hits.len(), 1, "expected exactly one P6 hit: {hits:#?}");
+        let w = hits[0];
+        assert!(
+            w.message.contains("P6:") && w.message.contains("'authority'"),
+            "message must cite P6 and name the field: {}",
+            w.message
+        );
+        assert!(
+            w.message
+                .contains("docs/limitations.md#pubkey-state-fields"),
+            "message must point at the workaround doc: {}",
+            w.message
+        );
+        assert_eq!(w.priority, 1, "P6 is a P1 lint");
+        assert_eq!(w.severity, Severity::Warning);
+    }
+
+    #[test]
+    fn pubkey_state_field_lint_silent_without_pubkey_field() {
+        // Control: no Pubkey field in state → no P6.
+        let spec = crate::chumsky_adapter::parse_str(
+            r#"spec NoPubkey
+type State | Active of { balance : U64 }
+handler bump : State.Active -> State.Active {
+  permissionless
+  effect { balance += 1 }
+}
+"#,
+        )
+        .expect("fixture should parse");
+        let warnings = check_completeness(&spec);
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.rule == "pubkey_state_field_unsupported"),
+            "no Pubkey field → no P6, got: {warnings:#?}"
+        );
+    }
+
+    #[test]
+    fn pubkey_state_field_lint_fires_per_field() {
+        // Two Pubkey fields → two P6 lints, each naming its specific
+        // field. The non-Pubkey `balance` must not appear in any hit's
+        // subject. This pins field-scoped reporting (mirrors how
+        // `wrapping_arithmetic` fires per-op).
+        let spec = crate::chumsky_adapter::parse_str(
+            r#"spec PubkeyMulti
+type State
+  | Active of {
+      authority : Pubkey,
+      mint : Pubkey,
+      balance : U64,
+    }
+handler h : State.Active -> State.Active {
+  permissionless
+  effect { balance += 1 }
+}
+"#,
+        )
+        .expect("fixture should parse");
+        let warnings = check_completeness(&spec);
+        let hits: Vec<_> = warnings
+            .iter()
+            .filter(|w| w.rule == "pubkey_state_field_unsupported")
+            .collect();
+        assert_eq!(hits.len(), 2, "expected two P6 hits: {hits:#?}");
+        let subjects: Vec<&str> = hits
+            .iter()
+            .map(|w| w.subject.as_deref().unwrap_or(""))
+            .collect();
+        assert!(
+            subjects.iter().any(|s| s.ends_with(".authority")),
+            "must name authority: {subjects:?}"
+        );
+        assert!(
+            subjects.iter().any(|s| s.ends_with(".mint")),
+            "must name mint: {subjects:?}"
+        );
+        assert!(
+            !subjects.iter().any(|s| s.ends_with(".balance")),
+            "must NOT name balance: {subjects:?}"
         );
     }
 }

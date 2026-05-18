@@ -1621,6 +1621,7 @@ mod tests {
             establishes: vec![],
             properties: vec![],
             calls: vec![],
+            effect_branches: None,
         }
     }
 

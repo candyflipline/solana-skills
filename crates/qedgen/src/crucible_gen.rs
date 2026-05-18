@@ -777,6 +777,7 @@ handler increment : State.Active -> State.Active {
             establishes: vec![],
             properties: vec![],
             calls: vec![],
+            effect_branches: None,
         }
     }
 

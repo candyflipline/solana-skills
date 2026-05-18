@@ -90,6 +90,64 @@ a property.
 
 ---
 
+## Pubkey state fields (v2.20 §S1.3)
+
+`Pubkey`-typed state fields are not supported by v2.20 codegen. Declaring
+one on a State type produces the P6
+`pubkey_state_field_unsupported` lint at `qedgen check` time.
+
+```
+type State
+  | Active of {
+      authority : Pubkey,   // ← P6
+      balance   : U64,
+    }
+```
+
+**Why it fails:** the proptest harness generator filters Pubkey fields
+out of the generated `struct State { ... }` (no clean `proptest::Arbitrary`
+lowering for `Pubkey` in the current pipeline), while handler bodies still
+emit `s.authority = authority`. Net effect: a generated `tests/proptest.rs`
+that doesn't compile (`no field 'authority' on State`).
+
+**Workaround — two options.** Pick whichever fits the property you're
+trying to verify:
+
+1. **Replace with `[u8; 32]`** — `Pubkey`'s on-chain representation. Kani
+   and proptest can both enumerate symbolic 32-byte arrays, so the field
+   stays in state and downstream `s.authority == admin` comparisons work
+   unchanged.
+
+   ```
+   type State
+     | Active of {
+         authority : [u8; 32],
+         balance   : U64,
+       }
+   ```
+
+2. **Model the value as a handler parameter** instead of state. If the
+   pubkey doesn't need to persist across calls — e.g. a one-shot admin
+   check at handler entry — pass it as a parameter rather than storing
+   it.
+
+   ```
+   handler set_admin (new_admin : Pubkey) : State.Active -> State.Active {
+     // Pubkey-as-parameter is supported; the elision bug is state-only.
+     // No state field needed.
+   }
+   ```
+
+   `Pubkey`-typed handler parameters are accepted by `qedgen check` and
+   codegen; the constraint is specifically on `field : Pubkey` inside
+   declared state.
+
+**What v2.21 may change:** Option B of the S1.3 ADR — lower `Pubkey` state
+fields to `[u8; 32]` in the generated structs automatically — is the
+follow-up. Until then, P6 is the user-visible gate.
+
+---
+
 ## Past limitations (lifted)
 
 - **`forall` over wider-than-U8 binder types verified vacuously** —
