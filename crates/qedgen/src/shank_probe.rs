@@ -224,10 +224,8 @@ fn relative_path(file: &Path, project_root: &Path) -> String {
 fn find_process_instruction(items: &[Item]) -> Option<&ItemFn> {
     for item in items {
         match item {
-            Item::Fn(f) => {
-                if is_process_instruction_signature(f) {
-                    return Some(f);
-                }
+            Item::Fn(f) if is_process_instruction_signature(f) => {
+                return Some(f);
             }
             // Some programs declare `impl Processor { pub fn process(...) }`.
             // We don't currently recognise that shape — `process_instruction`
