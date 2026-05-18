@@ -1,0 +1,12 @@
+[package]
+name = "shank-dispatcher-fixture"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Synthesised fixture for `qedgen probe --bootstrap` Shank-shape detection
+# (v2.20 §S2.1). Not built as part of the workspace (would pull in the full
+# Solana toolchain); parsed via `syn::parse_file` only.
+
+[dependencies]
+solana-program = "1.18"

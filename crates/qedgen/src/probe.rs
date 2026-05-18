@@ -360,12 +360,29 @@ pub enum Runtime {
 
 /// One discovered handler in bootstrap (spec-less) mode. Auditor reads
 /// `source_file` to investigate per-handler categories.
+///
+/// v2.20 §S2.1 added Shank-dispatcher fields (`enum_variant`,
+/// `entry_fn`, `line`). They're optional + `omitempty` so Anchor / IDL
+/// consumers see no change — the fields appear only when the
+/// dispatcher is Shank-shape.
 #[derive(Debug, Clone, Serialize)]
 pub struct BootstrapHandler {
     pub name: String,
     /// Path to the source file containing the handler, relative to
     /// `project_root` if possible. Auditor uses this for Read tool dispatch.
     pub source_file: String,
+    /// Full enum-path string from the dispatch arm pattern, e.g.
+    /// `MarketInstruction::InitializeMarket`. Shank dispatcher only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enum_variant: Option<String>,
+    /// Terminal `process_*` callee name extracted from the arm body,
+    /// e.g. `process_initialize_market`. Shank dispatcher only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry_fn: Option<String>,
+    /// 1-indexed line of the arm in the dispatcher file. Shank
+    /// dispatcher only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -420,6 +437,12 @@ pub struct ProbeOutput {
     /// auditor subagent reads these to drive the scaffold-to-spec interview.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub clusters: Option<Vec<crate::cluster::Cluster>>,
+    /// v2.20 §S2.1: structural shape of the native dispatcher when one
+    /// was detected. Currently only `"shank_central_match"` is emitted;
+    /// other runtime backings (Anchor IDL, Pinocchio probe, etc.) leave
+    /// this field absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dispatcher_kind: Option<String>,
 }
 
 pub fn run_probe(spec_path: &Path) -> Result<ProbeOutput> {
@@ -473,6 +496,7 @@ pub fn run_probe(spec_path: &Path) -> Result<ProbeOutput> {
         applicable_categories: None,
         findings,
         clusters: None,
+        dispatcher_kind: None,
     })
 }
 
@@ -499,14 +523,36 @@ pub fn run_bootstrap(project_root: &Path) -> Result<ProbeOutput> {
     }
 
     let runtime = detect_runtime(project_root);
-    let handlers = match runtime {
+    let (handlers, dispatcher_kind) = match runtime {
         // Quasar's `#[program] mod` form is structurally compatible with
         // the Anchor parser — `#[instruction(discriminator = N)]` is an
         // extra attribute that doesn't disturb `pub fn` extraction.
-        Runtime::Anchor | Runtime::Quasar | Runtime::QedgenCodegen => {
-            discover_anchor_handlers(project_root).unwrap_or_default()
-        }
-        _ => Vec::new(),
+        Runtime::Anchor | Runtime::Quasar | Runtime::QedgenCodegen => (
+            discover_anchor_handlers(project_root).unwrap_or_default(),
+            None,
+        ),
+        // v2.20 §S2.1: native programs may concentrate dispatch in a
+        // top-level `process_instruction` central match. Try the
+        // Shank-shape detector first; on no-match, fall back to an
+        // empty handler list (auditor walks source directly, as before).
+        Runtime::Native => match crate::shank_probe::detect_shank_dispatcher(project_root) {
+            Ok(Some(cat)) => {
+                let h: Vec<BootstrapHandler> = cat
+                    .handlers
+                    .into_iter()
+                    .map(|sh| BootstrapHandler {
+                        name: sh.name,
+                        source_file: sh.file,
+                        enum_variant: Some(sh.enum_variant),
+                        entry_fn: Some(sh.entry_fn),
+                        line: Some(sh.line),
+                    })
+                    .collect();
+                (h, Some("shank_central_match".to_string()))
+            }
+            _ => (Vec::new(), None),
+        },
+        _ => (Vec::new(), None),
     };
     let applicable = applicable_categories(&runtime);
 
@@ -520,6 +566,7 @@ pub fn run_bootstrap(project_root: &Path) -> Result<ProbeOutput> {
         applicable_categories: Some(applicable),
         findings: Vec::new(),
         clusters: None,
+        dispatcher_kind,
     })
 }
 
@@ -696,6 +743,9 @@ fn single_crate_handlers(crate_root: &Path, project_root: &Path) -> Result<Vec<B
         .map(|ix| BootstrapHandler {
             name: ix.name,
             source_file: lib_path.clone(),
+            enum_variant: None,
+            entry_fn: None,
+            line: None,
         })
         .collect())
 }

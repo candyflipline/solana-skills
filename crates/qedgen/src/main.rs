@@ -47,6 +47,7 @@ mod reconcile;
 mod regen_drift;
 mod rust_codegen_util;
 mod sbpf_verify;
+mod shank_probe;
 mod spec_hash;
 mod unit_test;
 mod upstream_check;
@@ -1324,6 +1325,7 @@ fn run_anchor_probe(
         applicable_categories: Some(applicable),
         findings: Vec::new(),
         clusters,
+        dispatcher_kind: None,
     };
     println!("{}", serde_json::to_string_pretty(&output)?);
     Ok(())
@@ -1368,16 +1370,42 @@ fn run_native_probe(
         eprintln!("Wrote audit working set to {}", dir.display());
     }
 
+    // v2.20 §S2.1: also try Shank-shape central-match dispatcher on
+    // the native `--program` path. The richer envelope (handlers +
+    // dispatcher_kind) is purely additive; absent detection leaves the
+    // path unchanged.
+    let (handlers, dispatcher_kind) = match shank_probe::detect_shank_dispatcher(prog_root)
+        .ok()
+        .flatten()
+    {
+        Some(cat) => {
+            let hs: Vec<probe::BootstrapHandler> = cat
+                .handlers
+                .into_iter()
+                .map(|sh| probe::BootstrapHandler {
+                    name: sh.name,
+                    source_file: sh.file,
+                    enum_variant: Some(sh.enum_variant),
+                    entry_fn: Some(sh.entry_fn),
+                    line: Some(sh.line),
+                })
+                .collect();
+            (Some(hs), Some("shank_central_match".to_string()))
+        }
+        None => (None, None),
+    };
+
     let output = probe::ProbeOutput {
         version: probe::schema_version(),
         mode: probe::Mode::SpecLess,
         spec_path: None,
         project_root: Some(prog_root.display().to_string()),
         runtime: Some(runtime_final),
-        handlers: None,
+        handlers,
         applicable_categories: Some(applicable),
         findings: Vec::new(),
         clusters,
+        dispatcher_kind,
     };
     println!("{}", serde_json::to_string_pretty(&output)?);
     Ok(())
@@ -1682,6 +1710,7 @@ async fn main() -> Result<()> {
                     )),
                     findings,
                     clusters,
+                    dispatcher_kind: None,
                 };
                 // Top-level envelope: include the raw catalogue so the
                 // subagent has both `findings[]` (per-site mapped) and
@@ -1753,6 +1782,7 @@ async fn main() -> Result<()> {
                     applicable_categories: None,
                     findings,
                     clusters: None,
+                    dispatcher_kind: None,
                 };
                 println!("{}", serde_json::to_string_pretty(&output)?);
                 return Ok(());

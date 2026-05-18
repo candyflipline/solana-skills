@@ -380,68 +380,101 @@ MEDIUM and below: a repro is encouraged but not required.
       style nits) don't have a clean state-corruption witness; ship
       them with the structural narrative.
 
-6. **Scaffold-to-spec interview** (v2.19 — replaces the silent scaffold).
-   For spec-less brownfield audits, drive the user through a markdown
-   interview that ratifies candidate spec clauses before emitting the
-   `.qedspec`. Yields a higher-quality spec than the silent scaffold and
-   captures rejected/bug-flagged decisions for the audit trail.
+6. **Run the audit as Phase 1 → Phase 2 → Phase 3, with no consent walls
+   until value has been delivered.** (v2.20 — replaces the v2.19
+   file-driven scaffold-to-spec interview.)
 
-   a) **Probe with `--emit-spec-candidates`** to materialize the audit
-      working set:
-      ```bash
-      qedgen probe --program <root> --emit-spec-candidates \
-        --audit-dir .qed/audit/<timestamp>
-      ```
-      Writes three files to the audit dir:
-      - `interview.md` — markdown checkboxes, one section per cluster
-      - `clusters.json` — full schema-v3 envelope with cluster metadata
-      - `skeleton.qedspec` — structural skeleton (handler stubs only)
+   The operational metric is **time-to-first-reproducible MED+ finding**.
+   The first fired repro is the value-transfer event that buys the agent
+   more user time. Race to it; surface findings event-driven as they
+   fire; never batch.
 
-   b) **Surface the interview to the user.** Read `interview.md` and
-      summarize the clusters in the digest — number of clusters,
-      confidence band, target handlers. Pause for the user to edit the
-      file by checking one option per cluster (`[x]`). They can choose
-      `accept` / `narrow` / `reject` / `bug` and optionally add notes.
+   ### Phase 1 — autonomous discovery (no user prompts)
 
-   c) **Ratify** when the user confirms the interview is complete:
-      ```bash
-      qedgen ratify --audit-dir .qed/audit/<timestamp> \
-        --out <program>.qedspec
-      ```
-      Writes:
-      - `<program>.qedspec` — skeleton + ratified clauses merged into
-        the appropriate handler bodies / top-level invariants
-      - `.qed/plan/scoping.md` — rejected clusters with user rationale
-      - `.qed/findings/scaffold-to-spec-<id>.md` — one file per
-        bug-flagged cluster (the user identified the implicit
-        precondition as a real missing-enforcement bug)
+   Two concurrent producers + one event-driven presentation rule:
 
-   d) **Confirm the spec parses.** Run `qedgen check --spec
-      <program>.qedspec` after ratification. P1 lints on placeholder
-      handler stubs are expected (handler bodies still need real
-      `requires` / `effect` clauses); zero parse errors is the gate.
+   - **Producer A — probe-driven discovery.** `qedgen probe` enumerates
+     sites on every supported runtime adapter (Pinocchio, Anchor,
+     native-Shank). Agent emits repros in parallel (multiple structured-
+     prompt outputs per message; multiple `cargo test` invocations
+     under one `run_in_background` Bash call). Internal ordering by
+     time-to-fire: Mollusk (≈30s, parallel) → Miri (3-5 min, background)
+     → Crucible (minutes to hours, background, requires skeleton spec).
+     See [probe orchestration runbook](references/probe_orchestration.md).
 
-   The interview is **harness-agnostic** — it's file-driven (Write +
-   Read), not interactive prompts. Codex/Cursor/Windsurf handle it
-   identically to Claude Code. The user can answer questions across
-   multiple sessions; unchecked clusters stay deferred.
+   - **Producer B — read-driven discovery.** §3c trust-surface walk,
+     intent-drift sweep, authority × invariant matrix. Producer B also
+     hypothesizes internal intent (invariants / state machine /
+     authority graph / threat model) from code + comments + docstrings
+     *without* prompting the user — these hypotheses feed Phase 2.
+     Long-running probe phases go to background; B continues foreground.
 
-   **When to use the interview vs the legacy silent scaffold:**
-   - Spec-less brownfield + clusters present → run the interview.
-   - Spec-aware mode (`.qedspec` already exists) → skip; the spec
-     drives the audit directly.
-   - Runtimes the extractor doesn't cover yet (sBPF, exotic) → fall
-     back to the legacy silent scaffold (`qedgen spec --idl <path>`
-     for Anchor with IDL, or hand-walk source).
+   - **Event-driven surface.** The instant any MED+ repro fires:
+     surface immediately ("Found <category>: <one-line>. Repro at
+     <path>. Continuing."). No batching. No draft report.
 
-   Other artifact emission (unchanged from earlier versions):
+   The probe→skeleton→Crucible auto-chain (closes the gap that v2.19
+   couldn't fire Crucible on brownfield audits) lives in the
+   orchestration runbook — agent auto-ratifies *high-confidence*
+   clusters into a skeleton spec without user interaction, then
+   invokes `qedgen probe --fuzz <budget> --spec <skeleton>`.
+
+   See [workflow walkthrough](references/workflow_walkthrough.md) for
+   a timestamped end-to-end example.
+
+   ### Phase 2 — post-first-finding interview (Claude Code TUI primary)
+
+   Triggered automatically by the first MED+ surface, OR by Phase 1
+   completing dry (framed: "Phase 1 didn't find a fired vuln; deepening
+   needs your input on intent.").
+
+   Four `AskUserQuestion` batches present Phase 1's internal
+   hypotheses as ratification candidates:
+
+   1. **Invariants** (multi-select, agent-derived candidates + Other,
+      `preview` field per option showing the inferred-from code excerpt)
+   2. **State machine shape** (single-select archetype, preview shows
+      struct + handler signatures)
+   3. **Authority graph** (multi-select role candidates from Signer
+      constraints / handler names)
+   4. **Threat scenarios + intentional gaps** (mixed single + multi-select)
+
+   See [interview examples](references/interview_examples.md) for
+   three worked transcripts.
+
+   **Harness fallback.** Harnesses without an `AskUserQuestion`-
+   equivalent fall back to the legacy v2.19 file-driven path
+   (`qedgen probe --emit-spec-candidates` → user edits `interview.md`
+   → `qedgen ratify`). Claude Code uses TUI; other harnesses use file.
+
+   ### Phase 3 — refined second wave
+
+   Producer A re-prioritizes probes against ratified invariants.
+   Producer B deepens intent-drift / authority sweeps with ratified
+   authority graph. Same event-driven surfacing. Stop on user signal,
+   budget exhaustion, or N consecutive units of work without a new
+   finding.
+
+   ### Spec-aware mode (when `.qedspec` already exists)
+
+   Skip Phase 2's interview — the spec is the ratified intent. Phase
+   1's Producer B uses the spec for invariants directly; auto-chain
+   step skipped (use the existing spec, not a synthesized skeleton).
+   Phase 3 continues.
+
+   ### Runtimes the extractor doesn't cover yet (sBPF, exotic)
+
+   Fall back to the legacy silent scaffold or hand-walk the source
+   (`qedgen spec --idl <path>` for Anchor with IDL).
+
+   ### Artifact emission
+
    - Write the full audit report to `.qed/findings/audit-<timestamp>.md`.
-   - Write `.qed/probe-suppress.toml` for auto-detected false-positives.
+   - Write `.qed/probe-suppress.toml` for auto-detected false positives.
    - Reproducers live under `target/qedgen-repros/audit/<finding-id>.rs`
-     (ephemeral). Don't commit them.
+     (ephemeral; don't commit).
    - **Don't** silently generate Lean / Kani / proptest. Those are
-     opt-in heavy artifacts that the user invokes explicitly via
-     `qedgen codegen`.
+     opt-in heavy artifacts the user invokes via `qedgen codegen`.
 
 7. **Return a vulnerability-first digest.** Real findings first
    (CRIT → HIGH → MED), then spec-gap suggestions, then suppressed
@@ -1465,6 +1498,13 @@ verification claim.
   that enforces it.
 
 ## Cluster taxonomy (scaffold-to-spec interview)
+
+*In v2.20, this taxonomy is a **Phase-2 fallback only** — surfaced as
+cluster cards for sites whose intent the four-question ratification
+didn't already classify. Most sites collapse automatically once
+invariants / state machine / authority graph are ratified. See
+[interview examples](references/interview_examples.md) for the
+primary TUI-based flow.*
 
 The interview groups probe findings by **cluster kind** — 14 categories
 that map detected site shapes to candidate spec clauses. Each kind has
