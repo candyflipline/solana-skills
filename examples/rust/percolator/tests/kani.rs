@@ -68,6 +68,12 @@ fn account_solvent(_s: &State) -> bool {
     true
 }
 
+/// account_solvent: per-slot check at `i: AccountIdx` (v2.20 forall lowering)
+#[allow(unused_variables)]
+fn account_solvent_at(s: &State, i: usize) -> bool {
+    (!(s.accounts[(i) as usize].active == 1)) || (((s.accounts[(i) as usize].capital) as i128) + s.accounts[(i) as usize].pnl >= ((0) as i128))
+}
+
 // ============================================================================
 // Transition functions (from qedspec operations — effects + guards)
 //
@@ -1034,11 +1040,11 @@ fn verify_add_user_preserves_account_solvent() {
     kani::assume(s.status == Status::Active);
     kani::assume(conservation(&s));
     kani::assume(vault_bounded(&s));
-    kani::assume(account_solvent(&s));
+    kani::assume(account_solvent_at(&s, i));
     let i: usize = kani::any();
     if add_user(&mut s, i) {
-        assert!(account_solvent(&s),
-            "account_solvent must hold after add_user");
+        assert!(account_solvent_at(&s, i),
+            "account_solvent must hold after add_user (forall i : AccountIdx)");
     }
 }
 
@@ -1056,11 +1062,11 @@ fn verify_add_lp_preserves_account_solvent() {
     kani::assume(s.status == Status::Active);
     kani::assume(conservation(&s));
     kani::assume(vault_bounded(&s));
-    kani::assume(account_solvent(&s));
+    kani::assume(account_solvent_at(&s, i));
     let i: usize = kani::any();
     if add_lp(&mut s, i) {
-        assert!(account_solvent(&s),
-            "account_solvent must hold after add_lp");
+        assert!(account_solvent_at(&s, i),
+            "account_solvent must hold after add_lp (forall i : AccountIdx)");
     }
 }
 
@@ -1078,11 +1084,11 @@ fn verify_reclaim_empty_account_preserves_account_solvent() {
     kani::assume(s.status == Status::Active);
     kani::assume(conservation(&s));
     kani::assume(vault_bounded(&s));
-    kani::assume(account_solvent(&s));
+    kani::assume(account_solvent_at(&s, i));
     let i: usize = kani::any();
     if reclaim_empty_account(&mut s, i) {
-        assert!(account_solvent(&s),
-            "account_solvent must hold after reclaim_empty_account");
+        assert!(account_solvent_at(&s, i),
+            "account_solvent must hold after reclaim_empty_account (forall i : AccountIdx)");
     }
 }
 
@@ -1100,11 +1106,11 @@ fn verify_close_account_preserves_account_solvent() {
     kani::assume(s.status == Status::Active);
     kani::assume(conservation(&s));
     kani::assume(vault_bounded(&s));
-    kani::assume(account_solvent(&s));
+    kani::assume(account_solvent_at(&s, i));
     let i: usize = kani::any();
     if close_account(&mut s, i) {
-        assert!(account_solvent(&s),
-            "account_solvent must hold after close_account");
+        assert!(account_solvent_at(&s, i),
+            "account_solvent must hold after close_account (forall i : AccountIdx)");
     }
 }
 
@@ -1122,12 +1128,12 @@ fn verify_deposit_preserves_account_solvent() {
     kani::assume(s.status == Status::Active);
     kani::assume(conservation(&s));
     kani::assume(vault_bounded(&s));
-    kani::assume(account_solvent(&s));
+    kani::assume(account_solvent_at(&s, i));
     let i: usize = kani::any();
     let amount: u128 = kani::any();
     if deposit(&mut s, i, amount) {
-        assert!(account_solvent(&s),
-            "account_solvent must hold after deposit");
+        assert!(account_solvent_at(&s, i),
+            "account_solvent must hold after deposit (forall i : AccountIdx)");
     }
 }
 
@@ -1145,12 +1151,12 @@ fn verify_withdraw_preserves_account_solvent() {
     kani::assume(s.status == Status::Active);
     kani::assume(conservation(&s));
     kani::assume(vault_bounded(&s));
-    kani::assume(account_solvent(&s));
+    kani::assume(account_solvent_at(&s, i));
     let i: usize = kani::any();
     let amount: u128 = kani::any();
     if withdraw(&mut s, i, amount) {
-        assert!(account_solvent(&s),
-            "account_solvent must hold after withdraw");
+        assert!(account_solvent_at(&s, i),
+            "account_solvent must hold after withdraw (forall i : AccountIdx)");
     }
 }
 
@@ -1166,13 +1172,14 @@ fn verify_top_up_insurance_preserves_account_solvent() {
         status: kani::any(),
     };
     kani::assume(s.status == Status::Active);
+    let i: usize = kani::any();
     kani::assume(conservation(&s));
     kani::assume(vault_bounded(&s));
-    kani::assume(account_solvent(&s));
+    kani::assume(account_solvent_at(&s, i));
     let amount: u128 = kani::any();
     if top_up_insurance(&mut s, amount) {
-        assert!(account_solvent(&s),
-            "account_solvent must hold after top_up_insurance");
+        assert!(account_solvent_at(&s, i),
+            "account_solvent must hold after top_up_insurance (forall i : AccountIdx)");
     }
 }
 
@@ -1190,12 +1197,12 @@ fn verify_deposit_fee_credits_preserves_account_solvent() {
     kani::assume(s.status == Status::Active);
     kani::assume(conservation(&s));
     kani::assume(vault_bounded(&s));
-    kani::assume(account_solvent(&s));
+    kani::assume(account_solvent_at(&s, i));
     let i: usize = kani::any();
     let amount: u128 = kani::any();
     if deposit_fee_credits(&mut s, i, amount) {
-        assert!(account_solvent(&s),
-            "account_solvent must hold after deposit_fee_credits");
+        assert!(account_solvent_at(&s, i),
+            "account_solvent must hold after deposit_fee_credits (forall i : AccountIdx)");
     }
 }
 
@@ -1213,12 +1220,12 @@ fn verify_convert_released_pnl_preserves_account_solvent() {
     kani::assume(s.status == Status::Active);
     kani::assume(conservation(&s));
     kani::assume(vault_bounded(&s));
-    kani::assume(account_solvent(&s));
+    kani::assume(account_solvent_at(&s, i));
     let i: usize = kani::any();
     let x: u128 = kani::any();
     if convert_released_pnl(&mut s, i, x) {
-        assert!(account_solvent(&s),
-            "account_solvent must hold after convert_released_pnl");
+        assert!(account_solvent_at(&s, i),
+            "account_solvent must hold after convert_released_pnl (forall i : AccountIdx)");
     }
 }
 
@@ -1234,16 +1241,17 @@ fn verify_execute_trade_preserves_account_solvent() {
         status: kani::any(),
     };
     kani::assume(s.status == Status::Active);
+    let i: usize = kani::any();
     kani::assume(conservation(&s));
     kani::assume(vault_bounded(&s));
-    kani::assume(account_solvent(&s));
+    kani::assume(account_solvent_at(&s, i));
     let a: usize = kani::any();
     let b: usize = kani::any();
     let size_q: i128 = kani::any();
     let exec_price: u64 = kani::any();
     if execute_trade(&mut s, a, b, size_q, exec_price) {
-        assert!(account_solvent(&s),
-            "account_solvent must hold after execute_trade");
+        assert!(account_solvent_at(&s, i),
+            "account_solvent must hold after execute_trade (forall i : AccountIdx)");
     }
 }
 
@@ -1261,11 +1269,11 @@ fn verify_liquidate_case_0_preserves_account_solvent() {
     kani::assume(s.status == Status::Active);
     kani::assume(conservation(&s));
     kani::assume(vault_bounded(&s));
-    kani::assume(account_solvent(&s));
+    kani::assume(account_solvent_at(&s, i));
     let i: usize = kani::any();
     if liquidate_case_0(&mut s, i) {
-        assert!(account_solvent(&s),
-            "account_solvent must hold after liquidate_case_0");
+        assert!(account_solvent_at(&s, i),
+            "account_solvent must hold after liquidate_case_0 (forall i : AccountIdx)");
     }
 }
 
@@ -1283,11 +1291,11 @@ fn verify_liquidate_case_1_preserves_account_solvent() {
     kani::assume(s.status == Status::Active);
     kani::assume(conservation(&s));
     kani::assume(vault_bounded(&s));
-    kani::assume(account_solvent(&s));
+    kani::assume(account_solvent_at(&s, i));
     let i: usize = kani::any();
     if liquidate_case_1(&mut s, i) {
-        assert!(account_solvent(&s),
-            "account_solvent must hold after liquidate_case_1");
+        assert!(account_solvent_at(&s, i),
+            "account_solvent must hold after liquidate_case_1 (forall i : AccountIdx)");
     }
 }
 
@@ -1305,11 +1313,11 @@ fn verify_liquidate_otherwise_preserves_account_solvent() {
     kani::assume(s.status == Status::Active);
     kani::assume(conservation(&s));
     kani::assume(vault_bounded(&s));
-    kani::assume(account_solvent(&s));
+    kani::assume(account_solvent_at(&s, i));
     let i: usize = kani::any();
     if liquidate_otherwise(&mut s, i) {
-        assert!(account_solvent(&s),
-            "account_solvent must hold after liquidate_otherwise");
+        assert!(account_solvent_at(&s, i),
+            "account_solvent must hold after liquidate_otherwise (forall i : AccountIdx)");
     }
 }
 
@@ -1327,11 +1335,11 @@ fn verify_settle_account_preserves_account_solvent() {
     kani::assume(s.status == Status::Active);
     kani::assume(conservation(&s));
     kani::assume(vault_bounded(&s));
-    kani::assume(account_solvent(&s));
+    kani::assume(account_solvent_at(&s, i));
     let i: usize = kani::any();
     if settle_account(&mut s, i) {
-        assert!(account_solvent(&s),
-            "account_solvent must hold after settle_account");
+        assert!(account_solvent_at(&s, i),
+            "account_solvent must hold after settle_account (forall i : AccountIdx)");
     }
 }
 
@@ -1347,12 +1355,13 @@ fn verify_trigger_adl_preserves_account_solvent() {
         status: kani::any(),
     };
     kani::assume(s.status == Status::Active);
+    let i: usize = kani::any();
     kani::assume(conservation(&s));
     kani::assume(vault_bounded(&s));
-    kani::assume(account_solvent(&s));
+    kani::assume(account_solvent_at(&s, i));
     if trigger_adl(&mut s) {
-        assert!(account_solvent(&s),
-            "account_solvent must hold after trigger_adl");
+        assert!(account_solvent_at(&s, i),
+            "account_solvent must hold after trigger_adl (forall i : AccountIdx)");
     }
 }
 
@@ -1368,12 +1377,13 @@ fn verify_complete_drain_preserves_account_solvent() {
         status: kani::any(),
     };
     kani::assume(s.status == Status::Draining);
+    let i: usize = kani::any();
     kani::assume(conservation(&s));
     kani::assume(vault_bounded(&s));
-    kani::assume(account_solvent(&s));
+    kani::assume(account_solvent_at(&s, i));
     if complete_drain(&mut s) {
-        assert!(account_solvent(&s),
-            "account_solvent must hold after complete_drain");
+        assert!(account_solvent_at(&s, i),
+            "account_solvent must hold after complete_drain (forall i : AccountIdx)");
     }
 }
 
@@ -1389,12 +1399,13 @@ fn verify_reset_preserves_account_solvent() {
         status: kani::any(),
     };
     kani::assume(s.status == Status::Resetting);
+    let i: usize = kani::any();
     kani::assume(conservation(&s));
     kani::assume(vault_bounded(&s));
-    kani::assume(account_solvent(&s));
+    kani::assume(account_solvent_at(&s, i));
     if reset(&mut s) {
-        assert!(account_solvent(&s),
-            "account_solvent must hold after reset");
+        assert!(account_solvent_at(&s, i),
+            "account_solvent must hold after reset (forall i : AccountIdx)");
     }
 }
 
