@@ -393,6 +393,7 @@ fn locate_match_line(source: &str, scrutinee: &str) -> Option<u32> {
 /// `try_from_primitive` invocation) on something named `instruction_data`
 /// or a derivative slice.
 fn ident_derived_from_instruction_data(f: &ItemFn, ident: &str) -> bool {
+    // Fast path: direct let-binding traces straight to instruction_data.
     for stmt in &f.block.stmts {
         if let Stmt::Local(local) = stmt {
             if local_binds_ident(local, ident) {
@@ -404,7 +405,78 @@ fn ident_derived_from_instruction_data(f: &ItemFn, ident: &str) -> bool {
             }
         }
     }
-    false
+    // Transitive path (Phoenix-shape): `let (tag, _) =
+    // instruction_data.split_first()...;` followed by `let instruction =
+    // X::try_from(*tag)...;`. The matched ident traces to a `try_from*`-
+    // style call (or a similar enum-conversion macro) AND the same fn
+    // body has *some* let-binding traceable to instruction_data. We
+    // don't try to chase the full data-flow graph — accepting on this
+    // co-occurrence is conservative enough in practice (non-dispatcher
+    // fns rarely combine the two shapes) and correctly catches the
+    // canonical Shank/Phoenix layout.
+    let ident_bound_by_try_from = f.block.stmts.iter().any(|stmt| {
+        if let Stmt::Local(local) = stmt {
+            if local_binds_ident(local, ident) {
+                if let Some(init) = &local.init {
+                    return expr_contains_try_from_like_call(&init.expr);
+                }
+            }
+        }
+        false
+    });
+    let body_touches_instruction_data = f.block.stmts.iter().any(|stmt| {
+        if let Stmt::Local(local) = stmt {
+            if let Some(init) = &local.init {
+                return expr_traces_to_instruction_data(&init.expr);
+            }
+        }
+        false
+    });
+    ident_bound_by_try_from && body_touches_instruction_data
+}
+
+/// True when `expr` (recursively through `?`, paren, return, and method-
+/// chain receivers) contains a call whose callee path ends in a segment
+/// named `try_from` / `try_from_primitive` / `from_bytes` / `from`.
+/// Conservative on direction: we don't want to claim a dispatcher when
+/// the let-binding is unrelated, so we only accept the well-known
+/// instruction-discriminator conversion fn names.
+fn expr_contains_try_from_like_call(expr: &Expr) -> bool {
+    match expr {
+        Expr::Try(t) => expr_contains_try_from_like_call(&t.expr),
+        Expr::Paren(p) => expr_contains_try_from_like_call(&p.expr),
+        Expr::Return(r) => r
+            .expr
+            .as_deref()
+            .is_some_and(expr_contains_try_from_like_call),
+        Expr::MethodCall(mc) => {
+            // `X::try_from(tag).or(Err(...))` shape — the receiver is
+            // the call we care about; method args may also contain it.
+            expr_contains_try_from_like_call(&mc.receiver)
+                || mc.args.iter().any(expr_contains_try_from_like_call)
+        }
+        Expr::Call(c) => {
+            // Direct call: `X::try_from(...)`, `try_from_primitive!(...)`,
+            // `FromPrimitive::from_u8(...)`, etc. Inspect the callee path.
+            if let Expr::Path(p) = &*c.func {
+                if let Some(last) = p.path.segments.last() {
+                    let name = last.ident.to_string();
+                    if matches!(
+                        name.as_str(),
+                        "try_from" | "try_from_primitive" | "from_bytes" | "from"
+                    ) {
+                        return true;
+                    }
+                }
+            }
+            c.args.iter().any(expr_contains_try_from_like_call)
+        }
+        Expr::Macro(m) => {
+            let toks = m.mac.tokens.to_string();
+            toks.contains("try_from") || toks.contains("from_primitive")
+        }
+        _ => false,
+    }
 }
 
 fn local_binds_ident(local: &Local, ident: &str) -> bool {
