@@ -631,6 +631,60 @@ fn abort_requires_proof(
     )
 }
 
+/// v2.21 Slice 4: render `effect { match SCRUTINEE { ... } }` as a
+/// Lean `match` term wrapped in `some { s with ... }`. The wildcard
+/// arm becomes a Lean `| _ =>` arm, which (paired with the literal
+/// arms) makes the match exhaustive over `Nat`. Lifecycle post-status
+/// updates are appended to *every* arm so the post-status assignment
+/// remains unconditional from the spec's perspective.
+fn render_match_then_body(
+    op: &crate::check::ParsedHandler,
+    branches: &crate::check::ParsedEffectBranches,
+    fields: &[(String, String)],
+) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("match {} with\n", branches.scrutinee_lean));
+    for arm in &branches.arms {
+        let mut with_parts: Vec<String> = Vec::new();
+        for (field, op_kind, value) in &arm.effects {
+            if op_kind == "set" && is_account_binding_pubkey_ref(value, &op.accounts) {
+                continue;
+            }
+            let sf = safe_name(field);
+            // Saturating / wrapping variants lower to the same Lean form
+            // as the checked default — `Nat` is unbounded in Lean, so
+            // `+=`, `+=!`, `+=?` all produce `s.field + value` at the
+            // theorem level. The runtime semantic difference matters in
+            // Rust but not in Lean.
+            match op_kind.as_str() {
+                "add" | "add_sat" | "add_wrap" => {
+                    with_parts.push(format!("{} := s.{} + {}", sf, sf, value))
+                }
+                "sub" | "sub_sat" | "sub_wrap" => {
+                    with_parts.push(format!("{} := s.{} - {}", sf, sf, value))
+                }
+                "set" => with_parts.push(format!("{} := {}", sf, value)),
+                _ => {}
+            }
+        }
+        if let Some(ref post) = op.post_status {
+            with_parts.push(format!("{} := .{}", lifecycle_marker_name(fields), post));
+        }
+        let arm_body = if with_parts.is_empty() {
+            "some s".to_string()
+        } else {
+            format!("some {{ s with {} }}", with_parts.join(", "))
+        };
+        out.push_str(&format!("    | {} => {}\n", arm.pattern_lean, arm_body));
+    }
+    // Trim trailing newline — the caller wraps the body inside a fn
+    // declaration and adds its own newline.
+    if out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
 fn render_transitions(
     out: &mut String,
     spec: &ParsedSpec,
@@ -652,30 +706,42 @@ fn render_transitions(
             .collect::<Vec<_>>()
             .join(" \u{2227} "); // ∧
 
-        // Build state update
-        let mut with_parts: Vec<String> = Vec::new();
-        for (field, op_kind, value) in &op.effects {
-            // Drop `<field> := <account_binding>.pubkey` — no Lean scope; see
-            // is_account_binding_pubkey_ref. Field stays at its default.
-            if op_kind == "set" && is_account_binding_pubkey_ref(value, &op.accounts) {
-                continue;
-            }
-            let sf = safe_name(field);
-            match op_kind.as_str() {
-                "add" => with_parts.push(format!("{} := s.{} + {}", sf, sf, value)),
-                "sub" => with_parts.push(format!("{} := s.{} - {}", sf, sf, value)),
-                "set" => with_parts.push(format!("{} := {}", sf, value)),
-                _ => {}
-            }
-        }
-        if let Some(ref post) = op.post_status {
-            with_parts.push(format!("{} := .{}", lifecycle_marker_name(fields), post));
-        }
-
-        let then_body = if with_parts.is_empty() {
-            "some s".to_string()
+        // Build state update.
+        //
+        // v2.21 Slice 4: when the handler has `effect_branches`, render a
+        // Lean `match` term so the conditional shape is reflected at the
+        // theorem level — proofs that depend on a specific arm can pattern-
+        // match on the scrutinee value, instead of facing the v2.20
+        // union-of-fields fallback (every potentially-modified field gets a
+        // per-handler obligation). Patterns are literal-integer + wildcard
+        // only in v2.21; enum-pattern lowering is v2.22 work.
+        let then_body = if let Some(branches) = &op.effect_branches {
+            render_match_then_body(op, branches, fields)
         } else {
-            format!("some {{ s with {} }}", with_parts.join(", "))
+            let mut with_parts: Vec<String> = Vec::new();
+            for (field, op_kind, value) in &op.effects {
+                // Drop `<field> := <account_binding>.pubkey` — no Lean scope; see
+                // is_account_binding_pubkey_ref. Field stays at its default.
+                if op_kind == "set" && is_account_binding_pubkey_ref(value, &op.accounts) {
+                    continue;
+                }
+                let sf = safe_name(field);
+                match op_kind.as_str() {
+                    "add" => with_parts.push(format!("{} := s.{} + {}", sf, sf, value)),
+                    "sub" => with_parts.push(format!("{} := s.{} - {}", sf, sf, value)),
+                    "set" => with_parts.push(format!("{} := {}", sf, value)),
+                    _ => {}
+                }
+            }
+            if let Some(ref post) = op.post_status {
+                with_parts.push(format!("{} := .{}", lifecycle_marker_name(fields), post));
+            }
+
+            if with_parts.is_empty() {
+                "some s".to_string()
+            } else {
+                format!("some {{ s with {} }}", with_parts.join(", "))
+            }
         };
 
         out.push_str(&format!(
@@ -5698,5 +5764,94 @@ handler send : State.Active -> State.Active {
                 "expected theorem `{name}` to be emitted; got:\n{lean}"
             );
         }
+    }
+
+    // ── v2.21 Slice 4: conditional effect lowering ────────────────────────
+
+    /// Inline conditional effect blocks (`effect { match X { 0 => …, _ => … } }`)
+    /// must render as a Lean `match` term inside the transition fn —
+    /// not as the v2.20 union-of-fields fallback. Per-arm bodies carry
+    /// only the effects from that arm; the wildcard provides
+    /// exhaustiveness over `Nat`.
+    #[test]
+    fn conditional_effect_renders_lean_match_term() {
+        let spec = crate::chumsky_adapter::parse_str(
+            r#"spec FeeRouter
+type State
+  | Active of {
+      fees_a : U64,
+      fees_b : U64,
+      fees_d : U64,
+    }
+type Error | InvalidAmount
+
+handler collect_fees (kind : U8) (amount : U64) : State.Active -> State.Active {
+  permissionless
+  requires amount > 0 else InvalidAmount
+  effect {
+    match kind {
+      0 => fees_a += amount,
+      1 => fees_b += amount,
+      _ => fees_d := 0,
+    }
+  }
+}
+"#,
+        )
+        .expect("parse");
+        let lean = render(&spec);
+
+        // The transition body must use Lean `match` over the scrutinee.
+        assert!(
+            lean.contains("match kind with"),
+            "expected `match kind with` in transition body; got:\n{lean}"
+        );
+        // Each arm renders its specific effect, not the union.
+        assert!(
+            lean.contains("| 0 => some { s with fees_a := s.fees_a + amount"),
+            "arm 0 should add to fees_a only; got:\n{lean}"
+        );
+        assert!(
+            lean.contains("| 1 => some { s with fees_b := s.fees_b + amount"),
+            "arm 1 should add to fees_b only; got:\n{lean}"
+        );
+        assert!(
+            lean.contains("| _ => some { s with fees_d := 0"),
+            "wildcard arm should set fees_d := 0; got:\n{lean}"
+        );
+    }
+
+    /// Saturating / wrapping effect ops (`+=!`, `+=?`) lower to the same
+    /// Lean form as the checked `+=` — Nat is unbounded so the three
+    /// runtime semantics collapse at the theorem level.
+    #[test]
+    fn conditional_effect_collapses_sat_wrap_ops_to_checked_lean_form() {
+        let spec = crate::chumsky_adapter::parse_str(
+            r#"spec SatRouter
+type State | Active of { x : U64 }
+type Error | E
+
+handler bump (k : U8) (amount : U64) : State.Active -> State.Active {
+  permissionless
+  requires amount > 0 else E
+  effect {
+    match k {
+      0 => x +=! amount,
+      _ => x +=? amount,
+    }
+  }
+}
+"#,
+        )
+        .expect("parse");
+        let lean = render(&spec);
+        assert!(
+            lean.contains("| 0 => some { s with x := s.x + amount"),
+            "+=! must render as `s.x + amount` in Lean; got:\n{lean}"
+        );
+        assert!(
+            lean.contains("| _ => some { s with x := s.x + amount"),
+            "+=? must render as `s.x + amount` in Lean; got:\n{lean}"
+        );
     }
 }
