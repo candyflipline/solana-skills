@@ -209,7 +209,24 @@ fn fixture_buggy_anchor_drives_brownfield_emit() {
     let body = std::fs::read_to_string(&main_rs).expect("read emitted main.rs");
     assert!(body.contains("pub fn action_run"));
     assert!(body.contains("pub fn action_maybe"));
+    assert!(body.contains("pub fn action_drain"));
     assert!(body.contains("Mode: PROTOCOL"));
+    // v2.21 §S1.2 — protocol-mode harness must carry the lamport-
+    // conservation helpers and wire the inflation check around every
+    // action_*.send(). buggy_anchor has no `auth X` declarations
+    // (handlers all take `Context<Empty>` with no signer constraint), so
+    // collect_signer_idents returns an empty set and the per-action
+    // wrap is suppressed — but the helpers are still emitted, ready for
+    // the moment the agent fills the `.accounts(...)` literal and the
+    // generated harness picks up signer pubkeys from the fixture.
+    assert!(
+        body.contains("fn assert_no_signer_inflation"),
+        "protocol-mode brownfield harness must emit assert_no_signer_inflation helper"
+    );
+    assert!(
+        body.contains("fn snapshot_lamports"),
+        "protocol-mode brownfield harness must emit snapshot_lamports helper"
+    );
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) {

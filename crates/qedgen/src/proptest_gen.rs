@@ -565,19 +565,30 @@ fn emit_account_section(
         map_type(t, spec)
     })?;
     rust_codegen_util::emit_unit_enum_sums(out, spec, "Debug, Clone, Copy, PartialEq, Eq")?;
-    rust_codegen_util::emit_lifecycle_status_enum(out, spec, "Debug, Clone, Copy, PartialEq, Eq");
+    // v2.21 mirror-fix: emit per-account `Status` from `lifecycle_states`
+    // rather than `spec.lifecycle_states`. In multi-ADT mode the caller
+    // passes `&acct.lifecycle`, so each module gets the correct variants
+    // for its ADT. Pre-fix lending's `mod loan` got Pool's `enum Status`
+    // and didn't compile.
+    rust_codegen_util::emit_lifecycle_status_enum_from(
+        out,
+        lifecycle_states,
+        "Debug, Clone, Copy, PartialEq, Eq",
+    );
     emit_record_prop_composes(out, spec)?;
     emit_unit_sum_prop_oneofs(out, spec)?;
 
-    // State struct (with synthetic `status: Status` when the spec has a
-    // multi-state lifecycle). emit_state_struct adds the discriminator
-    // unless `mutable_fields` already contains a user-declared `status`.
-    rust_codegen_util::emit_state_struct(
+    let section_has_lifecycle = lifecycle_states.len() >= 2;
+
+    // State struct (with synthetic `status: Status` when this section has a
+    // multi-state lifecycle). Uses the per-account lifecycle so a single-ADT
+    // section without a lifecycle doesn't get a stray `status` field.
+    rust_codegen_util::emit_state_struct_with_lifecycle(
         out,
         mutable_fields,
         "Debug, Clone, Copy",
         |t| map_type(t, spec),
-        spec,
+        section_has_lifecycle,
     )?;
 
     // Extract constant upper bounds from properties to cap arb_state() ranges.
@@ -597,7 +608,14 @@ fn emit_account_section(
             }
         }
     }
-    emit_state_strategy(out, mutable_fields, all_fields, &field_bounds, spec)?;
+    emit_state_strategy(
+        out,
+        mutable_fields,
+        all_fields,
+        &field_bounds,
+        lifecycle_states,
+        spec,
+    )?;
 
     // Property predicates
     let props_with_expr: Vec<&&ParsedProperty> = properties
@@ -688,7 +706,14 @@ fn emit_account_section(
 
     // Property preservation tests
     if !props_with_expr.is_empty() {
-        emit_preservation_tests_for(out, handlers, &owned_props, mutable_fields, spec)?;
+        emit_preservation_tests_for(
+            out,
+            handlers,
+            &owned_props,
+            mutable_fields,
+            lifecycle_states,
+            spec,
+        )?;
     }
 
     // Invariant preservation tests — one per (handler, invariant-it-claims-to-preserve)
@@ -696,7 +721,14 @@ fn emit_account_section(
     // since that's where the spec records it; properties iterate from the
     // property side (prop.preserved_by). Same logical join, different storage.
     if !linked_invs.is_empty() {
-        emit_invariant_preservation_tests_for(out, handlers, &linked_invs, mutable_fields, spec)?;
+        emit_invariant_preservation_tests_for(
+            out,
+            handlers,
+            &linked_invs,
+            mutable_fields,
+            lifecycle_states,
+            spec,
+        )?;
     }
 
     // Guard enforcement tests
@@ -744,6 +776,7 @@ fn emit_state_strategy(
     mutable_fields: &[&(String, String)],
     all_fields: &[(String, String)],
     field_bounds: &std::collections::HashMap<String, String>,
+    lifecycle_states: &[String],
     spec: &ParsedSpec,
 ) -> Result<()> {
     // Full-range strategy (capped by property bounds when available)
@@ -754,6 +787,7 @@ fn emit_state_strategy(
         all_fields,
         StrategyMode::Full,
         field_bounds,
+        lifecycle_states,
         spec,
     )?;
     // Boundary-biased strategy for guard rejection tests
@@ -764,6 +798,7 @@ fn emit_state_strategy(
         all_fields,
         StrategyMode::Boundary,
         field_bounds,
+        lifecycle_states,
         spec,
     )?;
     Ok(())
@@ -775,6 +810,7 @@ enum StrategyMode {
     Boundary,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_state_strategy_inner(
     out: &mut String,
     fn_name: &str,
@@ -782,6 +818,7 @@ fn emit_state_strategy_inner(
     all_fields: &[(String, String)],
     mode: StrategyMode,
     field_bounds: &std::collections::HashMap<String, String>,
+    lifecycle_states: &[String],
     spec: &ParsedSpec,
 ) -> Result<()> {
     match mode {
@@ -797,8 +834,8 @@ fn emit_state_strategy_inner(
     // (proptest's `Strategy` impl for tuples caps at 12-arity); `prop_compose!`
     // has no arity limit and produces the same `impl Strategy<Value = State>`
     // signature.
-    let emit_status = rust_codegen_util::has_lifecycle(spec)
-        && !mutable_fields.iter().any(|(n, _)| n == "status");
+    let emit_status =
+        lifecycle_states.len() >= 2 && !mutable_fields.iter().any(|(n, _)| n == "status");
     out.push_str("prop_compose! {\n");
     out.push_str(&format!("    fn {}()(\n", fn_name));
     for (fname, _ftype) in mutable_fields.iter() {
@@ -812,8 +849,7 @@ fn emit_state_strategy_inner(
         out.push_str(&format!("        {} in {},\n", fname, strategy));
     }
     if emit_status {
-        let variants = spec
-            .lifecycle_states
+        let variants = lifecycle_states
             .iter()
             .map(|s| format!("Just(Status::{})", s))
             .collect::<Vec<_>>()
@@ -852,6 +888,7 @@ fn emit_preservation_tests_for(
     handlers: &[&ParsedHandler],
     properties: &[ParsedProperty],
     mutable_fields: &[&(String, String)],
+    lifecycle_states: &[String],
     spec: &ParsedSpec,
 ) -> Result<()> {
     for prop in properties {
@@ -942,8 +979,8 @@ fn emit_preservation_tests_for(
                 // The `status` discriminator is added by emit_state_struct
                 // when has_lifecycle (≥2 states); seed it to the spec's
                 // declared initial state, not a hardcoded "Uninitialized".
-                if rust_codegen_util::has_lifecycle(spec) {
-                    if let Some(initial) = rust_codegen_util::initial_lifecycle_state(spec) {
+                if lifecycle_states.len() >= 2 {
+                    if let Some(initial) = lifecycle_states.first() {
                         out.push_str(&format!("            status: Status::{},\n", initial));
                     }
                 }
@@ -1030,6 +1067,7 @@ fn emit_invariant_preservation_tests_for(
     handlers: &[&ParsedHandler],
     invariants: &[&ParsedInvariant],
     mutable_fields: &[&(String, String)],
+    lifecycle_states: &[String],
     spec: &ParsedSpec,
 ) -> Result<()> {
     for op in handlers {
@@ -1090,8 +1128,8 @@ fn emit_invariant_preservation_tests_for(
                         out.push_str(&format!("            {}: {},\n", fname, default));
                     }
                 }
-                if rust_codegen_util::has_lifecycle(spec) {
-                    if let Some(initial) = rust_codegen_util::initial_lifecycle_state(spec) {
+                if lifecycle_states.len() >= 2 {
+                    if let Some(initial) = lifecycle_states.first() {
                         out.push_str(&format!("            status: Status::{},\n", initial));
                     }
                 }
@@ -1460,8 +1498,8 @@ fn emit_sequence_test_for(
             out.push_str(&format!("            {}: {},\n", fname, default));
         }
     }
-    if rust_codegen_util::has_lifecycle(spec) {
-        if let Some(initial) = rust_codegen_util::initial_lifecycle_state(spec) {
+    if has_lifecycle {
+        if let Some(initial) = lifecycle_states.first() {
             out.push_str(&format!("            status: Status::{},\n", initial));
         }
     }

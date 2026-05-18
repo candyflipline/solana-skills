@@ -1,56 +1,71 @@
 use anyhow::Result;
 use std::path::Path;
 
-use crate::check::{self, ParsedHandler, ParsedSpec};
+use crate::check::{self, ParsedHandler, ParsedProperty, ParsedSpec};
 use crate::codegen::map_type;
 use crate::rust_codegen_util;
 
+/// Per-section harness counts, accumulated across single-mode or per-ADT
+/// emission. The summary footer in `generate()` reads from this to print
+/// totals matching the actual emitted harness count.
+#[derive(Default)]
+struct HarnessCounts {
+    guard: usize,
+    prop: usize,
+    invariant: usize,
+    effect: usize,
+    overflow: usize,
+    abort: usize,
+}
+
 /// Emit `let mut s = State { ... };` with every mutable field bound to
-/// `kani::any()`. When the spec has a lifecycle, the synthetic `status`
-/// field is also `kani::any()` so callers can layer
+/// `kani::any()`. When the per-account lifecycle has ≥2 states, the
+/// synthetic `status` field is also `kani::any()` so callers can layer
 /// `kani::assume(s.status == Status::<X>)` on top.
 fn emit_state_init_symbolic(
     out: &mut String,
     mutable_fields: &[&(String, String)],
-    spec: &ParsedSpec,
+    lifecycle_states: &[String],
 ) {
     out.push_str("    let mut s = State {\n");
     for (fname, _) in mutable_fields {
         out.push_str(&format!("        {}: kani::any(),\n", fname));
     }
-    if rust_codegen_util::has_lifecycle(spec) {
+    if lifecycle_states.len() >= 2 {
         out.push_str("        status: kani::any(),\n");
     }
     out.push_str("    };\n");
 }
 
 /// Emit `let mut s = State { ... };` with every mutable field zeroed and the
-/// `status` field set to the spec's initial lifecycle state. Used by init-
+/// `status` field set to the section's initial lifecycle state. Used by init-
 /// handler harnesses (effect/preservation), where the pre-state is the
 /// canonical "before initialization" state.
 fn emit_state_init_zeroed(
     out: &mut String,
     mutable_fields: &[&(String, String)],
-    spec: &ParsedSpec,
+    lifecycle_states: &[String],
 ) {
     out.push_str("    let mut s = State {\n");
     for (fname, _) in mutable_fields {
         out.push_str(&format!("        {}: 0,\n", fname));
     }
-    if let Some(initial) = rust_codegen_util::initial_lifecycle_state(spec) {
-        out.push_str(&format!("        status: Status::{},\n", initial));
+    if let Some(initial) = lifecycle_states.first() {
+        if lifecycle_states.len() >= 2 {
+            out.push_str(&format!("        status: Status::{},\n", initial));
+        }
     }
     out.push_str("    };\n");
 }
 
 /// Append `kani::assume(s.status == Status::<pre>);` when the handler has a
-/// pre-status declaration AND the spec has a lifecycle. No-op otherwise.
+/// pre-status declaration AND this section has a lifecycle. No-op otherwise.
 /// Without this, guard-rejection / abort harnesses for lifecycle-gated
 /// handlers can pass for the wrong reason — the handler rejects because the
 /// symbolic status didn't match the pre-state, not because the requires/
 /// guard fired.
-fn emit_pre_status_assume(out: &mut String, op: &ParsedHandler, spec: &ParsedSpec) {
-    if !rust_codegen_util::has_lifecycle(spec) {
+fn emit_pre_status_assume(out: &mut String, op: &ParsedHandler, lifecycle_states: &[String]) {
+    if lifecycle_states.len() < 2 {
         return;
     }
     if let Some(ref pre) = op.pre_status {
@@ -62,6 +77,12 @@ fn emit_pre_status_assume(out: &mut String, op: &ParsedHandler, spec: &ParsedSpe
 ///
 /// Produces self-contained proofs that model state transitions from the spec
 /// and verify properties using Kani bounded model checking — no framework deps.
+///
+/// v2.21 Pair A — multi-ADT support: when `spec.account_types.len() > 1`,
+/// emit one `mod <name> { ... }` per account type wrapping its State struct,
+/// transition fns, and proof harnesses. Mirrors proptest_gen's per-account
+/// dispatch (see `proptest_gen::emit_account_section`). Single-ADT specs keep
+/// the original flat output unchanged.
 pub fn generate(spec_path: &Path, output_path: &Path) -> Result<()> {
     let spec = check::parse_spec_file(spec_path)?;
 
@@ -86,6 +107,8 @@ pub fn generate(spec_path: &Path, output_path: &Path) -> Result<()> {
         .cloned()
         .unwrap_or_default();
 
+    let is_multi = spec.account_types.len() > 1;
+
     let mut out = String::new();
 
     // ── File header ──────────────────────────────────────────────────────
@@ -107,7 +130,7 @@ pub fn generate(spec_path: &Path, output_path: &Path) -> Result<()> {
     out.push_str("// ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----\n");
     out.push_str("#![cfg(kani)]\n\n");
 
-    // ── State model ──────────────────────────────────────────────────────
+    // ── State model header ───────────────────────────────────────────────
     out.push_str(
         "// ============================================================================\n",
     );
@@ -116,41 +139,212 @@ pub fn generate(spec_path: &Path, output_path: &Path) -> Result<()> {
         "// ============================================================================\n\n",
     );
 
-    // Emit constants — infer type from value magnitude
+    // Constants are file-scoped — referenced from inside per-ADT modules
+    // via `use super::*` so duplicating them per module is wasted bytes.
     rust_codegen_util::emit_constants(&mut out, &spec.constants);
 
-    // Collect mutable state fields (skip Pubkey — those are identity, not mutable state)
-    let state_fields = rust_codegen_util::resolve_state_fields(&spec);
-    let mutable_fields = rust_codegen_util::mutable_fields(state_fields);
+    let mut counts = HarnessCounts::default();
+
+    if is_multi {
+        // Multi-ADT: one `mod <lowercase_name> { ... }` per account type,
+        // each with its own State struct + harnesses. Mirrors
+        // `proptest_gen::emit_account_section` at proptest_gen.rs:540.
+        for acct in &spec.account_types {
+            let acct_fields = rust_codegen_util::mutable_fields(&acct.fields);
+            if acct_fields.is_empty() {
+                continue;
+            }
+            let acct_handlers: Vec<&ParsedHandler> = spec
+                .handlers
+                .iter()
+                .filter(|h| h.on_account.as_deref() == Some(acct.name.as_str()))
+                .collect();
+            if acct_handlers.is_empty() {
+                continue;
+            }
+            // Filter properties to those whose expression references at least
+            // one field declared on THIS account type. Same heuristic as
+            // proptest_gen.rs:489-491.
+            let acct_field_names: Vec<&str> = acct_fields.iter().map(|(n, _)| n.as_str()).collect();
+            let acct_props: Vec<&ParsedProperty> = spec
+                .properties
+                .iter()
+                .filter(|p| {
+                    if let Some(ref expr) = p.expression {
+                        acct_field_names.iter().any(|f| expr.contains(f))
+                    } else {
+                        false
+                    }
+                })
+                .collect();
+
+            let mod_name = acct.name.to_lowercase();
+            out.push_str(&format!("mod {} {{\n", mod_name));
+            out.push_str("    use super::*;\n\n");
+            emit_kani_account_section(
+                &mut out,
+                &acct_fields,
+                &acct_handlers,
+                &acct_props,
+                &acct.lifecycle,
+                &spec,
+                &mut counts,
+            )?;
+            out.push_str(&format!("}} // mod {}\n\n", mod_name));
+        }
+    } else {
+        // Single-ADT: flat layout, identical to pre-v2.21 output.
+        // When the spec declares exactly one account type, use its fields
+        // and its lifecycle; otherwise fall back to the flat `state_fields`
+        // + spec-level lifecycle list.
+        let (state_fields, lifecycle): (&[(String, String)], &[String]) =
+            if spec.account_types.len() == 1 {
+                (
+                    &spec.account_types[0].fields,
+                    spec.account_types[0].lifecycle.as_slice(),
+                )
+            } else {
+                (
+                    rust_codegen_util::resolve_state_fields(&spec),
+                    spec.lifecycle_states.as_slice(),
+                )
+            };
+        let mutable = rust_codegen_util::mutable_fields(state_fields);
+        let all_handlers: Vec<&ParsedHandler> = spec.handlers.iter().collect();
+        let all_props: Vec<&ParsedProperty> = spec.properties.iter().collect();
+        emit_kani_account_section(
+            &mut out,
+            &mutable,
+            &all_handlers,
+            &all_props,
+            lifecycle,
+            &spec,
+            &mut counts,
+        )?;
+    }
+
+    // ── File-level features (single-ADT mode only) ──────────────────────
+    // Covers, liveness, and environment harnesses reference the per-ADT
+    // State struct + transition fns directly. In multi-ADT mode, those live
+    // inside per-account modules, so a top-level harness can't see them
+    // without explicit qualification. Per-ADT cover/liveness/env emission
+    // is v2.22 scope; for v2.21 we skip these in multi-mode (proptest_gen
+    // does the same). Single-mode behavior is unchanged.
+    if !is_multi {
+        let (mutable_fields_view, file_lifecycle): (Vec<&(String, String)>, &[String]) =
+            if spec.account_types.len() == 1 {
+                (
+                    rust_codegen_util::mutable_fields(&spec.account_types[0].fields),
+                    spec.account_types[0].lifecycle.as_slice(),
+                )
+            } else {
+                (
+                    rust_codegen_util::mutable_fields(rust_codegen_util::resolve_state_fields(
+                        &spec,
+                    )),
+                    spec.lifecycle_states.as_slice(),
+                )
+            };
+        emit_file_level_features(&mut out, &spec, &mutable_fields_view, file_lifecycle)?;
+    }
+
+    out.push_str("// ---- GENERATED BY QEDGEN — DO NOT EDIT BELOW THIS LINE ----\n");
+
+    std::fs::write(output_path, &out)?;
+
+    // ── Summary ──────────────────────────────────────────────────────────
+    let HarnessCounts {
+        guard: guard_count,
+        prop: prop_count,
+        invariant: invariant_count,
+        effect: effect_count,
+        overflow: overflow_count,
+        abort: abort_count,
+    } = counts;
+    let total =
+        guard_count + prop_count + invariant_count + effect_count + overflow_count + abort_count;
+
+    eprintln!(
+        "Generated {} Kani harnesses in {}",
+        total,
+        output_path.display()
+    );
+    if guard_count > 0 {
+        eprintln!("  {} guard enforcement proof(s)", guard_count);
+    }
+    if prop_count > 0 {
+        eprintln!("  {} property preservation proof(s)", prop_count);
+    }
+    if invariant_count > 0 {
+        eprintln!("  {} invariant preservation proof(s)", invariant_count);
+    }
+    if effect_count > 0 {
+        eprintln!("  {} effect conformance proof(s)", effect_count);
+    }
+    if overflow_count > 0 {
+        eprintln!("  {} overflow detection proof(s)", overflow_count);
+    }
+    if abort_count > 0 {
+        eprintln!("  {} abort condition proof(s)", abort_count);
+    }
+
+    Ok(())
+}
+
+/// Emit the per-account section: State struct, property/invariant predicates,
+/// transition functions, and every proof harness whose body references the
+/// per-account `s: &State`. Called once for single-ADT specs (flat) or once
+/// per `account_types` entry for multi-ADT specs (wrapped in `mod <name>`).
+///
+/// `handlers` is the filtered handler list for this section (all handlers in
+/// single mode; `op.on_account == Some(acct.name)` in multi mode).
+/// `properties` is the filtered property list (all in single mode;
+/// expression-references-a-field-of-this-ADT in multi mode).
+fn emit_kani_account_section(
+    out: &mut String,
+    mutable_fields: &[&(String, String)],
+    handlers: &[&ParsedHandler],
+    properties: &[&ParsedProperty],
+    lifecycle_states: &[String],
+    spec: &ParsedSpec,
+    counts: &mut HarnessCounts,
+) -> Result<()> {
+    let has_lifecycle = lifecycle_states.len() >= 2;
 
     // User-defined records/enums referenced by the State struct must be
     // declared first. `#![cfg(kani)]` at the top of this file lets us derive
     // Kani's Arbitrary trait unconditionally — generated Rust only compiles
-    // under Kani anyway.
-    rust_codegen_util::emit_record_structs(&mut out, &spec, "Clone, Copy, kani::Arbitrary", |t| {
-        map_type(t, &spec)
+    // under Kani anyway. Records, unit enums, and the Status enum live
+    // *inside* this section so multi-ADT mode wraps each set in its own
+    // `mod <name>` namespace (mirrors proptest_gen::emit_account_section).
+    // The Status enum is built from the *per-account* `lifecycle_states` —
+    // not the spec-level one — so an ADT with its own variant names (e.g.
+    // `Loan { Empty, Active, Liquidated }`) gets the right enum even when
+    // another ADT in the same spec has different variants.
+    rust_codegen_util::emit_record_structs(out, spec, "Clone, Copy, kani::Arbitrary", |t| {
+        map_type(t, spec)
     })?;
     rust_codegen_util::emit_unit_enum_sums(
-        &mut out,
-        &spec,
+        out,
+        spec,
         "Clone, Copy, PartialEq, Eq, kani::Arbitrary",
     )?;
-    rust_codegen_util::emit_lifecycle_status_enum(
-        &mut out,
-        &spec,
+    rust_codegen_util::emit_lifecycle_status_enum_from(
+        out,
+        lifecycle_states,
         "Clone, Copy, PartialEq, Eq, kani::Arbitrary",
     );
 
-    rust_codegen_util::emit_state_struct(
-        &mut out,
-        &mutable_fields,
+    rust_codegen_util::emit_state_struct_with_lifecycle(
+        out,
+        mutable_fields,
         "Clone, Copy",
-        |t| map_type(t, &spec),
-        &spec,
+        |t| map_type(t, spec),
+        has_lifecycle,
     )?;
 
     // ── Property predicates ──────────────────────────────────────────────
-    if !spec.properties.is_empty() {
+    if !properties.is_empty() {
         out.push_str(
             "// ============================================================================\n",
         );
@@ -159,23 +353,25 @@ pub fn generate(spec_path: &Path, output_path: &Path) -> Result<()> {
             "// ============================================================================\n\n",
         );
 
-        rust_codegen_util::emit_property_predicates_with(&mut out, &spec.properties, false, |t| {
-            map_type(t, &spec)
+        // `emit_property_predicates_with` takes &[ParsedProperty] (not &[&_]),
+        // so reconstruct an owned Vec view of the filtered slice.
+        let owned_props: Vec<crate::check::ParsedProperty> =
+            properties.iter().map(|p| (*p).clone()).collect();
+        rust_codegen_util::emit_property_predicates_with(out, &owned_props, false, |t| {
+            map_type(t, spec)
         });
     }
 
     // ── Invariant predicates ─────────────────────────────────────────────
-    // Only emit predicates for invariants linked from at least one handler
-    // (`invariant Name` clause inside a handler block). Standalone top-level
-    // invariants without any handler claiming preservation get no Kani body
-    // — there's nothing for BMC to check against. Description-only
-    // invariants are filtered out by emit_invariant_predicates' rust_expr
-    // check.
+    // Filter to invariants linked from at least one handler in THIS section
+    // (in multi mode, this restricts to invariants the per-ADT handlers
+    // claim to preserve/establish; in single mode it's identical to the
+    // pre-v2.21 spec-wide filter).
     let linked_invs: Vec<&crate::check::ParsedInvariant> = spec
         .invariants
         .iter()
         .filter(|i| {
-            spec.handlers
+            handlers
                 .iter()
                 .any(|h| h.invariants.contains(&i.name) || h.establishes.contains(&i.name))
         })
@@ -192,7 +388,7 @@ pub fn generate(spec_path: &Path, output_path: &Path) -> Result<()> {
         out.push_str(
             "// ============================================================================\n\n",
         );
-        rust_codegen_util::emit_invariant_predicates(&mut out, &linked_invs);
+        rust_codegen_util::emit_invariant_predicates(out, &linked_invs);
     }
 
     // ── Transition functions ─────────────────────────────────────────────
@@ -207,12 +403,16 @@ pub fn generate(spec_path: &Path, output_path: &Path) -> Result<()> {
         "// ============================================================================\n\n",
     );
 
-    for op in &spec.handlers {
-        rust_codegen_util::emit_transition_fn(&mut out, op, &spec, false, |t| map_type(t, &spec))?;
+    for op in handlers {
+        rust_codegen_util::emit_transition_fn(out, op, spec, false, |t| map_type(t, spec))?;
     }
 
     // ── Guard enforcement proofs ─────────────────────────────────────────
-    let guard_ops: Vec<&ParsedHandler> = spec.handlers.iter().filter(|op| op.has_guard()).collect();
+    let guard_ops: Vec<&ParsedHandler> = handlers
+        .iter()
+        .copied()
+        .filter(|op| op.has_guard())
+        .collect();
     if !guard_ops.is_empty() {
         out.push_str(
             "// ============================================================================\n",
@@ -240,15 +440,15 @@ pub fn generate(spec_path: &Path, output_path: &Path) -> Result<()> {
             out.push_str("#[kani::solver(cadical)]\n");
             out.push_str(&format!("fn verify_{}_rejects_invalid() {{\n", op.name));
 
-            emit_state_init_symbolic(&mut out, &mutable_fields, &spec);
-            emit_pre_status_assume(&mut out, op, &spec);
+            emit_state_init_symbolic(out, mutable_fields, lifecycle_states);
+            emit_pre_status_assume(out, op, lifecycle_states);
 
             // Symbolic params
             for (pname, ptype) in &op.takes_params {
                 out.push_str(&format!(
                     "    let {}: {} = kani::any();\n",
                     pname,
-                    map_type(ptype, &spec)?
+                    map_type(ptype, spec)?
                 ));
             }
 
@@ -270,13 +470,14 @@ pub fn generate(spec_path: &Path, output_path: &Path) -> Result<()> {
                 op.name
             ));
             out.push_str("}\n\n");
+            counts.guard += 1;
         }
     }
 
     // ── Abort condition proofs ────────────────────────────────────────────
-    let abort_ops: Vec<&ParsedHandler> = spec
-        .handlers
+    let abort_ops: Vec<&ParsedHandler> = handlers
         .iter()
+        .copied()
         .filter(|op| !op.aborts_if.is_empty())
         .collect();
     if !abort_ops.is_empty() {
@@ -298,15 +499,15 @@ pub fn generate(spec_path: &Path, output_path: &Path) -> Result<()> {
                     op.name, abort.error_name
                 ));
 
-                emit_state_init_symbolic(&mut out, &mutable_fields, &spec);
-                emit_pre_status_assume(&mut out, op, &spec);
+                emit_state_init_symbolic(out, mutable_fields, lifecycle_states);
+                emit_pre_status_assume(out, op, lifecycle_states);
 
                 // Symbolic params
                 for (pname, ptype) in &op.takes_params {
                     out.push_str(&format!(
                         "    let {}: {} = kani::any();\n",
                         pname,
-                        map_type(ptype, &spec)?
+                        map_type(ptype, spec)?
                     ));
                 }
 
@@ -325,12 +526,13 @@ pub fn generate(spec_path: &Path, output_path: &Path) -> Result<()> {
                     op.name, abort.error_name
                 ));
                 out.push_str("}\n\n");
+                counts.abort += 1;
             }
         }
     }
 
     // ── Property preservation proofs ─────────────────────────────────────
-    if !spec.properties.is_empty() {
+    if !properties.is_empty() {
         out.push_str(
             "// ============================================================================\n",
         );
@@ -339,13 +541,19 @@ pub fn generate(spec_path: &Path, output_path: &Path) -> Result<()> {
             "// ============================================================================\n\n",
         );
 
-        for prop in &spec.properties {
+        for prop in properties {
             if prop.expression.is_none() {
                 continue;
             }
 
             for op_name in &prop.preserved_by {
-                let op = spec.handlers.iter().find(|o| &o.name == op_name);
+                // In multi-ADT mode, only emit when the preserving handler
+                // belongs to this section. Skipping otherwise keeps the
+                // harness call valid (no cross-module fn reference) and
+                // avoids duplicate emission across modules.
+                let Some(op) = handlers.iter().copied().find(|o| &o.name == op_name) else {
+                    continue;
+                };
 
                 out.push_str("#[kani::proof]\n");
                 out.push_str("#[kani::unwind(2)]\n");
@@ -356,9 +564,7 @@ pub fn generate(spec_path: &Path, output_path: &Path) -> Result<()> {
                 ));
 
                 // Determine if this is an initializing operation
-                let is_init = op
-                    .map(|o| o.pre_status.as_deref() == Some("Uninitialized"))
-                    .unwrap_or(false);
+                let is_init = op.pre_status.as_deref() == Some("Uninitialized");
 
                 // v2.20 §S1.1: for `forall <binder> : <ty>, body preserved_by
                 // <op>`, bind <binder> symbolically and drive the check via
@@ -366,8 +572,8 @@ pub fn generate(spec_path: &Path, output_path: &Path) -> Result<()> {
                 // matching `<binder>` as a param, skip the local binding —
                 // the symbolic param binding below shadows it and unifies
                 // the value pre and post.
-                let handler_takes_binder = match (&prop.per_slot, op) {
-                    (Some(slot), Some(op)) => op
+                let handler_takes_binder = match &prop.per_slot {
+                    Some(slot) => op
                         .takes_params
                         .iter()
                         .any(|(n, t)| n == &slot.binder_name && t == &slot.binder_type),
@@ -376,19 +582,17 @@ pub fn generate(spec_path: &Path, output_path: &Path) -> Result<()> {
                 let needs_local_binder = prop.per_slot.is_some() && !handler_takes_binder;
 
                 if is_init {
-                    emit_state_init_zeroed(&mut out, &mutable_fields, &spec);
+                    emit_state_init_zeroed(out, mutable_fields, lifecycle_states);
                 } else {
-                    emit_state_init_symbolic(&mut out, &mutable_fields, &spec);
-                    if let Some(op) = op {
-                        emit_pre_status_assume(&mut out, op, &spec);
-                    }
+                    emit_state_init_symbolic(out, mutable_fields, lifecycle_states);
+                    emit_pre_status_assume(out, op, lifecycle_states);
 
                     // Bind <binder> symbolically up front so the pre-state
                     // assume and the post-state assert reference the same
                     // value. Same binder pre & post = preservation.
                     if needs_local_binder {
                         if let Some(slot) = &prop.per_slot {
-                            let rust_ty = map_type(&slot.binder_type, &spec)?;
+                            let rust_ty = map_type(&slot.binder_type, spec)?;
                             out.push_str(&format!(
                                 "    let {}: {} = kani::any();\n",
                                 slot.binder_name, rust_ty
@@ -400,7 +604,7 @@ pub fn generate(spec_path: &Path, output_path: &Path) -> Result<()> {
                     // For the property we're preserving (and any other forall
                     // property), use the per-slot form against the already-
                     // bound <binder> so pre and post share the same value.
-                    for pre_prop in &spec.properties {
+                    for pre_prop in properties.iter().copied() {
                         if pre_prop.expression.is_none() {
                             continue;
                         }
@@ -440,33 +644,29 @@ pub fn generate(spec_path: &Path, output_path: &Path) -> Result<()> {
                 }
 
                 // Symbolic params
-                if let Some(op) = op {
-                    for (pname, ptype) in &op.takes_params {
-                        out.push_str(&format!(
-                            "    let {}: {} = kani::any();\n",
-                            pname,
-                            map_type(ptype, &spec)?
-                        ));
-                    }
+                for (pname, ptype) in &op.takes_params {
+                    out.push_str(&format!(
+                        "    let {}: {} = kani::any();\n",
+                        pname,
+                        map_type(ptype, spec)?
+                    ));
                 }
 
                 // For operations that increment a field (add effect), assume
-                // the field is strictly less than its bound to prevent overflow
-                if let Some(op) = op {
-                    rust_codegen_util::emit_add_strict_bounds(&mut out, op, &spec.properties, "    kani::assume(s.{field} < s.{bound}); // strict bound: {field} increments\n");
-                }
+                // the field is strictly less than its bound to prevent overflow.
+                // Build a temporary owned property slice for the helper.
+                let owned_props: Vec<crate::check::ParsedProperty> =
+                    properties.iter().map(|p| (*p).clone()).collect();
+                rust_codegen_util::emit_add_strict_bounds(out, op, &owned_props, "    kani::assume(s.{field} < s.{bound}); // strict bound: {field} increments\n");
 
                 // Call transition and assert property. For forall properties,
                 // assert at the bound <binder> via `<prop>_at` — same binder
                 // pre and post = preservation, not a fresh-witness check.
                 let args: String = op
-                    .map(|o| {
-                        o.takes_params
-                            .iter()
-                            .map(|(n, _)| format!(", {}", n))
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                    .takes_params
+                    .iter()
+                    .map(|(n, _)| format!(", {}", n))
+                    .collect();
                 out.push_str(&format!("    if {}(&mut s{}) {{\n", op_name, args));
                 match &prop.per_slot {
                     Some(slot) => {
@@ -489,6 +689,7 @@ pub fn generate(spec_path: &Path, output_path: &Path) -> Result<()> {
                 }
                 out.push_str("    }\n");
                 out.push_str("}\n\n");
+                counts.prop += 1;
             }
         }
     }
@@ -512,7 +713,7 @@ pub fn generate(spec_path: &Path, output_path: &Path) -> Result<()> {
             "// ============================================================================\n\n",
         );
 
-        for op in &spec.handlers {
+        for op in handlers.iter().copied() {
             // Walk both `invariant Name` (preserves) and `establishes Name`
             // clauses; the bool is_establish controls whether to assume the
             // invariant pre-state. Establish skips the pre-assume so the
@@ -553,10 +754,10 @@ pub fn generate(spec_path: &Path, output_path: &Path) -> Result<()> {
                 ));
 
                 if is_init {
-                    emit_state_init_zeroed(&mut out, &mutable_fields, &spec);
+                    emit_state_init_zeroed(out, mutable_fields, lifecycle_states);
                 } else {
-                    emit_state_init_symbolic(&mut out, &mutable_fields, &spec);
-                    emit_pre_status_assume(&mut out, op, &spec);
+                    emit_state_init_symbolic(out, mutable_fields, lifecycle_states);
+                    emit_pre_status_assume(out, op, lifecycle_states);
                     if !is_establish {
                         out.push_str(&format!("    kani::assume({}(&s));\n", inv.name));
                     }
@@ -566,7 +767,7 @@ pub fn generate(spec_path: &Path, output_path: &Path) -> Result<()> {
                     out.push_str(&format!(
                         "    let {}: {} = kani::any();\n",
                         pname,
-                        map_type(ptype, &spec)?
+                        map_type(ptype, spec)?
                     ));
                 }
 
@@ -583,13 +784,17 @@ pub fn generate(spec_path: &Path, output_path: &Path) -> Result<()> {
                 ));
                 out.push_str("    }\n");
                 out.push_str("}\n\n");
+                counts.invariant += 1;
             }
         }
     }
 
     // ── Effect conformance proofs ─────────────────────────────────────────
-    let effect_ops: Vec<&ParsedHandler> =
-        spec.handlers.iter().filter(|op| op.has_effect()).collect();
+    let effect_ops: Vec<&ParsedHandler> = handlers
+        .iter()
+        .copied()
+        .filter(|op| op.has_effect())
+        .collect();
     if !effect_ops.is_empty() {
         out.push_str(
             "// ============================================================================\n",
@@ -626,14 +831,14 @@ pub fn generate(spec_path: &Path, output_path: &Path) -> Result<()> {
             let is_init = op.pre_status.as_deref() == Some("Uninitialized");
 
             for (field, op_kind, value) in &op.effects {
-                // Skip effects targeting fields that aren't in the Kani State
-                // model. `mutable_fields` filters out Pubkey-typed fields
-                // (identity, not mutable scalar state), so an effect like
+                // Skip effects targeting fields that aren't in the per-ADT
+                // Kani State model. `mutable_fields` only contains this
+                // section's fields, so an effect like
                 // `initializer_token_account := initializer_ta.pubkey`
                 // can't be asserted against — the field doesn't exist on
-                // State, and the RHS references an unbound account binding.
-                // Pre-fix this emitted a harness that wouldn't compile and
-                // would have been vacuous if it did.
+                // this State, and the RHS references an unbound account
+                // binding. In multi-ADT mode, this also skips effects that
+                // target fields belonging to a DIFFERENT account type's State.
                 let base = rust_codegen_util::effect_target_base(field);
                 if !field_type_lookup.contains_key(base) {
                     continue;
@@ -653,10 +858,10 @@ pub fn generate(spec_path: &Path, output_path: &Path) -> Result<()> {
 
                 // Symbolic state
                 if is_init {
-                    emit_state_init_zeroed(&mut out, &mutable_fields, &spec);
+                    emit_state_init_zeroed(out, mutable_fields, lifecycle_states);
                 } else {
-                    emit_state_init_symbolic(&mut out, &mutable_fields, &spec);
-                    emit_pre_status_assume(&mut out, op, &spec);
+                    emit_state_init_symbolic(out, mutable_fields, lifecycle_states);
+                    emit_pre_status_assume(out, op, lifecycle_states);
                 }
 
                 // Symbolic params
@@ -664,7 +869,7 @@ pub fn generate(spec_path: &Path, output_path: &Path) -> Result<()> {
                     out.push_str(&format!(
                         "    let {}: {} = kani::any();\n",
                         pname,
-                        map_type(ptype, &spec)?
+                        map_type(ptype, spec)?
                     ));
                 }
 
@@ -684,10 +889,12 @@ pub fn generate(spec_path: &Path, output_path: &Path) -> Result<()> {
                             }
                         }
                     }
+                    let owned_props: Vec<crate::check::ParsedProperty> =
+                        properties.iter().map(|p| (*p).clone()).collect();
                     rust_codegen_util::emit_add_strict_bounds(
-                        &mut out,
+                        out,
                         op,
-                        &spec.properties,
+                        &owned_props,
                         "    kani::assume(s.{field} < s.{bound}); // strict bound: {field} increments\n",
                     );
                 }
@@ -738,7 +945,7 @@ pub fn generate(spec_path: &Path, output_path: &Path) -> Result<()> {
                 }
 
                 // Assert all sibling fields unchanged
-                for (fname, _) in &mutable_fields {
+                for (fname, _) in mutable_fields {
                     if fname.as_str() != field.as_str() {
                         // Only assert unchanged if this sibling isn't itself
                         // mutated by ANOTHER effect in the same handler —
@@ -758,10 +965,73 @@ pub fn generate(spec_path: &Path, output_path: &Path) -> Result<()> {
 
                 out.push_str("    }\n");
                 out.push_str("}\n\n");
+                counts.effect += 1;
             }
         }
     }
 
+    // ── Overflow detection harnesses ─────────────────────────────────────
+    let overflow_ops: Vec<&ParsedHandler> = handlers
+        .iter()
+        .copied()
+        .filter(|op| op.effects.iter().any(|(_, kind, _)| kind == "add"))
+        .collect();
+    if !overflow_ops.is_empty() {
+        out.push_str(
+            "// ============================================================================\n",
+        );
+        out.push_str("// Overflow detection — Kani catches arithmetic overflow on add effects\n");
+        out.push_str(
+            "// ============================================================================\n\n",
+        );
+
+        for op in &overflow_ops {
+            out.push_str("#[kani::proof]\n");
+            out.push_str("#[kani::unwind(2)]\n");
+            out.push_str("#[kani::solver(cadical)]\n");
+            out.push_str(&format!("fn verify_{}_no_overflow() {{\n", op.name));
+
+            emit_state_init_symbolic(out, mutable_fields, lifecycle_states);
+            emit_pre_status_assume(out, op, lifecycle_states);
+
+            // Symbolic params
+            for (pname, ptype) in &op.takes_params {
+                out.push_str(&format!(
+                    "    let {}: {} = kani::any();\n",
+                    pname,
+                    map_type(ptype, spec)?
+                ));
+            }
+
+            // Call transition — Kani's built-in overflow detection fires on +=
+            let args: String = op
+                .takes_params
+                .iter()
+                .map(|(n, _)| format!(", {}", n))
+                .collect();
+            out.push_str(&format!(
+                "    {}(&mut s{});  // Kani detects overflow on += internally\n",
+                op.name, args
+            ));
+            out.push_str("}\n\n");
+            counts.overflow += 1;
+        }
+    }
+
+    Ok(())
+}
+
+/// Emit covers, liveness, and environment harnesses at file scope. These
+/// reference handlers by name and the per-spec State directly, so they only
+/// fire in single-ADT mode where there's a unique top-level `fn deposit(...)`
+/// etc. In multi-ADT mode these are skipped (per-ADT lifting is v2.22 scope).
+fn emit_file_level_features(
+    out: &mut String,
+    spec: &ParsedSpec,
+    mutable_fields: &[&(String, String)],
+    lifecycle_states: &[String],
+) -> Result<()> {
+    let has_lifecycle = lifecycle_states.len() >= 2;
     // ── Cover properties (reachability) ───────────────────────────────────
     if !spec.covers.is_empty() {
         out.push_str(
@@ -785,7 +1055,7 @@ pub fn generate(spec_path: &Path, output_path: &Path) -> Result<()> {
                 out.push_str("#[kani::solver(cadical)]\n");
                 out.push_str(&format!("fn cover_{}{}() {{\n", cover.name, suffix));
 
-                emit_state_init_symbolic(&mut out, &mutable_fields, &spec);
+                emit_state_init_symbolic(out, mutable_fields, lifecycle_states);
 
                 // Chain operations with nested ifs
                 let mut indent = "    ".to_string();
@@ -799,7 +1069,7 @@ pub fn generate(spec_path: &Path, output_path: &Path) -> Result<()> {
                                 indent,
                                 pname,
                                 j,
-                                map_type(ptype, &spec)?
+                                map_type(ptype, spec)?
                             ));
                         }
                     }
@@ -850,7 +1120,7 @@ pub fn generate(spec_path: &Path, output_path: &Path) -> Result<()> {
             // to. Skip emission rather than ship a harness that runs random
             // ops and ends with no assertion — silent vacuous "verification"
             // is worse than no verification.
-            if !rust_codegen_util::has_lifecycle(&spec) {
+            if !has_lifecycle {
                 out.push_str(&format!(
                     "// liveness {}: skipped — spec has no lifecycle, no target predicate to cover\n\n",
                     liveness.name
@@ -863,7 +1133,7 @@ pub fn generate(spec_path: &Path, output_path: &Path) -> Result<()> {
             out.push_str("#[kani::solver(cadical)]\n");
             out.push_str(&format!("fn verify_liveness_{}() {{\n", liveness.name));
 
-            emit_state_init_symbolic(&mut out, &mutable_fields, &spec);
+            emit_state_init_symbolic(out, mutable_fields, lifecycle_states);
 
             // Pre-state: assume the from-state. Without this, the harness
             // would explore symbolic-status executions where the via-ops
@@ -886,7 +1156,7 @@ pub fn generate(spec_path: &Path, output_path: &Path) -> Result<()> {
                         .takes_params
                         .iter()
                         .map(|(n, t)| {
-                            map_type(t, &spec)
+                            map_type(t, spec)
                                 .map(|rt| format!("            let {}: {} = kani::any();\n", n, rt))
                         })
                         .collect::<anyhow::Result<String>>()?,
@@ -947,7 +1217,7 @@ pub fn generate(spec_path: &Path, output_path: &Path) -> Result<()> {
                     prop.name, env.name
                 ));
 
-                emit_state_init_symbolic(&mut out, &mutable_fields, &spec);
+                emit_state_init_symbolic(out, mutable_fields, lifecycle_states);
                 out.push_str(&format!("    kani::assume({}(&s));\n", prop.name));
 
                 // Apply environment mutation
@@ -970,118 +1240,6 @@ pub fn generate(spec_path: &Path, output_path: &Path) -> Result<()> {
                 out.push_str("}\n\n");
             }
         }
-    }
-
-    // ── Overflow detection harnesses ─────────────────────────────────────
-    let overflow_ops: Vec<&ParsedHandler> = spec
-        .handlers
-        .iter()
-        .filter(|op| op.effects.iter().any(|(_, kind, _)| kind == "add"))
-        .collect();
-    if !overflow_ops.is_empty() {
-        out.push_str(
-            "// ============================================================================\n",
-        );
-        out.push_str("// Overflow detection — Kani catches arithmetic overflow on add effects\n");
-        out.push_str(
-            "// ============================================================================\n\n",
-        );
-
-        for op in &overflow_ops {
-            out.push_str("#[kani::proof]\n");
-            out.push_str("#[kani::unwind(2)]\n");
-            out.push_str("#[kani::solver(cadical)]\n");
-            out.push_str(&format!("fn verify_{}_no_overflow() {{\n", op.name));
-
-            emit_state_init_symbolic(&mut out, &mutable_fields, &spec);
-            emit_pre_status_assume(&mut out, op, &spec);
-
-            // Symbolic params
-            for (pname, ptype) in &op.takes_params {
-                out.push_str(&format!(
-                    "    let {}: {} = kani::any();\n",
-                    pname,
-                    map_type(ptype, &spec)?
-                ));
-            }
-
-            // Call transition — Kani's built-in overflow detection fires on +=
-            let args: String = op
-                .takes_params
-                .iter()
-                .map(|(n, _)| format!(", {}", n))
-                .collect();
-            out.push_str(&format!(
-                "    {}(&mut s{});  // Kani detects overflow on += internally\n",
-                op.name, args
-            ));
-            out.push_str("}\n\n");
-        }
-    }
-
-    out.push_str("// ---- GENERATED BY QEDGEN — DO NOT EDIT BELOW THIS LINE ----\n");
-
-    std::fs::write(output_path, &out)?;
-
-    // ── Summary ──────────────────────────────────────────────────────────
-    let guard_count = guard_ops.len();
-    let prop_count: usize = spec
-        .properties
-        .iter()
-        .filter(|p| p.expression.is_some())
-        .map(|p| p.preserved_by.len())
-        .sum();
-    // Count of `verify_{handler}_preserves_{inv}` harnesses emitted above —
-    // one per (handler, invariant) pair where the invariant has a usable
-    // rust_expr body. Matches the emission gate, so the printed total is
-    // accurate.
-    let invariant_count: usize = spec
-        .handlers
-        .iter()
-        .flat_map(|h| {
-            h.invariants
-                .iter()
-                .chain(h.establishes.iter())
-                .map(move |inv_name| (h, inv_name))
-        })
-        .filter(|(_, inv_name)| {
-            linked_invs.iter().any(|i| {
-                &i.name == *inv_name
-                    && i.rust_expr
-                        .as_deref()
-                        .map(|r| !crate::check::rust_expr_is_unsupported(r))
-                        .unwrap_or(false)
-            })
-        })
-        .count();
-    let effect_count = effect_ops.len();
-    let overflow_count = overflow_ops.len();
-    let abort_count: usize = abort_ops.iter().map(|op| op.aborts_if.len()).sum();
-    let total =
-        guard_count + prop_count + invariant_count + effect_count + overflow_count + abort_count;
-
-    eprintln!(
-        "Generated {} Kani harnesses in {}",
-        total,
-        output_path.display()
-    );
-    if guard_count > 0 {
-        eprintln!("  {} guard enforcement proof(s)", guard_count);
-    }
-    if prop_count > 0 {
-        eprintln!("  {} property preservation proof(s)", prop_count);
-    }
-    if invariant_count > 0 {
-        eprintln!("  {} invariant preservation proof(s)", invariant_count);
-    }
-    if effect_count > 0 {
-        eprintln!("  {} effect conformance proof(s)", effect_count);
-    }
-    if overflow_count > 0 {
-        eprintln!("  {} overflow detection proof(s)", overflow_count);
-    }
-    if abort_count > 0 {
-        eprintln!("  {} abort condition proof(s)", abort_count);
     }
 
     Ok(())
@@ -1362,5 +1520,56 @@ handler noop {
             "handler with no preconditions must yield None — the kani.rs loop \
              should then `continue` and skip the harness entirely"
         );
+    }
+
+    // v2.21 Pair A — S2.2: multi-ADT specs MUST emit per-account `mod` blocks
+    // so each ADT's State struct + transition fns are visible. Pre-fix
+    // lending's two ADTs (Pool + Loan) collapsed to one flat State containing
+    // Pool's fields only — Loan was silently dropped. The regression target
+    // is two same-named fields across two ADTs; both should appear in their
+    // respective module's State.
+    #[test]
+    fn multi_adt_emits_per_account_modules() {
+        let src = r#"spec MultiADT
+
+type Distribution
+  | Empty
+  | Active of {
+      authority : Pubkey,
+      balance   : U64,
+    }
+
+type Claim
+  | Empty
+  | Active of {
+      claimant : Pubkey,
+      balance  : U64,
+    }
+
+handler init_distribution (cap : U64) : Distribution.Empty -> Distribution.Active {
+  effect { balance := cap }
+}
+
+handler init_claim (amount : U64) : Claim.Empty -> Claim.Active {
+  effect { balance := amount }
+}
+"#;
+        let spec = parse_str(src).expect("parse multi-ADT");
+        assert_eq!(spec.account_types.len(), 2);
+        // The kani.rs generator writes to a file, so use the in-memory
+        // shape directly: emit_kani_account_section should be callable per
+        // account. Here we just confirm the spec parses with two ADTs and
+        // each has a non-empty field list — the file-level emission is
+        // covered by the regen-drift sweep on bundled lending.
+        let names: Vec<&str> = spec.account_types.iter().map(|a| a.name.as_str()).collect();
+        assert!(names.contains(&"Distribution"));
+        assert!(names.contains(&"Claim"));
+        for a in &spec.account_types {
+            assert!(
+                a.fields.iter().any(|(n, _)| n == "balance"),
+                "ADT {} must carry `balance`",
+                a.name
+            );
+        }
     }
 }

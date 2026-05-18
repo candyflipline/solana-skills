@@ -695,17 +695,34 @@ pub fn has_lifecycle(spec: &crate::check::ParsedSpec) -> bool {
 /// actually constrain reachable behavior: without a status field, a
 /// lifecycle-only handler's transition function has nothing to write, so
 /// every harness against it is vacuous.
+#[allow(dead_code)]
 pub fn emit_lifecycle_status_enum(
     out: &mut String,
     spec: &crate::check::ParsedSpec,
     derives: &str,
 ) {
-    if !has_lifecycle(spec) {
+    emit_lifecycle_status_enum_from(out, &spec.lifecycle_states, derives);
+}
+
+/// Same as `emit_lifecycle_status_enum` but takes the lifecycle slice
+/// explicitly. Used by per-account codegen (kani + proptest multi-ADT modes)
+/// where each `mod <acct> { ... }` needs its own Status enum populated from
+/// `acct.lifecycle` rather than the (single-ADT-flavored) spec-level
+/// lifecycle. Fixes a v2.21 regression where multi-ADT specs (lending)
+/// emitted `enum Status` with Pool's variants inside both `mod pool` AND
+/// `mod loan`, breaking compilation when Loan's transitions referenced its
+/// own variant names.
+pub fn emit_lifecycle_status_enum_from(
+    out: &mut String,
+    lifecycle_states: &[String],
+    derives: &str,
+) {
+    if lifecycle_states.len() < 2 {
         return;
     }
     out.push_str(&format!("#[derive({})]\n", derives));
     out.push_str("enum Status {\n");
-    for state in &spec.lifecycle_states {
+    for state in lifecycle_states {
         out.push_str(&format!("    {},\n", state));
     }
     out.push_str("}\n\n");
@@ -713,6 +730,7 @@ pub fn emit_lifecycle_status_enum(
 
 /// Initial lifecycle state — first entry in `lifecycle_states`. Returns
 /// `None` when the spec has no lifecycle.
+#[allow(dead_code)]
 pub fn initial_lifecycle_state(spec: &crate::check::ParsedSpec) -> Option<&str> {
     spec.lifecycle_states.first().map(|s| s.as_str())
 }
@@ -725,12 +743,28 @@ pub fn initial_lifecycle_state(spec: &crate::check::ParsedSpec) -> Option<&str> 
 /// When the spec has a multi-state lifecycle (`has_lifecycle(spec)`), this
 /// also appends a synthetic `status: Status` field. Callers must have
 /// already emitted the `Status` enum via `emit_lifecycle_status_enum`.
+#[allow(dead_code)]
 pub fn emit_state_struct(
     out: &mut String,
     fields: &[&(String, String)],
     derives: &str,
     map_type_fn: impl Fn(&str) -> anyhow::Result<String>,
     spec: &crate::check::ParsedSpec,
+) -> anyhow::Result<()> {
+    emit_state_struct_with_lifecycle(out, fields, derives, map_type_fn, has_lifecycle(spec))
+}
+
+/// Same as `emit_state_struct` but takes the `has_lifecycle` discriminator
+/// explicitly. Multi-ADT codegen uses this to thread the per-account
+/// lifecycle (`acct.lifecycle.len() >= 2`) rather than the spec-level one,
+/// so each module's State struct gets a `status: Status` field iff that
+/// ADT actually has a lifecycle.
+pub fn emit_state_struct_with_lifecycle(
+    out: &mut String,
+    fields: &[&(String, String)],
+    derives: &str,
+    map_type_fn: impl Fn(&str) -> anyhow::Result<String>,
+    has_lifecycle: bool,
 ) -> anyhow::Result<()> {
     // v2.21 Slice 3: Pubkey state fields are now lowered to `[u8; 32]`
     // by `primitive_map` (Standalone context). The v2.20 belt-and-
@@ -741,7 +775,7 @@ pub fn emit_state_struct(
     for (fname, ftype) in fields {
         out.push_str(&format!("    {}: {},\n", fname, map_type_fn(ftype)?));
     }
-    if has_lifecycle(spec) && !fields.iter().any(|(n, _)| n == "status") {
+    if has_lifecycle && !fields.iter().any(|(n, _)| n == "status") {
         out.push_str("    status: Status,\n");
     }
     out.push_str("}\n\n");

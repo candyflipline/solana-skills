@@ -1,13 +1,14 @@
-# v2.21 Slice 1 — Crucible crash-first regression fixture
+# v2.21 Slice 1 + §S1.2 — Crucible brownfield regression fixture
 
-This fixture pins the v2.21 PRD §"Slice 1" exit criterion: running
-`qedgen probe --fuzz <budget> --root <brownfield-program>` without a
-`.qedspec` surfaces a protocol-invariant violation on a deliberately
-buggy program.
+This fixture pins two v2.21 PRD exit criteria: the §"Slice 1" crash-
+first bear-hug (intrinsic panic / unwrap-on-None detection on a
+brownfield Anchor program without a `.qedspec`) AND the §S1.2 lamport-
+conservation companion (protocol-invariant guard around every
+`.send()`).
 
 ## What's in `buggy_anchor/`
 
-A minimal Anchor program with two deliberate bugs:
+A minimal Anchor program with three deliberate bugs:
 
 1. **`run` handler** — divides a constant by zero, panicking on the
    first invocation. Demonstrates Crucible's intrinsic panic detector
@@ -18,8 +19,16 @@ A minimal Anchor program with two deliberate bugs:
    Demonstrates the same intrinsic detector via the panic that
    `Option::unwrap` raises on `None`.
 
-Both bugs are reachable on **every** invocation — there's no input
-guard. A working Crucible run finds them on iteration 1.
+3. **`drain` handler** — sweeps all `source` lamports into `target`
+   with no authority check. When the fuzzer happens to pick a tracked
+   signer pubkey for `target`, qedgen's v2.21 §S1.2 lamport-inflation
+   guard (`assert_no_signer_inflation`) fires. Surfaces the drain
+   shape without any spec annotation.
+
+`run` and `maybe` are reachable on **every** invocation — a working
+Crucible run finds them on iteration 1. `drain` requires the fuzzer to
+land on a `target` that overlaps the tracked signer set; coverage-
+guided search reaches that case within a typical budget.
 
 ## Running the harness
 

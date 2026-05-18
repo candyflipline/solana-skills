@@ -3338,6 +3338,10 @@ pub fn check_completeness(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
     warnings.extend(check_unguarded_terminal_transition(spec));
     warnings.extend(check_unconditional_value_transfer(spec));
 
+    // v2.21 §S2.1 — flag bare same-named field references in multi-ADT
+    // specs. Lint-only; user qualifies or splits the property.
+    warnings.extend(check_cross_adt_field_ambiguity(spec));
+
     // Sort by priority (ascending), then by rule name for stability
     warnings.sort_by(|a, b| a.priority.cmp(&b.priority).then(a.rule.cmp(&b.rule)));
 
@@ -3475,6 +3479,119 @@ fn r25_will_bind_auth(handler: &ParsedHandler, spec: &ParsedSpec) -> bool {
 // `qedgen check` time means routine spec gaps don't have to wait for an
 // auditor invocation.
 // ============================================================================
+
+/// `[cross_adt_field_ambiguity]` — multi-ADT spec has a property whose
+/// expression mentions a bare field name that's declared in 2+ account
+/// types, and the reference isn't qualified by an account prefix. Codegen
+/// then assigns the property to every ADT module whose field set the
+/// expression substring-matches, which silently produces duplicate (and
+/// usually wrong) predicates.
+///
+/// v2.21 §S2.1 (Option A): lint, don't auto-qualify. Auto-qualification
+/// would silently pick the first-matching ADT, which can wedge invariants
+/// against the wrong State. Surfacing the ambiguity lets the user choose
+/// explicitly.
+fn check_cross_adt_field_ambiguity(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
+    let mut warnings = Vec::new();
+    if spec.account_types.len() < 2 {
+        return warnings;
+    }
+
+    // Build field_name → Vec<account_name>. Keep only fields declared on
+    // 2+ account types (the ambiguous set).
+    let mut field_to_adts: std::collections::BTreeMap<&str, Vec<&str>> =
+        std::collections::BTreeMap::new();
+    for acct in &spec.account_types {
+        for (fname, _) in &acct.fields {
+            field_to_adts
+                .entry(fname.as_str())
+                .or_default()
+                .push(acct.name.as_str());
+        }
+    }
+    field_to_adts.retain(|_, adts| adts.len() >= 2);
+    if field_to_adts.is_empty() {
+        return warnings;
+    }
+
+    let adt_prefixes: Vec<String> = spec
+        .account_types
+        .iter()
+        .map(|a| format!("{}.", a.name.to_lowercase()))
+        .collect();
+
+    // Walk every property's expression. For each ambiguous field, check
+    // for word-boundary references that are NOT already qualified by an
+    // ADT-name prefix or by `state.` (state.X means "the implicit single
+    // State", which is itself ambiguous in multi-ADT mode — flag it too).
+    for prop in &spec.properties {
+        let Some(ref expr) = prop.expression else {
+            continue;
+        };
+        for (&field, adts) in &field_to_adts {
+            // Quick reject: no occurrence of the field name anywhere.
+            if !expr.contains(field) {
+                continue;
+            }
+            // Walk every word-boundary position where `field` appears.
+            // A reference is "qualified" if the immediately-preceding
+            // character is a `.` AND the preceding identifier matches
+            // one of the lowercase ADT names (`<adt>.<field>`).
+            let bytes = expr.as_bytes();
+            let needle = field.as_bytes();
+            let mut idx = 0;
+            let mut any_unqualified = false;
+            while let Some(rel) = expr[idx..].find(field) {
+                let start = idx + rel;
+                let end = start + needle.len();
+                // Word-boundary check: not preceded/followed by identifier chars.
+                let pre_is_ident = start > 0
+                    && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_');
+                let post_is_ident =
+                    end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_');
+                if !pre_is_ident && !post_is_ident {
+                    // Is this an `<adt>.<field>` reference?
+                    let qualified = adt_prefixes.iter().any(|p| {
+                        let p_bytes = p.as_bytes();
+                        start >= p_bytes.len()
+                            && bytes[start - p_bytes.len()..start].eq_ignore_ascii_case(p_bytes)
+                    });
+                    if !qualified {
+                        any_unqualified = true;
+                        break;
+                    }
+                }
+                idx = end;
+            }
+            if !any_unqualified {
+                continue;
+            }
+            let adt_list = adts.join(", ");
+            let first_adt_lower = adts[0].to_lowercase();
+            warnings.push(CompletenessWarning {
+                rule: "cross_adt_field_ambiguity".to_string(),
+                severity: Severity::Warning,
+                priority: 2,
+                message: format!(
+                    "property '{}' references field `{}` which is declared in multiple account types ({}); codegen will emit the predicate inside every matching module",
+                    prop.name, field, adt_list,
+                ),
+                subject: Some(prop.name.clone()),
+                fix: format!(
+                    "Qualify the reference with the owning account type (e.g. `{}.{}`), or split the property into one per account type.",
+                    first_adt_lower, field,
+                ),
+                example: Some(format!(
+                    "  property {} \"...\"\n    {}.{} >= 0",
+                    prop.name, first_adt_lower, field,
+                )),
+                counterexample: None,
+                fix_options: vec![],
+            });
+        }
+    }
+    warnings
+}
 
 /// `[unbound_auth]` — `auth X` doesn't match a state field, so codegen's
 /// `auth → has_one` lowering (R25) can't fire. The signer check verifies
@@ -7258,5 +7375,130 @@ handler add : State.Active -> State.Active {
             calls: vec![],
             effect_branches: None,
         }
+    }
+
+    // v2.21 §S2.1 — cross-ADT field-ambiguity lint. Three cases:
+    //   (a) two ADTs share a field name AND a property references the bare
+    //       name → lint fires.
+    //   (b) single-ADT spec → never fires (lint short-circuits).
+    //   (c) explicit `<adt>.<field>` qualification → does not fire.
+    #[test]
+    fn cross_adt_field_ambiguity_fires_on_bare_reference() {
+        let src = r#"spec Pair
+
+type Distribution
+  | Empty
+  | Active of {
+      authority : Pubkey,
+      balance   : U64,
+    }
+
+type Claim
+  | Empty
+  | Active of {
+      claimant : Pubkey,
+      balance  : U64,
+    }
+
+property positive_balance :
+  state.balance >= 0
+  preserved_by all
+"#;
+        let spec = crate::chumsky_adapter::parse_str(src).expect("parse");
+        let warnings = check_cross_adt_field_ambiguity(&spec);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.rule == "cross_adt_field_ambiguity"),
+            "expected cross_adt_field_ambiguity to fire on bare `state.balance` ref, got: {:?}",
+            warnings.iter().map(|w| &w.rule).collect::<Vec<_>>(),
+        );
+        // The message names both ADTs so the user can pick.
+        let msg = &warnings
+            .iter()
+            .find(|w| w.rule == "cross_adt_field_ambiguity")
+            .unwrap()
+            .message;
+        assert!(
+            msg.contains("Distribution"),
+            "message must name Distribution: {}",
+            msg
+        );
+        assert!(msg.contains("Claim"), "message must name Claim: {}", msg);
+    }
+
+    #[test]
+    fn cross_adt_field_ambiguity_silent_on_single_adt() {
+        // Lending's exact shape: two ADTs but no overlapping field names.
+        // Cross-ADT lint must stay silent. (We don't try lending itself
+        // because the parser needs proper headers; use a synthetic two-ADT
+        // spec with disjoint fields.)
+        let src = r#"spec Lending
+
+type Pool
+  | Uninitialized
+  | Active of {
+      authority      : Pubkey,
+      total_deposits : U64,
+    }
+
+type Loan
+  | Empty
+  | Active of {
+      borrower : Pubkey,
+      amount   : U64,
+    }
+
+property pool_nonneg :
+  state.total_deposits >= 0
+  preserved_by all
+"#;
+        let spec = crate::chumsky_adapter::parse_str(src).expect("parse");
+        let warnings = check_cross_adt_field_ambiguity(&spec);
+        assert!(
+            warnings.is_empty(),
+            "no overlapping fields → no lint, got: {:?}",
+            warnings
+                .iter()
+                .map(|w| (&w.rule, &w.message))
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn cross_adt_field_ambiguity_silent_when_qualified() {
+        // Same shape as the positive-case fixture, but the property
+        // qualifies the reference as `distribution.balance`. The lint
+        // must NOT fire — the user has already disambiguated.
+        let src = r#"spec Pair
+
+type Distribution
+  | Empty
+  | Active of {
+      authority : Pubkey,
+      balance   : U64,
+    }
+
+type Claim
+  | Empty
+  | Active of {
+      claimant : Pubkey,
+      balance  : U64,
+    }
+
+property positive_balance :
+  distribution.balance >= 0
+  preserved_by all
+"#;
+        let spec = crate::chumsky_adapter::parse_str(src).expect("parse");
+        let warnings = check_cross_adt_field_ambiguity(&spec);
+        assert!(
+            warnings.is_empty(),
+            "qualified `distribution.balance` should clear the ambiguity, got: {:?}",
+            warnings
+                .iter()
+                .map(|w| (&w.rule, &w.message))
+                .collect::<Vec<_>>(),
+        );
     }
 }

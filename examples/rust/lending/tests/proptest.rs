@@ -248,9 +248,9 @@ mod loan {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Status {
-    Uninitialized,
+    Empty,
     Active,
-    Paused,
+    Liquidated,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -269,7 +269,7 @@ prop_compose! {
         pool in prop::array::uniform32(0u8..),
         amount in 0u64..=u64::MAX,
         collateral in 0u64..=u64::MAX,
-        status in prop_oneof![Just(Status::Uninitialized), Just(Status::Active), Just(Status::Paused)],
+        status in prop_oneof![Just(Status::Empty), Just(Status::Active), Just(Status::Liquidated)],
     ) -> State {
         State {
             borrower,
@@ -288,7 +288,7 @@ prop_compose! {
         pool in prop::array::uniform32(0u8..1u8),
         amount in prop_oneof![0u64..=3u64, (u64::MAX - 3)..=u64::MAX],
         collateral in prop_oneof![0u64..=3u64, (u64::MAX - 3)..=u64::MAX],
-        status in prop_oneof![Just(Status::Uninitialized), Just(Status::Active), Just(Status::Paused)],
+        status in prop_oneof![Just(Status::Empty), Just(Status::Active), Just(Status::Liquidated)],
     ) -> State {
         State {
             borrower,

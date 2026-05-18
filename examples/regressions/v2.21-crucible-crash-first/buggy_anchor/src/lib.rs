@@ -1,9 +1,17 @@
 //! Deliberately buggy Anchor program used by the v2.21 Slice 1
-//! Crucible-crash-first regression fixture. See ../README.md.
+//! Crucible-crash-first + Slice §S1.2 lamport-conservation regression
+//! fixtures. See ../README.md.
 //!
-//! Both handlers panic on every invocation — Crucible's brownfield
-//! protocol-mode harness should surface both bugs as `Finding`s without
-//! a `.qedspec` ever being written.
+//! Three handlers, each demonstrating a different protocol-invariant
+//! violation that Crucible's brownfield harness surfaces without a
+//! `.qedspec` ever being written:
+//!
+//!   * `run`   — divide-by-zero panic (intrinsic Crucible detector).
+//!   * `maybe` — `Option::unwrap` on `None` (same intrinsic detector).
+//!   * `drain` — routes all `source` lamports into `target` with no
+//!               authority check, triggering the v2.21 §S1.2 lamport-
+//!               inflation guard when the fuzzer picks `target` as a
+//!               tracked signer.
 
 use anchor_lang::prelude::*;
 
@@ -28,6 +36,22 @@ pub mod buggy_anchor {
         let _ = value.unwrap();
         Ok(())
     }
+
+    /// Sweeps every lamport from `source` into `target` with no
+    /// authority check. When Crucible's fuzzer happens to pick a
+    /// tracked signer for `target`, the brownfield harness's
+    /// `assert_no_signer_inflation` guard fires — surfacing a drain
+    /// shape (lamports appeared on a signer from outside the tracked
+    /// set) without any spec annotation.
+    pub fn drain(ctx: Context<DrainAccounts>) -> Result<()> {
+        let source = &ctx.accounts.source;
+        let target = &ctx.accounts.target;
+        let credit = source.lamports();
+        **source.try_borrow_mut_lamports()? = 0;
+        **target.try_borrow_mut_lamports()? =
+            target.lamports().checked_add(credit).unwrap();
+        Ok(())
+    }
 }
 
 #[derive(Accounts)]
@@ -36,4 +60,14 @@ pub struct Empty<'info> {
     /// access happens so the contents don't matter.
     /// CHECK: not validated; brownfield demo only.
     pub stub: AccountInfo<'info>,
+}
+
+#[derive(Accounts)]
+pub struct DrainAccounts<'info> {
+    /// CHECK: source PDA; no validation, deliberate drain shape.
+    #[account(mut)]
+    pub source: AccountInfo<'info>,
+    /// CHECK: target signer; no validation, deliberate drain shape.
+    #[account(mut)]
+    pub target: AccountInfo<'info>,
 }

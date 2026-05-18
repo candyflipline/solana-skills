@@ -1,13 +1,14 @@
 # Release v2.21.0 — Crucible crash-first + spec-mode codegen quality + tooling ergonomics
 
-> **Release status (2026-05-18):** paused on `feat/v2.21` at commit
-> `7f6b94e` pending fold-in of deferred v2.21.1 items per
-> `docs/prds/PLAN-v2.21-finish.md`. The pre-release gates below were
-> green at `7f6b94e`; they'll be re-run after the fold completes.
-> Branch is feature-complete for the PRD's blocking slices but the
-> user explicitly chose to land S2.1 + S2.2 + S1.2 lamport + S1.2
-> discriminator into the same release rather than ship them as
-> v2.21.1.
+> **Release status:** unpaused. Per
+> `docs/prds/PLAN-v2.21-finish.md` the deferred v2.21.1 items have
+> been folded into the same release: S2.2 (per-ADT Kani State + the
+> proptest mirror-fix), S2.1 (cross-ADT field-ambiguity lint), and
+> S1.2 lamport-conservation companion. S1.2 discriminator/size kept
+> at v2.22 — its typed-accounts introspection plumbing needs the
+> agent-fill site to resolve before the check can fire, and that
+> sequencing belongs in the v2.22 brownfield pass. All pre-release
+> gates were re-run after the fold.
 
 v2.21 ships the bear-hug reposition of Crucible alongside the v2.20.x
 backlog of codegen-quality fixes that real users (`rewards-feedback`)
@@ -54,10 +55,22 @@ Touched: `main.rs` (+162), `crucible_gen.rs` (+135),
 `tests/crucible_brownfield_smoke.rs` (new, ~250), `references/cli.md`,
 new fixture `examples/regressions/v2.21-crucible-crash-first/`.
 
-**Deferred to v2.21.1** (PRD scope-guards): lamport-conservation
-companion module, account discriminator / size invariants, auto-fill
-of the `accounts(todo!())` agent-fill site, brownfield support for
-non-Anchor runtimes.
+v2.21 also lands the **§S1.2 lamport-conservation companion**
+(folded from the v2.21.1 carve-out). In `InvariantMode::Protocol` /
+`InvariantMode::Both`, the emitted harness gets a top-level
+`snapshot_lamports` + `assert_no_signer_inflation` helper pair, and
+every `action_*` wraps its `.send()` with before/after signer-lamport
+snapshots. The check is asymmetric — signers may LOSE lamports (fees,
+rent) but must NOT GAIN them across a call, since inflation implies
+lamports flowed in from outside the tracked set (a drain shape). The
+`v2.21-crucible-crash-first/buggy_anchor` fixture gains a `drain`
+handler so this path is regression-pinned. Discriminator / size
+invariants stay v2.22 — they need the agent-fill site to land before
+typed-accounts introspection can fire.
+
+**Still deferred to v2.22** (PRD scope-guards): account discriminator
+/ size invariants, auto-fill of the `accounts(todo!())` agent-fill
+site, brownfield support for non-Anchor runtimes.
 
 ### Slice 6 — codegen determinism (`405eeff`)
 
@@ -119,9 +132,31 @@ Four of the seven rewards-feedback codegen bugs flagged in PRD-v2.20
   cases. Synthetic `_case_N` / `_otherwise` handlers skipped to
   avoid double-reporting.
 
-**Deferred to v2.21.1+**: S2.1 (cross-state monomorphisation),
-S2.2 (single-State Kani struct), S2.4 (Codama IDL ingest). Each
-is a multi-day codegen pass per the PRD's own day estimate.
+v2.21-finish folds in **S2.1** + **S2.2** (previously deferred):
+
+- **S2.2 — per-ADT Kani State**: multi-ADT specs (lending: Pool +
+  Loan) now emit one `mod <name> { use super::*; <State + Status +
+  predicates + transitions + proofs> }` per account type, mirroring
+  proptest's existing per-ADT split. The shared `Status` enum is
+  built from the *per-account* `acct.lifecycle` — not the
+  spec-level one — so lending's `mod loan` gets `Status { Empty,
+  Active, Liquidated }` instead of Pool's variants. Proptest had the
+  same latent bug (param plumbed, value unused) and got fixed in
+  the same pass (`emit_state_strategy`, `emit_preservation_tests_for`,
+  `emit_invariant_preservation_tests_for`, `emit_sequence_test_for`
+  all now thread `lifecycle_states: &[String]`).
+
+- **S2.1 — cross-ADT field-ambiguity lint**: PRD Option A. When a
+  multi-ADT spec has a property whose expression references a bare
+  field name declared on 2+ account types AND the reference is
+  unqualified, `qedgen check` emits a Warning at priority 2 naming
+  the candidate ADTs and suggesting the user qualify with
+  `<acct>.<field>`. Word-boundary scan; respects an explicit
+  `<acct>.<field>` prefix (no lint when the user has already
+  disambiguated).
+
+**Still deferred**: S2.4 (Codama IDL ingest) — multi-day pass per
+the PRD's own estimate, v2.22 scope.
 
 ### Slice 3 — Pubkey state-field lowering (Option B) (`97553df`)
 
@@ -192,34 +227,33 @@ because Lean `Nat` is unbounded.
 
 - [x] `cargo fmt --check`
 - [x] `cargo clippy -- -D warnings`
-- [x] `cargo test` — 715 passed, 0 failed, 8 ignored
+- [x] `cargo test` — 722 passed, 0 failed, 8 ignored (715 baseline
+      + 1 multi-ADT kani fixture + 3 cross-ADT lint cases + 3
+      protocol-mode lamport-check cases)
 - [x] `bash scripts/check-readme-drift.sh`
 - [x] `bash scripts/check-lake-build.sh` — 10/10 examples green
 - [x] `bash scripts/check-version-consistency.sh` — 2.21.0 everywhere
 - [x] Zero unintended `sorry` (ensures-as-axiom CPI theorems excepted)
 - [x] `qedgen check --regen-drift` clean against all 5 bundled
       examples
+- [x] `qedgen check --frozen` clean on every `examples/rust/*/qed.lock`
 - [x] No `feedback_no_anchor_v2_mentions` violations
 - [x] `CLAUDE.md` ↔ `claude.md` byte-identical
-- [x] `Cargo.toml` + `package.json` bumped to 2.21.0
+- [x] `Cargo.toml` + `package.json` at 2.21.0
 
-## Deferred to v2.21.1 / v2.22+
+## Deferred to v2.22+
 
-- **Slice 1 protocol-invariant companion module** — lamport-
-  conservation diff across CPI returns + account discriminator /
-  size invariants. v2.21 ships the brownfield emit pipeline; the
-  five protocol invariants from the PRD's S1.2 land as three (panic
-  / unwrap / borrow-mut, caught intrinsically by Crucible). Lamport
-  + discriminator are v2.21.1.
+- **S1.2 account discriminator / size invariants** — needs typed-
+  accounts introspection (the `accounts::*` literal is `todo!()` at
+  codegen time, fills happen during the agent flow). Sequencing this
+  belongs alongside the brownfield agent-fill landing.
 - **Slice 1 non-Anchor brownfield runtimes** — Pinocchio / Native /
   sBPF. Brownfield mode errors with a clear "v2.22+ tracking"
   message.
-- **Slice 2 deferred sub-bugs** —
-  - S2.1: cross-state-type field monomorphisation into wrong
-    modules (Distribution.balance vs Claim.balance disambiguation).
-  - S2.2: single-State Kani struct for multi-ADT specs (mirror the
-    proptest per-ADT module split).
-  - S2.4: Codama IDL ingest in `qedgen spec --idl`.
+- **Slice 1 auto-fill of `accounts(todo!())`** — handled by the
+  agent today; v2.22 explores tooling-side suggestions from the
+  spec's `accounts` block.
+- **Slice 2 — S2.4 Codama IDL ingest** in `qedgen spec --idl`.
 - **Slice 4 enum-pattern Lean lowering** — identifier patterns
   over enum-shaped state (reserved at the v2.20 PRD level for v2.7's
   full enum-State work).
@@ -227,6 +261,10 @@ because Lean `Nat` is unbounded.
   interview parity with Claude Code.
 - **PRD-v2.20 §S3.6 hook auto-install** via `npx skills add` —
   ergonomics polish.
+- **Per-ADT cover / liveness / environment harnesses** — multi-ADT
+  specs skip these at file level in v2.21 (since they reference
+  per-account `State` + transitions that now live inside `mod
+  <acct>`). Single-ADT behavior unchanged; v2.22 lifts the lift.
 
 ## Footer — relationship to existing memories
 
