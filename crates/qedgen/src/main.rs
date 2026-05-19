@@ -2693,7 +2693,13 @@ async fn main() -> Result<()> {
             codegen::generate(&spec, &output_dir, target)?;
 
             if kani || all {
-                deps::require_kani()?;
+                // Codegen is pure text generation; missing cargo-kani only
+                // matters when the harness is actually executed. The hard gate
+                // lives in `qedgen verify --kani` (see verify.rs). Warn here
+                // so the install hint surfaces, but don't block codegen.
+                if let Err(e) = deps::require_kani() {
+                    eprintln!("warning: {e}");
+                }
                 kani::generate(&spec, &kani_output)?;
             }
             if test || all {
@@ -2714,7 +2720,14 @@ async fn main() -> Result<()> {
                 integration_test::generate(&spec, &integration_output)?;
             }
             if lean || all {
-                deps::require_lean()?;
+                // Same rationale as the Kani branch: `lean_gen::generate` and
+                // `proofs_bootstrap::bootstrap_if_missing` are pure text
+                // writers. `lake` is only required to *build* the generated
+                // proofs, which `qedgen verify --lean` (and Aristotle) gate
+                // separately. Warn here without blocking codegen.
+                if let Err(e) = deps::require_lean() {
+                    eprintln!("warning: {e}");
+                }
                 let parsed = check::parse_spec_file(&spec)?;
                 lean_gen::generate(&parsed, &lean_output)?;
                 // Bootstrap Proofs.lean alongside Spec.lean. Never overwrites
