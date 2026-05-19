@@ -311,6 +311,18 @@ fn fixture_buggy_pinocchio_drives_brownfield_emit() {
     // name to build `instruction::Foo` literals that must match the
     // declare_fuzz_program! macro's type names).
     let main_rs = std::fs::read_to_string(harness.join("src/main.rs")).expect("read main.rs");
+
+    // Macro line uses the explicit `name = "path"` form so the generated
+    // module is named `buggy_pinocchio` regardless of the IDL's internal
+    // `program.name` casing (Codama IR camelCases program names; without
+    // the override the `use buggy_pinocchio::*` lines below the macro
+    // would unresolve when the IDL declares `buggyPinocchio`).
+    assert!(
+        main_rs.contains(
+            "crucible_idl_gen::declare_fuzz_program!(buggy_pinocchio = \"idls/buggy_pinocchio.json\")"
+        ),
+        "expected explicit-name declare_fuzz_program! invocation; got:\n{main_rs}"
+    );
     for action in ["action_run", "action_maybe", "action_drain"] {
         assert!(
             main_rs.contains(action),
