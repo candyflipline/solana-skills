@@ -476,6 +476,17 @@ pub struct Finding {
     /// `omitempty` so v1 schema consumers keep working.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reproducer: Option<Reproducer>,
+    /// v2.22 Slice 5: list of gate names the probe detected upstream of
+    /// this finding's site. For Pinocchio zero-copy loads the canonical
+    /// triad is `["length_check", "discriminator_check", "owner_check"]`;
+    /// for `offset_overrun` it's `["length_check"]`. When the gate
+    /// signals fire, the underlying unsafe pattern is defensively
+    /// fenced and the finding is much less likely to be a real bug.
+    /// The auditor subagent uses this list to bulk-suppress
+    /// belt-and-braces findings keyed on the triad rather than per
+    /// site. `None` for findings the gate detector doesn't analyze.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gated_by: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1000,6 +1011,7 @@ fn predicate_missing_signer(handler: &ParsedHandler) -> Option<Finding> {
         ),
         category_tag: "missing_signer".to_string(),
         reproducer: None,
+        gated_by: None,
     })
 }
 
@@ -1060,6 +1072,7 @@ fn predicate_arbitrary_cpi(handler: &ParsedHandler) -> Option<Finding> {
         ),
         category_tag: "arbitrary_cpi".to_string(),
         reproducer: None,
+        gated_by: None,
     })
 }
 
@@ -1122,6 +1135,7 @@ fn predicate_arithmetic_overflow_wrapping(handler: &ParsedHandler) -> Vec<Findin
             ),
             category_tag: "arithmetic_overflow_wrapping".to_string(),
             reproducer: None,
+            gated_by: None,
         });
     }
     out
@@ -1184,6 +1198,7 @@ fn predicate_lifecycle_one_shot_violation(
         ),
         category_tag: "lifecycle_one_shot_violation".to_string(),
         reproducer: None,
+        gated_by: None,
     })
 }
 
@@ -1256,6 +1271,7 @@ fn predicate_unbounded_amount_param(handler: &ParsedHandler) -> Vec<Finding> {
             ),
             category_tag: "unbounded_amount_param".to_string(),
             reproducer: None,
+            gated_by: None,
         });
     }
     out
@@ -1310,6 +1326,7 @@ fn predicate_permissionless_state_writer(handler: &ParsedHandler) -> Option<Find
         ),
         category_tag: "permissionless_state_writer".to_string(),
         reproducer: None,
+        gated_by: None,
     })
 }
 
@@ -1375,6 +1392,7 @@ fn predicate_init_without_pda(
         ),
         category_tag: "init_without_pda".to_string(),
         reproducer: None,
+        gated_by: None,
     })
 }
 
@@ -1538,6 +1556,7 @@ fn predicate_stored_field_never_written(spec: &ParsedSpec) -> Vec<Finding> {
                 ),
                 category_tag: "stored_field_never_written".to_string(),
                 reproducer: None,
+                gated_by: None,
             });
         }
     }

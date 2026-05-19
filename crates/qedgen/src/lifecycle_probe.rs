@@ -392,6 +392,7 @@ fn emit_findings(grants: &[AuthorityGrant], closes: &[CloseSite]) -> Vec<Finding
                 substitutions: subs,
                 repro_path: format!(".qed/probes/lifecycle/{finding_id}/repro.rs"),
             }),
+            gated_by: None,
         });
     }
     out

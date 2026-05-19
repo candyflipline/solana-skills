@@ -364,6 +364,7 @@ fn finding_from_crash(
             extra_seeds: Vec::new(),
             crucible_version,
         }),
+        gated_by: None,
     })
 }
 
@@ -714,6 +715,7 @@ mod tests {
                 extra_seeds: Vec::new(),
                 crucible_version: "test".into(),
             }),
+            gated_by: None,
         }
     }
 

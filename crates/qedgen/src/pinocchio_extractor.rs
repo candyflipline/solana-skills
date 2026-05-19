@@ -224,6 +224,7 @@ mod tests {
                 substitutions: subs,
                 repro_path: String::new(),
             }),
+            gated_by: None,
         }
     }
 

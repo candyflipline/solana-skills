@@ -875,6 +875,7 @@ pub fn findings_from_catalogue(cat: &PinocchioCatalogue) -> Vec<crate::probe::Fi
                     adversarial_inputs: adversarial.clone(),
                     invariant_asserts: invariants.clone(),
                 }),
+                gated_by: None,
             });
         }
 
@@ -919,6 +920,7 @@ pub fn findings_from_catalogue(cat: &PinocchioCatalogue) -> Vec<crate::probe::Fi
             ),
             category_tag: probe_md.to_string(),
             reproducer: Some(mollusk),
+            gated_by: None,
         });
 
         findings.push(Finding {
@@ -943,6 +945,7 @@ pub fn findings_from_catalogue(cat: &PinocchioCatalogue) -> Vec<crate::probe::Fi
             ),
             category_tag: probe_md.to_string(),
             reproducer: Some(miri),
+            gated_by: None,
         });
     }
 

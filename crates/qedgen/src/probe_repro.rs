@@ -293,6 +293,7 @@ mod tests {
             investigation_hint: "test".to_string(),
             category_tag: tag.to_string(),
             reproducer: None,
+            gated_by: None,
         }
     }
 

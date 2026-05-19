@@ -179,6 +179,7 @@ pub(crate) fn scan_silent_success_arithmetic(rel_file: &Path, source: &str) -> V
                 substitutions: subs,
                 repro_path: format!(".qed/probes/arithmetic_symbol/{}/repro.rs", finding_id),
             }),
+            gated_by: None,
         });
     }
     out
@@ -279,6 +280,7 @@ pub(crate) fn scan_graceful_error_as_dos(rel_file: &Path, source: &str) -> Vec<F
                 substitutions: subs,
                 repro_path: format!(".qed/probes/arithmetic_symbol/{}/repro.rs", finding_id),
             }),
+            gated_by: None,
         });
     }
     out
@@ -443,6 +445,7 @@ pub(crate) fn scan_unchecked_arith_with_fund_flow(rel_file: &Path, source: &str)
                 substitutions: subs,
                 repro_path: format!(".qed/probes/arithmetic_symbol/{}/repro.rs", finding_id),
             }),
+            gated_by: None,
         });
     }
     out

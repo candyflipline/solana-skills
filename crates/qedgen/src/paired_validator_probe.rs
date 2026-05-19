@@ -226,6 +226,7 @@ fn emit_findings(by_field: &BTreeMap<String, Vec<ValidatorSite>>) -> Vec<Finding
                 substitutions: subs,
                 repro_path: format!(".qed/probes/paired_validator/{finding_id}/repro.rs"),
             }),
+            gated_by: None,
         });
     }
     out

@@ -425,6 +425,7 @@ pub fn detect_divergence(
                 ),
                 category_tag: "execution_divergence".to_string(),
                 reproducer: None,
+                gated_by: None,
             });
         }
     }
