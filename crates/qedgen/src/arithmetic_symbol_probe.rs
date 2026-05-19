@@ -14,10 +14,12 @@
 //!   a non-trivial effect. The 0-or-MAX boundary value silently opens
 //!   a fund-flow gate that should have stayed closed.
 //!
-//! - **`graceful_error_as_dos`** (S1.2, HIGH; v2.22 follow-up) —
-//!   `checked_sub` / `checked_add` / `checked_mul` in an init / create
-//!   path where `Err` propagation permanently bricks a deterministic
-//!   PDA. Pending.
+//! - **`graceful_error_as_dos`** (S1.2, HIGH) — `checked_sub` /
+//!   `checked_add` / `checked_mul` in an init / create path where
+//!   `Err` propagation permanently bricks a deterministic PDA.
+//!   The operator is correct in isolation; the bug is the failure-mode
+//!   interaction with the address's permanence. Closes CAN-H3 on the
+//!   subscriptions bench.
 //!
 //! - **`unchecked_arith_with_fund_flow`** (S1.3, INFO; v2.22
 //!   follow-up) — unchecked `*` / `+` / `-` whose result gates a CPI.
@@ -66,6 +68,7 @@ pub fn scan_program(project_root: &Path) -> Result<Vec<Finding>> {
             .unwrap_or(file)
             .to_path_buf();
         findings.extend(scan_silent_success_arithmetic(&rel, &source));
+        findings.extend(scan_graceful_error_as_dos(&rel, &source));
     }
     Ok(findings)
 }
@@ -176,6 +179,175 @@ pub(crate) fn scan_silent_success_arithmetic(rel_file: &Path, source: &str) -> V
     out
 }
 
+/// S1.2 — `graceful_error_as_dos` scanner. Pattern criteria:
+///
+/// 1. A call site of `checked_sub` / `checked_add` / `checked_mul`.
+/// 2. The enclosing fn name contains `init` / `create` / `initialize`
+///    (case-insensitive) — the lifecycle handlers that materialise a
+///    deterministic address.
+/// 3. The fn body OR signature signals PDA / seed-driven derivation:
+///    - body contains `find_program_address`, OR
+///    - signature contains `seeds:` / `&[Seed` / `&Seed<`, OR
+///    - body contains `invoke_signed(` (signed CPI implies a PDA
+///      derivation upstream).
+/// 4. The operator's `Err` arm exits the function via `?` (the most
+///    common shape) or `return Err(...)`.
+///
+/// Surfaces as HIGH severity — the failure mode bricks a permanent
+/// address every caller subsequently hits.
+///
+/// False-positive guard: when none of the PDA / seed signals fire, the
+/// arithmetic is treated as user-funded (a user can retry with
+/// corrected inputs) and the finding is suppressed.
+pub(crate) fn scan_graceful_error_as_dos(rel_file: &Path, source: &str) -> Vec<Finding> {
+    let call_re = Regex::new(r"\.(?P<op>checked_sub|checked_add|checked_mul)\s*\(")
+        .expect("static regex compiles");
+
+    let mut out = Vec::new();
+    for caps in call_re.captures_iter(source) {
+        let m = caps.get(0).unwrap();
+        let op = caps.name("op").unwrap().as_str();
+        let line = byte_offset_to_line(source, m.start());
+        let Some(fn_name) = enclosing_fn_name(source, m.start()) else {
+            continue;
+        };
+        if !is_init_shape(&fn_name) {
+            continue;
+        }
+        let fn_body = enclosing_fn_body(source, m.start());
+        if !body_signals_pda(&fn_body) {
+            continue;
+        }
+        // Confirm the Err arm exits: look in the ~120 chars after the
+        // call for `?` or `return Err`. The propagation can chain
+        // through `.ok_or(...)` / `.ok_or_else(...)`.
+        let window = &source[m.end()..source.len().min(m.end() + 160)];
+        if !window.contains('?') && !window.contains("return Err") {
+            continue;
+        }
+
+        let finding_id = make_id(rel_file, line, "graceful_error_as_dos");
+        let mut subs = std::collections::BTreeMap::new();
+        subs.insert("FILE".to_string(), rel_file.display().to_string());
+        subs.insert("LINE".to_string(), line.to_string());
+        subs.insert("OPERATOR".to_string(), op.to_string());
+        subs.insert("FN".to_string(), fn_name.clone());
+
+        out.push(Finding {
+            id: finding_id.clone(),
+            category: Category::GracefulErrorAsDos,
+            severity: Severity::High,
+            handler: fn_name.clone(),
+            spec_silent_on: format!(
+                "`{}` at {}:{} inside `{}` propagates `Err` via `?` on \
+                 a PDA-init path. The PDA's seeds are deterministic; nobody \
+                 holds its private key; if the operator returns `None` on the \
+                 first call, every subsequent call hits the same failure — \
+                 the address is permanently locked.",
+                op,
+                rel_file.display(),
+                line,
+                fn_name
+            ),
+            suppression_hint: "Distinguish 'attacker pre-funded the PDA' from 'genuine \
+                 arithmetic underflow' explicitly. For pre-fund DoS, accept \
+                 the existing lamports and skip the transfer (idempotent \
+                 init). For genuine overflow on attacker-controlled inputs, \
+                 reject earlier in the handler via a `requires`-style \
+                 precondition check."
+                .to_string(),
+            investigation_hint: format!(
+                "Read `{}` around line {}. Confirm: (a) the touched account \
+                 reaches a `find_program_address` / signed CPI, so the \
+                 address is deterministic; (b) the `Err` propagation has no \
+                 alternate path — every caller hits the same operator. \
+                 Then derive an attack: pre-fund the PDA with `lamports + 1` \
+                 to force the underflow, observe permanent init failure.",
+                rel_file.display(),
+                line
+            ),
+            category_tag: "graceful_error_as_dos".to_string(),
+            reproducer: Some(Reproducer::MolluskPrompt {
+                template_path:
+                    "references/probes/arithmetic_symbol/graceful_error_as_dos.md#reproducer"
+                        .to_string(),
+                substitutions: subs,
+                repro_path: format!(".qed/probes/arithmetic_symbol/{}/repro.rs", finding_id),
+            }),
+        });
+    }
+    out
+}
+
+/// Walk forward from `offset` to find the body of the enclosing fn —
+/// the text between the next `{` after the fn signature and its
+/// matching `}`. Used by `scan_graceful_error_as_dos` to check
+/// PDA/seed signals across the whole fn, not just the call site.
+fn enclosing_fn_body(source: &str, offset: usize) -> String {
+    // Locate the enclosing `fn ... (` in source[..offset]; then track
+    // the first `{` after that point and its matching `}`.
+    let head = &source[..offset.min(source.len())];
+    let fn_re = Regex::new(r"\bfn\s+[A-Za-z_][A-Za-z0-9_]*\s*[<\(]").expect("static regex");
+    let Some(fn_match) = fn_re.find_iter(head).last() else {
+        return String::new();
+    };
+    let bytes = source.as_bytes();
+    let mut i = fn_match.start();
+    while i < bytes.len() && bytes[i] != b'{' {
+        i += 1;
+    }
+    if i >= bytes.len() {
+        return String::new();
+    }
+    let body_start = i + 1;
+    let mut depth: i32 = 1;
+    let mut j = body_start;
+    while j < bytes.len() && depth > 0 {
+        match bytes[j] {
+            b'{' => depth += 1,
+            b'}' => depth -= 1,
+            _ => {}
+        }
+        if depth == 0 {
+            return source[body_start..j].to_string();
+        }
+        j += 1;
+    }
+    source[body_start..].to_string()
+}
+
+/// True when the fn name suggests a lifecycle-initialisation handler.
+/// Case-insensitive substring match on the canonical naming
+/// conventions (`init`, `create`, `initialize`).
+fn is_init_shape(fn_name: &str) -> bool {
+    let lower = fn_name.to_ascii_lowercase();
+    lower == "init"
+        || lower == "create"
+        || lower == "initialize"
+        || lower.starts_with("init_")
+        || lower.starts_with("create_")
+        || lower.starts_with("initialize_")
+        || lower.ends_with("_init")
+        || lower.ends_with("_create")
+        || lower.ends_with("_initialize")
+        || lower.contains("_init_")
+        || lower.contains("_create_")
+        || lower.contains("_initialize_")
+}
+
+/// True when the function body or signature signals PDA / seed-driven
+/// derivation — the discriminator for "the address is deterministic and
+/// nobody holds the private key."
+fn body_signals_pda(body: &str) -> bool {
+    body.contains("find_program_address")
+        || body.contains("invoke_signed")
+        || body.contains("Pubkey::create_program_address")
+        || body.contains("seeds:")
+        || body.contains("&[Seed")
+        || body.contains("&Seed<")
+        || body.contains("&[&[u8]]")
+}
+
 /// Receiver-shape predicate. Returns true for identifiers and
 /// expressions that look like a Solana timestamp / clock value.
 fn is_timestamp_shape(recv: &str) -> bool {
@@ -256,11 +428,13 @@ fn byte_offset_to_line(source: &str, offset: usize) -> u32 {
 }
 
 /// Walk backward from the given offset to find the nearest enclosing
-/// `fn <name>(`. Returns the function name; falls back to `None` when
-/// the offset isn't inside a function.
+/// `fn <name>(...)` or `fn <name><...>(...)`. Returns the function
+/// name; falls back to `None` when the offset isn't inside a function.
+/// The `[<\(]` terminator captures both bare fns and generic fns
+/// (`fn init<'a, T>`, the CAN-H3 shape).
 fn enclosing_fn_name(source: &str, offset: usize) -> Option<String> {
     let head = &source[..offset.min(source.len())];
-    let re = Regex::new(r"fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(").expect("static regex");
+    let re = Regex::new(r"fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*[<\(]").expect("static regex");
     re.captures_iter(head).last().map(|c| c[1].to_string())
 }
 
@@ -407,6 +581,124 @@ fn log_elapsed(current_ts: i64, start_ts: i64) {
             findings.is_empty(),
             "no gating comparison should NOT fire; got {findings:#?}"
         );
+    }
+
+    // ───────────────────────────────────────────────────────────────
+    // S1.2 — graceful_error_as_dos tests
+    // ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn fires_on_canonical_subscriptions_can_h3_shape() {
+        // Mirrors the multi_delegator helpers/program.rs:47-49 site —
+        // the CAN-H3 firm-High miss. PDA-init path with `checked_sub`
+        // whose Err propagates via `?`.
+        let src = r#"
+fn init<'a, T: Sized>(
+    payer: &AccountView,
+    account: &AccountView,
+    seeds: &[Seed<'a>],
+    space: usize,
+) -> ProgramResult {
+    let lamports = Rent::get()?.try_minimum_balance(space)?;
+    let signer = [Signer::from(seeds)];
+
+    if account.lamports() == 0 {
+        // happy path
+    } else {
+        let required_lamports = lamports
+            .checked_sub(account.lamports())
+            .ok_or(ArithmeticUnderflow)?;
+        if required_lamports > 0 {
+            Transfer { from: payer, to: account, lamports: required_lamports }
+                .invoke()?;
+        }
+        Allocate { account, space: space as u64 }.invoke_signed(&signer)?;
+    }
+    Ok(())
+}
+"#;
+        let findings = scan_graceful_error_as_dos(&p("program.rs"), src);
+        assert_eq!(
+            findings.len(),
+            1,
+            "expected 1 graceful_error_as_dos finding, got {findings:#?}"
+        );
+        let f = &findings[0];
+        assert_eq!(f.category_tag, "graceful_error_as_dos");
+        assert!(matches!(f.severity, Severity::High));
+        assert_eq!(f.handler, "init");
+        assert!(matches!(
+            f.reproducer,
+            Some(Reproducer::MolluskPrompt { .. })
+        ));
+    }
+
+    #[test]
+    fn fires_on_create_named_fn_with_find_program_address() {
+        let src = r#"
+fn create_subscription(ctx: Context, amount: u64) -> Result<()> {
+    let (pda, bump) = Pubkey::find_program_address(&[b"sub", ctx.user.key.as_ref()], &ctx.program.key);
+    let cost = amount.checked_sub(BASE_FEE).ok_or(Underflow)?;
+    msg!("cost: {}", cost);
+    Ok(())
+}
+"#;
+        let findings = scan_graceful_error_as_dos(&p("create.rs"), src);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].handler, "create_subscription");
+    }
+
+    #[test]
+    fn ignores_checked_sub_outside_init_fn() {
+        // Non-init / non-create fn — even with a PDA signal — shouldn't
+        // fire. The rule is specifically about lifecycle-init paths
+        // whose failure permanently bricks the address.
+        let src = r#"
+fn transfer(ctx: Context, amount: u64) -> Result<()> {
+    let (_pda, _bump) = Pubkey::find_program_address(&[b"x"], &ctx.program.key);
+    let remaining = ctx.balance.checked_sub(amount).ok_or(Underflow)?;
+    Ok(())
+}
+"#;
+        let findings = scan_graceful_error_as_dos(&p("transfer.rs"), src);
+        assert!(
+            findings.is_empty(),
+            "non-init fn should NOT fire, got {findings:#?}"
+        );
+    }
+
+    #[test]
+    fn ignores_init_fn_without_pda_signal() {
+        // `init`-named but no PDA / seeds / invoke_signed in the body —
+        // user-funded account, retryable, suppressed.
+        let src = r#"
+fn init_user(ctx: Context, balance: u64) -> Result<()> {
+    let remaining = balance.checked_sub(MIN_BALANCE).ok_or(Underflow)?;
+    ctx.user.balance = remaining;
+    Ok(())
+}
+"#;
+        let findings = scan_graceful_error_as_dos(&p("init_user.rs"), src);
+        assert!(
+            findings.is_empty(),
+            "init fn without PDA signal should NOT fire, got {findings:#?}"
+        );
+    }
+
+    #[test]
+    fn fires_on_invoke_signed_in_init_body() {
+        // No find_program_address but invoke_signed indicates a PDA
+        // derivation upstream. Still fires.
+        let src = r#"
+fn initialize(payer: &AccountView, pda: &AccountView, bump: u8) -> ProgramResult {
+    let required = MIN_LAMPORTS.checked_sub(pda.lamports()).ok_or(Underflow)?;
+    let signer = [Signer::from(&[b"acc", &[bump]])];
+    Transfer { from: payer, to: pda, lamports: required }.invoke_signed(&signer)?;
+    Ok(())
+}
+"#;
+        let findings = scan_graceful_error_as_dos(&p("init.rs"), src);
+        assert_eq!(findings.len(), 1);
     }
 
     #[test]
