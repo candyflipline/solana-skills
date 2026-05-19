@@ -134,6 +134,17 @@ pub enum Category {
     /// underflow → the address is locked forever. Closes CAN-H3 on
     /// the subscriptions bench. See PRD-v2.22 §S1.2.
     GracefulErrorAsDos,
+    /// Unchecked `*` / `+` / `-` arithmetic on integer values inside a
+    /// handler whose body also contains a token / system CPI. The
+    /// arithmetic is locally safe under the program's current bounds
+    /// (e.g. `period_hours * 3600` where `period_hours` is capped
+    /// upstream), but the local code makes no explicit invariant
+    /// claim — if the upstream bound ever loosens the multiplication
+    /// wraps and the fund-flow effect proceeds on a corrupted value.
+    /// Surfaced as Low severity because most call sites are safe
+    /// today and the recommendation is preventive (`checked_*`). See
+    /// PRD-v2.22 §S1.3.
+    UncheckedArithWithFundFlow,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]

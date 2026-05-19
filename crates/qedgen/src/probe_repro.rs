@@ -185,7 +185,8 @@ pub fn construct_reproducer(
         // `arithmetic_symbol_probe::scan_program`. Same out-of-band
         // shape as the Pinocchio probes.
         | Category::SilentSuccessArithmetic
-        | Category::GracefulErrorAsDos => Err(ConstructFailure::NotImplemented),
+        | Category::GracefulErrorAsDos
+        | Category::UncheckedArithWithFundFlow => Err(ConstructFailure::NotImplemented),
     }
 }
 
