@@ -41,14 +41,35 @@ fn emit_state_init_symbolic(
 /// `status` field set to the section's initial lifecycle state. Used by init-
 /// handler harnesses (effect/preservation), where the pre-state is the
 /// canonical "before initialization" state.
+///
+/// Defaults are type-aware via `proptest_gen::default_value_for_field`:
+/// `Map[N] T` → `[<inner>; N]`, named records → `<Name>::default()`, named
+/// sums with a zero-payload variant → that variant; primitives → `0`. A
+/// `None` return means "no sensible default" — skip the field and let
+/// rustc surface the missing field with E0063, which is a clearer
+/// diagnostic than emitting wrong-type code.
+///
+/// Same shape (and same helper) as the seed-state init fix landed in
+/// `fix(proptest_gen): type-aware seed-state init for arrays + lifecycle
+/// status` (#45). Without this, every array-typed state field literals
+/// to `{}: 0` and the harness fails to compile:
+///
+///     error[E0308]: mismatched types
+///        --> tests/kani.rs:N:M
+///         |
+///       N |         rfp_milestone_amounts: 0,
+///         |                                ^ expected `[u64; 8]`, found integer
 fn emit_state_init_zeroed(
     out: &mut String,
     mutable_fields: &[&(String, String)],
     lifecycle_states: &[String],
+    spec: &ParsedSpec,
 ) {
     out.push_str("    let mut s = State {\n");
-    for (fname, _) in mutable_fields {
-        out.push_str(&format!("        {}: 0,\n", fname));
+    for (fname, ftype) in mutable_fields {
+        if let Some(default) = crate::proptest_gen::default_value_for_field(ftype, spec) {
+            out.push_str(&format!("        {}: {},\n", fname, default));
+        }
     }
     if let Some(initial) = lifecycle_states.first() {
         if lifecycle_states.len() >= 2 {
@@ -618,7 +639,7 @@ fn emit_kani_account_section(
                 let needs_local_binder = prop.per_slot.is_some() && !handler_takes_binder;
 
                 if is_init {
-                    emit_state_init_zeroed(out, mutable_fields, lifecycle_states);
+                    emit_state_init_zeroed(out, mutable_fields, lifecycle_states, spec);
                 } else {
                     emit_state_init_symbolic(out, mutable_fields, lifecycle_states);
                     emit_pre_status_assume(out, op, lifecycle_states);
@@ -790,7 +811,7 @@ fn emit_kani_account_section(
                 ));
 
                 if is_init {
-                    emit_state_init_zeroed(out, mutable_fields, lifecycle_states);
+                    emit_state_init_zeroed(out, mutable_fields, lifecycle_states, spec);
                 } else {
                     emit_state_init_symbolic(out, mutable_fields, lifecycle_states);
                     emit_pre_status_assume(out, op, lifecycle_states);
@@ -894,7 +915,7 @@ fn emit_kani_account_section(
 
                 // Symbolic state
                 if is_init {
-                    emit_state_init_zeroed(out, mutable_fields, lifecycle_states);
+                    emit_state_init_zeroed(out, mutable_fields, lifecycle_states, spec);
                 } else {
                     emit_state_init_symbolic(out, mutable_fields, lifecycle_states);
                     emit_pre_status_assume(out, op, lifecycle_states);
