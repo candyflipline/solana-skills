@@ -14,6 +14,21 @@
 // ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 #![cfg(kani)]
 
+#[allow(dead_code)]
+#[inline]
+fn mul_div_floor_u128(a: u128, b: u128, d: u128) -> u128 {
+if d == 0 { return 0; }
+a.saturating_mul(b) / d
+}
+
+#[allow(dead_code)]
+#[inline]
+fn mul_div_ceil_u128(a: u128, b: u128, d: u128) -> u128 {
+if d == 0 { return 0; }
+let prod = a.saturating_mul(b);
+if prod % d == 0 { prod / d } else { (prod / d).saturating_add(1) }
+}
+
 // ============================================================================
 // State model (derived from qedspec — no framework dependencies)
 // ============================================================================
