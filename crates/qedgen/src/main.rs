@@ -31,6 +31,7 @@ mod integration_test;
 mod interface_gen;
 mod kani;
 mod lean_gen;
+mod lifecycle_probe;
 mod miri_verify;
 mod native_extractor;
 mod paired_validator_probe;
@@ -1738,6 +1739,10 @@ async fn main() -> Result<()> {
                 // files. Runs alongside the per-file scanners; merges
                 // into the same envelope.
                 findings.extend(paired_validator_probe::scan_program(prog_root)?);
+                // v2.22 Slice 4 — lifecycle external-state catalog.
+                // Cross-file: pairs authority-conferring CPI grants
+                // with close-handler bodies that don't tear them down.
+                findings.extend(lifecycle_probe::scan_program(prog_root)?);
                 // M1.3+M1.4: when --emit-spec-candidates is set, lift
                 // findings into proto-clauses via the Pinocchio extractor,
                 // then cluster them via the runtime-agnostic algorithm.
