@@ -130,6 +130,42 @@ pub fn generate(spec_path: &Path, output_path: &Path) -> Result<()> {
     out.push_str("// ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----\n");
     out.push_str("#![cfg(kani)]\n\n");
 
+    // ── Math helpers (mirrors proptest_gen) ─────────────────────────────
+    // The standalone kani harness lives at `programs/<prog>/tests/kani.rs`
+    // (no `pub use crate::math::*`) — generated under `qedgen codegen
+    // --kani` against an existing program crate that hasn't been emitted
+    // via `--all`. In that case `src/math.rs` is never (re)generated, so
+    // any `mul_div_floor_u128` / `mul_div_ceil_u128` calls emitted by
+    // `chumsky_adapter::expr_to_rust` have no definition in scope:
+    //
+    //     error[E0425]: cannot find function `mul_div_floor_u128`
+    //                   in this scope
+    //
+    // Same mismatch + same fix shape as
+    // `fix(proptest_gen): inline mul_div helpers when standalone proptest
+    // needs them` (#45). Inline the canonical bodies here too, gated by
+    // the same `guards_use_math_helpers` predicate so we ship the helpers
+    // ONLY when the spec actually calls into them — otherwise we'd ship
+    // two sources of truth for the helpers (kani.rs + math.rs) with the
+    // silent-divergence risk that implies for any future change.
+    if crate::codegen::guards_use_math_helpers(&spec) {
+        out.push_str(
+            "#[allow(dead_code)]\n\
+#[inline]\n\
+fn mul_div_floor_u128(a: u128, b: u128, d: u128) -> u128 {\n\
+    if d == 0 { return 0; }\n\
+    a.saturating_mul(b) / d\n\
+}\n\n\
+#[allow(dead_code)]\n\
+#[inline]\n\
+fn mul_div_ceil_u128(a: u128, b: u128, d: u128) -> u128 {\n\
+    if d == 0 { return 0; }\n\
+    let prod = a.saturating_mul(b);\n\
+    if prod % d == 0 { prod / d } else { (prod / d).saturating_add(1) }\n\
+}\n\n",
+        );
+    }
+
     // ── State model header ───────────────────────────────────────────────
     out.push_str(
         "// ============================================================================\n",
