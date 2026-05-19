@@ -61,7 +61,7 @@ mod verify_kani_parse;
 mod verify_probe_repros;
 mod verify_proptest_parse;
 
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context as _, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::{Path, PathBuf};
 
@@ -1806,51 +1806,56 @@ async fn main() -> Result<()> {
             // synthesised) and (b) which invariant family
             // `crucible_gen::generate` emits. See PRD-v2.21 §"Slice 1".
             if let Some(budget_secs) = fuzz {
-                let (synthesised_spec, spec_path_for_ctx, project_root_for_idl, mode) =
-                    match (spec.clone(), root.clone()) {
-                        (Some(spec_path), maybe_root) => {
-                            let parsed = check::parse_spec_file(&spec_path)?;
-                            let spec_parent = spec_path
-                                .parent()
-                                .map(|p| p.to_path_buf())
-                                .unwrap_or_else(|| std::path::PathBuf::from("."));
-                            // --spec + --root layers spec invariants on
-                            // top of protocol-mode crash detection.
-                            let mode = if maybe_root.is_some() {
-                                crucible_gen::InvariantMode::Both
-                            } else {
-                                crucible_gen::InvariantMode::Spec
-                            };
-                            (parsed, spec_path, spec_parent, mode)
-                        }
-                        (None, Some(root_path)) => {
-                            let resolved = crucible_brownfield::resolve_program_root(&root_path)?;
-                            let detected = probe::detect_runtime_public(&resolved);
-                            let runtime_final = match runtime {
-                                Some(RuntimeOverride::Anchor) => probe::Runtime::Anchor,
-                                Some(RuntimeOverride::Quasar) => probe::Runtime::Quasar,
-                                Some(RuntimeOverride::Pinocchio) => probe::Runtime::Pinocchio,
-                                Some(RuntimeOverride::Native) => probe::Runtime::Native,
-                                Some(RuntimeOverride::Sbpf) => probe::Runtime::Sbpf,
-                                None => detected,
-                            };
-                            let parsed =
-                                crucible_brownfield::synthesize_spec(&resolved, runtime_final)?;
-                            (
-                                parsed,
-                                resolved.clone(),
-                                resolved,
-                                crucible_gen::InvariantMode::Protocol,
-                            )
-                        }
-                        (None, None) => {
-                            return Err(anyhow::anyhow!(
-                                "--fuzz requires either --spec <path> (spec-driven) \
+                let (
+                    synthesised_spec,
+                    synthesised_idl,
+                    spec_path_for_ctx,
+                    project_root_for_idl,
+                    mode,
+                ) = match (spec.clone(), root.clone()) {
+                    (Some(spec_path), maybe_root) => {
+                        let parsed = check::parse_spec_file(&spec_path)?;
+                        let spec_parent = spec_path
+                            .parent()
+                            .map(|p| p.to_path_buf())
+                            .unwrap_or_else(|| std::path::PathBuf::from("."));
+                        // --spec + --root layers spec invariants on
+                        // top of protocol-mode crash detection.
+                        let mode = if maybe_root.is_some() {
+                            crucible_gen::InvariantMode::Both
+                        } else {
+                            crucible_gen::InvariantMode::Spec
+                        };
+                        (parsed, None, spec_path, spec_parent, mode)
+                    }
+                    (None, Some(root_path)) => {
+                        let resolved = crucible_brownfield::resolve_program_root(&root_path)?;
+                        let detected = probe::detect_runtime_public(&resolved);
+                        let runtime_final = match runtime {
+                            Some(RuntimeOverride::Anchor) => probe::Runtime::Anchor,
+                            Some(RuntimeOverride::Quasar) => probe::Runtime::Quasar,
+                            Some(RuntimeOverride::Pinocchio) => probe::Runtime::Pinocchio,
+                            Some(RuntimeOverride::Native) => probe::Runtime::Native,
+                            Some(RuntimeOverride::Sbpf) => probe::Runtime::Sbpf,
+                            None => detected,
+                        };
+                        let synth = crucible_brownfield::synthesize_spec(&resolved, runtime_final)?;
+                        (
+                            synth.spec,
+                            synth.idl_json,
+                            resolved.clone(),
+                            resolved,
+                            crucible_gen::InvariantMode::Protocol,
+                        )
+                    }
+                    (None, None) => {
+                        return Err(anyhow::anyhow!(
+                            "--fuzz requires either --spec <path> (spec-driven) \
                                  or --root <project-path> (brownfield protocol-mode). \
                                  See `qedgen probe --help` for details."
-                            ));
-                        }
-                    };
+                        ));
+                    }
+                };
                 let prog = if synthesised_spec.program_name.is_empty() {
                     "program".to_string()
                 } else {
@@ -1883,6 +1888,17 @@ async fn main() -> Result<()> {
                 if matches!(mode, crucible_gen::InvariantMode::Protocol) && !harness.exists() {
                     std::fs::create_dir_all(&harness_parent)?;
                     crucible_gen::generate(&synthesised_spec, &harness_parent, mode)?;
+                }
+                // v2.22 Slice 3: Pinocchio brownfield ships its own
+                // IDL — there's no `anchor build` step to feed
+                // `discover_idl`. Write the synthesised JSON straight
+                // into `<harness>/idls/<prog>.json` so the existing
+                // emitter path picks it up unchanged. Overwrite on every
+                // run so scanner improvements propagate without manual
+                // cleanup.
+                if let Some(idl_json) = synthesised_idl.as_deref() {
+                    crucible_brownfield::write_synthesized_idl(&harness, &prog, idl_json)
+                        .context("writing synthesised IDL")?;
                 }
                 // Budget-0 emit-and-exit: lets users preview the
                 // harness without paying the Crucible build cost. The
