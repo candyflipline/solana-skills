@@ -125,6 +125,15 @@ pub enum Category {
     /// that should have stayed closed. Closes CAN-H1 on the
     /// subscriptions bench. See PRD-v2.22 §S1.1.
     SilentSuccessArithmetic,
+    /// `checked_sub` / `checked_add` / `checked_mul` whose `Err`
+    /// propagation permanently bricks a deterministic / PDA-derived
+    /// address. The operator is correct in isolation; the bug is the
+    /// failure-mode interaction with the address's *permanence*.
+    /// Nobody holds the PDA's private key, the seeds are
+    /// deterministic, and every subsequent init attempt hits the same
+    /// underflow → the address is locked forever. Closes CAN-H3 on
+    /// the subscriptions bench. See PRD-v2.22 §S1.2.
+    GracefulErrorAsDos,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]

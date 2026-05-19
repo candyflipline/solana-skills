@@ -184,7 +184,8 @@ pub fn construct_reproducer(
         // MolluskPrompt reproducer at site discovery time in
         // `arithmetic_symbol_probe::scan_program`. Same out-of-band
         // shape as the Pinocchio probes.
-        | Category::SilentSuccessArithmetic => Err(ConstructFailure::NotImplemented),
+        | Category::SilentSuccessArithmetic
+        | Category::GracefulErrorAsDos => Err(ConstructFailure::NotImplemented),
     }
 }
 
