@@ -2563,6 +2563,7 @@ fn adapt_handler(h: &a::HandlerDecl, consts: ConstTable, env: &TypeEnv) -> Parse
                         pda_seeds: None,
                         account_type: None,
                         authority: None,
+                        default_pubkey: None,
                     };
                     for attr in &d.attrs {
                         match attr {
@@ -2837,6 +2838,7 @@ fn adapt_interface_handler<'a>(
                         pda_seeds: None,
                         account_type: None,
                         authority: None,
+                        default_pubkey: None,
                     };
                     for attr in &d.attrs {
                         match attr {
