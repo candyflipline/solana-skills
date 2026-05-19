@@ -1657,6 +1657,7 @@ mod tests {
             pda_seeds: None,
             account_type: Some("token".to_string()),
             authority: Some("pool".to_string()),
+            default_pubkey: None,
         });
         let f = predicate_arbitrary_cpi(&h).expect("expected arbitrary_cpi finding");
         assert_eq!(f.category_tag, "arbitrary_cpi");
@@ -1675,6 +1676,7 @@ mod tests {
             pda_seeds: None,
             account_type: Some("token".to_string()),
             authority: None,
+            default_pubkey: None,
         });
         h.transfers.push(ParsedTransfer {
             from: "src".into(),
@@ -1707,6 +1709,7 @@ mod tests {
             pda_seeds: None,
             account_type: Some("token".to_string()),
             authority: None,
+            default_pubkey: None,
         });
         assert!(predicate_arbitrary_cpi(&h).is_none());
     }

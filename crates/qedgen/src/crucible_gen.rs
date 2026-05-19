@@ -448,10 +448,24 @@ fn emit_fixture_struct(out: &mut String, spec: &ParsedSpec, fixture: &str) {
     out.push_str("    ctx: TestContext,\n");
     out.push_str("    program_id: Pubkey,\n");
 
-    // Signing identities — derive from auth-cited handlers + named PDAs.
-    let signers = collect_signer_idents(spec);
-    for sig in &signers {
-        out.push_str(&format!("    {sig}: Rc<Keypair>,\n"));
+    if spec_is_brownfield_with_idl_accounts(spec) {
+        // Brownfield path: one Keypair per non-default, non-PDA account
+        // across all handlers (signers AND user-provided writable
+        // accounts). The field ident is snake_cased to satisfy Rust
+        // naming-convention lints — the original camelCase name is kept
+        // on `ParsedHandlerAccount` to match the macro-generated struct
+        // field name; the emitter does the case conversion at use sites.
+        for name in collect_brownfield_keypair_names(spec) {
+            let ident = brownfield_keypair_ident(&name);
+            out.push_str(&format!("    {ident}: Rc<Keypair>,\n"));
+        }
+    } else {
+        // Spec-mode path: signing identities derive from auth-cited
+        // handlers + named PDAs (v2.21 behavior).
+        let signers = collect_signer_idents(spec);
+        for sig in &signers {
+            out.push_str(&format!("    {sig}: Rc<Keypair>,\n"));
+        }
     }
 
     // Shadow fields for mutable state — read after each action.
@@ -463,6 +477,19 @@ fn emit_fixture_struct(out: &mut String, spec: &ParsedSpec, fixture: &str) {
     }
 
     out.push_str("}\n");
+}
+
+/// True when at least one handler carries the IDL-derived account
+/// metadata that distinguishes brownfield Pinocchio (Codama IDL) from
+/// spec-mode (where accounts come from the `.qedspec`'s accounts
+/// block). Used to switch the fixture/setup emitters between the two
+/// generation paths.
+fn spec_is_brownfield_with_idl_accounts(spec: &ParsedSpec) -> bool {
+    spec.handlers.iter().any(|h| {
+        h.accounts
+            .iter()
+            .any(|a| a.default_pubkey.is_some() || a.pda_seeds.is_some())
+    })
 }
 
 /// Map a DSL type to its Rust shadow type. v0 handles only primitives + Pubkey;
@@ -501,6 +528,47 @@ fn collect_signer_idents(spec: &ParsedSpec) -> Vec<String> {
     seen.into_iter().collect()
 }
 
+/// v2.22 S3.3: collect every account name across all handlers that
+/// needs a fixture-owned `Rc<Keypair>` field. An account qualifies when
+/// it has neither a hardcoded `default_pubkey` (those become
+/// `pubkey!("...")` literals) nor a `pda_seeds` derivation. Both signer
+/// and non-signer "user" accounts pass — Crucible needs the pubkey
+/// tracked for snapshot/restore even when the harness doesn't sign for
+/// it.
+///
+/// Returns names in the IDL's original (camelCase) form. The emitter
+/// builds the fixture field ident via `brownfield_keypair_ident` to
+/// avoid Rust naming convention warnings.
+fn collect_brownfield_keypair_names(spec: &ParsedSpec) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    for h in &spec.handlers {
+        for acc in &h.accounts {
+            if acc.default_pubkey.is_none() && acc.pda_seeds.is_none() {
+                seen.insert(acc.name.clone());
+            }
+        }
+    }
+    seen.into_iter().collect()
+}
+
+/// Convert a brownfield account name (kept in the IDL's case so it
+/// matches the macro-generated struct field name) into a snake_case Rust
+/// ident for the fixture struct. `sourceAccountInfo` → `source_account_info`.
+pub(crate) fn brownfield_keypair_ident(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for (i, ch) in name.chars().enumerate() {
+        if ch.is_ascii_uppercase() {
+            if i > 0 {
+                out.push('_');
+            }
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 fn emit_fixture_impl(
     out: &mut String,
     spec: &ParsedSpec,
@@ -508,7 +576,13 @@ fn emit_fixture_impl(
     mode: InvariantMode,
 ) -> Result<()> {
     let prog = spec_program_name(spec);
+    let is_brownfield = spec_is_brownfield_with_idl_accounts(spec);
     let signers = collect_signer_idents(spec);
+    let brownfield_names = if is_brownfield {
+        collect_brownfield_keypair_names(spec)
+    } else {
+        Vec::new()
+    };
 
     out.push_str("#[fuzz_fixture]\n");
     out.push_str(&format!("impl {fixture} {{\n"));
@@ -530,11 +604,21 @@ fn emit_fixture_impl(
         "        ctx.add_program(&program_id, \"{so_path_prefix}/target/deploy/{prog}.so\")\n"
     ));
     out.push_str("            .unwrap();\n");
-    for sig in &signers {
-        out.push_str(&format!("        let {sig} = Rc::new(Keypair::new());\n"));
-        out.push_str(&format!(
-            "        ctx.create_account()\n            .pubkey({sig}.pubkey())\n            .lamports(100_000_000_000)\n            .owner(system_program::ID)\n            .create()\n            .unwrap();\n"
-        ));
+    if is_brownfield {
+        for name in &brownfield_names {
+            let ident = brownfield_keypair_ident(name);
+            out.push_str(&format!("        let {ident} = Rc::new(Keypair::new());\n"));
+            out.push_str(&format!(
+                "        ctx.create_account()\n            .pubkey({ident}.pubkey())\n            .lamports(100_000_000_000)\n            .owner(system_program::ID)\n            .create()\n            .unwrap();\n"
+            ));
+        }
+    } else {
+        for sig in &signers {
+            out.push_str(&format!("        let {sig} = Rc::new(Keypair::new());\n"));
+            out.push_str(&format!(
+                "        ctx.create_account()\n            .pubkey({sig}.pubkey())\n            .lamports(100_000_000_000)\n            .owner(system_program::ID)\n            .create()\n            .unwrap();\n"
+            ));
+        }
     }
 
     let state_fields = rust_codegen_util::resolve_state_fields(spec);
@@ -543,8 +627,15 @@ fn emit_fixture_impl(
     out.push_str("        Self {\n");
     out.push_str("            ctx,\n");
     out.push_str("            program_id,\n");
-    for sig in &signers {
-        out.push_str(&format!("            {sig},\n"));
+    if is_brownfield {
+        for name in &brownfield_names {
+            let ident = brownfield_keypair_ident(name);
+            out.push_str(&format!("            {ident},\n"));
+        }
+    } else {
+        for sig in &signers {
+            out.push_str(&format!("            {sig},\n"));
+        }
     }
     for (fname, ftype) in &mutable_fields {
         let init = match map_simple_type(ftype) {
@@ -641,11 +732,22 @@ fn emit_action_fn(
     // inside the agent-filled `.accounts(...)` literal — wiring spec
     // PDAs into the tracked set is v2.22 scope).
     let want_protocol = matches!(mode, InvariantMode::Protocol | InvariantMode::Both);
+    let is_brownfield = spec_is_brownfield_with_idl_accounts(spec);
     let signers = collect_signer_idents(spec);
     if want_protocol && !signers.is_empty() {
         out.push_str("        let __tracked_pubkeys: Vec<Pubkey> = vec![\n");
         for sig in &signers {
-            out.push_str(&format!("            self.{sig}.pubkey(),\n"));
+            // Brownfield fixture fields go through `brownfield_keypair_ident`
+            // for snake-case Rust idents (the original camelCase name is
+            // kept on `ParsedHandlerAccount`); the tracker must reference
+            // the same ident form or the emit produces `self.escrowSeed`
+            // while the fixture has `self.escrow_seed`.
+            let ident = if is_brownfield {
+                brownfield_keypair_ident(sig)
+            } else {
+                sig.clone()
+            };
+            out.push_str(&format!("            self.{ident}.pubkey(),\n"));
         }
         out.push_str("        ];\n");
         out.push_str(
@@ -657,25 +759,66 @@ fn emit_action_fn(
     out.push_str(&format!(
         "            .call(instruction::{ix_name} {{ {arg_inits}}})\n"
     ));
-    // Notes on the emitted line:
+    // v2.22 S3.3: when the handler's `accounts` list is populated (set
+    // from a Codama IR / Anchor 0.30 IDL by the brownfield path), emit a
+    // real `accounts::Foo { ... }` literal. Crucible's generated
+    // `accounts::Foo` struct OMITS accounts with fixed-pubkey defaults
+    // (publicKeyValueNode → auto-filled by the macro) and snake-cases
+    // every remaining field name (`escrowSeed` → `escrow_seed`). So:
     //
-    // 1. `{{ ... }}` in the todo!() message is escaped braces in the
-    //    emitter's format string AND in the emitted Rust string —
-    //    `todo!()` is a format-string macro, so a literal `{` would be
-    //    parsed as a format directive. The escaping yields
-    //    `accounts::Foo { ... }` in the eventual panic message.
-    // 2. `.accounts::<accounts::Foo>(todo!())` pins the generic with a
-    //    turbofish so `todo!()` (`!`) coerces into the right concrete
-    //    type. Without the turbofish, type inference picks `()` and
-    //    `(): ToAccountMetas` fails the trait bound. Crucible's
-    //    `declare_fuzz_program!` macro derives `ToAccountMetas` for
-    //    each `accounts::Foo` from the IDL.
-    out.push_str(&format!(
-        "            .accounts::<accounts::{ix_name}>(todo!(\"agent-fill: accounts::{ix_name} {{{{ ... }}}} from spec accounts block\"))\n"
-    ));
+    //   - Account carries `default_pubkey` → SKIP. Crucible auto-fills it.
+    //   - Account is a PDA (`pda_seeds: Some(...)`) → emit a placeholder
+    //     `Pubkey::find_program_address(&[], &self.program_id).0`. Real
+    //     seed-aware derivation is v2.22.x; the placeholder compiles
+    //     and the program's PDA check rejects the call, which is fine
+    //     signal for a crash-first fuzzer.
+    //   - Otherwise → `self.<keypair_ident>.pubkey()`.
+    //
+    // Spec-mode handlers (accounts populated but typically lacking
+    // `default_pubkey` / `pda_seeds`) fall through the same path. When
+    // the list is empty (no IDL, no spec accounts block) fall back to
+    // the v2.21 `todo!()` agent-fill.
+    if op.accounts.is_empty() {
+        out.push_str(&format!(
+            "            .accounts::<accounts::{ix_name}>(todo!(\"agent-fill: accounts::{ix_name} {{{{ ... }}}} from spec accounts block\"))\n"
+        ));
+    } else {
+        out.push_str(&format!("            .accounts(accounts::{ix_name} {{\n"));
+        for acc in &op.accounts {
+            if acc.default_pubkey.is_some() {
+                // Crucible auto-fills fixed-address accounts; the
+                // generated struct doesn't have a field for them.
+                continue;
+            }
+            let value = if acc.pda_seeds.is_some() {
+                "Pubkey::find_program_address(&[], &self.program_id).0".to_string()
+            } else {
+                format!("self.{}.pubkey()", brownfield_keypair_ident(&acc.name))
+            };
+            // Field name on the macro-generated struct is the
+            // snake_case form of the IDL's camelCase name.
+            let field = brownfield_keypair_ident(&acc.name);
+            out.push_str(&format!("                {field}: {value},\n"));
+        }
+        out.push_str("            })\n");
+    }
 
-    // Signers: take from `auth X` on the handler.
-    if let Some(who) = &op.who {
+    // Signers: prefer the IDL's per-account `isSigner` flags when the
+    // brownfield path populated them; otherwise fall back to the v2.21
+    // `auth X` lift from the spec.
+    let brownfield_signers: Vec<&str> = op
+        .accounts
+        .iter()
+        .filter(|a| a.is_signer && a.default_pubkey.is_none() && a.pda_seeds.is_none())
+        .map(|a| a.name.as_str())
+        .collect();
+    if !brownfield_signers.is_empty() {
+        let refs: Vec<String> = brownfield_signers
+            .iter()
+            .map(|n| format!("&*self.{}", brownfield_keypair_ident(n)))
+            .collect();
+        out.push_str(&format!("            .signers(&[{}])\n", refs.join(", ")));
+    } else if let Some(who) = &op.who {
         out.push_str(&format!("            .signers(&[&self.{who}])\n"));
     }
     out.push_str("            .send();\n");

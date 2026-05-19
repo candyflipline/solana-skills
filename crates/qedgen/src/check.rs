@@ -815,7 +815,7 @@ impl ParsedHandlerAccount {
 
 /// An account descriptor within a handler's `accounts` block.
 /// IDL-level: no framework-specific annotations.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ParsedHandlerAccount {
     pub name: String,
     pub is_signer: bool,
@@ -827,6 +827,12 @@ pub struct ParsedHandlerAccount {
     pub account_type: Option<String>,
     /// Authority constraint (e.g., "escrow").
     pub authority: Option<String>,
+    /// Hardcoded base58 pubkey when the account has a fixed default
+    /// (Codama `publicKeyValueNode`: system_program, the program itself,
+    /// event authority, etc.). Lets brownfield codegen emit
+    /// `solana_pubkey::pubkey!("...")` for these instead of generating a
+    /// keypair the fuzzer would have to populate.
+    pub default_pubkey: Option<String>,
 }
 
 /// A token transfer intent within a handler's `transfers` block.
@@ -5336,6 +5342,7 @@ mod tests {
                 pda_seeds: None,
                 account_type: None,
                 authority: None,
+                default_pubkey: None,
             },
             ParsedHandlerAccount {
                 name: "source".to_string(),
@@ -5345,6 +5352,7 @@ mod tests {
                 pda_seeds: None,
                 account_type: Some("token".to_string()),
                 authority: None,
+                default_pubkey: None,
             },
             ParsedHandlerAccount {
                 name: "dest".to_string(),
@@ -5354,6 +5362,7 @@ mod tests {
                 pda_seeds: None,
                 account_type: Some("token".to_string()),
                 authority: None,
+                default_pubkey: None,
             },
             ParsedHandlerAccount {
                 name: "token_program".to_string(),
@@ -5363,6 +5372,7 @@ mod tests {
                 pda_seeds: None,
                 account_type: Some("token".to_string()),
                 authority: None,
+                default_pubkey: None,
             },
         ];
         let spec = ParsedSpec {

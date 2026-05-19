@@ -31,7 +31,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use regex::Regex;
 use std::path::{Path, PathBuf};
 
-use crate::check::{ParsedHandler, ParsedSpec};
+use crate::check::{ParsedHandler, ParsedHandlerAccount, ParsedSpec};
 use crate::probe::Runtime;
 
 /// Output of a brownfield synthesis: the [`ParsedSpec`] that drives
@@ -157,6 +157,7 @@ fn synthesize_pinocchio(project_root: &Path) -> Result<BrownfieldSynthesis> {
     })?;
 
     let handlers_with_args = handlers_with_args_from_idl(&idl_text);
+    let accounts_per_handler = accounts_per_handler_from_idl(&idl_text);
     if handlers_with_args.is_empty() {
         bail!(
             "Codama IDL at {} parsed but has no `instructions[]` entries. \
@@ -179,8 +180,9 @@ fn synthesize_pinocchio(project_root: &Path) -> Result<BrownfieldSynthesis> {
     let handlers = handlers_with_args
         .into_iter()
         .map(|(name, args)| {
-            let mut h = empty_handler(name);
+            let mut h = empty_handler(name.clone());
             h.takes_params = args;
+            h.accounts = accounts_per_handler.get(&name).cloned().unwrap_or_default();
             h
         })
         .collect();
@@ -329,6 +331,95 @@ fn handlers_with_args_from_idl(idl_text: &str) -> Vec<(String, Vec<(String, Stri
             Some((snake, args))
         })
         .collect()
+}
+
+/// Extract per-handler account lists. Keyed by snake_case handler name
+/// (matching `handlers_with_args_from_idl`'s output). Each entry is the
+/// flat list of accounts in declaration order — the `.accounts(...)`
+/// literal in the emitted harness uses this list to produce a real
+/// `accounts::Foo { ... }` initializer instead of a `todo!()` placeholder.
+///
+/// Codama account fields used:
+/// - `name` → ParsedHandlerAccount.name (kept camelCase to match the
+///   macro-generated struct field name).
+/// - `isSigner` / `isWritable` → flags.
+/// - `defaultValue.kind: "publicKeyValueNode"` + `publicKey` → store
+///   the literal base58 in `default_pubkey` so the emitter renders
+///   `solana_pubkey::pubkey!("...")`.
+/// - `defaultValue.kind: "pdaValueNode"` → leave `default_pubkey: None`
+///   and mark `pda_seeds: Some(vec![])` so the emitter knows to derive
+///   via `Pubkey::find_program_address` (v2.22 emits a placeholder; full
+///   seed-aware derivation is v2.22.x).
+fn accounts_per_handler_from_idl(
+    idl_text: &str,
+) -> std::collections::HashMap<String, Vec<ParsedHandlerAccount>> {
+    let mut out = std::collections::HashMap::new();
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(idl_text) else {
+        return out;
+    };
+    let ixs = v
+        .get("instructions")
+        .and_then(|v| v.as_array())
+        .or_else(|| {
+            v.get("program")
+                .and_then(|p| p.get("instructions"))
+                .and_then(|v| v.as_array())
+        });
+    let Some(ixs) = ixs else {
+        return out;
+    };
+    for ix in ixs {
+        let Some(raw_name) = ix.get("name").and_then(|n| n.as_str()) else {
+            continue;
+        };
+        let snake = camel_to_snake(raw_name);
+        let accounts_array = ix.get("accounts").and_then(|v| v.as_array());
+        let Some(arr) = accounts_array else {
+            out.insert(snake, Vec::new());
+            continue;
+        };
+        let accounts: Vec<ParsedHandlerAccount> = arr
+            .iter()
+            .filter_map(|a| {
+                let name = a.get("name").and_then(|n| n.as_str())?.to_string();
+                let is_signer = a.get("isSigner").and_then(|b| b.as_bool()).unwrap_or(false);
+                let is_writable = a
+                    .get("isWritable")
+                    .and_then(|b| b.as_bool())
+                    .unwrap_or(false);
+                let default = a.get("defaultValue");
+                let default_kind = default.and_then(|d| d.get("kind")).and_then(|k| k.as_str());
+                let (default_pubkey, pda_seeds, is_program) = match default_kind {
+                    Some("publicKeyValueNode") => {
+                        let pk = default
+                            .and_then(|d| d.get("publicKey"))
+                            .and_then(|k| k.as_str())
+                            .map(|s| s.to_string());
+                        // Codama marks program defaults via the
+                        // accountValueNode/programLink chain in other
+                        // shapes; for our scope, a publicKeyValueNode
+                        // pointing at a fixed pubkey is effectively a
+                        // program/sysvar account.
+                        (pk, None, true)
+                    }
+                    Some("pdaValueNode") => (None, Some(vec![]), false),
+                    _ => (None, None, false),
+                };
+                Some(ParsedHandlerAccount {
+                    name,
+                    is_signer,
+                    is_writable,
+                    is_program,
+                    pda_seeds,
+                    account_type: None,
+                    authority: None,
+                    default_pubkey,
+                })
+            })
+            .collect();
+        out.insert(snake, accounts);
+    }
+    out
 }
 
 fn camel_to_snake(name: &str) -> String {
