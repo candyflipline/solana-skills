@@ -5,6 +5,7 @@ mod anchor_project;
 mod anchor_resolver;
 mod api;
 mod aristotle;
+mod arithmetic_symbol_probe;
 mod asm2lean;
 mod ast;
 mod banner;
@@ -1723,7 +1724,15 @@ async fn main() -> Result<()> {
                     return Ok(());
                 }
                 let catalogue = pinocchio_probe::scan_program(prog_root)?;
-                let findings = pinocchio_probe::findings_from_catalogue(&catalogue);
+                let mut findings = pinocchio_probe::findings_from_catalogue(&catalogue);
+                // v2.22 Slice 1 — arithmetic-symbol catalog. Runtime-
+                // agnostic source-scanner findings (currently:
+                // silent_success_arithmetic) merge into the same
+                // envelope as the Pinocchio-specific probes. Both run
+                // on the `--program <root>` path; the
+                // arithmetic-symbol rules fire on any Rust source
+                // regardless of detected runtime.
+                findings.extend(arithmetic_symbol_probe::scan_program(prog_root)?);
                 // M1.3+M1.4: when --emit-spec-candidates is set, lift
                 // findings into proto-clauses via the Pinocchio extractor,
                 // then cluster them via the runtime-agnostic algorithm.

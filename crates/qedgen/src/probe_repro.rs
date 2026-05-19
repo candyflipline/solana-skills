@@ -179,7 +179,12 @@ pub fn construct_reproducer(
         | Category::PinocchioOffsetOverrun
         | Category::PinocchioMissingPdaVerification
         | Category::PinocchioStaleSafetyComment
-        | Category::ExecutionDivergence => Err(ConstructFailure::NotImplemented),
+        | Category::ExecutionDivergence
+        // Arithmetic-symbol probes (v2.22 Slice 1) attach a
+        // MolluskPrompt reproducer at site discovery time in
+        // `arithmetic_symbol_probe::scan_program`. Same out-of-band
+        // shape as the Pinocchio probes.
+        | Category::SilentSuccessArithmetic => Err(ConstructFailure::NotImplemented),
     }
 }
 

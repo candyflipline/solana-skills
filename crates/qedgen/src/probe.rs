@@ -114,6 +114,17 @@ pub enum Category {
     /// Critical because the deployed `.so`'s release-mode wrap +
     /// sBPF alignment hides UB the host interpreter exposes.
     ExecutionDivergence,
+    // ----- Arithmetic-symbol catalog (v2.22 Slice 1) ----------------
+    /// `saturating_sub` / `saturating_add` on a timestamp-shape
+    /// receiver (`current_ts`, `Clock::get()?.unix_timestamp`, `slot`,
+    /// `epoch`, `block_height`) whose result feeds a `>=`/`>` comparison
+    /// that gates a non-trivial effect (transfer / mint / state
+    /// mutation). The operator returns the boundary value (0 / MAX)
+    /// when the conceptual operation would underflow, collapsing two
+    /// semantically distinct states into one — opens a fund-flow gate
+    /// that should have stayed closed. Closes CAN-H1 on the
+    /// subscriptions bench. See PRD-v2.22 §S1.1.
+    SilentSuccessArithmetic,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
