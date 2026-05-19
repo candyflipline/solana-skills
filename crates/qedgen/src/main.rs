@@ -33,6 +33,7 @@ mod kani;
 mod lean_gen;
 mod miri_verify;
 mod native_extractor;
+mod paired_validator_probe;
 mod pinocchio_extractor;
 mod pinocchio_probe;
 mod pinocchio_to_spec;
@@ -1733,6 +1734,10 @@ async fn main() -> Result<()> {
                 // arithmetic-symbol rules fire on any Rust source
                 // regardless of detected runtime.
                 findings.extend(arithmetic_symbol_probe::scan_program(prog_root)?);
+                // v2.22 Slice 2 — paired-validator asymmetry across
+                // files. Runs alongside the per-file scanners; merges
+                // into the same envelope.
+                findings.extend(paired_validator_probe::scan_program(prog_root)?);
                 // M1.3+M1.4: when --emit-spec-candidates is set, lift
                 // findings into proto-clauses via the Pinocchio extractor,
                 // then cluster them via the runtime-agnostic algorithm.

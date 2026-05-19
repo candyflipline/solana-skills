@@ -145,6 +145,16 @@ pub enum Category {
     /// today and the recommendation is preventive (`checked_*`). See
     /// PRD-v2.22 §S1.3.
     UncheckedArithWithFundFlow,
+    /// Two or more validator-shape sites in the program apply
+    /// distinct accept-domains to the same logical field. Canonical:
+    /// `create_*::validate` rejects `field == 0` (treats it as
+    /// "past expiry"); `transfer_validation` carves out `field == 0`
+    /// as "never expires." Users following the docs for one path
+    /// hit a hard rejection on the other. The mismatch is a sentinel-
+    /// semantics drift across handlers. Closes CAN-M1 / CAN-M2 /
+    /// CAN-L2 / CAN-L3 on the subscriptions bench. See PRD-v2.22
+    /// §S2.1.
+    PairedValidatorInputDomainMismatch,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]

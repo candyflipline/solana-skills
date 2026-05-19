@@ -186,7 +186,8 @@ pub fn construct_reproducer(
         // shape as the Pinocchio probes.
         | Category::SilentSuccessArithmetic
         | Category::GracefulErrorAsDos
-        | Category::UncheckedArithWithFundFlow => Err(ConstructFailure::NotImplemented),
+        | Category::UncheckedArithWithFundFlow
+        | Category::PairedValidatorInputDomainMismatch => Err(ConstructFailure::NotImplemented),
     }
 }
 
