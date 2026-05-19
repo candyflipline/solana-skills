@@ -380,6 +380,30 @@ fn scan_file(rel_file: &Path, source: &str, p: &SitePatterns) -> Vec<PinocchioSi
             });
         }
         for m in p.transmute_account.find_iter(&stripped) {
+            // Skip `use core::mem::{transmute, ...};` imports — they
+            // match the bare `transmute` token but aren't call sites.
+            let trimmed = stripped.trim_start();
+            if trimmed.starts_with("use ") || trimmed.starts_with("pub use ") {
+                continue;
+            }
+            // Same LHS-shape guard as the `raw_ptr_cast` branch above:
+            // a real transmute on account data references `data` /
+            // `borrow` / `account` / `input` in its surrounding
+            // expression. Filters out non-data transmutes (size_of
+            // arithmetic, type conversions on local arrays).
+            let context_start = stripped[..m.start()].rfind([';', '{', '(', ',']);
+            let context = match context_start {
+                Some(p) => &stripped[p + 1..],
+                None => &stripped[..],
+            };
+            let context_lc = context.to_lowercase();
+            if !(context_lc.contains("data")
+                || context_lc.contains("borrow")
+                || context_lc.contains("account")
+                || context_lc.contains("input"))
+            {
+                continue;
+            }
             sites.push(PinocchioSite {
                 kind: SiteKind::RawPtrCastFromAccount,
                 file: rel_file.to_path_buf(),
@@ -725,6 +749,27 @@ pub fn findings_from_catalogue(cat: &PinocchioCatalogue) -> Vec<crate::probe::Fi
     use crate::probe::{Category, Finding, Reproducer, Severity};
     use sha2::{Digest, Sha256};
 
+    // Cache per-file source so repeated lookups (multiple sites in one
+    // file) don't re-read the same content. Maps absolute path →
+    // contents. Sites carry their path relative to `cat.project_root`.
+    let mut source_cache: std::collections::HashMap<PathBuf, String> =
+        std::collections::HashMap::new();
+    let mut load_source = |rel: &Path| -> Option<String> {
+        if let Some(s) = source_cache.get(rel) {
+            return Some(s.clone());
+        }
+        // Try absolute (catalogue may store absolute paths) then
+        // relative to project_root.
+        let abs = if rel.is_absolute() {
+            rel.to_path_buf()
+        } else {
+            cat.project_root.join(rel)
+        };
+        let text = std::fs::read_to_string(&abs).ok()?;
+        source_cache.insert(rel.to_path_buf(), text.clone());
+        Some(text)
+    };
+
     let mut findings = Vec::new();
 
     for site in &cat.sites {
@@ -766,6 +811,31 @@ pub fn findings_from_catalogue(cat: &PinocchioCatalogue) -> Vec<crate::probe::Fi
             ),
             // SafetyComment: informational only — never a finding.
             SiteKind::SafetyComment => continue,
+        };
+
+        // v2.22 Slice 5: compute `gated_by` for the high-noise
+        // categories. Walks the source preceding the site for length /
+        // discriminator / owner gate signals; the auditor subagent
+        // bulk-suppresses findings whose gate set covers the
+        // expected triad. Computed once per (site, finding pair) and
+        // shared between the Mollusk and Miri finding emissions
+        // below.
+        let gated_by = match site.kind {
+            SiteKind::BytemuckCall
+            | SiteKind::RawPtrCastFromAccount
+            | SiteKind::CustomLoadCall
+            | SiteKind::IndexedDataSlice
+            | SiteKind::TryIntoUnwrapOnSlice => {
+                let source = load_source(&site.file);
+                source
+                    .as_deref()
+                    .map(|src| detect_gates(src, site.line))
+                    // Collapse empty-gate to None so the JSON envelope
+                    // omits the field for findings with no gates
+                    // detected (the auditor-focus subset).
+                    .filter(|gates| !gates.is_empty())
+            }
+            _ => None,
         };
 
         // Stable id: hash of (file, line, kind). Mirrors probe.rs's
@@ -875,7 +945,7 @@ pub fn findings_from_catalogue(cat: &PinocchioCatalogue) -> Vec<crate::probe::Fi
                     adversarial_inputs: adversarial.clone(),
                     invariant_asserts: invariants.clone(),
                 }),
-                gated_by: None,
+                gated_by: gated_by.clone(),
             });
         }
 
@@ -920,7 +990,7 @@ pub fn findings_from_catalogue(cat: &PinocchioCatalogue) -> Vec<crate::probe::Fi
             ),
             category_tag: probe_md.to_string(),
             reproducer: Some(mollusk),
-            gated_by: None,
+            gated_by: gated_by.clone(),
         });
 
         findings.push(Finding {
@@ -945,11 +1015,61 @@ pub fn findings_from_catalogue(cat: &PinocchioCatalogue) -> Vec<crate::probe::Fi
             ),
             category_tag: probe_md.to_string(),
             reproducer: Some(miri),
-            gated_by: None,
+            gated_by,
         });
     }
 
     findings
+}
+
+/// v2.22 Slice 5: detect upstream guards preceding a zero-copy /
+/// account-data load. Walks backward from `target_line` for ~30 lines
+/// looking for canonical Pinocchio gate signals:
+///
+/// - **`length_check`** — any `<...>.len() < N` / `!= LEN` / `== LEN`
+///   / `>= N` comparison (the prerequisite for safe transmute /
+///   bytemuck on a byte slice).
+/// - **`discriminator_check`** — any reference to an
+///   `AccountDiscriminator::*` constant or a `discriminator` /
+///   `DISCRIMINATOR` ident compared.
+/// - **`owner_check`** — `ProgramAccount::check(<acc>, ...)` /
+///   `<acc>.owner()` reference / `&crate::ID` comparison.
+///
+/// When all three fire upstream, the load is defensively fenced and
+/// the auditor subagent can bulk-suppress the finding via the
+/// `gated_by` list. When only the length gate fires (the
+/// instruction-data parsing case), the finding stays but the
+/// auditor knows the buffer-bound check is in place.
+pub(crate) fn detect_gates(source: &str, target_line: u32) -> Vec<String> {
+    let lines: Vec<&str> = source.lines().collect();
+    if target_line == 0 || (target_line as usize) > lines.len() {
+        return Vec::new();
+    }
+    let target_idx = (target_line as usize) - 1;
+    let lo = target_idx.saturating_sub(30);
+    let window = lines[lo..=target_idx].join("\n");
+    let mut gates: Vec<String> = Vec::new();
+    let has_len = regex::Regex::new(r"\.len\(\)\s*(?:[<>!=]=?|<|>)")
+        .ok()
+        .map(|re| re.is_match(&window))
+        .unwrap_or(false);
+    if has_len {
+        gates.push("length_check".to_string());
+    }
+    let has_disc = window.contains("Discriminator")
+        || window.contains("discriminator")
+        || window.contains("DISCRIMINATOR");
+    if has_disc {
+        gates.push("discriminator_check".to_string());
+    }
+    let has_owner = window.contains("ProgramAccount::check")
+        || window.contains(".owner()")
+        || window.contains("check_owner")
+        || window.contains("&crate::ID");
+    if has_owner {
+        gates.push("owner_check".to_string());
+    }
+    gates
 }
 
 /// Per-category catalogue of adversarial inputs the agent should
@@ -1132,6 +1252,55 @@ fn foo() {
         assert!(load.safety_comment.is_some());
         let txt = load.safety_comment.clone().unwrap();
         assert!(txt.contains("initialized"));
+    }
+
+    #[test]
+    fn detect_gates_fires_on_canonical_triad() {
+        let src = r#"
+pub fn load(account: &AccountView, data: &[u8]) -> Result<&Self, ProgramError> {
+    if data.len() != Self::LEN {
+        return Err(InvalidData);
+    }
+    if data[DISCRIMINATOR_OFFSET] != AccountDiscriminator::Plan as u8 {
+        return Err(InvalidDiscriminator);
+    }
+    ProgramAccount::check(account, &crate::ID)?;
+    Ok(unsafe { &*transmute::<*const u8, *const Self>(data.as_ptr()) })
+}
+"#;
+        // target_line points at the transmute (last non-blank line ≈ 9).
+        let gates = super::detect_gates(src, 9);
+        assert!(gates.contains(&"length_check".to_string()));
+        assert!(gates.contains(&"discriminator_check".to_string()));
+        assert!(gates.contains(&"owner_check".to_string()));
+    }
+
+    #[test]
+    fn detect_gates_returns_empty_when_no_gates() {
+        let src = r#"
+pub fn risky_load(data: &[u8]) -> &Self {
+    unsafe { &*transmute::<*const u8, *const Self>(data.as_ptr()) }
+}
+"#;
+        let gates = super::detect_gates(src, 3);
+        assert!(gates.is_empty());
+    }
+
+    #[test]
+    fn detect_gates_partial_length_only() {
+        // Instruction-data parse — has length gate but no
+        // discriminator / owner (those don't apply to instruction
+        // data).
+        let src = r#"
+pub fn load(data: &[u8]) -> Result<&Self, ProgramError> {
+    if data.len() != Self::LEN {
+        return Err(InvalidData);
+    }
+    Ok(unsafe { &*transmute::<*const u8, *const Self>(data.as_ptr()) })
+}
+"#;
+        let gates = super::detect_gates(src, 5);
+        assert_eq!(gates, vec!["length_check".to_string()]);
     }
 
     #[test]
