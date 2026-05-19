@@ -109,12 +109,12 @@ fn verify_initialize_rejects_invalid() {
 #[kani::solver(cadical)]
 fn verify_initialize_effect_initializer_amount() {
     let mut s = State {
-        initializer: 0,
-        initializer_token_account: 0,
-        taker: 0,
+        initializer: [0u8; 32],
+        initializer_token_account: [0u8; 32],
+        taker: [0u8; 32],
         initializer_amount: 0,
         taker_amount: 0,
-        escrow_token_account: 0,
+        escrow_token_account: [0u8; 32],
         status: Status::Uninitialized,
     };
     let deposit_amount: u64 = kani::any();
@@ -137,12 +137,12 @@ fn verify_initialize_effect_initializer_amount() {
 #[kani::solver(cadical)]
 fn verify_initialize_effect_taker_amount() {
     let mut s = State {
-        initializer: 0,
-        initializer_token_account: 0,
-        taker: 0,
+        initializer: [0u8; 32],
+        initializer_token_account: [0u8; 32],
+        taker: [0u8; 32],
         initializer_amount: 0,
         taker_amount: 0,
-        escrow_token_account: 0,
+        escrow_token_account: [0u8; 32],
         status: Status::Uninitialized,
     };
     let deposit_amount: u64 = kani::any();
@@ -165,12 +165,12 @@ fn verify_initialize_effect_taker_amount() {
 #[kani::solver(cadical)]
 fn verify_initialize_effect_initializer_token_account() {
     let mut s = State {
-        initializer: 0,
-        initializer_token_account: 0,
-        taker: 0,
+        initializer: [0u8; 32],
+        initializer_token_account: [0u8; 32],
+        taker: [0u8; 32],
         initializer_amount: 0,
         taker_amount: 0,
-        escrow_token_account: 0,
+        escrow_token_account: [0u8; 32],
         status: Status::Uninitialized,
     };
     let deposit_amount: u64 = kani::any();

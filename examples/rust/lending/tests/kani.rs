@@ -131,7 +131,7 @@ fn verify_deposit_rejects_invalid() {
 #[kani::solver(cadical)]
 fn verify_init_pool_preserves_pool_solvency() {
     let mut s = State {
-        authority: 0,
+        authority: [0u8; 32],
         total_deposits: 0,
         total_borrows: 0,
         interest_rate: 0,
@@ -176,7 +176,7 @@ fn verify_deposit_preserves_pool_solvency() {
 #[kani::solver(cadical)]
 fn verify_init_pool_effect_interest_rate() {
     let mut s = State {
-        authority: 0,
+        authority: [0u8; 32],
         total_deposits: 0,
         total_borrows: 0,
         interest_rate: 0,
@@ -197,7 +197,7 @@ fn verify_init_pool_effect_interest_rate() {
 #[kani::solver(cadical)]
 fn verify_init_pool_effect_total_deposits() {
     let mut s = State {
-        authority: 0,
+        authority: [0u8; 32],
         total_deposits: 0,
         total_borrows: 0,
         interest_rate: 0,
@@ -218,7 +218,7 @@ fn verify_init_pool_effect_total_deposits() {
 #[kani::solver(cadical)]
 fn verify_init_pool_effect_total_borrows() {
     let mut s = State {
-        authority: 0,
+        authority: [0u8; 32],
         total_deposits: 0,
         total_borrows: 0,
         interest_rate: 0,

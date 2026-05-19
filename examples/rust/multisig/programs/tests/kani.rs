@@ -330,11 +330,11 @@ fn verify_remove_member_rejects_invalid() {
 #[kani::solver(cadical)]
 fn verify_create_vault_preserves_threshold_bounded() {
     let mut s = State {
-        creator: 0,
+        creator: [0u8; 32],
         threshold: 0,
         member_count: 0,
-        members: 0,
-        voted: 0,
+        members: [[0u8; 32]; 32],
+        voted: [0; 32],
         approval_count: 0,
         rejection_count: 0,
         status: Status::Uninitialized,
@@ -526,11 +526,11 @@ fn verify_remove_member_preserves_threshold_bounded() {
 #[kani::solver(cadical)]
 fn verify_create_vault_preserves_votes_bounded() {
     let mut s = State {
-        creator: 0,
+        creator: [0u8; 32],
         threshold: 0,
         member_count: 0,
-        members: 0,
-        voted: 0,
+        members: [[0u8; 32]; 32],
+        voted: [0; 32],
         approval_count: 0,
         rejection_count: 0,
         status: Status::Uninitialized,
@@ -652,11 +652,11 @@ fn verify_remove_member_preserves_votes_bounded() {
 #[kani::solver(cadical)]
 fn verify_create_vault_effect_threshold() {
     let mut s = State {
-        creator: 0,
+        creator: [0u8; 32],
         threshold: 0,
         member_count: 0,
-        members: 0,
-        voted: 0,
+        members: [[0u8; 32]; 32],
+        voted: [0; 32],
         approval_count: 0,
         rejection_count: 0,
         status: Status::Uninitialized,
@@ -682,11 +682,11 @@ fn verify_create_vault_effect_threshold() {
 #[kani::solver(cadical)]
 fn verify_create_vault_effect_member_count() {
     let mut s = State {
-        creator: 0,
+        creator: [0u8; 32],
         threshold: 0,
         member_count: 0,
-        members: 0,
-        voted: 0,
+        members: [[0u8; 32]; 32],
+        voted: [0; 32],
         approval_count: 0,
         rejection_count: 0,
         status: Status::Uninitialized,
@@ -712,11 +712,11 @@ fn verify_create_vault_effect_member_count() {
 #[kani::solver(cadical)]
 fn verify_create_vault_effect_approval_count() {
     let mut s = State {
-        creator: 0,
+        creator: [0u8; 32],
         threshold: 0,
         member_count: 0,
-        members: 0,
-        voted: 0,
+        members: [[0u8; 32]; 32],
+        voted: [0; 32],
         approval_count: 0,
         rejection_count: 0,
         status: Status::Uninitialized,
@@ -742,11 +742,11 @@ fn verify_create_vault_effect_approval_count() {
 #[kani::solver(cadical)]
 fn verify_create_vault_effect_rejection_count() {
     let mut s = State {
-        creator: 0,
+        creator: [0u8; 32],
         threshold: 0,
         member_count: 0,
-        members: 0,
-        voted: 0,
+        members: [[0u8; 32]; 32],
+        voted: [0; 32],
         approval_count: 0,
         rejection_count: 0,
         status: Status::Uninitialized,
