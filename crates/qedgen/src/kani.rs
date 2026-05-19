@@ -921,24 +921,43 @@ fn emit_kani_account_section(
                     .collect();
                 out.push_str(&format!("    if {}(&mut s{}) {{\n", op.name, args));
 
-                // Assert THIS field's effect only
+                // Assert THIS field's effect only.
+                //
+                // The effect-conformance harness snapshots every mutable
+                // field as `pre_<fname> = s.<fname>` BEFORE calling the
+                // transition. The post-condition RHS — `value` here — comes
+                // from the spec's effect block (e.g. `:= state.now`), with
+                // the `state.` prefix already stripped by the upstream
+                // chumsky_adapter so each backend can apply its own binder.
+                //
+                // Without binder resolution the emitted assertion reads
+                // `assert!(s.X == now)` — bare `now` is undefined in scope
+                // and the harness fails to compile with
+                // `error[E0425]: cannot find value 'now' in this scope`.
+                //
+                // `resolve_value` is identity for handler params and inlines
+                // constants; the `Some("pre_")` binder is applied only when
+                // `value` is a state field name. Same shape as the
+                // analogous fix in `rust_codegen_util::emit_one_effect` for
+                // the transition-fn emission target (`Some("s.")`).
+                let resolved = rust_codegen_util::resolve_value(value, op, spec, Some("pre_"));
                 match op_kind.as_str() {
                     "set" => {
                         out.push_str(&format!(
                             "        assert!(s.{} == {}, \"{} must equal {}\");\n",
-                            field, value, field, value
+                            field, resolved, field, resolved
                         ));
                     }
                     "add" => {
                         out.push_str(&format!(
                             "        assert!(s.{} == pre_{}.wrapping_add({}), \"{} must increment by {}\");\n",
-                            field, field, value, field, value
+                            field, field, resolved, field, resolved
                         ));
                     }
                     "sub" => {
                         out.push_str(&format!(
                             "        assert!(s.{} == pre_{}.wrapping_sub({}), \"{} must decrement by {}\");\n",
-                            field, field, value, field, value
+                            field, field, resolved, field, resolved
                         ));
                     }
                     _ => {}
