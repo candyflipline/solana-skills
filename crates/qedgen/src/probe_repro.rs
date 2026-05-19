@@ -187,7 +187,8 @@ pub fn construct_reproducer(
         | Category::SilentSuccessArithmetic
         | Category::GracefulErrorAsDos
         | Category::UncheckedArithWithFundFlow
-        | Category::PairedValidatorInputDomainMismatch => Err(ConstructFailure::NotImplemented),
+        | Category::PairedValidatorInputDomainMismatch
+        | Category::ExternalAuthorityNotRevokedOnClose => Err(ConstructFailure::NotImplemented),
     }
 }
 

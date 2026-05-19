@@ -155,6 +155,16 @@ pub enum Category {
     /// CAN-L2 / CAN-L3 on the subscriptions bench. See PRD-v2.22
     /// §S2.1.
     PairedValidatorInputDomainMismatch,
+    /// A handler closes a PDA that holds external authority (SPL
+    /// Approve delegate, token mint authority, ATA delegate, etc.)
+    /// without issuing the corresponding reverse CPI (`Revoke`,
+    /// `SetAuthority::None`, `Assign`). The closed PDA is still
+    /// registered as an active delegate / authority on the external
+    /// account — visible to wallet UIs and downstream programs as
+    /// live permission. Closes QED-HEAD-MED-3 (subscriptions
+    /// `close_subscription_authority`) on the bench. See PRD-v2.22
+    /// §S4.1.
+    ExternalAuthorityNotRevokedOnClose,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
