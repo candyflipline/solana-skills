@@ -21,9 +21,13 @@
 //!   interaction with the address's permanence. Closes CAN-H3 on the
 //!   subscriptions bench.
 //!
-//! - **`unchecked_arith_with_fund_flow`** (S1.3, INFO; v2.22
-//!   follow-up) — unchecked `*` / `+` / `-` whose result gates a CPI.
-//!   Pending.
+//! - **`unchecked_arith_with_fund_flow`** (S1.3, LOW) — unchecked
+//!   `<ident> * <literal>` / `+ <literal>` / `- <literal>` inside a
+//!   function whose body also contains a token / system CPI. The
+//!   arithmetic is locally safe today under upstream bounds but the
+//!   local site makes no explicit invariant claim — preventive
+//!   recommendation (use `checked_*`). Closes CAN-I3 on the
+//!   subscriptions bench.
 //!
 //! ## Why source-scan, not spec
 //!
@@ -69,6 +73,7 @@ pub fn scan_program(project_root: &Path) -> Result<Vec<Finding>> {
             .to_path_buf();
         findings.extend(scan_silent_success_arithmetic(&rel, &source));
         findings.extend(scan_graceful_error_as_dos(&rel, &source));
+        findings.extend(scan_unchecked_arith_with_fund_flow(&rel, &source));
     }
     Ok(findings)
 }
@@ -277,6 +282,235 @@ pub(crate) fn scan_graceful_error_as_dos(rel_file: &Path, source: &str) -> Vec<F
         });
     }
     out
+}
+
+/// S1.3 — `unchecked_arith_with_fund_flow` scanner. Pattern criteria:
+///
+/// 1. A bare `*` / `+` / `-` BinOp shape `<ident_path> <op>
+///    <numeric_literal>` (e.g. `period_hours * 3600`, `slot + 100`).
+///    The literal-on-RHS restriction is the v2.22 first-ship guard
+///    that keeps false-positive volume tractable; the bench's
+///    canonical CAN-I3 site matches this shape exactly.
+/// 2. The enclosing fn body contains a CPI signal: `Transfer`,
+///    `MintTo`, `invoke(`, `invoke_signed(`, `cpi::`, `token::`,
+///    `system_program::`. The signal discriminates "arithmetic that
+///    crosses into fund flow" from "arithmetic on book-keeping
+///    counters" — the former is what the rule targets.
+/// 3. The same line is not already inside a `checked_*` /
+///    `saturating_*` call (those are already correctly defensive).
+///
+/// Surfaces as LOW severity — the recommendation is preventive
+/// (`checked_*`) and most sites are safe today under upstream
+/// bounds. The bench surfaces the pattern so the audit subagent can
+/// triage and confirm the bound holds.
+pub(crate) fn scan_unchecked_arith_with_fund_flow(rel_file: &Path, source: &str) -> Vec<Finding> {
+    // `<ident_or_path> <space> [*+-] <space> <int_literal>`. The path
+    // can include dots, indexes, and `_`. We accept up to ~48 chars to
+    // keep matching tractable. Integer literals carry optional
+    // underscores (`3_600`) and optional Rust type suffix (`100u64`).
+    let bin_re = Regex::new(
+        r"(?P<lhs>[A-Za-z_][\w\.\[\]]{0,48})\s*(?P<op>[*+\-])\s*(?P<rhs>\d[\d_]*(?:u\d{1,3}|i\d{1,3}|usize|isize)?)\b",
+    )
+    .expect("static regex compiles");
+
+    let mut out = Vec::new();
+    let mut seen_lines = std::collections::BTreeSet::new();
+    for caps in bin_re.captures_iter(source) {
+        let m = caps.get(0).unwrap();
+        let lhs = caps.name("lhs").unwrap().as_str();
+        let op = caps.name("op").unwrap().as_str();
+        let rhs = caps.name("rhs").unwrap().as_str();
+        // Skip patterns that aren't really arithmetic on user values:
+        // numeric-only LHS (e.g. `1 - 2`), single-character LHS likely
+        // to be `i + 1` index math (deliberate false negative for
+        // v2.22 — bench evidence didn't surface index-arithmetic
+        // findings).
+        if lhs.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        if lhs.len() < 3 {
+            continue;
+        }
+        // Skip lifetime suffixes / pointer-like patterns.
+        if lhs.contains("'") {
+            continue;
+        }
+        // Skip if the operator is `-` and the LHS looks like a generic
+        // bound (`T -> U`) or a pointer (`&-`); the heuristic is that
+        // `<` or `>` adjacent to the match flags non-arithmetic shapes.
+        let surrounding_start = m.start().saturating_sub(2);
+        let surrounding = &source[surrounding_start..m.end()];
+        if surrounding.contains("->") || surrounding.contains("<-") {
+            continue;
+        }
+        // Reject sites already inside a `checked_*` / `saturating_*` /
+        // `wrapping_*` call — the operator family is part of the
+        // method name and the literal is a closing paren away. Look
+        // at the ~80 chars preceding the match for any of those.
+        let before_start = m.start().saturating_sub(80);
+        let before = &source[before_start..m.start()];
+        if before.contains("checked_")
+            || before.contains("saturating_")
+            || before.contains("wrapping_")
+            || before.contains("overflowing_")
+        {
+            continue;
+        }
+        let line = byte_offset_to_line(source, m.start());
+        // Comment-line guard: if the line starts (after whitespace)
+        // with `//`, or if a `//` precedes the match on the same line,
+        // skip. Comments routinely contain shapes like `// Token-2022`
+        // that match the BinOp regex but are obviously not real
+        // arithmetic.
+        if line_is_commented(source, m.start()) {
+            continue;
+        }
+        // Dedupe by (line, lhs) — multi-statement lines (e.g. macro
+        // arg lists) trigger the regex multiple times.
+        if !seen_lines.insert((line, lhs.to_string())) {
+            continue;
+        }
+        let Some(fn_name) = enclosing_fn_name(source, m.start()) else {
+            continue;
+        };
+        // Skip test fns: `fn test_*`, `fn *_tests`, `fn it_*` (the
+        // common test-naming conventions). Inline `#[cfg(test)]
+        // mod tests { ... }` blocks live in the same file as
+        // production code, so the file-level filter in
+        // `collect_rust_files` doesn't catch them.
+        if is_test_fn_name(&fn_name) {
+            continue;
+        }
+        let fn_body = enclosing_fn_body(source, m.start());
+        if !body_signals_cpi(&fn_body) {
+            continue;
+        }
+
+        let finding_id = make_id(rel_file, line, "unchecked_arith_with_fund_flow");
+        let mut subs = std::collections::BTreeMap::new();
+        subs.insert("FILE".to_string(), rel_file.display().to_string());
+        subs.insert("LINE".to_string(), line.to_string());
+        subs.insert("LHS".to_string(), lhs.to_string());
+        subs.insert("OPERATOR".to_string(), op.to_string());
+        subs.insert("RHS".to_string(), rhs.to_string());
+        subs.insert("FN".to_string(), fn_name.clone());
+
+        let suggested_op = match op {
+            "*" => "checked_mul",
+            "+" => "checked_add",
+            "-" => "checked_sub",
+            _ => "checked_<op>",
+        };
+
+        out.push(Finding {
+            id: finding_id.clone(),
+            category: Category::UncheckedArithWithFundFlow,
+            severity: Severity::Low,
+            handler: fn_name.clone(),
+            spec_silent_on: format!(
+                "`{} {} {}` at {}:{} inside `{}` uses bare arithmetic where the \
+                 surrounding handler dispatches a CPI. The operation is locally \
+                 safe today under upstream bounds on `{}`, but the local code \
+                 makes no explicit invariant claim — if the upstream bound ever \
+                 loosens, the operator wraps and the fund-flow effect proceeds \
+                 on a corrupted value.",
+                lhs,
+                op,
+                rhs,
+                rel_file.display(),
+                line,
+                fn_name,
+                lhs
+            ),
+            suppression_hint: format!(
+                "Replace `{lhs} {op} {rhs}` with \
+                 `{lhs}.{suggested_op}({rhs}).ok_or(/* explicit error */)?`. \
+                 The explicit error path documents the local bound assumption \
+                 and survives upstream changes that loosen `{lhs}`'s range."
+            ),
+            investigation_hint: format!(
+                "Trace `{lhs}`'s upstream bound. If the bound is enforced at a \
+                 distance (e.g. `MAX_X` constant elsewhere, a `requires` clause \
+                 in a sibling handler), confirm whether the local code path is \
+                 robust against the bound loosening. Otherwise, switch to the \
+                 checked variant."
+            ),
+            category_tag: "unchecked_arith_with_fund_flow".to_string(),
+            reproducer: Some(Reproducer::MolluskPrompt {
+                template_path:
+                    "references/probes/arithmetic_symbol/unchecked_arith_with_fund_flow.md#reproducer"
+                        .to_string(),
+                substitutions: subs,
+                repro_path: format!(".qed/probes/arithmetic_symbol/{}/repro.rs", finding_id),
+            }),
+        });
+    }
+    out
+}
+
+/// Test-fn name predicate. Skips inline `#[cfg(test)] mod tests {
+/// fn test_* / fn it_* / fn *_test }` patterns that
+/// `collect_rust_files`'s directory filter doesn't catch (those tests
+/// live in the same file as the production code).
+fn is_test_fn_name(fn_name: &str) -> bool {
+    let lower = fn_name.to_ascii_lowercase();
+    lower.starts_with("test_")
+        || lower.starts_with("it_")
+        || lower.ends_with("_test")
+        || lower.ends_with("_tests")
+}
+
+/// Comment-line predicate. Walks backward from the offset to the line
+/// start; returns true when a `//` appears before the offset on the
+/// same line. Stripping block comments (`/* ... */`) is out of scope
+/// for v2.22 — the bench evidence so far doesn't need it.
+fn line_is_commented(source: &str, offset: usize) -> bool {
+    let bytes = source.as_bytes();
+    let mut i = offset.min(bytes.len());
+    while i > 0 && bytes[i - 1] != b'\n' {
+        i -= 1;
+    }
+    let line_prefix = &source[i..offset.min(source.len())];
+    if let Some(idx) = line_prefix.find("//") {
+        // Confirm `//` isn't inside a string literal earlier on the
+        // line. Counting double-quotes is a rough approximation.
+        let before = &line_prefix[..idx];
+        let quote_count = before.chars().filter(|c| *c == '"').count();
+        quote_count % 2 == 0
+    } else {
+        false
+    }
+}
+
+/// True when the function body invokes a token / system CPI — the
+/// discriminator for "arithmetic that crosses into fund flow." Also
+/// accepts helper-function calls whose name suggests transfer / mint
+/// dispatch (`transfer_with_delegate`, `mint_to_user`, ...) because
+/// the CAN-I3 site dispatches through a `transfer_with_delegate`
+/// helper rather than constructing the CPI directly.
+fn body_signals_cpi(body: &str) -> bool {
+    if body.contains("invoke(")
+        || body.contains("invoke_signed(")
+        || body.contains("Transfer ")
+        || body.contains("Transfer {")
+        || body.contains("MintTo ")
+        || body.contains("MintTo {")
+        || body.contains("Burn ")
+        || body.contains("Burn {")
+        || body.contains("cpi::")
+        || body.contains("token::transfer")
+        || body.contains("token::mint_to")
+        || body.contains("system_program::transfer")
+    {
+        return true;
+    }
+    // Helper-function dispatch: `transfer_with_delegate(...)`,
+    // `mint_to_user(...)`. Anchor / native programs commonly factor
+    // the CPI behind a `<verb>_<descriptor>` helper.
+    let helper_re =
+        Regex::new(r"\b(?:transfer|mint|burn|withdraw|deposit|approve|revoke)_[a-z_]+\s*\(")
+            .expect("static regex compiles");
+    helper_re.is_match(body)
 }
 
 /// Walk forward from `offset` to find the body of the enclosing fn —
@@ -699,6 +933,83 @@ fn initialize(payer: &AccountView, pda: &AccountView, bump: u8) -> ProgramResult
 "#;
         let findings = scan_graceful_error_as_dos(&p("init.rs"), src);
         assert_eq!(findings.len(), 1);
+    }
+
+    // ───────────────────────────────────────────────────────────────
+    // S1.3 — unchecked_arith_with_fund_flow tests
+    // ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn fires_on_canonical_subscriptions_can_i3_shape() {
+        // Mirrors transfer_subscription.rs:61 — the CAN-I3 site.
+        let src = r#"
+fn process_transfer(ctx: Context) -> Result<()> {
+    let period_length_s = plan.data.period_hours * 3600;
+    Transfer { from: ctx.user, to: ctx.dest, lamports: 1000 }.invoke()?;
+    Ok(())
+}
+"#;
+        let findings = scan_unchecked_arith_with_fund_flow(&p("transfer.rs"), src);
+        assert_eq!(findings.len(), 1);
+        let f = &findings[0];
+        assert_eq!(f.category_tag, "unchecked_arith_with_fund_flow");
+        assert!(matches!(f.severity, Severity::Low));
+        assert_eq!(f.handler, "process_transfer");
+    }
+
+    #[test]
+    fn ignores_checked_mul_in_same_fn() {
+        let src = r#"
+fn process_safe(ctx: Context) -> Result<()> {
+    let period_length_s = plan.data.period_hours.checked_mul(3600).ok_or(Overflow)?;
+    Transfer { from: ctx.user, to: ctx.dest, lamports: 1000 }.invoke()?;
+    Ok(())
+}
+"#;
+        let findings = scan_unchecked_arith_with_fund_flow(&p("safe.rs"), src);
+        assert!(
+            findings.is_empty(),
+            "checked_mul should NOT fire, got {findings:#?}"
+        );
+    }
+
+    #[test]
+    fn ignores_arithmetic_without_cpi_signal() {
+        // No CPI in the fn body — book-keeping arithmetic, not
+        // fund-flow.
+        let src = r#"
+fn compute_only(period_hours: u32) -> u32 {
+    let period_seconds = period_hours * 3600;
+    period_seconds
+}
+"#;
+        let findings = scan_unchecked_arith_with_fund_flow(&p("compute.rs"), src);
+        assert!(
+            findings.is_empty(),
+            "no CPI in body should NOT fire, got {findings:#?}"
+        );
+    }
+
+    #[test]
+    fn ignores_short_lhs_index_arithmetic() {
+        // `i + 1` index arithmetic is a deliberate false negative for
+        // v2.22 — short LHS skipped.
+        let src = r#"
+fn loop_through(ctx: Context, items: &[u64]) -> Result<()> {
+    for i in 0..items.len() {
+        let next = i + 1;
+        if next < items.len() {
+            Transfer { lamports: items[next] }.invoke()?;
+        }
+    }
+    Ok(())
+}
+"#;
+        let findings = scan_unchecked_arith_with_fund_flow(&p("loop.rs"), src);
+        assert!(
+            findings.is_empty(),
+            "short-LHS index math should NOT fire, got {findings:#?}"
+        );
     }
 
     #[test]
