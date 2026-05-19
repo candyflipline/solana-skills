@@ -41,14 +41,35 @@ fn emit_state_init_symbolic(
 /// `status` field set to the section's initial lifecycle state. Used by init-
 /// handler harnesses (effect/preservation), where the pre-state is the
 /// canonical "before initialization" state.
+///
+/// Defaults are type-aware via `proptest_gen::default_value_for_field`:
+/// `Map[N] T` → `[<inner>; N]`, named records → `<Name>::default()`, named
+/// sums with a zero-payload variant → that variant; primitives → `0`. A
+/// `None` return means "no sensible default" — skip the field and let
+/// rustc surface the missing field with E0063, which is a clearer
+/// diagnostic than emitting wrong-type code.
+///
+/// Same shape (and same helper) as the seed-state init fix landed in
+/// `fix(proptest_gen): type-aware seed-state init for arrays + lifecycle
+/// status` (#45). Without this, every array-typed state field literals
+/// to `{}: 0` and the harness fails to compile:
+///
+///     error[E0308]: mismatched types
+///        --> tests/kani.rs:N:M
+///         |
+///       N |         rfp_milestone_amounts: 0,
+///         |                                ^ expected `[u64; 8]`, found integer
 fn emit_state_init_zeroed(
     out: &mut String,
     mutable_fields: &[&(String, String)],
     lifecycle_states: &[String],
+    spec: &ParsedSpec,
 ) {
     out.push_str("    let mut s = State {\n");
-    for (fname, _) in mutable_fields {
-        out.push_str(&format!("        {}: 0,\n", fname));
+    for (fname, ftype) in mutable_fields {
+        if let Some(default) = crate::proptest_gen::default_value_for_field(ftype, spec) {
+            out.push_str(&format!("        {}: {},\n", fname, default));
+        }
     }
     if let Some(initial) = lifecycle_states.first() {
         if lifecycle_states.len() >= 2 {
@@ -129,6 +150,42 @@ pub fn generate(spec_path: &Path, output_path: &Path) -> Result<()> {
     out.push_str("// To run:  cargo kani --harness <name>   (requires cargo-kani)\n");
     out.push_str("// ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----\n");
     out.push_str("#![cfg(kani)]\n\n");
+
+    // ── Math helpers (mirrors proptest_gen) ─────────────────────────────
+    // The standalone kani harness lives at `programs/<prog>/tests/kani.rs`
+    // (no `pub use crate::math::*`) — generated under `qedgen codegen
+    // --kani` against an existing program crate that hasn't been emitted
+    // via `--all`. In that case `src/math.rs` is never (re)generated, so
+    // any `mul_div_floor_u128` / `mul_div_ceil_u128` calls emitted by
+    // `chumsky_adapter::expr_to_rust` have no definition in scope:
+    //
+    //     error[E0425]: cannot find function `mul_div_floor_u128`
+    //                   in this scope
+    //
+    // Same mismatch + same fix shape as
+    // `fix(proptest_gen): inline mul_div helpers when standalone proptest
+    // needs them` (#45). Inline the canonical bodies here too, gated by
+    // the same `guards_use_math_helpers` predicate so we ship the helpers
+    // ONLY when the spec actually calls into them — otherwise we'd ship
+    // two sources of truth for the helpers (kani.rs + math.rs) with the
+    // silent-divergence risk that implies for any future change.
+    if crate::codegen::guards_use_math_helpers(&spec) {
+        out.push_str(
+            "#[allow(dead_code)]\n\
+#[inline]\n\
+fn mul_div_floor_u128(a: u128, b: u128, d: u128) -> u128 {\n\
+    if d == 0 { return 0; }\n\
+    a.saturating_mul(b) / d\n\
+}\n\n\
+#[allow(dead_code)]\n\
+#[inline]\n\
+fn mul_div_ceil_u128(a: u128, b: u128, d: u128) -> u128 {\n\
+    if d == 0 { return 0; }\n\
+    let prod = a.saturating_mul(b);\n\
+    if prod % d == 0 { prod / d } else { (prod / d).saturating_add(1) }\n\
+}\n\n",
+        );
+    }
 
     // ── State model header ───────────────────────────────────────────────
     out.push_str(
@@ -582,7 +639,7 @@ fn emit_kani_account_section(
                 let needs_local_binder = prop.per_slot.is_some() && !handler_takes_binder;
 
                 if is_init {
-                    emit_state_init_zeroed(out, mutable_fields, lifecycle_states);
+                    emit_state_init_zeroed(out, mutable_fields, lifecycle_states, spec);
                 } else {
                     emit_state_init_symbolic(out, mutable_fields, lifecycle_states);
                     emit_pre_status_assume(out, op, lifecycle_states);
@@ -754,7 +811,7 @@ fn emit_kani_account_section(
                 ));
 
                 if is_init {
-                    emit_state_init_zeroed(out, mutable_fields, lifecycle_states);
+                    emit_state_init_zeroed(out, mutable_fields, lifecycle_states, spec);
                 } else {
                     emit_state_init_symbolic(out, mutable_fields, lifecycle_states);
                     emit_pre_status_assume(out, op, lifecycle_states);
@@ -858,7 +915,7 @@ fn emit_kani_account_section(
 
                 // Symbolic state
                 if is_init {
-                    emit_state_init_zeroed(out, mutable_fields, lifecycle_states);
+                    emit_state_init_zeroed(out, mutable_fields, lifecycle_states, spec);
                 } else {
                     emit_state_init_symbolic(out, mutable_fields, lifecycle_states);
                     emit_pre_status_assume(out, op, lifecycle_states);
@@ -921,24 +978,43 @@ fn emit_kani_account_section(
                     .collect();
                 out.push_str(&format!("    if {}(&mut s{}) {{\n", op.name, args));
 
-                // Assert THIS field's effect only
+                // Assert THIS field's effect only.
+                //
+                // The effect-conformance harness snapshots every mutable
+                // field as `pre_<fname> = s.<fname>` BEFORE calling the
+                // transition. The post-condition RHS — `value` here — comes
+                // from the spec's effect block (e.g. `:= state.now`), with
+                // the `state.` prefix already stripped by the upstream
+                // chumsky_adapter so each backend can apply its own binder.
+                //
+                // Without binder resolution the emitted assertion reads
+                // `assert!(s.X == now)` — bare `now` is undefined in scope
+                // and the harness fails to compile with
+                // `error[E0425]: cannot find value 'now' in this scope`.
+                //
+                // `resolve_value` is identity for handler params and inlines
+                // constants; the `Some("pre_")` binder is applied only when
+                // `value` is a state field name. Same shape as the
+                // analogous fix in `rust_codegen_util::emit_one_effect` for
+                // the transition-fn emission target (`Some("s.")`).
+                let resolved = rust_codegen_util::resolve_value(value, op, spec, Some("pre_"));
                 match op_kind.as_str() {
                     "set" => {
                         out.push_str(&format!(
                             "        assert!(s.{} == {}, \"{} must equal {}\");\n",
-                            field, value, field, value
+                            field, resolved, field, resolved
                         ));
                     }
                     "add" => {
                         out.push_str(&format!(
                             "        assert!(s.{} == pre_{}.wrapping_add({}), \"{} must increment by {}\");\n",
-                            field, field, value, field, value
+                            field, field, resolved, field, resolved
                         ));
                     }
                     "sub" => {
                         out.push_str(&format!(
                             "        assert!(s.{} == pre_{}.wrapping_sub({}), \"{} must decrement by {}\");\n",
-                            field, field, value, field, value
+                            field, field, resolved, field, resolved
                         ));
                     }
                     _ => {}

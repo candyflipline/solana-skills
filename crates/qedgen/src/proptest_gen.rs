@@ -170,7 +170,7 @@ fn strategy_for_field(
 /// type with payload variants); the caller should skip the seed-init for
 /// that field and rely on `cargo` to surface the missing field, which
 /// gives a clearer diagnostic than emitting wrong-type code.
-fn default_value_for_field(dsl_type: &str, spec: &ParsedSpec) -> Option<String> {
+pub(crate) fn default_value_for_field(dsl_type: &str, spec: &ParsedSpec) -> Option<String> {
     let dsl_type = dsl_type.trim();
     // Map[BOUND] T → [<default of T>; N]
     if let Some(rest) = dsl_type.strip_prefix("Map") {
