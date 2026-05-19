@@ -305,13 +305,13 @@ fn fixture_buggy_pinocchio_drives_brownfield_emit() {
         "harness IDL should be the maintainer-authored Codama IDL (address prefix BgyP1n); got: {idl_text}"
     );
 
-    // Action stubs derived from the IDL's three instructions.
+    // Action stubs derived from the IDL's three instructions. Handler
+    // names come from the IDL `instructions[].name` field (no
+    // `process_` prefix — the harness emitter PascalCases the handler
+    // name to build `instruction::Foo` literals that must match the
+    // declare_fuzz_program! macro's type names).
     let main_rs = std::fs::read_to_string(harness.join("src/main.rs")).expect("read main.rs");
-    for action in [
-        "action_process_run",
-        "action_process_maybe",
-        "action_process_drain",
-    ] {
+    for action in ["action_run", "action_maybe", "action_drain"] {
         assert!(
             main_rs.contains(action),
             "expected `{action}` in emitted harness; got:\n{main_rs}"

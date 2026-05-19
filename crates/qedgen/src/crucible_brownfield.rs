@@ -226,23 +226,39 @@ pub(crate) fn discover_pinocchio_idl(project_root: &Path) -> Result<Option<Strin
     Ok(None)
 }
 
-/// Extract `instructions[].name` from an Anchor / Codama IDL JSON.
-/// Returns the snake_case form (Anchor IDL convention emits camelCase;
-/// `process_*` Pinocchio handler names would match the snake_case form,
-/// so we convert before populating ParsedHandler::name).
+/// Extract instruction names from either an Anchor 0.30 IDL JSON
+/// (top-level `instructions[]`) or a Codama IR JSON (nested
+/// `program.instructions[]` under a `rootNode`). Returns the snake_case
+/// form *without* a `process_` prefix — the harness emitter PascalCases
+/// the handler name to build `instruction::Foo` literals that must
+/// match the IDL macro's output, and the macro names types from the
+/// IDL's `instructions[].name` field (no prefix). A `process_` prefix
+/// would produce `instruction::ProcessFoo`, which `declare_fuzz_program!`
+/// doesn't emit.
 fn handler_names_from_idl(idl_text: &str) -> Vec<String> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(idl_text) else {
         return Vec::new();
     };
-    let Some(ixs) = v.get("instructions").and_then(|v| v.as_array()) else {
+    let ixs = v
+        .get("instructions")
+        .and_then(|v| v.as_array())
+        .or_else(|| {
+            // Codama IR: `program.instructions[]` under a `rootNode`.
+            v.get("program")
+                .and_then(|p| p.get("instructions"))
+                .and_then(|v| v.as_array())
+        });
+    let Some(ixs) = ixs else {
         return Vec::new();
     };
     ixs.iter()
         .filter_map(|ix| ix.get("name").and_then(|n| n.as_str()))
         .map(|name| {
-            // camelCase → snake_case, prepend `process_` so the handler
-            // name lines up with the Pinocchio source convention.
-            let mut snake = String::with_capacity(name.len() + 8);
+            // camelCase → snake_case. The harness emitter will PascalCase
+            // again when constructing `instruction::Foo`; the macro
+            // generates Foo from the camelCase IDL name. So snake-case
+            // here, PascalCase there, both round-trip to the same type.
+            let mut snake = String::with_capacity(name.len());
             for (i, ch) in name.chars().enumerate() {
                 if ch.is_ascii_uppercase() {
                     if i > 0 {
@@ -253,7 +269,7 @@ fn handler_names_from_idl(idl_text: &str) -> Vec<String> {
                     snake.push(ch);
                 }
             }
-            format!("process_{snake}")
+            snake
         })
         .collect()
 }
@@ -642,10 +658,53 @@ version = "0.1.0"
             .iter()
             .map(|h| h.name.as_str())
             .collect();
-        assert_eq!(
-            handler_names,
-            vec!["process_create_plan", "process_update_plan"]
+        assert_eq!(handler_names, vec!["create_plan", "update_plan"]);
+    }
+
+    #[test]
+    fn pinocchio_brownfield_consumes_codama_ir_tree() {
+        // Codama IR (the format `solana-program/` Pinocchio crates ship):
+        // instructions are nested under `program.instructions[]` with a
+        // top-level `kind: "rootNode"` envelope. We must enumerate handlers
+        // from this shape too — the multi_delegator subscriptions bench
+        // entry uses exactly this layout.
+        let tmp = tempfile::tempdir().unwrap();
+        write_manifest(
+            tmp.path(),
+            r#"
+[package]
+name = "multi_delegator"
+version = "0.1.0"
+"#,
         );
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("lib.rs"), "// dispatcher elsewhere\n").unwrap();
+        let codama_ir = r#"{
+  "additionalPrograms": [],
+  "kind": "rootNode",
+  "program": {
+    "name": "multi_delegator",
+    "publicKey": "11111111111111111111111111111111",
+    "version": "1.0.0",
+    "instructions": [
+      { "kind": "instructionNode", "name": "createPlan", "arguments": [], "accounts": [] },
+      { "kind": "instructionNode", "name": "transferFixed", "arguments": [], "accounts": [] }
+    ],
+    "accounts": [], "errors": [], "definedTypes": [], "pdas": []
+  },
+  "standard": "codama",
+  "version": "1.0.0"
+}"#;
+        std::fs::write(tmp.path().join("idl.json"), codama_ir).unwrap();
+        let synth = synthesize_spec(tmp.path(), Runtime::Pinocchio).unwrap();
+        let handler_names: Vec<&str> = synth
+            .spec
+            .handlers
+            .iter()
+            .map(|h| h.name.as_str())
+            .collect();
+        assert_eq!(handler_names, vec!["create_plan", "transfer_fixed"]);
     }
 
     #[test]

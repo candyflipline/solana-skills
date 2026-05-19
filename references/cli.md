@@ -387,13 +387,25 @@ $QEDGEN probe --fuzz 300 --root programs/my_program
 # build cost. Useful for previewing the action_* stubs the agent
 # is asked to fill.
 $QEDGEN probe --fuzz 0 --root programs/my_program
+
+# v2.22 — same shape, Pinocchio. Requires a maintainer-authored
+# Codama / Anchor 0.30 IDL on disk; canonical paths the dispatcher
+# probes (first match wins):
+#   <root>/idl.json
+#   <root>/program/idl.json
+#   <root>/target/idl/*.json     (Anchor `anchor build` output)
+#   <root>/idl/*.json            (Codama default output dir)
+# Anchor 0.30 top-level `instructions[]` and Codama IR nested
+# `program.instructions[]` are both recognised. Native + sBPF still
+# bail (deferred to v2.23+; native will gate on Shank).
+$QEDGEN probe --fuzz 300 --root programs/my_pinocchio_program
 ```
 
 | Flag | Type | Default | Description |
 |---|---|---|---|
 | `--spec` | Path | optional | Path to `.qedspec` (spec-aware mode) — conflicts with `--bootstrap` and `--program` |
 | `--bootstrap` | bool | false | Spec-less mode — walk a project root and emit the auditor work list. Requires `--root`. |
-| `--root` | Path | optional | Project root for spec-less mode (the program crate dir). v2.21 also paired with `--fuzz` (no `--spec`) for brownfield protocol-mode Crucible — emits a harness at `<root>/.qed/fuzz/<prog>/` whose `invariant_test()` body is empty so only intrinsic crashes (panic / unwrap-on-None / `BorrowMutError` / arithmetic overflow) fire. |
+| `--root` | Path | optional | Project root for spec-less mode (the program crate dir). v2.21 also paired with `--fuzz` (no `--spec`) for brownfield protocol-mode Crucible — emits a harness at `<root>/.qed/fuzz/<prog>/` whose `invariant_test()` body is empty so only intrinsic crashes (panic / unwrap-on-None / `BorrowMutError` / arithmetic overflow) fire. v2.22 lifts the runtime gate for Pinocchio when a Codama / Anchor 0.30 IDL is on disk (canonical paths: `idl.json`, `program/idl.json`, `idl/*.json`, `target/idl/*.json`); native + sBPF still bail with a v2.23-deferral message. |
 | `--program` | Path | optional | v2.19 user-facing alias for `--bootstrap --root <path>` (the Pinocchio-shape probe entry point; auto-routes via `Cargo.toml` detection so the same flag works for Anchor / native crates too, falling back to the generic spec-less envelope when not Pinocchio) |
 | `--runtime` | enum | auto | Override runtime detection. Values: `pinocchio`, `anchor`, `quasar`, `native`, `sbpf`. Only `pinocchio` has dedicated probe output today; the others fall back to the generic bootstrap envelope. |
 | `--emit-spec-candidates` | bool | false | v2.19 — lift findings into candidate spec clauses (clusters) the auditor subagent surfaces through the scaffold-to-spec interview. Schema bumps to v3 with a `clusters[]` field. v2-shape consumers see no change when the flag is off. |

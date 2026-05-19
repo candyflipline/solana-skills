@@ -29,9 +29,14 @@ qedgen probe --fuzz 0 --root examples/regressions/v2.22-pinocchio-brownfield-fuz
   `Cargo.toml` and picks `Runtime::Pinocchio`.
 - `crucible_brownfield::synthesize_spec` discovers `idl.json` at the project
   root (highest-precedence Codama path) and passes it through verbatim.
+- Handler list is synthesized from the IDL's `instructions[].name` (snake-cased,
+  no `process_` prefix). The harness emitter PascalCases each handler to
+  produce `instruction::Run`, `instruction::Maybe`, `instruction::Drain`
+  literals matching the macro's output.
 - `crucible_gen::generate` emits the harness at
-  `<root>/.qed/fuzz/buggy_pinocchio/`.
-- The synthesised IDL is copied to `<harness>/idls/buggy_pinocchio.json` so
+  `<root>/.qed/fuzz/buggy_pinocchio/` with action stubs
+  `action_run`, `action_maybe`, `action_drain`.
+- The IDL is copied to `<harness>/idls/buggy_pinocchio.json` so
   `declare_fuzz_program!` finds it.
 - `--fuzz 0` short-circuits before `cargo build` / `crucible run`, so the
   test doesn't need the Crucible binary on PATH.

@@ -130,8 +130,11 @@ fn harness_dir_for(spec: &ParsedSpec, output_dir: &Path) -> std::path::PathBuf {
 }
 
 /// Snake-case program name derived from the spec. Mirrors the convention
-/// used by codegen.rs for the program crate name.
-fn spec_program_name(spec: &ParsedSpec) -> String {
+/// used by codegen.rs for the program crate name. `pub(crate)` so the
+/// CLI dispatcher in `main.rs` can use the same conversion when
+/// computing the brownfield harness path (the two derivations have to
+/// agree or the IDL ends up in the wrong subdirectory).
+pub(crate) fn spec_program_name(spec: &ParsedSpec) -> String {
     let raw: &str = if spec.program_name.is_empty() {
         "program"
     } else {
@@ -416,12 +419,18 @@ fn header(spec: &ParsedSpec, mode: InvariantMode) -> String {
 }
 
 fn fixture_name(spec: &ParsedSpec) -> String {
-    let raw: &str = if spec.program_name.is_empty() {
+    // Run the name through spec_program_name first so kebab-case Cargo
+    // names (`multi-delegator`) get normalised to snake_case before the
+    // PascalCase converter — `to_pascal_case` only splits on `_`, so a
+    // raw kebab name would yield `Multi-delegator` (invalid Rust).
+    let normalised = spec_program_name(spec);
+    let pascal = crate::codegen::to_pascal_case(&normalised);
+    let head: &str = if pascal.is_empty() {
         "Program"
     } else {
-        spec.program_name.as_str()
+        &pascal
     };
-    format!("{}Fixture", crate::codegen::to_pascal_case(raw))
+    format!("{head}Fixture")
 }
 
 fn emit_fixture_struct(out: &mut String, spec: &ParsedSpec, fixture: &str) {

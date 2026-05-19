@@ -1856,23 +1856,14 @@ async fn main() -> Result<()> {
                         ));
                     }
                 };
-                let prog = if synthesised_spec.program_name.is_empty() {
-                    "program".to_string()
-                } else {
-                    synthesised_spec
-                        .program_name
-                        .chars()
-                        .map(|c| {
-                            if c.is_uppercase() {
-                                format!("_{}", c.to_lowercase())
-                            } else {
-                                c.to_string()
-                            }
-                        })
-                        .collect::<String>()
-                        .trim_start_matches('_')
-                        .to_string()
-                };
+                // Use the same name normalization as crucible_gen so
+                // the harness path the dispatcher computes here lines
+                // up with the directory crucible_gen::generate actually
+                // creates. Kebab-case Cargo names like `multi-delegator`
+                // must become `multi_delegator`; otherwise the dispatcher
+                // writes the IDL to a sibling directory of the real
+                // harness.
+                let prog = crucible_gen::spec_program_name(&synthesised_spec);
                 let harness_parent = if matches!(mode, crucible_gen::InvariantMode::Protocol) {
                     crucible_brownfield::brownfield_harness_parent(&project_root_for_idl)
                 } else {
