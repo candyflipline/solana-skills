@@ -159,10 +159,19 @@ If a background job hasn't notified within 2× its expected budget:
 
 ## Probe → skeleton → Crucible auto-chain
 
-The v2.20 deliverable that closes the brownfield-to-Crucible gap.
-Without this chain, `qedgen probe --fuzz` errors with `--fuzz requires
---spec` on brownfield projects, so the audit never reaches
-coverage-guided fuzzing.
+The v2.20 deliverable that closes the brownfield-to-Crucible gap. v2.21
+lifted the `--fuzz requires --spec` gate for Anchor / Quasar /
+qedgen-codegen brownfield (protocol-mode crash detection runs without a
+skeleton). v2.22 lifted the gate for Pinocchio too, provided the program
+ships a Codama / Anchor 0.30 IDL on disk (checked at `idl.json`,
+`program/idl.json`, `idl/*.json`, `target/idl/*.json` — Codama IR with
+`program.instructions[]` and Anchor 0.30 with top-level `instructions[]`
+are both recognised). Native + sBPF still error with a v2.23-deferral
+message — native will gate on Shank when it lands.
+
+The auto-chain below still applies when richer spec-driven invariants
+are wanted (or when the protocol-mode crash surface is too narrow for
+the audit's threat model).
 
 ### Step 1 — emit spec candidates
 
