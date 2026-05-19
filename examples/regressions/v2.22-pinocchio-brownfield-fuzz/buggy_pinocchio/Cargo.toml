@@ -1,0 +1,20 @@
+# Deliberately *not* part of the qedgen workspace. To build this
+# crate, copy it out of the repo first (see ../README.md). The
+# crate-type / no_std settings mirror solana-program/subscriptions
+# (and most pinocchio crates) so qedgen treats it as a real Pinocchio
+# brownfield target.
+[package]
+name = "buggy_pinocchio"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+# Dep presence is what triggers `Runtime::Pinocchio` detection in
+# `probe::detect_runtime_public`. We do NOT pin a real version; the
+# fixture is read as text by the qedgen scanner and never compiled.
+pinocchio = "0.6"
+
+[workspace]

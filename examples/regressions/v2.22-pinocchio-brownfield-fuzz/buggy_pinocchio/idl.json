@@ -1,0 +1,36 @@
+{
+  "address": "BgyP1n11111111111111111111111111111111111",
+  "metadata": {
+    "name": "buggy_pinocchio",
+    "version": "0.1.0",
+    "spec": "0.1.0",
+    "description": "Deliberately buggy Pinocchio program for v2.22 Slice 3 brownfield Crucible fuzz regression fixture"
+  },
+  "instructions": [
+    {
+      "name": "run",
+      "discriminator": [0],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "maybe",
+      "discriminator": [1],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "drain",
+      "discriminator": [2],
+      "accounts": [
+        { "name": "source", "writable": true, "signer": false },
+        { "name": "target", "writable": true, "signer": false }
+      ],
+      "args": []
+    }
+  ],
+  "accounts": [],
+  "events": [],
+  "errors": [],
+  "types": []
+}

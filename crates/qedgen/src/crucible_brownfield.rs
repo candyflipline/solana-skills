@@ -1,4 +1,5 @@
-//! Brownfield Crucible harness emission — v2.21 Slice 1.
+//! Brownfield Crucible harness emission — v2.21 Slice 1, extended in
+//! v2.22 Slice 3 for Pinocchio.
 //!
 //! Lifts the `qedgen probe --fuzz requires --spec` gate by synthesising
 //! a minimal [`ParsedSpec`] from a brownfield project root (no
@@ -8,18 +9,23 @@
 //! crash detector (panic / unwrap-on-None / BorrowMutError / arithmetic
 //! overflow) does the lifting. See PRD-v2.21 §"Slice 1".
 //!
-//! ## Runtime coverage in v2.21
+//! ## Runtime coverage
 //!
-//! - **Anchor / Quasar / qedgen-codegen** — handler enumeration via the
-//!   regex used by `anchor_extractor::scan_handler_context_map`. Anchor
-//!   IDL discovery hooks the same `target/idl/<prog>.json` lookup as
-//!   spec-mode.
-//! - **Pinocchio / Native / sBPF** — deferred (errors with a clear
-//!   message). The site-catalogue path
-//!   (`pinocchio_probe::scan_program`) gives us entry-point names but
-//!   Crucible's existing `declare_fuzz_program!` macro expects an
-//!   Anchor-shaped IDL. A separate `crucible_idl_gen` template for
-//!   Pinocchio is a v2.22 item.
+//! - **Anchor / Quasar / qedgen-codegen** (v2.21) — handler enumeration
+//!   via the regex used by `anchor_extractor::scan_handler_context_map`.
+//!   Anchor IDL discovery hooks the same `target/idl/<prog>.json` lookup
+//!   as spec-mode.
+//! - **Pinocchio** (v2.22) — requires an on-disk Codama / Anchor 0.30
+//!   IDL (canonical paths: `idl.json`, `program/idl.json`,
+//!   `idl/*.json`, `target/idl/*.json`). The IDL is passed through to
+//!   `<harness>/idls/<prog>.json` verbatim. Scanner-based metadata
+//!   inference from handler bodies is intentionally out of scope —
+//!   account flags and arg types extracted via regex are too noisy to
+//!   ship; the maintainer-authored Codama IDL is the trusted source.
+//! - **Native / sBPF** — deferred (errors with a clear message). Native
+//!   programs follow the same gate: Shank IDL discovery is the v2.23
+//!   target. sBPF brownfield fuzz is parked indefinitely (no
+//!   AccountInfo abstraction at source level).
 
 use anyhow::{anyhow, bail, Context, Result};
 use regex::Regex;
@@ -27,6 +33,21 @@ use std::path::{Path, PathBuf};
 
 use crate::check::{ParsedHandler, ParsedSpec};
 use crate::probe::Runtime;
+
+/// Output of a brownfield synthesis: the [`ParsedSpec`] that drives
+/// `crucible_gen::generate` plus, when the runtime needs it, a
+/// pre-rendered IDL JSON to drop at `<harness>/idls/<prog>.json` (the
+/// macro input). Anchor-family programs return `idl_json: None` and let
+/// the existing `crucible_probe::discover_idl` symlink the
+/// `anchor build`-produced IDL.
+#[derive(Debug)]
+pub struct BrownfieldSynthesis {
+    pub spec: ParsedSpec,
+    /// Pinocchio: anchor-shaped IDL JSON synthesised from the source
+    /// scan. Anchor-family: `None` (the existing IDL pickup path
+    /// applies).
+    pub idl_json: Option<String>,
+}
 
 /// Synthesise a [`ParsedSpec`] from a brownfield project root. The
 /// resulting spec has:
@@ -43,22 +64,55 @@ use crate::probe::Runtime;
 ///   doesn't assert spec invariants. See
 ///   [`crate::crucible_gen::InvariantMode::Protocol`].
 ///
-/// Errors when the runtime is not Anchor-family. Pinocchio / Native /
-/// sBPF return an explanatory error pointing the user at v2.22.
-pub fn synthesize_spec(project_root: &Path, runtime: Runtime) -> Result<ParsedSpec> {
-    if !matches!(
-        runtime,
-        Runtime::Anchor | Runtime::Quasar | Runtime::QedgenCodegen
-    ) {
-        bail!(
-            "Crucible brownfield mode (`--fuzz --root`) ships Anchor / Quasar / qedgen-codegen \
-             in v2.21. Detected runtime: {runtime:?}. \
-             Pinocchio / Native / sBPF brownfield support is tracked for v2.22+; \
-             until then, fall back to `qedgen probe --program <path>` for the \
-             site-catalogue audit envelope."
-        );
+/// Errors on Native / sBPF (deferred); routes Pinocchio through the
+/// v2.22 metadata-extraction + IDL-synthesis path; otherwise falls
+/// through to the v2.21 Anchor-family handler enumeration.
+pub fn synthesize_spec(project_root: &Path, runtime: Runtime) -> Result<BrownfieldSynthesis> {
+    match runtime {
+        Runtime::Anchor | Runtime::Quasar | Runtime::QedgenCodegen => {
+            synthesize_anchor_family(project_root)
+        }
+        Runtime::Pinocchio => synthesize_pinocchio(project_root),
+        Runtime::Native | Runtime::Sbpf | Runtime::Unknown => bail!(
+            "Crucible brownfield mode (`--fuzz --root`) on `{runtime:?}` is tracked for v2.23+. \
+             v2.22 covers Anchor / Quasar / qedgen-codegen / Pinocchio. Until then, fall back \
+             to `qedgen probe --program <path>` for the site-catalogue audit envelope. \
+             Pass `--runtime <name>` to override detection if needed."
+        ),
     }
+}
 
+fn empty_handler(name: String) -> ParsedHandler {
+    ParsedHandler {
+        name,
+        doc: None,
+        who: None,
+        on_account: None,
+        pre_status: None,
+        post_status: None,
+        takes_params: vec![],
+        guard_str: None,
+        guard_str_rust: None,
+        aborts_if: vec![],
+        requires: vec![],
+        ensures: vec![],
+        modifies: None,
+        let_bindings: vec![],
+        aborts_total: false,
+        permissionless: true,
+        effects: vec![],
+        accounts: vec![],
+        transfers: vec![],
+        emits: vec![],
+        invariants: vec![],
+        establishes: vec![],
+        properties: vec![],
+        calls: vec![],
+        effect_branches: None,
+    }
+}
+
+fn synthesize_anchor_family(project_root: &Path) -> Result<BrownfieldSynthesis> {
     let program_name = program_name_from_root(project_root)?;
     let handlers = scan_anchor_handlers(project_root)?;
     if handlers.is_empty() {
@@ -69,42 +123,155 @@ pub fn synthesize_spec(project_root: &Path, runtime: Runtime) -> Result<ParsedSp
             project_root.display()
         );
     }
-
-    let mut spec = ParsedSpec {
+    let spec = ParsedSpec {
         program_name,
+        handlers: handlers.into_iter().map(empty_handler).collect(),
         ..Default::default()
     };
-    spec.handlers = handlers
-        .into_iter()
-        .map(|name| ParsedHandler {
-            name,
-            doc: None,
-            who: None,
-            on_account: None,
-            pre_status: None,
-            post_status: None,
-            takes_params: vec![],
-            guard_str: None,
-            guard_str_rust: None,
-            aborts_if: vec![],
-            requires: vec![],
-            ensures: vec![],
-            modifies: None,
-            let_bindings: vec![],
-            aborts_total: false,
-            permissionless: true,
-            effects: vec![],
-            accounts: vec![],
-            transfers: vec![],
-            emits: vec![],
-            invariants: vec![],
-            establishes: vec![],
-            properties: vec![],
-            calls: vec![],
-            effect_branches: None,
+    Ok(BrownfieldSynthesis {
+        spec,
+        idl_json: None,
+    })
+}
+
+fn synthesize_pinocchio(project_root: &Path) -> Result<BrownfieldSynthesis> {
+    let program_name = program_name_from_root(project_root)?;
+
+    // v2.22 Slice 3 gates Pinocchio brownfield on a maintainer-authored
+    // Codama / Anchor 0.30 IDL. Scanner-based account & arg inference
+    // from `pub fn process_*` bodies is fragile — `.borrow_mut_*`
+    // patterns miss CPI-mutated accounts, `from_le_bytes` patterns miss
+    // zero-copy unpacking, and account-name suffix conventions vary by
+    // codebase. A hand-validated Codama IDL is the trusted source.
+    //
+    // Future runtimes follow the same gate: Shank for legacy native
+    // Rust programs (v2.23+); custom dispatchers carry a Codama IDL via
+    // codama-cli or are out of scope.
+    let idl_text = discover_pinocchio_idl(project_root)?.ok_or_else(|| {
+        anyhow!(
+            "Brownfield Pinocchio fuzz requires a Codama / Anchor 0.30 IDL on disk. \
+             Checked: {root}/idl.json, {root}/program/idl.json, {root}/idl/*.json, \
+             {root}/target/idl/*.json — none found. \
+             Generate one with `codama --output idl.json` (https://codama.org), then re-run. \
+             For Anchor programs, point `--root` at the crate that runs `anchor build`.",
+            root = project_root.display()
+        )
+    })?;
+
+    let handler_names = handler_names_from_idl(&idl_text);
+    if handler_names.is_empty() {
+        bail!(
+            "Codama IDL at {} parsed but has no `instructions[]` entries. \
+             Brownfield fuzz needs at least one instruction to dispatch.",
+            project_root.display()
+        );
+    }
+    let spec = ParsedSpec {
+        program_name: program_name.clone(),
+        handlers: handler_names.into_iter().map(empty_handler).collect(),
+        ..Default::default()
+    };
+    Ok(BrownfieldSynthesis {
+        spec,
+        idl_json: Some(idl_text),
+    })
+}
+
+/// Search the brownfield project root for a Codama / Anchor 0.30 IDL
+/// JSON. Returns the file contents verbatim when found so the macro
+/// consumes the maintainer-authored schema rather than a regex-derived
+/// reconstruction.
+///
+/// Lookup order (first match wins):
+/// 1. `<root>/idl.json` — Codama convention (also used by
+///    `solana-program/` Pinocchio crates).
+/// 2. `<root>/program/idl.json` — workspace-rooted variant.
+/// 3. `<root>/target/idl/<*>.json` — Anchor `anchor build` output (may
+///    appear in a Pinocchio workspace that also builds via Anchor).
+/// 4. `<root>/idl/*.json` — Codama default output dir.
+///
+/// Multiple matches at the same precedence level are sorted
+/// alphabetically and the first picked, so behavior is deterministic
+/// across runs.
+pub(crate) fn discover_pinocchio_idl(project_root: &Path) -> Result<Option<String>> {
+    let candidates = [
+        project_root.join("idl.json"),
+        project_root.join("program").join("idl.json"),
+    ];
+    for c in &candidates {
+        if c.is_file() {
+            return Ok(Some(
+                std::fs::read_to_string(c).with_context(|| format!("reading {}", c.display()))?,
+            ));
+        }
+    }
+    for sub in ["target/idl", "idl"] {
+        let dir = project_root.join(sub);
+        if dir.is_dir() {
+            let mut entries: Vec<PathBuf> = std::fs::read_dir(&dir)
+                .with_context(|| format!("reading {}", dir.display()))?
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
+                .collect();
+            entries.sort();
+            if let Some(first) = entries.first() {
+                return Ok(Some(
+                    std::fs::read_to_string(first)
+                        .with_context(|| format!("reading {}", first.display()))?,
+                ));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Extract `instructions[].name` from an Anchor / Codama IDL JSON.
+/// Returns the snake_case form (Anchor IDL convention emits camelCase;
+/// `process_*` Pinocchio handler names would match the snake_case form,
+/// so we convert before populating ParsedHandler::name).
+fn handler_names_from_idl(idl_text: &str) -> Vec<String> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(idl_text) else {
+        return Vec::new();
+    };
+    let Some(ixs) = v.get("instructions").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    ixs.iter()
+        .filter_map(|ix| ix.get("name").and_then(|n| n.as_str()))
+        .map(|name| {
+            // camelCase → snake_case, prepend `process_` so the handler
+            // name lines up with the Pinocchio source convention.
+            let mut snake = String::with_capacity(name.len() + 8);
+            for (i, ch) in name.chars().enumerate() {
+                if ch.is_ascii_uppercase() {
+                    if i > 0 {
+                        snake.push('_');
+                    }
+                    snake.push(ch.to_ascii_lowercase());
+                } else {
+                    snake.push(ch);
+                }
+            }
+            format!("process_{snake}")
         })
-        .collect();
-    Ok(spec)
+        .collect()
+}
+
+/// Write the synthesised IDL JSON into `<harness>/idls/<prog>.json`.
+/// Idempotent — if the destination already exists it is overwritten so
+/// re-runs pick up scanner improvements without manual cleanup.
+pub fn write_synthesized_idl(
+    harness_dir: &Path,
+    program_name: &str,
+    idl_json: &str,
+) -> Result<PathBuf> {
+    let idls_dir = harness_dir.join("idls");
+    std::fs::create_dir_all(&idls_dir)
+        .with_context(|| format!("creating {}", idls_dir.display()))?;
+    let dest = idls_dir.join(format!("{program_name}.json"));
+    std::fs::write(&dest, idl_json).with_context(|| format!("writing {}", dest.display()))?;
+    Ok(dest)
 }
 
 /// Read `Cargo.toml`'s `[package] name`. Falls back to the root's
@@ -341,10 +508,17 @@ pub mod my_prog {
     }
 
     #[test]
-    fn synthesize_spec_rejects_pinocchio() {
+    fn synthesize_spec_rejects_native_and_sbpf() {
         let tmp = tempfile::tempdir().unwrap();
-        let err = synthesize_spec(tmp.path(), Runtime::Pinocchio).unwrap_err();
-        assert!(format!("{err:#}").contains("Pinocchio"));
+        for rt in [Runtime::Native, Runtime::Sbpf] {
+            let label = format!("{rt:?}");
+            let err = synthesize_spec(tmp.path(), rt).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("v2.23"),
+                "{label} bail should cite v2.23 deferral, got: {msg}"
+            );
+        }
     }
 
     #[test]
@@ -365,14 +539,17 @@ version = "0.1.0"
             "pub fn run(ctx: Context<Run>) -> Result<()> { Ok(()) }\n",
         )
         .unwrap();
-        let spec = synthesize_spec(tmp.path(), Runtime::Anchor).unwrap();
-        assert_eq!(spec.program_name, "buggy_anchor");
-        assert_eq!(spec.handlers.len(), 1);
-        assert_eq!(spec.handlers[0].name, "run");
+        let synth = synthesize_spec(tmp.path(), Runtime::Anchor).unwrap();
+        assert_eq!(synth.spec.program_name, "buggy_anchor");
+        assert_eq!(synth.spec.handlers.len(), 1);
+        assert_eq!(synth.spec.handlers[0].name, "run");
         // Brownfield handlers are `permissionless` — no `auth` to lift.
-        assert!(spec.handlers[0].permissionless);
-        assert!(spec.invariants.is_empty());
-        assert!(spec.properties.is_empty());
+        assert!(synth.spec.handlers[0].permissionless);
+        assert!(synth.spec.invariants.is_empty());
+        assert!(synth.spec.properties.is_empty());
+        // Anchor path doesn't synthesise an IDL — the v2.21 discover_idl
+        // symlink picks up `target/idl/<prog>.json`.
+        assert!(synth.idl_json.is_none());
     }
 
     #[test]
@@ -399,6 +576,109 @@ version = "0.1.0"
         assert_eq!(
             brownfield_harness_parent(root),
             PathBuf::from("/workspace/my_prog/.qed/fuzz")
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // v2.22 Slice 3 — Pinocchio brownfield
+    // ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn pinocchio_brownfield_requires_codama_idl_on_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_manifest(
+            tmp.path(),
+            r#"
+[package]
+name = "p"
+version = "0.1.0"
+"#,
+        );
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("lib.rs"), "// no IDL\n").unwrap();
+        let err = synthesize_spec(tmp.path(), Runtime::Pinocchio).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("Codama"), "should cite Codama, got: {msg}");
+        assert!(
+            msg.contains("codama"),
+            "should reference the codama CLI; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn pinocchio_brownfield_consumes_codama_idl() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_manifest(
+            tmp.path(),
+            r#"
+[package]
+name = "subscriptions"
+version = "0.1.0"
+"#,
+        );
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        // Source has zero `process_*` handlers — would normally bail.
+        std::fs::write(src.join("lib.rs"), "// dispatcher elsewhere\n").unwrap();
+        // Codama IDL is on disk → discovery takes precedence.
+        let codama = r#"{
+  "address": "Suprm111111111111111111111111111111111111",
+  "metadata": { "name": "subscriptions", "version": "1.0.0", "spec": "0.1.0" },
+  "instructions": [
+    { "name": "createPlan", "discriminator": [0], "accounts": [], "args": [] },
+    { "name": "updatePlan", "discriminator": [1], "accounts": [], "args": [] }
+  ],
+  "accounts": [], "errors": [], "events": [], "types": []
+}"#;
+        std::fs::write(tmp.path().join("idl.json"), codama).unwrap();
+        let synth = synthesize_spec(tmp.path(), Runtime::Pinocchio).unwrap();
+        let idl = synth.idl_json.expect("on-disk IDL passed through");
+        assert!(idl.contains("Suprm"));
+        // Handler list synthesized from instructions[].name
+        let handler_names: Vec<&str> = synth
+            .spec
+            .handlers
+            .iter()
+            .map(|h| h.name.as_str())
+            .collect();
+        assert_eq!(
+            handler_names,
+            vec!["process_create_plan", "process_update_plan"]
+        );
+    }
+
+    #[test]
+    fn discover_pinocchio_idl_walks_canonical_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Empty root → None
+        assert!(discover_pinocchio_idl(tmp.path()).unwrap().is_none());
+        // target/idl/<x>.json present
+        std::fs::create_dir_all(tmp.path().join("target/idl")).unwrap();
+        std::fs::write(
+            tmp.path().join("target/idl/foo.json"),
+            "{\"address\":\"A\"}",
+        )
+        .unwrap();
+        let found = discover_pinocchio_idl(tmp.path()).unwrap().unwrap();
+        assert!(found.contains("\"A\""));
+        // <root>/idl.json beats target/idl
+        std::fs::write(tmp.path().join("idl.json"), "{\"address\":\"B\"}").unwrap();
+        let found2 = discover_pinocchio_idl(tmp.path()).unwrap().unwrap();
+        assert!(
+            found2.contains("\"B\""),
+            "root idl.json should take precedence"
+        );
+    }
+
+    #[test]
+    fn write_synthesized_idl_creates_idls_subdir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = write_synthesized_idl(tmp.path(), "myprog", "{\"address\": \"x\"}").unwrap();
+        assert!(dest.ends_with("idls/myprog.json"));
+        assert_eq!(
+            std::fs::read_to_string(&dest).unwrap(),
+            "{\"address\": \"x\"}"
         );
     }
 }

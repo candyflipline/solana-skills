@@ -243,6 +243,118 @@ fn copy_dir_recursive(src: &Path, dst: &Path) {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// v2.22 Slice 3 — Pinocchio brownfield Crucible fuzz
+// ─────────────────────────────────────────────────────────────────────
+
+/// Pins that the committed v2.22 fixture under
+/// `examples/regressions/v2.22-pinocchio-brownfield-fuzz/buggy_pinocchio/`
+/// drives the Pinocchio brownfield path end-to-end.
+///
+/// Validates:
+/// - `--fuzz 0 --root <pinocchio-crate>` succeeds (no runtime gate).
+/// - The harness is emitted at `.qed/fuzz/buggy_pinocchio/`.
+/// - The Codama IDL is copied to `<harness>/idls/buggy_pinocchio.json`.
+/// - The harness Carries action stubs for the IDL's three instructions
+///   (`run`, `maybe`, `drain`) — handler names are derived from the
+///   IDL's `instructions[].name`, prefixed with `process_` to match
+///   the Pinocchio source convention.
+#[test]
+fn fixture_buggy_pinocchio_drives_brownfield_emit() {
+    ensure_qedgen_built();
+    let src =
+        repo_root().join("examples/regressions/v2.22-pinocchio-brownfield-fuzz/buggy_pinocchio");
+    assert!(
+        src.exists(),
+        "fixture missing at {} — did the v2.22 commit land?",
+        src.display()
+    );
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    let dst = tmp.path().join("buggy_pinocchio");
+    copy_dir_recursive(&src, &dst);
+
+    let out = Command::new(qedgen_bin())
+        .args(["probe", "--fuzz", "0", "--root"])
+        .arg(&dst)
+        .output()
+        .expect("spawn qedgen");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "Pinocchio brownfield emit failed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    let harness = dst.join(".qed/fuzz/buggy_pinocchio");
+    assert!(
+        harness.join("Cargo.toml").exists(),
+        "harness Cargo.toml missing at {}",
+        harness.display()
+    );
+
+    // IDL was copied through to the harness.
+    let harness_idl = harness.join("idls/buggy_pinocchio.json");
+    assert!(
+        harness_idl.exists(),
+        "synthesised IDL not written at {}",
+        harness_idl.display()
+    );
+    let idl_text = std::fs::read_to_string(&harness_idl).expect("read harness IDL");
+    assert!(
+        idl_text.contains("BgyP1n"),
+        "harness IDL should be the maintainer-authored Codama IDL (address prefix BgyP1n); got: {idl_text}"
+    );
+
+    // Action stubs derived from the IDL's three instructions.
+    let main_rs = std::fs::read_to_string(harness.join("src/main.rs")).expect("read main.rs");
+    for action in [
+        "action_process_run",
+        "action_process_maybe",
+        "action_process_drain",
+    ] {
+        assert!(
+            main_rs.contains(action),
+            "expected `{action}` in emitted harness; got:\n{main_rs}"
+        );
+    }
+    // Protocol-mode banner + lamport-conservation guard from v2.21 §S1.2
+    // still ship for Pinocchio brownfield (same emitter path).
+    assert!(
+        main_rs.contains("Mode: PROTOCOL"),
+        "Pinocchio brownfield should emit PROTOCOL-mode harness"
+    );
+    assert!(
+        main_rs.contains("fn snapshot_lamports"),
+        "lamport-conservation guard should ship for Pinocchio brownfield"
+    );
+}
+
+#[test]
+fn pinocchio_brownfield_bails_without_idl_on_disk() {
+    ensure_qedgen_built();
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+    std::fs::write(
+        tmp.path().join("Cargo.toml"),
+        "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\npinocchio = \"0.6\"\n",
+    )
+    .unwrap();
+    // Source has no `process_*` handlers AND no idl.json — gate should
+    // bail clearly pointing at Codama.
+    std::fs::write(tmp.path().join("src/lib.rs"), "// no IDL\n").unwrap();
+    let out = Command::new(qedgen_bin())
+        .args(["probe", "--fuzz", "0", "--root"])
+        .arg(tmp.path())
+        .output()
+        .expect("spawn qedgen");
+    assert!(!out.status.success(), "expected non-zero exit");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Codama") && stderr.contains("codama"),
+        "Pinocchio bail should cite Codama and the codama CLI; got: {stderr}"
+    );
+}
+
 #[test]
 fn brownfield_errors_when_no_anchor_handlers_found() {
     ensure_qedgen_built();
