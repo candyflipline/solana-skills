@@ -135,8 +135,6 @@ fn synthesize_anchor_family(project_root: &Path) -> Result<BrownfieldSynthesis> 
 }
 
 fn synthesize_pinocchio(project_root: &Path) -> Result<BrownfieldSynthesis> {
-    let program_name = program_name_from_root(project_root)?;
-
     // v2.22 Slice 3 gates Pinocchio brownfield on a maintainer-authored
     // Codama / Anchor 0.30 IDL. Scanner-based account & arg inference
     // from `pub fn process_*` bodies is fragile — `.borrow_mut_*`
@@ -158,23 +156,60 @@ fn synthesize_pinocchio(project_root: &Path) -> Result<BrownfieldSynthesis> {
         )
     })?;
 
-    let handler_names = handler_names_from_idl(&idl_text);
-    if handler_names.is_empty() {
+    let handlers_with_args = handlers_with_args_from_idl(&idl_text);
+    if handlers_with_args.is_empty() {
         bail!(
             "Codama IDL at {} parsed but has no `instructions[]` entries. \
              Brownfield fuzz needs at least one instruction to dispatch.",
             project_root.display()
         );
     }
+    // Pull the program name from the IDL itself when present. The
+    // declare_fuzz_program! macro derives the generated module name
+    // from the IDL's `program.name` (Codama IR) or `metadata.name`
+    // (Anchor 0.30), so the harness's `use {prog}::instruction;` must
+    // line up with that — not with the surrounding Cargo workspace's
+    // leaf directory. Fall back to the Cargo / leaf-dir name when the
+    // IDL doesn't carry one (rare; an Anchor IDL always does, and
+    // Codama IR carries `program.name` even when the file doesn't
+    // declare `metadata`).
+    let program_name = program_name_from_idl(&idl_text)
+        .or_else(|| program_name_from_root(project_root).ok())
+        .unwrap_or_else(|| "program".to_string());
+    let handlers = handlers_with_args
+        .into_iter()
+        .map(|(name, args)| {
+            let mut h = empty_handler(name);
+            h.takes_params = args;
+            h
+        })
+        .collect();
     let spec = ParsedSpec {
-        program_name: program_name.clone(),
-        handlers: handler_names.into_iter().map(empty_handler).collect(),
+        program_name,
+        handlers,
         ..Default::default()
     };
     Ok(BrownfieldSynthesis {
         spec,
         idl_json: Some(idl_text),
     })
+}
+
+/// Extract the program name from either an Anchor 0.30 IDL
+/// (`metadata.name`) or a Codama IR JSON (`program.name`). Returns
+/// `None` when neither is present.
+fn program_name_from_idl(idl_text: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(idl_text).ok()?;
+    v.get("metadata")
+        .and_then(|m| m.get("name"))
+        .and_then(|n| n.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            v.get("program")
+                .and_then(|p| p.get("name"))
+                .and_then(|n| n.as_str())
+                .map(|s| s.to_string())
+        })
 }
 
 /// Search the brownfield project root for a Codama / Anchor 0.30 IDL
@@ -226,6 +261,134 @@ pub(crate) fn discover_pinocchio_idl(project_root: &Path) -> Result<Option<Strin
     Ok(None)
 }
 
+/// Extract per-handler argument lists alongside instruction names. The
+/// harness emitter uses `takes_params` to build `instruction::Foo { arg1,
+/// arg2, ... }` literals that match the macro-generated struct shape;
+/// without typed args the literals leave fields uninitialised and the
+/// build fails with E0063.
+///
+/// Returns one entry per IDL instruction. Each entry: `(snake_name,
+/// vec![(arg_name, rust_type), ...])`. Discriminator arguments and any
+/// argument flagged `defaultValueStrategy: "omitted"` are skipped — the
+/// macro doesn't surface those as struct fields.
+///
+/// Type mapping (current scope):
+/// - Codama `numberTypeNode { format: "u8" | "u16" | ... | "i128" }` →
+///   `"u8"` / `"u16"` / ... / `"i128"`.
+/// - Codama `publicKeyTypeNode`, Anchor `"pubkey"` → `"Pubkey"`.
+/// - Codama `booleanTypeNode`, Anchor `"bool"` → `"bool"`.
+/// - Codama `stringTypeNode`, Anchor `"string"` → `"String"`.
+/// - Anything else → `"u64"` placeholder (the action param will compile
+///   but the fuzzer-generated value may not type-coerce into the
+///   macro's field; the caller should refine the IDL or accept the
+///   compile error as a signal that the type isn't supported yet).
+fn handlers_with_args_from_idl(idl_text: &str) -> Vec<(String, Vec<(String, String)>)> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(idl_text) else {
+        return Vec::new();
+    };
+    let ixs = v
+        .get("instructions")
+        .and_then(|v| v.as_array())
+        .or_else(|| {
+            v.get("program")
+                .and_then(|p| p.get("instructions"))
+                .and_then(|v| v.as_array())
+        });
+    let Some(ixs) = ixs else {
+        return Vec::new();
+    };
+    ixs.iter()
+        .filter_map(|ix| {
+            let raw_name = ix.get("name").and_then(|n| n.as_str())?;
+            let snake = camel_to_snake(raw_name);
+            // Codama IR uses `arguments[]`; Anchor 0.30 uses `args[]`.
+            let args_array = ix
+                .get("arguments")
+                .or_else(|| ix.get("args"))
+                .and_then(|v| v.as_array());
+            let args = args_array
+                .map(|arr| {
+                    arr.iter()
+                        .filter(|a| {
+                            // Codama: skip args with `defaultValueStrategy: "omitted"`
+                            // (e.g. the discriminator field). The macro elides
+                            // those from the generated struct.
+                            a.get("defaultValueStrategy")
+                                .and_then(|s| s.as_str())
+                                .map(|s| s != "omitted")
+                                .unwrap_or(true)
+                        })
+                        .filter_map(|a| {
+                            let name = a.get("name").and_then(|n| n.as_str())?;
+                            let ty = idl_arg_type(a.get("type")?);
+                            Some((name.to_string(), ty))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            Some((snake, args))
+        })
+        .collect()
+}
+
+fn camel_to_snake(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for (i, ch) in name.chars().enumerate() {
+        if ch.is_ascii_uppercase() {
+            if i > 0 {
+                out.push('_');
+            }
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Map an IDL argument's `type` field to a qedgen DSL type identifier
+/// (`U8`, `U64`, `Pubkey`, `Bool`, ...). The harness emitter runs the
+/// result back through `crucible_gen::map_simple_type` to get the
+/// Rust-side type, so this returns the DSL convention used by
+/// `ParsedHandler::takes_params`.
+///
+/// Tolerates both the Codama IR tree shape (`{kind, format, ...}`) and
+/// the Anchor 0.30 string-shorthand shape (`"u64"`).
+fn idl_arg_type(ty: &serde_json::Value) -> String {
+    if let Some(s) = ty.as_str() {
+        return anchor_str_to_dsl(s);
+    }
+    let kind = ty.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+    match kind {
+        "numberTypeNode" => ty
+            .get("format")
+            .and_then(|f| f.as_str())
+            .map(anchor_str_to_dsl)
+            .unwrap_or_else(|| "U64".to_string()),
+        "publicKeyTypeNode" => "Pubkey".to_string(),
+        "booleanTypeNode" => "Bool".to_string(),
+        _ => "U64".to_string(),
+    }
+}
+
+fn anchor_str_to_dsl(s: &str) -> String {
+    match s {
+        "u8" => "U8".to_string(),
+        "u16" => "U16".to_string(),
+        "u32" => "U32".to_string(),
+        "u64" => "U64".to_string(),
+        "u128" => "U128".to_string(),
+        "i8" => "I8".to_string(),
+        "i16" => "I16".to_string(),
+        "i32" => "I32".to_string(),
+        "i64" => "I64".to_string(),
+        "i128" => "I128".to_string(),
+        "pubkey" | "publicKey" => "Pubkey".to_string(),
+        "bool" => "Bool".to_string(),
+        _ => "U64".to_string(),
+    }
+}
+
 /// Extract instruction names from either an Anchor 0.30 IDL JSON
 /// (top-level `instructions[]`) or a Codama IR JSON (nested
 /// `program.instructions[]` under a `rootNode`). Returns the snake_case
@@ -235,42 +398,11 @@ pub(crate) fn discover_pinocchio_idl(project_root: &Path) -> Result<Option<Strin
 /// IDL's `instructions[].name` field (no prefix). A `process_` prefix
 /// would produce `instruction::ProcessFoo`, which `declare_fuzz_program!`
 /// doesn't emit.
+#[cfg(test)]
 fn handler_names_from_idl(idl_text: &str) -> Vec<String> {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(idl_text) else {
-        return Vec::new();
-    };
-    let ixs = v
-        .get("instructions")
-        .and_then(|v| v.as_array())
-        .or_else(|| {
-            // Codama IR: `program.instructions[]` under a `rootNode`.
-            v.get("program")
-                .and_then(|p| p.get("instructions"))
-                .and_then(|v| v.as_array())
-        });
-    let Some(ixs) = ixs else {
-        return Vec::new();
-    };
-    ixs.iter()
-        .filter_map(|ix| ix.get("name").and_then(|n| n.as_str()))
-        .map(|name| {
-            // camelCase → snake_case. The harness emitter will PascalCase
-            // again when constructing `instruction::Foo`; the macro
-            // generates Foo from the camelCase IDL name. So snake-case
-            // here, PascalCase there, both round-trip to the same type.
-            let mut snake = String::with_capacity(name.len());
-            for (i, ch) in name.chars().enumerate() {
-                if ch.is_ascii_uppercase() {
-                    if i > 0 {
-                        snake.push('_');
-                    }
-                    snake.push(ch.to_ascii_lowercase());
-                } else {
-                    snake.push(ch);
-                }
-            }
-            snake
-        })
+    handlers_with_args_from_idl(idl_text)
+        .into_iter()
+        .map(|(n, _)| n)
         .collect()
 }
 
@@ -659,6 +791,41 @@ version = "0.1.0"
             .map(|h| h.name.as_str())
             .collect();
         assert_eq!(handler_names, vec!["create_plan", "update_plan"]);
+    }
+
+    #[test]
+    fn pinocchio_brownfield_takes_program_name_from_idl_not_cargo() {
+        // Cargo.toml at workspace root has no `[package] name` (the
+        // `solana-program-escrow-2026-05` audit corpus shape). The
+        // discovered IDL declares `program.name = escrowProgram`. The
+        // synthesized spec must use the IDL's name so the harness's
+        // `use {prog}::instruction;` matches the
+        // `declare_fuzz_program!` macro's module name.
+        let tmp = tempfile::tempdir().unwrap();
+        // Workspace Cargo.toml — no [package].
+        std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/lib.rs"), "// dispatch elsewhere\n").unwrap();
+        let codama_ir = r#"{
+  "kind": "rootNode",
+  "additionalPrograms": [],
+  "program": {
+    "kind": "programNode",
+    "name": "escrowProgram",
+    "publicKey": "Esc1111111111111111111111111111111111111111",
+    "version": "1.0.0",
+    "instructions": [
+      { "kind": "instructionNode", "name": "deposit", "arguments": [], "accounts": [] }
+    ],
+    "accounts": [], "errors": [], "definedTypes": [], "pdas": []
+  },
+  "standard": "codama",
+  "version": "1.0.0"
+}"#;
+        std::fs::write(tmp.path().join("idl.json"), codama_ir).unwrap();
+        let synth = synthesize_spec(tmp.path(), Runtime::Pinocchio).unwrap();
+        // IDL's program.name takes precedence over the tmpdir leaf name.
+        assert_eq!(synth.spec.program_name, "escrowProgram");
     }
 
     #[test]

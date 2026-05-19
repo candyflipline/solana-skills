@@ -299,7 +299,12 @@ use anchor_lang::system_program;
 use std::rc::Rc;
 
 // IDL-generated types. Drop the IDL at idls/{prog}.json before building.
-crucible_idl_gen::declare_fuzz_program!("idls/{prog}.json");
+// `name = "path"` form pins the generated module to our snake_case program
+// name regardless of the IDL's internal `program.name` casing (Codama IRs
+// typically camelCase it, e.g. `multiDelegator`; Anchor IDLs vary). Without
+// the override, the macro emits `pub mod multiDelegator` and the `use`
+// statements below unresolve.
+crucible_idl_gen::declare_fuzz_program!({prog} = "idls/{prog}.json");
 use {prog}::instruction;
 use {prog}::accounts;
 
@@ -512,8 +517,17 @@ fn emit_fixture_impl(
     out.push_str("    pub fn setup() -> Self {\n");
     out.push_str("        let mut ctx = TestContext::new();\n");
     out.push_str(&format!("        let program_id = {prog}::ID;\n"));
+    // Spec-mode harness lives at <root>/fuzz/<prog>/ — `../../target/`
+    // walks two levels back to the project root. Brownfield (protocol)
+    // mode harness lives at <root>/.qed/fuzz/<prog>/ — needs one extra
+    // level. Without this, the harness panics at `ctx.add_program`
+    // immediately on startup (No such file or directory).
+    let so_path_prefix = match mode {
+        InvariantMode::Protocol => "../../..",
+        InvariantMode::Spec | InvariantMode::Both => "../..",
+    };
     out.push_str(&format!(
-        "        ctx.add_program(&program_id, \"../../target/deploy/{prog}.so\")\n"
+        "        ctx.add_program(&program_id, \"{so_path_prefix}/target/deploy/{prog}.so\")\n"
     ));
     out.push_str("            .unwrap();\n");
     for sig in &signers {
@@ -567,8 +581,19 @@ fn emit_action_fn(
     out.push_str("    /// via `qedgen codegen --fill` once that hook lands for Crucible.\n");
 
     // Build param list with #[range] hints when bounds are inferable.
+    // Pubkey-typed args are deliberately *not* exposed as Arbitrary-derived
+    // action params: Crucible's #[fuzz_fixture] macro can't derive
+    // Arbitrary for Solana's Pubkey (its internal `Address` wrapper has no
+    // Arbitrary impl), so passing one through the action signature breaks
+    // the build. The call-literal logic below inlines `Pubkey::default()`
+    // for those fields. Real PDAs / signer pubkeys belong in the
+    // `.accounts(...)` literal which the agent fills, not in the call
+    // payload that gets fuzzed.
     let mut params = String::new();
     for (pname, ptype) in &op.takes_params {
+        if ptype == "Pubkey" {
+            continue;
+        }
         let rust_ty = map_simple_type(ptype);
         let range_attr = infer_range_attr(spec, ptype);
         if !range_attr.is_empty() {
@@ -593,10 +618,20 @@ fn emit_action_fn(
     // counts as a failed action for fuzz purposes, same as a program-
     // side error.
     let ix_name = pascal_case(&op.name);
+    // Pubkey-typed fields are *not* declared as action params (Crucible
+    // can't fuzz Pubkey), so inline `Pubkey::default()` for them in the
+    // struct literal. Other params are passed through via field
+    // shorthand — they're declared as fn parameters above.
     let arg_inits: String = op
         .takes_params
         .iter()
-        .map(|(n, _)| format!("{n}, "))
+        .map(|(n, t)| {
+            if t == "Pubkey" {
+                format!("{n}: Pubkey::default(), ")
+            } else {
+                format!("{n}, ")
+            }
+        })
         .collect();
     // ── v2.21 §S1.2 — snapshot signer lamports before .send() ───────────
     // Emitted only in Protocol / Both modes. Tracked set = every signer
@@ -622,8 +657,21 @@ fn emit_action_fn(
     out.push_str(&format!(
         "            .call(instruction::{ix_name} {{ {arg_inits}}})\n"
     ));
+    // Notes on the emitted line:
+    //
+    // 1. `{{ ... }}` in the todo!() message is escaped braces in the
+    //    emitter's format string AND in the emitted Rust string —
+    //    `todo!()` is a format-string macro, so a literal `{` would be
+    //    parsed as a format directive. The escaping yields
+    //    `accounts::Foo { ... }` in the eventual panic message.
+    // 2. `.accounts::<accounts::Foo>(todo!())` pins the generic with a
+    //    turbofish so `todo!()` (`!`) coerces into the right concrete
+    //    type. Without the turbofish, type inference picks `()` and
+    //    `(): ToAccountMetas` fails the trait bound. Crucible's
+    //    `declare_fuzz_program!` macro derives `ToAccountMetas` for
+    //    each `accounts::Foo` from the IDL.
     out.push_str(&format!(
-        "            .accounts(todo!(\"agent-fill: accounts::{ix_name} {{ ... }} from spec accounts block\"))\n"
+        "            .accounts::<accounts::{ix_name}>(todo!(\"agent-fill: accounts::{ix_name} {{{{ ... }}}} from spec accounts block\"))\n"
     ));
 
     // Signers: take from `auth X` on the handler.
