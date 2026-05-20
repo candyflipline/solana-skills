@@ -1,0 +1,70 @@
+// Brownfield onboarding demo — codifies one audit finding as a
+// permanent regression guard.
+//
+// The shipped `program/src/lib.rs` is the FIXED variant: every
+// property below verifies green against the committed source. The
+// README walks the audit→spec→verify→fix flow on a buggy variant
+// (described inline as a 2-line diff). Drift gates assume the fixed
+// source.
+
+spec BrownfieldOnboarding
+program_id "11111111111111111111111111111111"
+
+type State
+  | Active of {
+      counter : U64,
+      paused  : U8,
+    }
+
+type Error
+  | Paused
+  | Overflow
+  | MathOverflow
+
+// `bump (delta)` increments the counter unless paused. Idiomatic
+// "monotonic counter under a pause gate" — the audit demo's target.
+handler bump (delta : U64) : State.Active -> State.Active {
+  permissionless
+  requires state.paused == 0 else Paused
+  effect {
+    counter += delta
+  }
+}
+
+// `pause` flips the gate; counter stops advancing.
+handler pause : State.Active -> State.Active {
+  permissionless
+  effect {
+    paused := 1
+  }
+}
+
+// `unpause` reopens the gate.
+handler unpause : State.Active -> State.Active {
+  permissionless
+  effect {
+    paused := 0
+  }
+}
+
+// ── Audit-derived property ──────────────────────────────────────────
+//
+// [from audit finding .qed/findings/001-counter-monotonicity.md]:
+//   `bump` initially shipped with `wrapping_sub` instead of
+//   `wrapping_add`. Under unpaused inputs, the counter advanced
+//   *downward* — violating monotonicity. Repro fired at
+//   programs/src/lib.rs:22. Codified as a binary preservation
+//   property: post-state must be ≥ pre-state across every handler.
+//
+//   v2.23 pre/post lowering: the `old(...)` reference here makes
+//   `counter_monotonic` a Binary property, lowering to
+//     fn counter_monotonic(pre: &State, post: &State) -> bool {
+//         post.counter >= pre.counter
+//     }
+//   The per-handler proptest harness captures `let pre = s.clone();
+//   let mut post = s;` before the handler call. On the buggy
+//   `wrapping_sub` variant, the test fires red with a concrete
+//   counterexample (any nonzero `delta` violates the obligation).
+property counter_monotonic :
+  state.counter >= old(state.counter)
+  preserved_by all

@@ -19,6 +19,30 @@ Mission:
 
 Do not present generated Rust as complete business logic. Anchor and Quasar output is an implementation scaffold. Handler files can intentionally contain `todo!()` for transfers, events, CPI wiring, and non-mechanical effects until the agent fills them.
 
+## First Contact (Brownfield)
+
+If the user invokes you on an **existing** Solana program with no real `.qedspec` (or only a skeleton), do **not** route them straight into spec-writing. Spec-writing from a cold start is unmotivated work. Instead, route them through `/qedgen-auditor` first; the auditor surfaces real findings in their code, and *then* the spec captures those findings as permanent regression guards. The pitch:
+
+> "I see this is an existing Solana program. Before we write a spec, let me hand off to `/qedgen-auditor` to find what's already broken. We'll lock those findings in as a spec so they don't come back."
+
+### Brownfield indicators (agent-side detection)
+
+Walk the filesystem (Read / Glob via the harness's tools; no new CLI needed per `[[feedback_agent_lsp_substrate]]`). The repo is brownfield-onboarding when **any** of:
+
+- `Cargo.toml` exists at the root or under `programs/` / `program/`, with Rust source under `src/` or `programs/*/src/`, **and** no `*.qedspec` file anywhere in the tree.
+- A `*.qedspec` exists at the root but contains no `state { }` block (template-only skeleton). Skeleton specs are a near-universal "I tried, got stuck" signal.
+- An Anchor IDL (`target/idl/*.json`) exists but no committed `.qedspec`.
+
+### What to issue
+
+When detected, recommend the cross-skill switch in your harness's idiom (Claude Code TUI: suggest `/qedgen-auditor`; Codex / Cursor / etc.: name the skill the user should invoke next). Do not programmatic-spawn the auditor — per `[[feedback_audit_as_subagent]]`, the auditor is a harness-native subagent that the user enters explicitly. Your job here ends at the **recommendation** and a one-line summary of what they'll get.
+
+The user re-enters `/qedgen` after the audit produces `.qed/findings/`; the audit-side handoff section in `skills/qedgen-auditor/SKILL.md` and the `references/finding_to_spec.md` mapping table drive the conversion from findings to spec constructs.
+
+### Greenfield path stays unchanged
+
+If the repo has no `Cargo.toml` (or none of the brownfield indicators fire), proceed to the standard validate → scaffold → fill → verify flow. The brownfield branch only intercepts first-contact when there's already-deployed code to audit.
+
 ## How To Run QEDGen
 
 Prefer the installed skill wrapper when available:

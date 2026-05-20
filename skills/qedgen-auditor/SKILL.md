@@ -1795,3 +1795,90 @@ to public repos, no posts to Discord/Slack). Surface in the digest
 only. Recommend the user follow the program's responsible-disclosure
 channel (`SECURITY.md`, security advisory link, etc.) before any
 broader sharing.
+
+## Handoff to `/qedgen` for spec scaffold (v2.23 Slice 8)
+
+Once you've fired at least one MED+ repro (per
+`[[feedback_audit_first_finding_buys_time]]`), the next operational
+move is to convert the findings into a `.qedspec` so they become
+**permanent regression guards**. The audit found the bugs; the spec
+ensures they never come back. This is the brownfield onboarding
+wedge — the user feels value first (real bugs surfaced from their
+existing code), then commits to specification with motivation that
+isn't cold.
+
+### When to offer the handoff
+
+The audit "feels complete enough to specify" when **any** of:
+
+- A CRIT or HIGH finding has fired (`repro_status = fired` in the
+  digest).
+- ≥ 2 MED findings have fired across distinct categories.
+- The user signals stop (`/done`, "that's enough", "let's lock this
+  in").
+
+Don't gate on the full latency budget — the bear hug requires
+incremental value, not a complete sweep
+([[feedback_audit_first_finding_buys_time]]).
+
+### The pitch
+
+Carry this framing verbatim:
+
+> "I helped find so many bugs, now let's get you to specify them so
+> they never come back. For each finding I've written under
+> `.qed/findings/`, I have a `.qedspec` construct that locks the
+> finding in as a permanent regression guard. Want me to draft a
+> `.qedspec` (or extend yours) and walk you through verification?"
+
+If the user agrees, the next step is to **re-enter the `/qedgen`
+skill** for the scaffolding (the cross-skill switch is harness-
+handled per `[[feedback_audit_as_subagent]]` — issue a recommendation,
+don't programmatic-spawn). The auditor's job ends at "findings
+written + handoff offered."
+
+### Operating reference
+
+For the conversion table — probe category → spec construct shape →
+why it locks the finding in → what the harness asserts on regression
+— see `references/finding_to_spec.md`. Eight families cover the
+high-yield categories (authorization, arithmetic, lifecycle / PDA,
+data-structure dep invariants, paired validators, intent drift,
+external-state revocation, out-of-band documentation invariants).
+
+Pre-conversion checklist (the agent owns each, per
+`[[feedback_audit_interview_intent_not_sites]]`):
+
+1. **Read the finding's category and citation.** Both from
+   `.qed/findings/<id>.md` (markdown header + cited fields) and from
+   `.qed/probes/*.json` (structured fields).
+2. **Look up the family in `finding_to_spec.md`.**
+3. **Draft the spec snippet** with placeholder slots filled from
+   code-derivable facts (handler name, field name, error code symbol).
+4. **Ask the user only for intent decisions** when multiple families
+   could apply (e.g. `PermissionlessStateWriter` — remove
+   `permissionless`, add a bound, or split into two handlers?).
+5. **Run `qedgen check`** to validate the snippet — iterate to lint-
+   clean before moving on.
+6. **Run `qedgen codegen --all` + `qedgen verify`** to confirm the
+   harness fires red against the buggy code and green against the
+   fix. This is the user-visible payoff.
+
+The conversion is **agent-authored**, not CLI-emitted per
+`[[feedback_repros_agent_authored]]`. The data layer
+(`.qed/probes/*.json`, `.qed/findings/*.md`) gives you everything you
+need; no `qedgen scaffold-spec --from-findings` verb exists or should
+in v2.x.
+
+### When the spec already exists
+
+The audit may have run on a brownfield repo that already carries a
+partial `.qedspec` (spec-aware mode). Don't draft a parallel spec —
+extend the existing one. For each finding:
+
+- If the relevant handler is already in the spec, add the missing
+  guard / property / effect inline.
+- If the handler is missing, add it (and note "[from audit finding
+  <id>]" in the doc-comment).
+- Diff the resulting `.qedspec` against the original at the end so
+  the user can see what the audit drove.

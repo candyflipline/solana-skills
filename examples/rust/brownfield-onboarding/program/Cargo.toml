@@ -1,0 +1,23 @@
+[package]
+name = "brownfield-onboarding-demo"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+# Standalone leaf crate — kept out of the workspace via
+# `exclude = ["examples/rust/brownfield-onboarding/program"]` in the
+# top-level Cargo.toml. The demo's value is in the audit/spec/verify
+# walkthrough (see ../README.md), not in workspace-wide test runs.
+
+[lib]
+name = "brownfield_onboarding_demo"
+path = "src/lib.rs"
+
+[dependencies]
+# No runtime dependencies. In a real Solana program these handlers
+# would live inside Anchor `#[program]` arms or Pinocchio dispatcher
+# arms with Account / Pubkey types around them; this demo stays
+# plain-Rust so the audit→spec flow is the focus.
+
+[dev-dependencies]

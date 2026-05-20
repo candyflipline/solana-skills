@@ -1,20 +1,23 @@
-# Release v2.23.0 — Pre/post property lowering
+# Release v2.23.0 — Pre/post property lowering + brownfield first-contact
 
-v2.23 closes a silent-vacuous-proof bug class in proptest and Kani
-codegen: every preservation `property` whose body referenced `old(...)`
-lowered to a structural tautology (`s.x cmp s.x`) and reported green
-without actually checking the binary obligation. Lean's sibling path
-had been doing this correctly for years; the Rust side was the gap.
-The fix is structural — classify properties at parse time, bifurcate
-the property-fn signature, and capture pre-state in the per-handler
+v2.23 carries two paired themes. **Trust side** (Slices 1, 1b, 2-7):
+closes a silent-vacuous-proof bug class in proptest and Kani codegen.
+Every preservation `property` whose body referenced `old(...)` lowered
+to a structural tautology (`s.x cmp s.x`) and reported green without
+actually checking the binary obligation. Lean's sibling path had been
+doing this correctly for years; the Rust side was the gap. The fix is
+structural — classify properties at parse time, bifurcate the
+property-fn signature, capture pre-state in the per-handler
 preservation harness — plus two defense-in-depth lints
-(`vacuous_property_lowering` for codegen regressions,
-`old_in_single_state_context` for misuse in `requires` / `invariant`).
+(`vacuous_property_lowering`, `old_in_single_state_context`).
 
-Trust-side slices (1, 1b, 2-7) ship in v2.23.0. Slice 8 (brownfield
-first-contact onboarding flow) carries over to a follow-up; its scope
-(~4 working days, new bundled example, two SKILL.md edits) doesn't fit
-a focused trust-restoration release.
+**Onboarding side** (Slice 8): brownfield first-contact now routes
+through `/qedgen-auditor` first, then converts validated findings into
+a `.qedspec` that locks them in as permanent regression guards. The
+SKILL files carry the branch logic; `references/finding_to_spec.md`
+carries the conversion table; `examples/rust/brownfield-onboarding/`
+walks the audit → spec → verify → fix cycle end-to-end on a real bug
+class showcasing v2.23's new pre/post lowering.
 
 ## What's in
 
@@ -167,16 +170,52 @@ verbatim per the PRD's worked example.
   bundled spec with `old(...)` in a `property` body and confirm
   the binary signature ships.
 
+### Slice 8 — Brownfield first-contact
+
+SKILL.md, auditor handoff, mapping table, and a bundled example
+demonstrating the end-to-end flow.
+
+- **`SKILL.md` "First Contact (Brownfield)" section.** Detection
+  heuristics (Cargo.toml + Rust source + no .qedspec; or .qedspec
+  with no `state {}` block; or Anchor IDL with no committed spec).
+  When detected, recommend the cross-skill switch to
+  `/qedgen-auditor`. Per `[[feedback_audit_as_subagent]]` the
+  switch is harness-handled (TUI suggestion, not programmatic
+  spawn). Greenfield path unchanged.
+
+- **`skills/qedgen-auditor/SKILL.md` "Handoff to `/qedgen`"
+  section.** When to offer the handoff (≥ 1 fired MED+ per
+  `[[feedback_audit_first_finding_buys_time]]`), the pitch
+  verbatim, the operating reference pointing at
+  `references/finding_to_spec.md`, and the pre-conversion
+  checklist (read finding category, look up family, draft snippet,
+  ask user only for intent-level decisions per
+  `[[feedback_audit_interview_intent_not_sites]]`, validate, verify).
+
+- **`skills/qedgen-auditor/references/finding_to_spec.md`.** 580-line
+  conversion table organized into 8 families: authorization,
+  arithmetic, lifecycle / PDA, data-structure dep invariants,
+  paired validators, intent drift, external-state revocation,
+  out-of-band (documentation-only). Each family carries signal /
+  spec construct / why it locks the finding in / failure mode, plus
+  a worked example walking three findings on a brownfield
+  Pinocchio program.
+
+- **`examples/rust/brownfield-onboarding/`.** Bundled walkthrough on
+  a tiny monotonic-counter program. The committed source and spec
+  are the FIXED variant; the README documents a 1-line spec edit
+  (`counter += delta` → `counter -=? delta`) that lowers to
+  `wrapping_sub` and fires `counter_monotonic` red — exactly the
+  v2.23 binary-property obligation working as intended. Layout
+  intentionally minimal: README script + spec + sample audit
+  finding + standalone Rust source (no Anchor scaffold, no Lake
+  project committed; the user generates both as part of Step 3).
+  Demo asymmetry — "red then green" not "stays green" — documented
+  in README and the release-gate context note.
+
 ## What's not in (carries to follow-up)
 
-- **Slice 8 — Brownfield first-contact flow.** SKILL.md
-  brownfield-detect branch, auditor → spec scaffold handoff,
-  `references/finding_to_spec.md` mapping table, and a bundled
-  `examples/rust/brownfield-onboarding/` walkthrough. ~4 working
-  days of separate work that doesn't fit a focused trust-side
-  release. Tracking the source signals
-  ([[feedback_audit_as_brownfield_wedge]],
-  [[feedback_audit_first_finding_buys_time]]) for the follow-on.
+(None — Slice 8 sub-slices S8.1–S8.4 all shipped above.)
 
 ## Migration
 

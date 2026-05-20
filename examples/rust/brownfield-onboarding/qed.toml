@@ -1,0 +1,7 @@
+# Brownfield onboarding demo — empty dependencies manifest.
+#
+# Kept present so QEDGen's example discovery and codegen-drift
+# checks treat all examples uniformly. The demo carries no external
+# interface imports.
+
+[dependencies]
