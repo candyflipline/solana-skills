@@ -1,0 +1,15 @@
+# qedgen's CLI defaults output paths to CWD (`./programs`,
+# `./formal_verification`, `./fuzz`, `./tests/proptest.rs`, etc.). If a
+# developer runs `qedgen init` or `qedgen codegen` from inside this crate
+# while debugging the binary, the scaffolds land directly in the source
+# tree. These ignores keep that from polluting git status — pass
+# explicit `--output-dir` / `--*-output` flags or `cd` somewhere else
+# when you want to keep the output.
+/programs/
+/fuzz/
+/formal_verification/
+/.github/
+/tests/proptest.rs
+/tests/kani.rs
+/src/integration_tests.rs
+/src/tests.rs

@@ -638,11 +638,60 @@ fn emit_kani_account_section(
                 };
                 let needs_local_binder = prop.per_slot.is_some() && !handler_takes_binder;
 
+                // v2.23 Slice 4: produce `pre` (symbolic or zeroed) and
+                // `let mut post = pre;`. The handler mutates `post`; the
+                // preservation assertion compares to `pre` for Binary
+                // properties (those containing `old(...)`) and to `post`
+                // alone for Unary properties. Pre-v2.23 the Kani harness
+                // used a single `s` that was mutated in place, mirroring
+                // the proptest bug — every `old(...)`-bearing property
+                // verified vacuously because the temporal marker had
+                // been overwritten before the assertion fired. Open
+                // question 3 (PRD-v2.23): we assume `State: Copy` on the
+                // Kani path; this is true for every shipping spec today
+                // and is documented as a Kani-side limitation.
                 if is_init {
-                    emit_state_init_zeroed(out, mutable_fields, lifecycle_states, spec);
+                    // Init handler — pre-state is the zeroed initial state.
+                    // `let pre = State { ... }; let mut post = pre;` so the
+                    // shape matches the proptest init path.
+                    out.push_str("    let pre = ");
+                    // Emit the literal struct body inline so we can name the
+                    // binding `pre` instead of `s`. Same fields/values as
+                    // `emit_state_init_zeroed`.
+                    out.push_str("State {\n");
+                    for (fname, ftype) in mutable_fields {
+                        if let Some(default) =
+                            crate::proptest_gen::default_value_for_field(ftype, spec)
+                        {
+                            out.push_str(&format!("        {}: {},\n", fname, default));
+                        }
+                    }
+                    if let Some(initial) = lifecycle_states.first() {
+                        if lifecycle_states.len() >= 2 {
+                            out.push_str(&format!("        status: Status::{},\n", initial));
+                        }
+                    }
+                    out.push_str("    };\n");
+                    out.push_str("    let mut post = pre;\n");
                 } else {
-                    emit_state_init_symbolic(out, mutable_fields, lifecycle_states);
-                    emit_pre_status_assume(out, op, lifecycle_states);
+                    // Non-init handler — pre is symbolic; assumptions apply
+                    // to pre; post is a Copy of pre before mutation.
+                    out.push_str("    let pre = State {\n");
+                    for (fname, _) in mutable_fields {
+                        out.push_str(&format!("        {}: kani::any(),\n", fname));
+                    }
+                    if lifecycle_states.len() >= 2 {
+                        out.push_str("        status: kani::any(),\n");
+                    }
+                    out.push_str("    };\n");
+                    if lifecycle_states.len() >= 2 {
+                        if let Some(ref pre_status) = op.pre_status {
+                            out.push_str(&format!(
+                                "    kani::assume(pre.status == Status::{});\n",
+                                pre_status
+                            ));
+                        }
+                    }
 
                     // Bind <binder> symbolically up front so the pre-state
                     // assume and the post-state assert reference the same
@@ -657,24 +706,29 @@ fn emit_kani_account_section(
                         }
                     }
 
-                    // Assume all declared properties hold before transition.
-                    // For the property we're preserving (and any other forall
-                    // property), use the per-slot form against the already-
-                    // bound <binder> so pre and post share the same value.
+                    // v2.23 Slice 4: assume all declared (unary) properties
+                    // hold before the transition. Binary properties have a
+                    // `(pre, post)` signature with no single-state form —
+                    // asserting them against `(pre, pre)` is trivially true
+                    // and offers no information. Skip them in the assume
+                    // loop; the post-assert below dispatches by class.
                     for pre_prop in properties.iter().copied() {
                         if pre_prop.expression.is_none() {
+                            continue;
+                        }
+                        if pre_prop.class == crate::check::PropertyClass::Binary {
                             continue;
                         }
                         match &pre_prop.per_slot {
                             Some(slot) if pre_prop.name == prop.name => {
                                 out.push_str(&format!(
-                                    "    kani::assume({}_at(&s, {}));\n",
+                                    "    kani::assume({}_at(&pre, {}));\n",
                                     pre_prop.name, slot.binder_name
                                 ));
                             }
                             _ => {
                                 out.push_str(&format!(
-                                    "    kani::assume({}(&s));\n",
+                                    "    kani::assume({}(&pre));\n",
                                     pre_prop.name
                                 ));
                             }
@@ -683,14 +737,12 @@ fn emit_kani_account_section(
 
                     // Assume MAX_MEMBERS bound (derived from create_vault guard)
                     if !spec.constants.is_empty() {
-                        // Find a "members" or "max" constant
                         for (cname, _cval) in &spec.constants {
                             let upper = cname.to_uppercase();
                             if upper.contains("MAX") || upper.contains("MEMBER") {
-                                // Assume member_count <= MAX (from create_vault guard)
                                 if mutable_fields.iter().any(|(f, _)| f == "member_count") {
                                     out.push_str(&format!(
-                                        "    kani::assume(s.member_count <= {});\n",
+                                        "    kani::assume(pre.member_count <= {});\n",
                                         upper
                                     ));
                                 }
@@ -698,6 +750,9 @@ fn emit_kani_account_section(
                             }
                         }
                     }
+
+                    // post = Copy of pre; handler mutates post.
+                    out.push_str("    let mut post = pre;\n");
                 }
 
                 // Symbolic params
@@ -711,37 +766,51 @@ fn emit_kani_account_section(
 
                 // For operations that increment a field (add effect), assume
                 // the field is strictly less than its bound to prevent overflow.
-                // Build a temporary owned property slice for the helper.
+                // v2.23 Slice 4: bounds apply to pre-state.
                 let owned_props: Vec<crate::check::ParsedProperty> =
                     properties.iter().map(|p| (*p).clone()).collect();
-                rust_codegen_util::emit_add_strict_bounds(out, op, &owned_props, "    kani::assume(s.{field} < s.{bound}); // strict bound: {field} increments\n");
+                rust_codegen_util::emit_add_strict_bounds(out, op, &owned_props, "    kani::assume(pre.{field} < pre.{bound}); // strict bound: {field} increments\n");
 
-                // Call transition and assert property. For forall properties,
-                // assert at the bound <binder> via `<prop>_at` — same binder
-                // pre and post = preservation, not a fresh-witness check.
+                // Call transition (mutates `post`) and assert property.
+                // v2.23 Slice 4 dispatch on `prop.class`:
+                //   - Unary, per_slot: `<prop>_at(&post, binder)`.
+                //   - Unary, plain:    `<prop>(&post)`.
+                //   - Binary:          `<prop>(&pre, &post)` — the binary
+                //     signature emitted by `emit_property_predicates_with`.
+                // Per_slot × Binary is deferred per PRD open question 4;
+                // such a property falls through to the plain binary form.
                 let args: String = op
                     .takes_params
                     .iter()
                     .map(|(n, _)| format!(", {}", n))
                     .collect();
-                out.push_str(&format!("    if {}(&mut s{}) {{\n", op_name, args));
-                match &prop.per_slot {
-                    Some(slot) => {
-                        out.push_str(&format!(
-                            "        assert!({}_at(&s, {}),\n",
-                            prop.name, slot.binder_name
-                        ));
-                        out.push_str(&format!(
-                            "            \"{} must hold after {} (forall {} : {})\");\n",
-                            prop.name, op_name, slot.binder_name, slot.binder_type
-                        ));
-                    }
-                    None => {
-                        out.push_str(&format!("        assert!({}(&s),\n", prop.name));
-                        out.push_str(&format!(
-                            "            \"{} must hold after {}\");\n",
-                            prop.name, op_name
-                        ));
+                out.push_str(&format!("    if {}(&mut post{}) {{\n", op_name, args));
+                let is_binary_prop = prop.class == crate::check::PropertyClass::Binary;
+                if is_binary_prop {
+                    out.push_str(&format!("        assert!({}(&pre, &post),\n", prop.name));
+                    out.push_str(&format!(
+                        "            \"{} must hold after {} (binary: pre/post)\");\n",
+                        prop.name, op_name
+                    ));
+                } else {
+                    match &prop.per_slot {
+                        Some(slot) => {
+                            out.push_str(&format!(
+                                "        assert!({}_at(&post, {}),\n",
+                                prop.name, slot.binder_name
+                            ));
+                            out.push_str(&format!(
+                                "            \"{} must hold after {} (forall {} : {})\");\n",
+                                prop.name, op_name, slot.binder_name, slot.binder_type
+                            ));
+                        }
+                        None => {
+                            out.push_str(&format!("        assert!({}(&post),\n", prop.name));
+                            out.push_str(&format!(
+                                "            \"{} must hold after {}\");\n",
+                                prop.name, op_name
+                            ));
+                        }
                     }
                 }
                 out.push_str("    }\n");
@@ -1323,6 +1392,8 @@ fn emit_file_level_features(
 
 #[cfg(test)]
 mod tests {
+    use super::{emit_kani_account_section, HarnessCounts};
+    use crate::check::{ParsedHandler, ParsedProperty};
     use crate::chumsky_adapter::parse_str;
 
     // B4 regression: a handler whose precondition is expressed purely through
@@ -1647,5 +1718,168 @@ handler init_claim (amount : U64) : Claim.Empty -> Claim.Active {
                 a.name
             );
         }
+    }
+
+    // ========================================================================
+    // v2.23 Slice 4 — Kani preservation harness pre/post bifurcation
+    // ========================================================================
+
+    /// Parse a single-ADT spec and emit its Kani section to a string. Used
+    /// by Slice 4 tests to assert on the harness shape.
+    fn emit_kani_section(src: &str) -> String {
+        let spec = parse_str(src).expect("parse");
+        let mutable_fields: Vec<&(String, String)> = spec.state_fields.iter().collect();
+        let handlers: Vec<&ParsedHandler> = spec.handlers.iter().collect();
+        let properties: Vec<&ParsedProperty> = spec.properties.iter().collect();
+        let mut out = String::new();
+        let mut counts = HarnessCounts::default();
+        emit_kani_account_section(
+            &mut out,
+            &mutable_fields,
+            &handlers,
+            &properties,
+            &spec.lifecycle_states,
+            &spec,
+            &mut counts,
+        )
+        .expect("emit");
+        out
+    }
+
+    const KANI_BINARY_SPEC: &str = r#"
+spec KaniBinaryTest
+program_id "11111111111111111111111111111111"
+
+type State
+  | Active of { balance : U64, settled : U64 }
+
+type Error
+  | E
+
+handler bump (delta : U64) : State.Active -> State.Active {
+  permissionless
+  effect { balance := balance + delta }
+}
+
+property balance_nonneg :
+  state.balance >= 0
+  preserved_by all
+
+property settled_monotonic :
+  state.settled >= old(state.settled)
+  preserved_by all
+"#;
+
+    #[test]
+    fn kani_binary_property_predicate_has_pre_post_signature() {
+        // Slice 4: `fn settled_monotonic(pre: &State, post: &State) -> bool`
+        // — pre-v2.23 it emitted the single-state signature, producing
+        // `s.settled >= s.settled` (tautology) in the body.
+        let out = emit_kani_section(KANI_BINARY_SPEC);
+        assert!(
+            out.contains("fn settled_monotonic(pre: &State, post: &State) -> bool"),
+            "binary predicate must have (pre, post) signature; got:\n{}",
+            out
+        );
+        assert!(
+            !out.contains("fn settled_monotonic(s: &State)"),
+            "binary predicate must not have unary signature; got:\n{}",
+            out
+        );
+    }
+
+    #[test]
+    fn kani_unary_property_predicate_keeps_single_state_signature() {
+        // Slice 4 is additive on the binary path — unary properties see no
+        // diff in their signature or body.
+        let out = emit_kani_section(KANI_BINARY_SPEC);
+        assert!(
+            out.contains("fn balance_nonneg(s: &State) -> bool"),
+            "unary predicate must keep single-state signature; got:\n{}",
+            out
+        );
+    }
+
+    #[test]
+    fn kani_preservation_harness_captures_pre_state() {
+        // Slice 4: each `verify_<op>_preserves_<prop>` harness must emit
+        // `let pre = State { ... };` (symbolic) and `let mut post = pre;`
+        // — the pre-v2.23 single `let mut s` shape destroyed the pre-state
+        // before the assertion could see it.
+        let out = emit_kani_section(KANI_BINARY_SPEC);
+        let start = out
+            .find("fn verify_bump_preserves_settled_monotonic()")
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing verify_bump_preserves_settled_monotonic; got:\n{}",
+                    out
+                )
+            });
+        let end = out[start..]
+            .find("\n}\n\n")
+            .map(|i| start + i)
+            .unwrap_or(out.len());
+        let body = &out[start..end];
+        assert!(
+            body.contains("let pre = State {"),
+            "harness must declare symbolic `pre`; got:\n{}",
+            body
+        );
+        assert!(
+            body.contains("let mut post = pre;"),
+            "harness must clone `post` from `pre` before mutation; got:\n{}",
+            body
+        );
+        assert!(
+            body.contains("bump(&mut post"),
+            "handler must mutate `post`, not `s`; got:\n{}",
+            body
+        );
+        assert!(
+            body.contains("settled_monotonic(&pre, &post)"),
+            "binary post-assert must use (&pre, &post); got:\n{}",
+            body
+        );
+    }
+
+    #[test]
+    fn kani_preservation_harness_assumes_use_pre() {
+        // Slice 4: `kani::assume(<unary>(&pre))` — pre-conditions apply to
+        // the pre-state. Binary properties are skipped in the assume loop
+        // (their (pre, pre) form is trivially true and offers no info).
+        let out = emit_kani_section(KANI_BINARY_SPEC);
+        let start = out
+            .find("fn verify_bump_preserves_balance_nonneg()")
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing verify_bump_preserves_balance_nonneg; got:\n{}",
+                    out
+                )
+            });
+        let end = out[start..]
+            .find("\n}\n\n")
+            .map(|i| start + i)
+            .unwrap_or(out.len());
+        let body = &out[start..end];
+        assert!(
+            body.contains("kani::assume(balance_nonneg(&pre))"),
+            "unary kani::assume must use `&pre`; got:\n{}",
+            body
+        );
+        assert!(
+            !body.contains("kani::assume(settled_monotonic("),
+            "binary property must not appear in kani::assume; got:\n{}",
+            body
+        );
+        assert!(
+            body.contains("balance_nonneg(&post)"),
+            "unary post-assert must use `&post`; got:\n{}",
+            body
+        );
+        assert!(
+            !body.contains("balance_nonneg(&s)"),
+            "harness must not still reference legacy `&s`; got:\n{}",
+            body
+        );
     }
 }

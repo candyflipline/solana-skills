@@ -702,15 +702,122 @@ fn strip_state_prefix(s: &str) -> String {
         .unwrap_or_else(|| s.to_string())
 }
 
+/// v2.23 Slice 1: walk a property body AST looking for any `Expr::Old(_)`
+/// node. Used both by `classify_property_body` and (in Slice 5) by the
+/// `vacuous_property_lowering` lint to gate its codegen-induced tautology
+/// rule on the temporal-marker being present in the source.
+///
+/// Mirrors the shape of `quantifier::find_nested_quantifier` — same set of
+/// AST nodes, different predicate.
+pub(crate) fn expr_contains_old(node: &Node<Expr>) -> bool {
+    match &node.node {
+        Expr::Old(_) => true,
+        Expr::BoolOp { lhs, rhs, .. }
+        | Expr::Cmp { lhs, rhs, .. }
+        | Expr::Arith { lhs, rhs, .. } => expr_contains_old(lhs) || expr_contains_old(rhs),
+        Expr::Not(inner) | Expr::Paren(inner) => expr_contains_old(inner),
+        Expr::Sum { body, .. } | Expr::Quant { body, .. } => expr_contains_old(body),
+        Expr::MulDivFloor { a, b, d } | Expr::MulDivCeil { a, b, d } => {
+            expr_contains_old(a) || expr_contains_old(b) || expr_contains_old(d)
+        }
+        Expr::Match { scrutinee, arms } => {
+            expr_contains_old(scrutinee) || arms.iter().any(|arm| expr_contains_old(&arm.body))
+        }
+        Expr::IfThenElse {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            expr_contains_old(cond)
+                || expr_contains_old(then_branch)
+                || expr_contains_old(else_branch)
+        }
+        Expr::Let { value, body, .. } => expr_contains_old(value) || expr_contains_old(body),
+        Expr::App { args, .. } => args.iter().any(expr_contains_old),
+        Expr::Field { base, .. } => expr_contains_old(base),
+        Expr::RecordLit(fs) => fs.iter().any(|(_, v)| expr_contains_old(v)),
+        Expr::RecordUpdate { base, updates } => {
+            expr_contains_old(base) || updates.iter().any(|(_, v)| expr_contains_old(v))
+        }
+        Expr::Ctor { payload, .. } => payload.as_ref().is_some_and(|p| expr_contains_old(p)),
+        Expr::IsVariant { scrutinee, .. } => expr_contains_old(scrutinee),
+        // Leaves
+        Expr::Int(_) | Expr::Bool(_) | Expr::Path(_) => false,
+    }
+}
+
+/// v2.23 Slice 1: classify a property body's temporal shape. Body contains
+/// `Expr::Old(_)` anywhere ⇒ `Binary`; otherwise `Unary`. Drives codegen
+/// dispatch downstream (see [`crate::check::PropertyClass`]).
+pub(crate) fn classify_property_body(node: &Node<Expr>) -> crate::check::PropertyClass {
+    if expr_contains_old(node) {
+        crate::check::PropertyClass::Binary
+    } else {
+        crate::check::PropertyClass::Unary
+    }
+}
+
+/// v2.23 Slice 2: lowering mode for state-path rendering in property
+/// bodies. `Unary` keeps today's behavior (`state.x` → `s.x`, no pre/post
+/// distinction). `Binary` is set by `proptest_gen` / `kani` when rendering
+/// a `PropertyClass::Binary` property's body: `state.x` → `post.x` and
+/// `old(state.x)` → `pre.x`, matching the per-handler preservation harness
+/// shape that captures pre-state before the handler call.
+///
+/// Mirrors the Lean side's `Ctx::Ensures` + `inside_old` distinction at
+/// `path_to_lean` (line 598), which has always done this correctly. The
+/// Rust side was the gap.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum StateMode {
+    /// Today's behavior — `state.x` and `old(state.x)` both render to
+    /// `s.x`. Correct for guards / requires / ensures bodies that already
+    /// emit against a single-state context. Default on every callsite
+    /// that doesn't explicitly opt into Binary.
+    Unary,
+    /// Slice 2 binary mode — `state.x` renders to `post.x`,
+    /// `old(state.x)` to `pre.x`. Used only by Slices 3-4 when emitting
+    /// `PropertyClass::Binary` property fn bodies.
+    #[allow(dead_code)] // Consumed by Slices 3-4.
+    Binary,
+}
+
 /// Per-render options for `expr_to_rust`. `pod_aware` is set when the
 /// containing codegen target is Quasar — that's where state/record
 /// integer fields are lowered to Pod companions and need `.get()` on
 /// access plus a Nat→Int promotion for mixed-kind binops. `env` carries
 /// the `TypeEnv` used to infer kinds and detect Pod fields.
+///
+/// v2.23 Slice 2: `state_mode` selects unary vs binary state-path
+/// lowering (see [`StateMode`]); `inside_old` tracks recursive descent
+/// into an `old(...)` subexpression so nested state refs render against
+/// pre-state. Both fields default to the unary/no-old shape that
+/// preserves every existing callsite.
 #[derive(Copy, Clone)]
 struct RustOpts<'a, 'env> {
     pod_aware: bool,
     env: &'a TypeEnv<'env>,
+    state_mode: StateMode,
+    inside_old: bool,
+}
+
+impl<'a, 'env> RustOpts<'a, 'env> {
+    /// Return a copy with `inside_old = true`. Used when descending into
+    /// `Expr::Old(_)` so nested state-path renders see the pre-state
+    /// prefix.
+    fn with_inside_old(self) -> Self {
+        RustOpts {
+            inside_old: true,
+            ..self
+        }
+    }
+
+    /// Return a copy with the given `state_mode`. Used by Slices 3-4 to
+    /// switch from Unary (default) to Binary when rendering a
+    /// `PropertyClass::Binary` property body.
+    #[allow(dead_code)] // Consumed by Slices 3-4.
+    fn with_state_mode(self, state_mode: StateMode) -> Self {
+        RustOpts { state_mode, ..self }
+    }
 }
 
 /// Empty `RustOpts` for callsites that don't have a real `TypeEnv` (e.g.
@@ -721,6 +828,8 @@ fn rust_opts_default<'a>() -> RustOpts<'a, 'a> {
     RustOpts {
         pod_aware: false,
         env: Box::leak(Box::new(TypeEnv::default())),
+        state_mode: StateMode::Unary,
+        inside_old: false,
     }
 }
 
@@ -731,6 +840,8 @@ fn opts_native<'a, 'env>(env: &'a TypeEnv<'env>) -> RustOpts<'a, 'env> {
     RustOpts {
         pod_aware: false,
         env,
+        state_mode: StateMode::Unary,
+        inside_old: false,
     }
 }
 
@@ -740,6 +851,8 @@ fn opts_pod<'a, 'env>(env: &'a TypeEnv<'env>) -> RustOpts<'a, 'env> {
     RustOpts {
         pod_aware: true,
         env,
+        state_mode: StateMode::Unary,
+        inside_old: false,
     }
 }
 
@@ -748,11 +861,14 @@ fn expr_to_rust(e: &Expr, ctx: Ctx, consts: ConstTable, opts: RustOpts<'_, '_>) 
     match e {
         Expr::Int(v) => v.to_string(),
         Expr::Bool(b) => b.to_string(),
-        Expr::Path(p) => render_path_with_pod(p, ctx, false, consts, opts),
-        Expr::Old(inner) => match &inner.node {
-            Expr::Path(p) => render_path_with_pod(p, ctx, true, consts, opts),
-            other => format!("/*old({})*/", expr_to_rust(other, ctx, consts, opts)),
-        },
+        Expr::Path(p) => render_path_with_pod(p, ctx, consts, opts),
+        // v2.23 Slice 2: route `old(...)` through `inside_old` on opts.
+        // For `Path`, the path renderer consults `opts.inside_old` and
+        // (in Binary mode) emits `pre.x` instead of the default `post.x`.
+        // For non-Path inner exprs, recursively render with the flag set —
+        // this avoids the pre-Slice-2 comment-form lowering (`/*old(e)*/`)
+        // which produced invalid Rust in expression position.
+        Expr::Old(inner) => expr_to_rust(&inner.node, ctx, consts, opts.with_inside_old()),
         Expr::Sum {
             binder,
             binder_ty,
@@ -943,14 +1059,18 @@ fn expr_to_rust(e: &Expr, ctx: Ctx, consts: ConstTable, opts: RustOpts<'_, '_>) 
 /// resolves to a Pod-flavored field on Quasar (`pod_aware`). Non-Pod
 /// fields (`u8`/`i8`/`Bool` already alignment 1, plus paths into
 /// non-state types) pass through unchanged.
+///
+/// v2.23 Slice 2: the `inside_old` / state-mode signaling moved into
+/// `RustOpts` (see `opts.inside_old`, `opts.state_mode`). This wrapper
+/// no longer threads `inside_old` as a separate argument — `path_to_rust`
+/// reads it from opts.
 fn render_path_with_pod(
     p: &a::Path,
     ctx: Ctx,
-    inside_old: bool,
     consts: ConstTable,
     opts: RustOpts<'_, '_>,
 ) -> String {
-    let base = path_to_rust(p, ctx, inside_old, consts);
+    let base = path_to_rust(p, ctx, consts, opts);
     if opts.pod_aware && opts.env.path_is_pod_field(p) {
         format!("{}.get()", base)
     } else {
@@ -1022,7 +1142,7 @@ fn render_helper_arg(e: &Expr, ctx: Ctx, consts: ConstTable, opts: RustOpts<'_, 
     format!("(({}) as u128)", rendered)
 }
 
-fn path_to_rust(p: &a::Path, _ctx: Ctx, _inside_old: bool, consts: ConstTable) -> String {
+fn path_to_rust(p: &a::Path, _ctx: Ctx, consts: ConstTable, opts: RustOpts<'_, '_>) -> String {
     let mut out = String::new();
     if p.segments.is_empty() && p.root != "state" {
         // Bare ident — substitute if declared as a const (pest parity).
@@ -1036,8 +1156,22 @@ fn path_to_rust(p: &a::Path, _ctx: Ctx, _inside_old: bool, consts: ConstTable) -
     // relied on a post-hoc `translate_guard_to_rust` string replace to fix it,
     // which covered `requires` but missed property bodies consumed raw via
     // `prop.rust_expression`.
+    //
+    // v2.23 Slice 2: when `state_mode == Binary` (set by Slices 3-4 for
+    // `PropertyClass::Binary` property bodies), the state prefix splits
+    // by `inside_old`:
+    //   - inside_old=true  → `pre.<field>`   (old(state.x))
+    //   - inside_old=false → `post.<field>`  (state.x)
+    // Mirrors `path_to_lean` at line 598 which has always done this.
+    // `Unary` callers (every existing site) keep the legacy `s.<field>`
+    // prefix regardless of inside_old.
     if p.root == "state" {
-        out.push('s');
+        let prefix = match (opts.state_mode, opts.inside_old) {
+            (StateMode::Unary, _) => "s",
+            (StateMode::Binary, true) => "pre",
+            (StateMode::Binary, false) => "post",
+        };
+        out.push_str(prefix);
     } else {
         out.push_str(&p.root);
     }
@@ -2099,8 +2233,22 @@ pub fn adapt(spec: &a::Spec) -> ParsedSpec {
             }
             TopItem::Property(p) => {
                 let lean = expr_to_lean(&p.body.node, Ctx::Guard, consts, &env);
-                let rust = expr_to_rust(&p.body.node, Ctx::Guard, consts, opts_native(&env));
-                let rust_pod = expr_to_rust(&p.body.node, Ctx::Guard, consts, opts_pod(&env));
+                // v2.23 Slice 3: pick state_mode by the property's class.
+                // Unary properties render today's way (`s.x`). Binary
+                // properties — bodies containing `old(...)` — render with
+                // `post.x` for the current state and `pre.x` inside
+                // `old(...)`, matching the per-handler preservation
+                // harness shape that `emit_preservation_tests_for` emits.
+                // Pre-v2.23 both classes rendered identically, collapsing
+                // every `old(...)` into a structural tautology.
+                let property_state_mode = match classify_property_body(&p.body) {
+                    crate::check::PropertyClass::Unary => StateMode::Unary,
+                    crate::check::PropertyClass::Binary => StateMode::Binary,
+                };
+                let native_opts = opts_native(&env).with_state_mode(property_state_mode);
+                let pod_opts = opts_pod(&env).with_state_mode(property_state_mode);
+                let rust = expr_to_rust(&p.body.node, Ctx::Guard, consts, native_opts);
+                let rust_pod = expr_to_rust(&p.body.node, Ctx::Guard, consts, pod_opts);
                 let preserved = match &p.preserved_by {
                     // `preserved_by all` — kept as the sentinel "all".
                     // Expanded to the full handler-name list below after all
@@ -2168,6 +2316,7 @@ pub fn adapt(spec: &a::Spec) -> ParsedSpec {
                         })
                     }
                 };
+                let class = classify_property_body(&p.body);
                 out.properties.push(ParsedProperty {
                     name: p.name.clone(),
                     expression: Some(lean),
@@ -2176,6 +2325,8 @@ pub fn adapt(spec: &a::Spec) -> ParsedSpec {
                     preserved_by: preserved,
                     per_slot,
                     quantifier_lint,
+                    class,
+                    ast_body: Some(p.body.clone()),
                 });
             }
             TopItem::Cover(c) => {
@@ -2220,6 +2371,7 @@ pub fn adapt(spec: &a::Spec) -> ParsedSpec {
                             doc: String::new(),
                             lean_expr: Some(lean),
                             rust_expr: Some(rust),
+                            ast_body: Some(e.clone()),
                         }
                     }
                     a::InvariantBody::Description(s) => crate::check::ParsedInvariant {
@@ -2227,6 +2379,7 @@ pub fn adapt(spec: &a::Spec) -> ParsedSpec {
                         doc: s.clone(),
                         lean_expr: None,
                         rust_expr: None,
+                        ast_body: None,
                     },
                 };
                 out.invariants.push(parsed);
@@ -2452,6 +2605,11 @@ fn expand_handler(
                 rust_expr: rust_neg.clone(),
                 rust_expr_pod: rust_pod_neg.clone(),
                 error_name: None,
+                // Synthetic: derived from prior arms' negations, not a
+                // single source AST node. Slice 1b's
+                // `old_in_single_state_context` lint skips synthetic
+                // requires — there's nothing for the author to fix here.
+                ast_body: None,
             });
         }
 
@@ -2466,6 +2624,7 @@ fn expand_handler(
                 rust_expr: rust.clone(),
                 rust_expr_pod: rust_pod.clone(),
                 error_name: None,
+                ast_body: Some(guard.clone()),
             });
             prior_conds.push((
                 format!("\u{00AC}({})", lean),
@@ -2486,6 +2645,9 @@ fn expand_handler(
                     rust_expr: "false".to_string(),
                     rust_expr_pod: "false".to_string(),
                     error_name: Some(err.clone()),
+                    // Synthetic: arm-abort lowers to literal `false`
+                    // with no source AST. Slice 1b lint skips.
+                    ast_body: None,
                 });
             }
             a::MatchBody::Effect(stmts) => {
@@ -2588,6 +2750,7 @@ fn adapt_handler(h: &a::HandlerDecl, consts: ConstTable, env: &TypeEnv) -> Parse
                     rust_expr: expr_to_rust(&guard.node, Ctx::Guard, consts, opts_native(env)),
                     rust_expr_pod: expr_to_rust(&guard.node, Ctx::Guard, consts, opts_pod(env)),
                     error_name: on_fail.clone(),
+                    ast_body: Some(guard.clone()),
                 });
             }
             a::HandlerClause::Ensures(e) => {
@@ -2863,6 +3026,7 @@ fn adapt_interface_handler<'a>(
                     rust_expr: expr_to_rust(&guard.node, Ctx::Guard, consts, opts_native(env)),
                     rust_expr_pod: expr_to_rust(&guard.node, Ctx::Guard, consts, opts_pod(env)),
                     error_name: on_fail.clone(),
+                    ast_body: Some(guard.clone()),
                 });
             }
             a::InterfaceHandlerClause::Ensures(e) => {
@@ -3373,6 +3537,244 @@ handler refresh : State.Active -> State.Active {
             req.rust_expr.contains("Clock::get"),
             "rust expr should mention Clock::get; got: {}",
             req.rust_expr
+        );
+    }
+
+    // ========================================================================
+    // v2.23 Slice 1 — property classification snapshot tests
+    // ========================================================================
+
+    /// Helper: parse a tiny spec and return the named property's class.
+    fn class_of(spec_src: &str, prop_name: &str) -> crate::check::PropertyClass {
+        let spec = parse_str(spec_src).expect("parse");
+        let prop = spec
+            .properties
+            .iter()
+            .find(|p| p.name == prop_name)
+            .unwrap_or_else(|| panic!("property `{}` not found", prop_name));
+        prop.class
+    }
+
+    const CLASSIFY_SPEC_HEAD: &str = r#"
+spec ClassifyTest
+program_id "11111111111111111111111111111111"
+
+type State
+  | Active of { balance : U64, settled : U64, admin : U64 }
+
+type Error
+  | E
+
+handler bump (delta : U64) : State.Active -> State.Active {
+  permissionless
+  effect { balance := balance + delta }
+}
+"#;
+
+    #[test]
+    fn classify_property_bare_comparison_is_unary() {
+        // No `old(...)`, no temporal markers — single-state predicate.
+        let src = format!(
+            "{}{}",
+            CLASSIFY_SPEC_HEAD, r#"property balance_nonneg : state.balance >= 0 preserved_by all"#
+        );
+        assert_eq!(
+            class_of(&src, "balance_nonneg"),
+            crate::check::PropertyClass::Unary
+        );
+    }
+
+    #[test]
+    fn classify_property_with_single_old_is_binary() {
+        // `old(state.x)` anywhere ⇒ Binary. This is the 001 bug class —
+        // before v2.23 it lowered to `s.x >= s.x` silently; v2.23 routes
+        // through the binary preservation harness.
+        let src = format!(
+            "{}{}",
+            CLASSIFY_SPEC_HEAD,
+            r#"property balance_monotonic : state.balance >= old(state.balance) preserved_by all"#
+        );
+        assert_eq!(
+            class_of(&src, "balance_monotonic"),
+            crate::check::PropertyClass::Binary
+        );
+    }
+
+    #[test]
+    fn classify_property_with_old_under_not_is_binary() {
+        // `old(...)` nested under boolean negation still triggers Binary.
+        let src = format!(
+            "{}{}",
+            CLASSIFY_SPEC_HEAD,
+            r#"property settled_changed : not (state.settled == old(state.settled)) preserved_by all"#
+        );
+        assert_eq!(
+            class_of(&src, "settled_changed"),
+            crate::check::PropertyClass::Binary
+        );
+    }
+
+    #[test]
+    fn classify_property_with_old_in_implication_is_binary() {
+        // `old(...)` on the LHS of an implication body — Binary.
+        // Mirrors `vectors_seeded_latches_true` from pool.qedspec:694.
+        let src = format!(
+            "{}{}",
+            CLASSIFY_SPEC_HEAD,
+            r#"property latches : old(state.settled) == 1 implies state.settled == 1 preserved_by all"#
+        );
+        assert_eq!(
+            class_of(&src, "latches"),
+            crate::check::PropertyClass::Binary
+        );
+    }
+
+    #[test]
+    fn classify_property_constant_body_is_unary() {
+        // No state refs at all — Unary. Lowers to a constant predicate.
+        let src = format!(
+            "{}{}",
+            CLASSIFY_SPEC_HEAD, r#"property trivially_true : 1 == 1 preserved_by all"#
+        );
+        assert_eq!(
+            class_of(&src, "trivially_true"),
+            crate::check::PropertyClass::Unary
+        );
+    }
+
+    // ========================================================================
+    // v2.23 Slice 2 — RustOpts.state_mode + inside_old round-trips
+    // ========================================================================
+
+    /// Helper: parse a tiny spec and render the named property's body via
+    /// `expr_to_rust` under the given `RustOpts`. Returns the rendered
+    /// string for assertion.
+    fn render_property_body(spec_src: &str, prop_name: &str, mode: StateMode) -> String {
+        let typed = crate::chumsky_parser::parse(spec_src)
+            .map_err(|e| format!("parse failed: {:?}", e))
+            .expect("parse");
+        // Find the property in the typed AST.
+        let prop_decl = typed
+            .items
+            .iter()
+            .find_map(|item| match &item.node {
+                a::TopItem::Property(p) if p.name == prop_name => Some(p),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("property `{}` not found in spec", prop_name));
+        let env = TypeEnv::from_spec(&typed);
+        let consts: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+        let opts = opts_native(&env).with_state_mode(mode);
+        expr_to_rust(&prop_decl.body.node, Ctx::Guard, &consts, opts)
+    }
+
+    #[test]
+    fn render_unary_mode_state_x_lowers_to_s_dot_x() {
+        // Today's behavior preserved under StateMode::Unary: `state.x` → `s.x`.
+        let src = format!(
+            "{}{}",
+            CLASSIFY_SPEC_HEAD, r#"property balance_nonneg : state.balance >= 0 preserved_by all"#
+        );
+        let rendered = render_property_body(&src, "balance_nonneg", StateMode::Unary);
+        assert!(
+            rendered.contains("s.balance"),
+            "expected `s.balance` in unary mode; got: {}",
+            rendered
+        );
+        assert!(
+            !rendered.contains("post.balance") && !rendered.contains("pre.balance"),
+            "unary mode must not emit pre./post.; got: {}",
+            rendered
+        );
+    }
+
+    #[test]
+    fn render_binary_mode_state_x_lowers_to_post_dot_x() {
+        // Slice 2 binary mode: `state.x` (no `old`) → `post.x`.
+        let src = format!(
+            "{}{}",
+            CLASSIFY_SPEC_HEAD, r#"property balance_nonneg : state.balance >= 0 preserved_by all"#
+        );
+        let rendered = render_property_body(&src, "balance_nonneg", StateMode::Binary);
+        assert!(
+            rendered.contains("post.balance"),
+            "expected `post.balance` in binary mode; got: {}",
+            rendered
+        );
+        assert!(
+            !rendered.contains("s.balance") && !rendered.contains("pre.balance"),
+            "binary mode without old() must use post., not s. or pre.; got: {}",
+            rendered
+        );
+    }
+
+    #[test]
+    fn render_binary_mode_old_state_x_lowers_to_pre_dot_x() {
+        // Slice 2 binary mode: `old(state.x)` → `pre.x`. This is the
+        // load-bearing fix for finding 001 — the temporal marker is
+        // honored in the rendered Rust.
+        let src = format!(
+            "{}{}",
+            CLASSIFY_SPEC_HEAD,
+            r#"property balance_monotonic : state.balance >= old(state.balance) preserved_by all"#
+        );
+        let rendered = render_property_body(&src, "balance_monotonic", StateMode::Binary);
+        // Expect BOTH post.balance (LHS) and pre.balance (RHS, inside old)
+        // to appear — the binary obligation made explicit in the rendered
+        // expression.
+        assert!(
+            rendered.contains("post.balance"),
+            "expected `post.balance` for LHS; got: {}",
+            rendered
+        );
+        assert!(
+            rendered.contains("pre.balance"),
+            "expected `pre.balance` for RHS inside old(); got: {}",
+            rendered
+        );
+        assert!(
+            !rendered.contains("s.balance"),
+            "binary mode must not emit `s.balance`; got: {}",
+            rendered
+        );
+    }
+
+    #[test]
+    fn render_unary_mode_old_collapses_to_s_dot_x() {
+        // Pre-Slice-2 behavior preserved on the unary path: `old(state.x)`
+        // and `state.x` both render to `s.x`. This is the bug surface for
+        // existing callers — Slice 5's lint will P1 a tautology here when
+        // the AST contains `Expr::Old(_)`. Slice 2 itself doesn't change
+        // this path; it stays for compat with all non-property callsites.
+        let src = format!(
+            "{}{}",
+            CLASSIFY_SPEC_HEAD,
+            r#"property balance_monotonic : state.balance >= old(state.balance) preserved_by all"#
+        );
+        let rendered = render_property_body(&src, "balance_monotonic", StateMode::Unary);
+        // Both sides collapse to s.balance — the structural tautology.
+        let s_count = rendered.matches("s.balance").count();
+        assert!(
+            s_count >= 2,
+            "expected ≥2 `s.balance` (tautology shape) in unary mode; got: {} ({})",
+            s_count,
+            rendered
+        );
+    }
+
+    #[test]
+    fn classify_property_authored_tautology_no_old_is_unary() {
+        // Author-written `state.x == state.x` (no `old(...)`) — Unary.
+        // Mirrors pool.qedspec:660-662 `admin_field_tracked` pattern.
+        // Slice 5's vacuous-lowering lint must NOT fire on this case.
+        let src = format!(
+            "{}{}",
+            CLASSIFY_SPEC_HEAD,
+            r#"property balance_tracked : state.balance == state.balance preserved_by all"#
+        );
+        assert_eq!(
+            class_of(&src, "balance_tracked"),
+            crate::check::PropertyClass::Unary
         );
     }
 }

@@ -109,6 +109,12 @@ pub struct ParsedRequires {
     pub rust_expr: String,
     pub rust_expr_pod: String,
     pub error_name: Option<String>,
+    /// v2.23 Slice 1b: source AST body retained for lints that need to
+    /// detect `Expr::Old(_)` (`old_in_single_state_context`) and any
+    /// future AST-level scans. `None` for synthetic requires generated
+    /// from `match`-arm desugaring (prior-arm negations, abort
+    /// `requires false`), where no source AST exists.
+    pub ast_body: Option<crate::ast::Node<crate::ast::Expr>>,
 }
 
 /// Parsed ensures clause: post-condition relating pre and post state.
@@ -165,6 +171,10 @@ pub struct ParsedInvariant {
     /// v2.14 ships only the Lean theorem path.
     #[allow(dead_code)]
     pub rust_expr: Option<String>,
+    /// v2.23 Slice 1b: source AST body retained for the
+    /// `old_in_single_state_context` lint. `None` for the
+    /// description-only form (no expression body to inspect).
+    pub ast_body: Option<crate::ast::Node<crate::ast::Expr>>,
 }
 
 /// Parsed environment block (external state).
@@ -211,6 +221,27 @@ pub struct ParsedOperation {
     pub aborts_if: Vec<ParsedAbort>,
 }
 
+/// Classification of a property body's temporal shape, computed at parse
+/// time from the AST. Drives codegen dispatch in `proptest_gen` and `kani`
+/// per PRD-v2.23 Slices 2-4: a `Binary` property lowers to a per-handler
+/// preservation harness that captures pre-state before the handler call
+/// and asserts `prop(&pre, &post)`; a `Unary` property keeps today's
+/// single-state predicate shape.
+///
+/// Classification rule: any `Expr::Old(_)` anywhere in the body ⇒ `Binary`;
+/// otherwise `Unary`. The walk is `expr_contains_old` in
+/// `chumsky_adapter.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PropertyClass {
+    /// Single-state predicate — no `old(...)`. Lowers to
+    /// `fn name(s: &State) -> bool`.
+    Unary,
+    /// Transition predicate — body references `old(...)`. Lowers to
+    /// `fn name(pre: &State, post: &State) -> bool`. Only meaningful
+    /// at handler boundaries.
+    Binary,
+}
+
 /// Parsed property from a qedspec block.
 #[derive(Debug, Clone)]
 pub struct ParsedProperty {
@@ -246,6 +277,18 @@ pub struct ParsedProperty {
     /// `None` means the shape is supported (no quantifier, or a single-
     /// binder forall lowered to `per_slot`).
     pub quantifier_lint: Option<QuantifierLint>,
+    /// v2.23 Slice 1: property body classification, drives the
+    /// `proptest_gen` / `kani` per-handler preservation harness shape.
+    /// `PropertyClass::Binary` (body contains `old(...)`) emits
+    /// `fn name(pre, post) -> bool` and harnesses that capture pre-state;
+    /// `PropertyClass::Unary` keeps the legacy `fn name(s) -> bool`.
+    pub class: PropertyClass,
+    /// v2.23 Slice 1: the AST body of the property, retained for
+    /// downstream consumers that need to walk it (Slice 5's
+    /// `vacuous_property_lowering` lint gates on `Expr::Old(_)`
+    /// presence; future work may inspect more shape). `None` only on
+    /// test fixtures constructed by hand without an AST source.
+    pub ast_body: Option<crate::ast::Node<crate::ast::Expr>>,
 }
 
 /// Per-slot rendering of a `forall <binder> : <T>, body` property. See
@@ -3348,10 +3391,326 @@ pub fn check_completeness(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
     // specs. Lint-only; user qualifies or splits the property.
     warnings.extend(check_cross_adt_field_ambiguity(spec));
 
+    // v2.23 Slice 5 — vacuous_property_lowering defense-in-depth lint.
+    // Catches codegen-induced tautologies (Expr::Old(_) in source AST +
+    // identical sides in rendered Rust — the finding 001 bug class), plus
+    // unconditional rules for the unsupported-quantifier marker and
+    // literal `true` bodies. Author-written tautologies (no `Expr::Old`
+    // in AST) translate faithfully and are silently accepted.
+    warnings.extend(check_vacuous_property_lowering(spec));
+
+    // v2.23 Slice 1b — `old_in_single_state_context`. Walks every
+    // `requires` clause and every `invariant` body, looking for
+    // `Expr::Old(_)`. Fires P1 with a fix-it diagnostic. `requires` /
+    // `invariant` describe a single state and have no "old" value to
+    // reference; the construct is a category error.
+    warnings.extend(check_old_in_single_state_context(spec));
+
     // Sort by priority (ascending), then by rule name for stability
     warnings.sort_by(|a, b| a.priority.cmp(&b.priority).then(a.rule.cmp(&b.rule)));
 
     warnings
+}
+
+/// v2.23 Slice 5 — defense-in-depth lint that catches three vacuous-
+/// property-body shapes in the *rendered Rust*:
+///
+/// 1. **Codegen-induced tautology (P1, AST-gated).** Property's AST body
+///    contains `Expr::Old(_)` *and* `rust_expression` reduces to
+///    `<expr> cmp <expr>` with structurally identical sides. This is the
+///    001 bug class — the spec carried temporal content, codegen dropped
+///    the marker, both sides collapsed to the same path. Pre-v2.23 this
+///    fired routinely; post-Slices 2-4 it should be unreachable from
+///    codegen and remains as a regression net.
+/// 2. **Unsupported-quantifier marker (P1).** `rust_expression` contains
+///    `QEDGEN_UNSUPPORTED_QUANTIFIER`. Stronger sibling of the legacy
+///    `unsupported_quantifier_shape` (which only fires when `per_slot`
+///    is `None`); this one fires regardless of `per_slot`. The marker
+///    means codegen emitted a stub `true` body — any harness sitting on
+///    top is vacuous.
+/// 3. **Literal `true` body (P1).** `rust_expression` is the literal
+///    token `true` (post-trim). Catches any other codegen path that
+///    short-circuited to a constant.
+///
+/// **Author-written tautologies are silently accepted.** A property
+/// whose AST has no `Expr::Old(_)` and whose body renders to
+/// `<expr> cmp <expr>` with identical sides is an authored choice (see
+/// `pool.qedspec:660-662 admin_field_tracked` — the "field tracking"
+/// pattern). Rule 1 gates on `Expr::Old(_)` presence precisely so this
+/// case passes silently.
+fn check_vacuous_property_lowering(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
+    let mut warnings = Vec::new();
+    for prop in &spec.properties {
+        let Some(rs) = prop.rust_expression.as_deref() else {
+            continue;
+        };
+        let trimmed = rs.trim();
+
+        // Rule 2 — unconditional: marker present, body is a stub.
+        if rs.contains(QEDGEN_UNSUPPORTED_MARKER) {
+            warnings.push(CompletenessWarning {
+                rule: "vacuous_property_lowering".to_string(),
+                severity: Severity::Warning,
+                priority: 1,
+                message: format!(
+                    "property '{}' lowered Rust contains \
+                     QEDGEN_UNSUPPORTED_QUANTIFIER — the harness emits a `true` \
+                     body and skips the real check",
+                    prop.name
+                ),
+                subject: Some(prop.name.clone()),
+                fix: "Rewrite the quantifier in a shape qedgen can lower \
+                      (see docs/limitations.md#unsupported-quantifier-shapes) \
+                      or split the property into per-element guards."
+                    .to_string(),
+                example: None,
+                counterexample: None,
+                fix_options: vec![],
+            });
+            continue;
+        }
+
+        // Rule 3 — unconditional: bare `true` body.
+        if trimmed == "true" {
+            warnings.push(CompletenessWarning {
+                rule: "vacuous_property_lowering".to_string(),
+                severity: Severity::Warning,
+                priority: 1,
+                message: format!(
+                    "property '{}' lowered to the literal `true` — the harness \
+                     can never fail. Check the spec body and re-run check.",
+                    prop.name
+                ),
+                subject: Some(prop.name.clone()),
+                fix: "Inspect the property body for a spec construct that \
+                      lowered to a constant. If the property is genuinely \
+                      trivial, remove it; otherwise file a codegen bug."
+                    .to_string(),
+                example: None,
+                counterexample: None,
+                fix_options: vec![],
+            });
+            continue;
+        }
+
+        // Rule 1 — AST-gated: temporal marker present in source AND
+        // rendered body is `<expr> cmp <expr>` with identical sides.
+        // Without the AST gate, this would fire on author-written
+        // tautologies (e.g. pool.qedspec:660 `state.admin == state.admin`
+        // as a field-tracking pattern), which the lint must not override.
+        let Some(ast) = &prop.ast_body else {
+            continue;
+        };
+        if !crate::chumsky_adapter::expr_contains_old(ast) {
+            continue;
+        }
+        let Some((lhs, _op, rhs)) = parse_top_level_cmp(trimmed) else {
+            continue;
+        };
+        if lhs == rhs {
+            warnings.push(CompletenessWarning {
+                rule: "vacuous_property_lowering".to_string(),
+                severity: Severity::Warning,
+                priority: 1,
+                message: format!(
+                    "property '{}' uses `old(...)` but lowered Rust collapses to a \
+                     structural tautology (`{} {} {}`). The temporal marker was \
+                     dropped during lowering — this indicates a codegen regression.",
+                    prop.name, lhs, _op, rhs
+                ),
+                subject: Some(prop.name.clone()),
+                fix: "File a qedgen issue with the spec snippet. Pre-v2.23 this \
+                      was the default behavior for `old(...)` in proptest/Kani; \
+                      post-Slices 2-4 it should be unreachable."
+                    .to_string(),
+                example: None,
+                counterexample: None,
+                fix_options: vec![],
+            });
+        }
+    }
+    warnings
+}
+
+/// v2.23 Slice 5 helper. Split a rendered Rust comparison expression
+/// `<lhs> <op> <rhs>` at the top-level comparison operator into its
+/// three pieces. Returns `None` if the expression isn't a top-level
+/// comparison. String-level only — no AST round-trip.
+///
+/// Top-level means: not inside parens, not inside angle-bracketed
+/// generic args (`Vec<...>`), not inside `[...]` indices. We scan
+/// left-to-right and track paren / bracket depth; the first comparison
+/// operator at depth 0 is the split. Operators tried in priority order
+/// so `==`/`!=`/`<=`/`>=` are matched before `<`/`>`.
+fn parse_top_level_cmp(expr: &str) -> Option<(&str, &str, &str)> {
+    let bytes = expr.as_bytes();
+    let mut depth: i32 = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match b {
+            b'(' | b'[' | b'<' => {
+                // `<` could be the comparison or the start of a generic.
+                // Heuristic: if the next char is `=`, it's `<=` — handle
+                // below. Otherwise treat `<` as depth-increment only when
+                // preceded by an alphanumeric (generic) or whitespace
+                // around a punctuation form is the comparison case.
+                if b == b'<' {
+                    let prev = if i > 0 { bytes[i - 1] } else { b' ' };
+                    let next = if i + 1 < bytes.len() {
+                        bytes[i + 1]
+                    } else {
+                        b' '
+                    };
+                    // `<=` — comparison
+                    if next == b'=' && depth == 0 {
+                        let lhs = expr[..i].trim();
+                        let rhs = expr[i + 2..].trim();
+                        return Some((lhs, "<=", rhs));
+                    }
+                    // bare `<` at depth 0 after an identifier could be a
+                    // generic-list start (e.g. `Vec<u8>`). Treat as depth
+                    // increment in that case.
+                    if prev.is_ascii_alphanumeric() || prev == b'_' {
+                        depth += 1;
+                    } else if depth == 0 {
+                        let lhs = expr[..i].trim();
+                        let rhs = expr[i + 1..].trim();
+                        return Some((lhs, "<", rhs));
+                    }
+                } else {
+                    depth += 1;
+                }
+            }
+            b')' | b']' | b'>' => {
+                if b == b'>' {
+                    let next = if i + 1 < bytes.len() {
+                        bytes[i + 1]
+                    } else {
+                        b' '
+                    };
+                    if next == b'=' && depth == 0 {
+                        let lhs = expr[..i].trim();
+                        let rhs = expr[i + 2..].trim();
+                        return Some((lhs, ">=", rhs));
+                    }
+                    if depth > 0 {
+                        depth -= 1;
+                    } else if depth == 0 {
+                        let lhs = expr[..i].trim();
+                        let rhs = expr[i + 1..].trim();
+                        return Some((lhs, ">", rhs));
+                    }
+                } else {
+                    if depth > 0 {
+                        depth -= 1;
+                    }
+                }
+            }
+            b'=' => {
+                let next = if i + 1 < bytes.len() {
+                    bytes[i + 1]
+                } else {
+                    b' '
+                };
+                if next == b'=' && depth == 0 {
+                    let lhs = expr[..i].trim();
+                    let rhs = expr[i + 2..].trim();
+                    return Some((lhs, "==", rhs));
+                }
+            }
+            b'!' => {
+                let next = if i + 1 < bytes.len() {
+                    bytes[i + 1]
+                } else {
+                    b' '
+                };
+                if next == b'=' && depth == 0 {
+                    let lhs = expr[..i].trim();
+                    let rhs = expr[i + 2..].trim();
+                    return Some((lhs, "!=", rhs));
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// v2.23 Slice 1b — `old_in_single_state_context`. Walks every
+/// `requires` clause (across handlers + interface handlers) and every
+/// `invariant` body looking for `Expr::Old(_)`. Fires P1 with a fix-it
+/// diagnostic pointing the author at `ensures` / `property` as the
+/// right construct for transition-time obligations.
+///
+/// `requires` describes a precondition on the pre-state — no transition
+/// has happened yet, so there is no "old" value. `invariant` is a
+/// single-state predicate; the binary form is `property … preserved_by …`.
+/// Both misuses are category errors; today Lean renders them as
+/// guillemet-quoted `«old(...)»` (which type-fails downstream) and Rust
+/// silently drops the marker. The lint surfaces both uniformly.
+///
+/// Synthetic requires (prior-arm negations, abort `requires false` from
+/// match-arm desugaring) carry `ast_body: None` and are skipped — they
+/// have no source to fix.
+///
+/// Bundled-corpus audit (2026-05-20, PRD-v2.23 Slice 1b): 0 of 45 specs
+/// use this pattern. The lint breaks no current example.
+fn check_old_in_single_state_context(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
+    let mut warnings = Vec::new();
+    for op in &spec.handlers {
+        for req in &op.requires {
+            let Some(ast) = &req.ast_body else { continue };
+            if crate::chumsky_adapter::expr_contains_old(ast) {
+                warnings.push(make_old_in_single_state_warning(
+                    &op.name,
+                    "requires",
+                    &req.rust_expr,
+                ));
+            }
+        }
+    }
+    for inv in &spec.invariants {
+        let Some(ast) = &inv.ast_body else { continue };
+        if crate::chumsky_adapter::expr_contains_old(ast) {
+            let body_display = inv.lean_expr.as_deref().unwrap_or("(body)");
+            warnings.push(make_old_in_single_state_warning(
+                &inv.name,
+                "invariant",
+                body_display,
+            ));
+        }
+    }
+    warnings
+}
+
+fn make_old_in_single_state_warning(
+    holder: &str,
+    kind: &str,
+    body_snippet: &str,
+) -> CompletenessWarning {
+    CompletenessWarning {
+        rule: "old_in_single_state_context".to_string(),
+        severity: Severity::Warning,
+        priority: 1,
+        message: format!(
+            "'{}' uses `old(...)` inside a `{}` body ({}) — only meaningful in \
+             `ensures` or `property` bodies (a binary transition context). \
+             `requires` and `invariant` describe a single state and have no \
+             \"old\" value to reference.",
+            holder, kind, body_snippet
+        ),
+        subject: Some(holder.to_string()),
+        fix: "If you meant a precondition on the pre-state, drop `old(...)` \
+              and reference `state.x` directly. If you meant a property across \
+              the transition, lift the clause into a `property X : ... \
+              preserved_by Y`."
+            .to_string(),
+        example: None,
+        counterexample: None,
+        fix_options: vec![],
+    }
 }
 
 /// v2.8 F8: emit a `[missing_math_overflow]` warning when a spec uses
@@ -5318,6 +5677,8 @@ mod tests {
                 preserved_by: vec!["deposit".to_string()],
                 per_slot: None,
                 quantifier_lint: None,
+                class: PropertyClass::Unary,
+                ast_body: None,
             }],
             lifecycle_states: vec!["Active".to_string()],
             ..empty_spec()
@@ -5801,6 +6162,8 @@ handler liquidate : State.Active -> State.Liquidated {
                 preserved_by: vec!["deposit".to_string()], // only covers deposit
                 per_slot: None,
                 quantifier_lint: None,
+                class: PropertyClass::Unary,
+                ast_body: None,
             }],
             lifecycle_states: vec!["Active".to_string()],
             ..empty_spec()
@@ -5833,6 +6196,8 @@ handler liquidate : State.Active -> State.Liquidated {
                 preserved_by: vec!["deposit".to_string()],
                 per_slot: None,
                 quantifier_lint: None,
+                class: PropertyClass::Unary,
+                ast_body: None,
             }],
             lifecycle_states: vec!["Active".to_string()],
             ..empty_spec()
@@ -6367,6 +6732,8 @@ interface Token {
                 preserved_by: vec![],
                 per_slot: None,
                 quantifier_lint: None,
+                class: PropertyClass::Unary,
+                ast_body: None,
             }],
             ..empty_spec()
         };
@@ -6399,6 +6766,8 @@ interface Token {
                 preserved_by: vec![],
                 per_slot: None,
                 quantifier_lint: None,
+                class: PropertyClass::Unary,
+                ast_body: None,
             }],
             ..empty_spec()
         };
@@ -7505,6 +7874,308 @@ property positive_balance :
         assert!(
             warnings.is_empty(),
             "qualified `distribution.balance` should clear the ambiguity, got: {:?}",
+            warnings
+                .iter()
+                .map(|w| (&w.rule, &w.message))
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    // ========================================================================
+    // v2.23 Slice 5 — vacuous_property_lowering lint
+    // ========================================================================
+
+    const VPL_SPEC_HEAD: &str = r#"
+spec VplTest
+program_id "11111111111111111111111111111111"
+
+type State
+  | Active of { balance : U64, admin : U64 }
+
+type Error
+  | E
+
+handler bump (delta : U64) : State.Active -> State.Active {
+  permissionless
+  effect { balance := balance + delta }
+}
+"#;
+
+    #[test]
+    fn parse_top_level_cmp_handles_simple_comparison() {
+        let r = parse_top_level_cmp("s.balance >= s.balance");
+        assert_eq!(r, Some(("s.balance", ">=", "s.balance")));
+    }
+
+    #[test]
+    fn parse_top_level_cmp_handles_equality() {
+        let r = parse_top_level_cmp("s.admin == s.admin");
+        assert_eq!(r, Some(("s.admin", "==", "s.admin")));
+    }
+
+    #[test]
+    fn parse_top_level_cmp_returns_none_on_non_comparison() {
+        let r = parse_top_level_cmp("s.x + 1");
+        assert!(r.is_none(), "expected None on non-comparison; got: {:?}", r);
+    }
+
+    #[test]
+    fn vpl_lint_silent_on_author_tautology_without_old() {
+        // pool.qedspec:660-662 pattern — `state.x == state.x` with no
+        // `old(...)` in the AST. The author wants the field surfaced in
+        // proofs; the lint must NOT fire.
+        let src = format!(
+            "{}{}",
+            VPL_SPEC_HEAD,
+            r#"property admin_tracked : state.admin == state.admin preserved_by all"#
+        );
+        let spec = crate::chumsky_adapter::parse_str(&src).expect("parse");
+        let warnings = check_vacuous_property_lowering(&spec);
+        assert!(
+            warnings.is_empty(),
+            "author-written tautology (no Expr::Old) must not fire; got: {:?}",
+            warnings.iter().map(|w| &w.message).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn vpl_lint_silent_on_distinct_sides() {
+        // Distinct comparison — silent regardless of `old(...)`.
+        let src = format!(
+            "{}{}",
+            VPL_SPEC_HEAD, r#"property balance_le_max : state.balance <= 1000 preserved_by all"#
+        );
+        let spec = crate::chumsky_adapter::parse_str(&src).expect("parse");
+        let warnings = check_vacuous_property_lowering(&spec);
+        assert!(
+            warnings.is_empty(),
+            "distinct-sides comparison must not fire; got: {:?}",
+            warnings.iter().map(|w| &w.message).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn vpl_lint_silent_on_binary_property_post_slice_2() {
+        // A binary property (`old(...)` in body) lowered after Slices 2-4
+        // emits `post.balance >= pre.balance` — distinct sides, no
+        // tautology. The lint should be silent: Slices 2-4 fixed the
+        // underlying bug. (If the lint fires here, it means the
+        // codegen regressed.)
+        let src = format!(
+            "{}{}",
+            VPL_SPEC_HEAD,
+            r#"property balance_monotonic : state.balance >= old(state.balance) preserved_by all"#
+        );
+        let spec = crate::chumsky_adapter::parse_str(&src).expect("parse");
+        let warnings = check_vacuous_property_lowering(&spec);
+        let vpl: Vec<_> = warnings
+            .iter()
+            .filter(|w| w.rule == "vacuous_property_lowering")
+            .collect();
+        assert!(
+            vpl.is_empty(),
+            "binary property correctly lowered to pre/post must not fire VPL; got: {:?}",
+            vpl.iter().map(|w| &w.message).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn vpl_lint_fires_on_literal_true_body() {
+        // Construct a property whose rust_expression is the literal "true"
+        // — Rule 3 unconditionally fires.
+        let mut spec = ParsedSpec::default();
+        spec.properties.push(ParsedProperty {
+            name: "always_true".to_string(),
+            expression: Some("True".to_string()),
+            rust_expression: Some("true".to_string()),
+            rust_expression_pod: Some("true".to_string()),
+            preserved_by: vec![],
+            per_slot: None,
+            quantifier_lint: None,
+            class: PropertyClass::Unary,
+            ast_body: None,
+        });
+        let warnings = check_vacuous_property_lowering(&spec);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.rule == "vacuous_property_lowering"),
+            "literal `true` body must fire VPL; got: {:?}",
+            warnings.iter().map(|w| &w.rule).collect::<Vec<_>>(),
+        );
+    }
+
+    // ========================================================================
+    // v2.23 Slice 1b — old_in_single_state_context lint
+    // ========================================================================
+
+    const OLD_SSC_SPEC_HEAD: &str = r#"
+spec OldSscTest
+program_id "11111111111111111111111111111111"
+
+type State
+  | Active of { balance : U64 }
+
+type Error
+  | E
+  | BadGuard
+"#;
+
+    #[test]
+    fn old_ssc_lint_fires_on_old_in_requires() {
+        // `old(...)` inside a `requires` body — category error, P1.
+        let src = format!(
+            "{}{}",
+            OLD_SSC_SPEC_HEAD,
+            r#"
+handler tweak (delta : U64) : State.Active -> State.Active {
+  permissionless
+  requires state.balance >= old(state.balance) else BadGuard
+  effect { balance := balance + delta }
+}
+"#
+        );
+        let spec = crate::chumsky_adapter::parse_str(&src).expect("parse");
+        let warnings = check_old_in_single_state_context(&spec);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.rule == "old_in_single_state_context"),
+            "expected lint to fire on old() inside requires; got: {:?}",
+            warnings.iter().map(|w| &w.rule).collect::<Vec<_>>(),
+        );
+        let w = &warnings[0];
+        assert_eq!(w.severity, Severity::Warning);
+        assert_eq!(w.priority, 1);
+        assert!(w.message.contains("requires"), "msg: {}", w.message);
+    }
+
+    #[test]
+    fn old_ssc_lint_fires_on_old_in_invariant() {
+        // `old(...)` inside an `invariant` body — category error, P1.
+        let src = format!(
+            "{}{}",
+            OLD_SSC_SPEC_HEAD,
+            r#"
+invariant balance_nondec : state.balance >= old(state.balance)
+
+handler tweak (delta : U64) : State.Active -> State.Active {
+  permissionless
+  effect { balance := balance + delta }
+}
+"#
+        );
+        let spec = crate::chumsky_adapter::parse_str(&src).expect("parse");
+        let warnings = check_old_in_single_state_context(&spec);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.rule == "old_in_single_state_context"
+                    && w.message.contains("invariant")),
+            "expected lint to fire on old() inside invariant; got: {:?}",
+            warnings.iter().map(|w| (&w.rule, &w.message)).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn old_ssc_lint_silent_on_clean_requires() {
+        // `requires` without `old(...)` — silent, no false positive.
+        let src = format!(
+            "{}{}",
+            OLD_SSC_SPEC_HEAD,
+            r#"
+handler tweak (delta : U64) : State.Active -> State.Active {
+  permissionless
+  requires delta > 0 else BadGuard
+  effect { balance := balance + delta }
+}
+"#
+        );
+        let spec = crate::chumsky_adapter::parse_str(&src).expect("parse");
+        let warnings = check_old_in_single_state_context(&spec);
+        assert!(
+            warnings.is_empty(),
+            "clean requires must not fire the lint; got: {:?}",
+            warnings.iter().map(|w| &w.message).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn old_ssc_lint_silent_on_old_in_ensures() {
+        // `old(...)` inside `ensures` — the right context, must NOT fire.
+        let src = format!(
+            "{}{}",
+            OLD_SSC_SPEC_HEAD,
+            r#"
+handler tweak (delta : U64) : State.Active -> State.Active {
+  permissionless
+  effect { balance := balance + delta }
+  ensures state.balance >= old(state.balance)
+}
+"#
+        );
+        let spec = crate::chumsky_adapter::parse_str(&src).expect("parse");
+        let warnings = check_old_in_single_state_context(&spec);
+        assert!(
+            warnings.is_empty(),
+            "old() in ensures must not fire the lint; got: {:?}",
+            warnings.iter().map(|w| &w.message).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn old_ssc_lint_silent_on_old_in_property() {
+        // `old(...)` inside a `property` body — the right context, must
+        // NOT fire (this is the v2.23 Slices 1-4 happy path).
+        let src = format!(
+            "{}{}",
+            OLD_SSC_SPEC_HEAD,
+            r#"
+handler tweak (delta : U64) : State.Active -> State.Active {
+  permissionless
+  effect { balance := balance + delta }
+}
+
+property balance_monotonic :
+  state.balance >= old(state.balance)
+  preserved_by all
+"#
+        );
+        let spec = crate::chumsky_adapter::parse_str(&src).expect("parse");
+        let warnings = check_old_in_single_state_context(&spec);
+        assert!(
+            warnings.is_empty(),
+            "old() in property body must not fire the single-state lint; got: {:?}",
+            warnings.iter().map(|w| &w.message).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn vpl_lint_fires_on_unsupported_quantifier_marker() {
+        // Construct a property whose rust_expression carries the marker
+        // — Rule 2 unconditionally fires.
+        let mut spec = ParsedSpec::default();
+        spec.properties.push(ParsedProperty {
+            name: "stub_forall".to_string(),
+            expression: Some("forall x : U64, x > 0".to_string()),
+            rust_expression: Some(format!(
+                "/* {} : forall x : U64, x > 0 */ true",
+                QEDGEN_UNSUPPORTED_MARKER
+            )),
+            rust_expression_pod: Some("true".to_string()),
+            preserved_by: vec![],
+            per_slot: None,
+            quantifier_lint: None,
+            class: PropertyClass::Unary,
+            ast_body: None,
+        });
+        let warnings = check_vacuous_property_lowering(&spec);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.rule == "vacuous_property_lowering"
+                    && w.message.contains("QEDGEN_UNSUPPORTED_QUANTIFIER")),
+            "marker body must fire VPL with marker mention; got: {:?}",
             warnings
                 .iter()
                 .map(|w| (&w.rule, &w.message))

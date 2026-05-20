@@ -229,7 +229,7 @@ Always run `lake build` after editing Lean and run `qedgen check` after proofs c
 
 Two related but distinct constructs in `.qedspec`:
 
-- **`property` / `preserved_by`** — a predicate over `state` that some named set of handlers must preserve. Use when the predicate is the headline correctness claim for those handlers (`pool_solvency preserved_by all`, `votes_bounded preserved_by [create_vault, propose, ...]`). Generates per-handler proptest/Kani harnesses and Lean preservation theorems.
+- **`property` / `preserved_by`** — a predicate over `state` that some named set of handlers must preserve. Use when the predicate is the headline correctness claim for those handlers (`pool_solvency preserved_by all`, `votes_bounded preserved_by [create_vault, propose, ...]`). Generates per-handler proptest/Kani harnesses and Lean preservation theorems. v2.23: properties whose bodies reference `old(...)` lower to a binary predicate `fn p(pre: &State, post: &State) -> bool`, and the preservation harness captures pre-state before the handler call so the obligation is real. The `vacuous_property_lowering` lint surfaces any property whose lowered Rust collapses to a structural tautology (`s.x cmp s.x`) when the source AST carries `old(...)` — a regression guard on the structural fix.
 - **`invariant` + handler-side `invariant Name` / `establishes Name`** — a named predicate referenced from inside handler blocks. Use when the same predicate is asserted by multiple handlers and the handler-side claim is what you want the spec to highlight. The handler clause is the join: `invariant Foo` means *preserves* (assume Foo pre-state, assert post), `establishes Foo` means *establishes* (no pre-assume, assert post only — useful for init / one-shot transitions).
 
 ```fsharp

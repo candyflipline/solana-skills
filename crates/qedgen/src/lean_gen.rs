@@ -1221,6 +1221,8 @@ fn render_properties_multi(out: &mut String, spec: &ParsedSpec) {
                 preserved_by: p.preserved_by.clone(),
                 per_slot: p.per_slot.clone(),
                 quantifier_lint: p.quantifier_lint.clone(),
+                class: p.class,
+                ast_body: p.ast_body.clone(),
             })
             .collect();
 

@@ -578,7 +578,19 @@ Pool.Active
 state.approval_count
 state.accounts[i].capital
 
-// Pre-state reference (only inside ensures)
+// Pre-state reference (use inside `ensures` or `property` bodies)
+//
+// v2.23: a `property` whose body contains `old(...)` is a binary
+// (pre / post) preservation predicate. Codegen emits
+//   fn <prop>(pre: &State, post: &State) -> bool
+// in proptest / Kani, and the per-handler preservation harness
+// captures `let pre = s.clone(); let mut post = s;` before the
+// handler call. Inside the body, `state.x` lowers to `post.x` and
+// `old(state.x)` lowers to `pre.x`. A `property` body without
+// `old(...)` keeps the legacy `fn <prop>(s: &State) -> bool` shape.
+// Pre-v2.23 every preservation property silently lowered to a
+// structural tautology (`s.x cmp s.x`) — fixed structurally; the
+// `vacuous_property_lowering` lint guards against regression.
 old(state.balance)
 old(state.accounts[i].pnl)
 

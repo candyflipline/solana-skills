@@ -636,8 +636,32 @@ fn emit_account_section(
             };
             let doc = prop.expression.as_deref().unwrap_or("");
             out.push_str(&format!("/// {}: {}\n", prop.name, doc));
+            // v2.23 Slice 3: binary properties (body contains `old(...)`)
+            // emit `fn p(pre: &State, post: &State) -> bool` and consume
+            // the binary-rendered body (where `state.x` → `post.x` and
+            // `old(state.x)` → `pre.x`, set by the adapter at parse
+            // time per chumsky_adapter `TopItem::Property` arm).
+            // Unary properties keep today's `fn p(s: &State) -> bool`.
+            // The per-handler preservation harness in
+            // `emit_preservation_tests_for` captures `let pre = s.clone()`
+            // and dispatches the assertion arity on `prop.class`.
+            let is_binary = prop.class == crate::check::PropertyClass::Binary;
+            let signature = if is_binary {
+                format!("fn {}(pre: &State, post: &State) -> bool", prop.name)
+            } else {
+                format!("fn {}(s: &State) -> bool", prop.name)
+            };
+            // Suppress unused-variable warnings on stub bodies (true /
+            // unsupported_quantifier) by underscoring the params. Without
+            // this the binary stub `fn p(pre, post) -> bool { true }`
+            // would emit `unused_variables` warnings.
+            let unused_signature = if is_binary {
+                format!("fn {}(_pre: &State, _post: &State) -> bool", prop.name)
+            } else {
+                format!("fn {}(_s: &State) -> bool", prop.name)
+            };
             if crate::check::rust_expr_is_unsupported(&rust_expr) {
-                out.push_str(&format!("fn {}(_s: &State) -> bool {{\n", prop.name));
+                out.push_str(&format!("{} {{\n", unused_signature));
                 out.push_str(&format!(
                     "    // {} — property uses a quantifier; not lowerable to a predicate.\n",
                     rust_expr.trim()
@@ -645,7 +669,7 @@ fn emit_account_section(
                 out.push_str("    true\n");
                 out.push_str("}\n\n");
             } else {
-                out.push_str(&format!("fn {}(s: &State) -> bool {{\n", prop.name));
+                out.push_str(&format!("{} {{\n", signature));
                 out.push_str(&format!("    {}\n", rust_expr));
                 out.push_str("}\n\n");
             }
@@ -965,8 +989,16 @@ fn emit_preservation_tests_for(
                 param_parts.join(", ")
             ));
 
+            // v2.23 Slice 3: capture pre-state before the handler runs,
+            // then drive the post-assert with both `&pre` (for binary
+            // properties' `old(...)` substitution at codegen time, via
+            // `pre.x`) and `&post` (the mutated state). Pre-Slice-3 the
+            // pre-state was overwritten by `op(&mut s, ...)` before the
+            // assertion fired, so every preservation property with
+            // `old(...)` reported green on a tautology (`s.x cmp s.x`).
+            // The capture below is the load-bearing fix for finding 001.
             if is_init {
-                out.push_str("        let mut s = State {\n");
+                out.push_str("        let mut post = State {\n");
                 for (fname, ftype) in mutable_fields {
                     if let Some(default) = default_value_for_field(ftype, spec) {
                         out.push_str(&format!("            {}: {},\n", fname, default));
@@ -985,26 +1017,37 @@ fn emit_preservation_tests_for(
                     }
                 }
                 out.push_str("        };\n");
+                // Init handlers conceptually have no pre-state; surface a
+                // synthetic `pre` that matches `post` so binary property
+                // assertions (`prop(&pre, &post)`) have a defined shape.
+                // A property with `old(...)` on an init handler is rare
+                // (pre-state is the zero state), but we keep the binding
+                // for codegen symmetry.
+                out.push_str("        let pre = post;\n");
             } else {
-                out.push_str("        let mut s = s;\n");
-                // Assume all declared properties hold before transition.
-                // For the property we're preserving (and any other forall
-                // property), use the per-slot form against the already-bound
-                // <binder> so pre and post share the same value.
+                out.push_str("        let pre = s.clone();\n");
+                out.push_str("        let mut post = s;\n");
+                // Assume all declared (unary) properties hold pre-handler.
+                // Binary properties are skipped here — their `(pre, post)`
+                // signature has no single-state form, and asserting them
+                // against `(pre, pre)` is trivially true.
                 for pre_prop in properties {
                     if pre_prop.expression.is_none() {
+                        continue;
+                    }
+                    if pre_prop.class == crate::check::PropertyClass::Binary {
                         continue;
                     }
                     match &pre_prop.per_slot {
                         Some(slot) if pre_prop.name == prop.name => {
                             out.push_str(&format!(
-                                "        prop_assume!({}_at(&s, {}));\n",
+                                "        prop_assume!({}_at(&pre, {}));\n",
                                 pre_prop.name, slot.binder_name
                             ));
                         }
                         _ => {
                             out.push_str(&format!(
-                                "        prop_assume!({}(&s));\n",
+                                "        prop_assume!({}(&pre));\n",
                                 pre_prop.name
                             ));
                         }
@@ -1012,17 +1055,17 @@ fn emit_preservation_tests_for(
                 }
             }
 
-            // Emit strict bounds for add effects
+            // Emit strict bounds for add effects (against pre-state).
             if let Some(op) = op {
                 rust_codegen_util::emit_add_strict_bounds(
                     out,
                     op,
                     properties,
-                    "        prop_assume!(s.{field} < s.{bound}); // strict bound for add\n",
+                    "        prop_assume!(pre.{field} < pre.{bound}); // strict bound for add\n",
                 );
             }
 
-            // Call transition and assert
+            // Call transition and assert.
             let args: String = op
                 .map(|o| {
                     o.takes_params
@@ -1031,15 +1074,24 @@ fn emit_preservation_tests_for(
                         .collect()
                 })
                 .unwrap_or_default();
-            out.push_str(&format!("        if {}(&mut s{}) {{\n", op_name, args));
-            // v2.20: drive the assertion via `<prop>_at` when per_slot is
-            // populated. The <binder> was bound either by the handler param
-            // (handler_takes_binder case) or by the fresh proptest input
-            // (local_binder case); both sidestep the legacy `<prop>(&s) ⟶
-            // true` stub that made every forall harness verify vacuously.
-            let assert_call = match &prop.per_slot {
-                Some(slot) => format!("{}_at(&s, {})", prop.name, slot.binder_name),
-                None => format!("{}(&s)", prop.name),
+            out.push_str(&format!("        if {}(&mut post{}) {{\n", op_name, args));
+            // v2.23 Slice 3: dispatch assertion arity on `prop.class`.
+            // - Unary, no per_slot: `<prop>(&post)`.
+            // - Unary, per_slot:    `<prop>_at(&post, binder)`.
+            // - Binary:             `<prop>(&pre, &post)` — the binary
+            //   signature emitted by the property predicate above. The
+            //   per_slot path is unary by construction (per_slot bodies
+            //   don't carry `old(...)`); a Binary × per_slot property
+            //   falls through to the non-per-slot binary form for v2.23
+            //   per PRD-v2.23 open question 4 (joint lowering deferred).
+            let is_binary_prop = prop.class == crate::check::PropertyClass::Binary;
+            let assert_call = if is_binary_prop {
+                format!("{}(&pre, &post)", prop.name)
+            } else {
+                match &prop.per_slot {
+                    Some(slot) => format!("{}_at(&post, {})", prop.name, slot.binder_name),
+                    None => format!("{}(&post)", prop.name),
+                }
             };
             out.push_str(&format!("            prop_assert!({},\n", assert_call));
             out.push_str(&format!(
@@ -1420,15 +1472,29 @@ fn emit_sequence_test_for(
     out.push_str("    }\n");
     out.push_str("}\n\n");
 
-    // Assert all properties
+    // Assert all properties.
+    // v2.23 Slice 3: only unary properties — binary properties (those
+    // containing `old(...)`) have a `(pre, post)` signature that this
+    // single-state aggregate can't satisfy. Per-handler preservation
+    // tests cover the binary ones via their own `let pre = s.clone()`
+    // capture in `emit_preservation_tests_for`.
     out.push_str("fn assert_all_properties(s: &State, context: &str) {\n");
     for prop in properties {
-        if prop.expression.is_some() {
-            out.push_str(&format!(
-                "    assert!({}(s), \"{{}} violated: {}\", context);\n",
-                prop.name, prop.name
-            ));
+        if prop.expression.is_none() {
+            continue;
         }
+        if prop.class == crate::check::PropertyClass::Binary {
+            out.push_str(&format!(
+                "    // {} — binary (pre/post) property; checked at handler \
+                 boundaries via the preservation harness below, not here.\n",
+                prop.name
+            ));
+            continue;
+        }
+        out.push_str(&format!(
+            "    assert!({}(s), \"{{}} violated: {}\", context);\n",
+            prop.name, prop.name
+        ));
     }
     out.push_str("}\n\n");
 
@@ -1759,5 +1825,197 @@ handler noop { }
         let s = strategy_for_field("U64", &spec, StrategyMode::Boundary, Some("2")).unwrap();
         assert_eq!(s, "0u64..=2u64");
         assert!(!s.contains("- 3"), "must not emit `(b - 3)` for b < 3");
+    }
+
+    // ========================================================================
+    // v2.23 Slice 3 — pre/post preservation harness shape
+    // ========================================================================
+
+    /// Helper: parse a spec and emit its full account section to a string.
+    /// Used by Slice 3 tests to verify the generated harness shape.
+    fn emit_test_section(src: &str) -> String {
+        let spec = crate::chumsky_adapter::parse_str(src).expect("parse");
+        let mutable_fields: Vec<&(String, String)> = spec.state_fields.iter().collect();
+        let all_fields: Vec<(String, String)> = spec.state_fields.clone();
+        let handlers: Vec<&ParsedHandler> = spec.handlers.iter().collect();
+        let properties: Vec<&ParsedProperty> = spec.properties.iter().collect();
+        let mut out = String::new();
+        emit_account_section(
+            &mut out,
+            "TestAccount",
+            &mutable_fields,
+            &all_fields,
+            &handlers,
+            &properties,
+            &spec.lifecycle_states,
+            &spec,
+        )
+        .expect("emit");
+        out
+    }
+
+    const BINARY_PROP_SPEC: &str = r#"
+spec BinaryPropTest
+program_id "11111111111111111111111111111111"
+
+type State
+  | Active of { balance : U64, settled : U64 }
+
+type Error
+  | E
+
+handler bump (delta : U64) : State.Active -> State.Active {
+  permissionless
+  effect { balance := balance + delta }
+}
+
+property balance_nonneg :
+  state.balance >= 0
+  preserved_by all
+
+property settled_monotonic :
+  state.settled >= old(state.settled)
+  preserved_by all
+"#;
+
+    #[test]
+    fn binary_property_fn_has_pre_post_signature() {
+        // The binary property `settled_monotonic` must emit:
+        //   fn settled_monotonic(pre: &State, post: &State) -> bool { ... }
+        // Pre-v2.23 it emitted `fn settled_monotonic(s: &State) -> bool { s.settled >= s.settled }`
+        // — a structural tautology.
+        let out = emit_test_section(BINARY_PROP_SPEC);
+        assert!(
+            out.contains("fn settled_monotonic(pre: &State, post: &State) -> bool"),
+            "binary property must have (pre, post) signature; got:\n{}",
+            out
+        );
+        assert!(
+            !out.contains("fn settled_monotonic(s: &State)"),
+            "binary property must not have single-state signature; got:\n{}",
+            out
+        );
+    }
+
+    #[test]
+    fn binary_property_body_uses_post_and_pre_not_s() {
+        // The body must reference `post.settled` and `pre.settled`, not
+        // `s.settled >= s.settled` (the pre-v2.23 tautology).
+        let out = emit_test_section(BINARY_PROP_SPEC);
+        let body_start = out.find("fn settled_monotonic(pre").unwrap_or(0);
+        let body_end = out[body_start..]
+            .find("}\n\n")
+            .map(|i| body_start + i)
+            .unwrap_or(out.len());
+        let body = &out[body_start..body_end];
+        assert!(
+            body.contains("post.settled"),
+            "binary body must reference post.settled; got: {}",
+            body
+        );
+        assert!(
+            body.contains("pre.settled"),
+            "binary body must reference pre.settled; got: {}",
+            body
+        );
+        // The tautology shape must NOT appear.
+        assert!(
+            !body.contains("s.settled >= s.settled")
+                && !body.contains("post.settled >= post.settled"),
+            "binary body must not be a structural tautology; got: {}",
+            body
+        );
+    }
+
+    #[test]
+    fn unary_property_fn_keeps_single_state_signature() {
+        // Unary properties stay `fn p(s: &State) -> bool` — Slice 3 is
+        // purely additive on the binary path; unary callers see no diff.
+        let out = emit_test_section(BINARY_PROP_SPEC);
+        assert!(
+            out.contains("fn balance_nonneg(s: &State) -> bool"),
+            "unary property must keep single-state signature; got:\n{}",
+            out
+        );
+    }
+
+    #[test]
+    fn assert_all_properties_skips_binary() {
+        // The aggregate predicate `assert_all_properties` is the wrong
+        // shape for binary properties (no single-state form). Slice 3
+        // skips them with a documentation comment.
+        let out = emit_test_section(BINARY_PROP_SPEC);
+        // Find the assert_all_properties body (it lives outside
+        // emit_account_section, in emit_sequence_test_for — so it won't
+        // appear in this fragment). We only assert that this section's
+        // body doesn't try to call settled_monotonic with a single arg.
+        // The aggregate fn is exercised separately via the full generate
+        // path; this test pins the section-level shape.
+        assert!(
+            !out.contains("settled_monotonic(s)"),
+            "binary property must not be called with single state; got:\n{}",
+            out
+        );
+    }
+
+    #[test]
+    fn preservation_test_captures_pre_state() {
+        // Each `<op>_preserves_<prop>` test must emit
+        // `let pre = s.clone();` before the handler call, so the
+        // post-assertion has both states in scope.
+        let out = emit_test_section(BINARY_PROP_SPEC);
+        let test_start = out
+            .find("fn bump_preserves_settled_monotonic")
+            .unwrap_or_else(|| panic!("missing bump_preserves_settled_monotonic; got:\n{}", out));
+        let test_end = out[test_start..]
+            .find("    }\n}")
+            .map(|i| test_start + i)
+            .unwrap_or(out.len());
+        let body = &out[test_start..test_end];
+        assert!(
+            body.contains("let pre = s.clone();"),
+            "preservation test must capture pre-state; got: {}",
+            body
+        );
+        assert!(
+            body.contains("let mut post = s;"),
+            "preservation test must rename mutated state to `post`; got: {}",
+            body
+        );
+        assert!(
+            body.contains("bump(&mut post"),
+            "handler must mutate `post`, not `s`; got: {}",
+            body
+        );
+        assert!(
+            body.contains("settled_monotonic(&pre, &post)"),
+            "binary post-assert must use (&pre, &post); got: {}",
+            body
+        );
+    }
+
+    #[test]
+    fn preservation_test_unary_assertion_uses_post() {
+        // Unary property preservation must call `<prop>(&post)`, not
+        // `<prop>(&s)` — the rename keeps the harness consistent.
+        let out = emit_test_section(BINARY_PROP_SPEC);
+        let test_start = out
+            .find("fn bump_preserves_balance_nonneg")
+            .unwrap_or_else(|| panic!("missing bump_preserves_balance_nonneg; got:\n{}", out));
+        let test_end = out[test_start..]
+            .find("    }\n}")
+            .map(|i| test_start + i)
+            .unwrap_or(out.len());
+        let body = &out[test_start..test_end];
+        assert!(
+            body.contains("balance_nonneg(&post)"),
+            "unary post-assert must use (&post); got: {}",
+            body
+        );
+        assert!(
+            !body.contains("balance_nonneg(&s)"),
+            "unary post-assert must not still reference (&s); got: {}",
+            body
+        );
     }
 }

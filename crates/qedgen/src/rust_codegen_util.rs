@@ -860,11 +860,31 @@ pub fn emit_property_predicates_with(
         let Some(rust_expr) = rendered else { continue };
         let doc = prop.expression.as_deref().unwrap_or("");
         out.push_str(&format!("/// {}: {}\n", prop.name, doc));
+        // v2.23 Slice 4: binary properties (body contains `old(...)`)
+        // emit `fn p(pre: &State, post: &State) -> bool` — the rust_expression
+        // is rendered with `state.x` → `post.x` and `old(state.x)` → `pre.x`
+        // by the adapter (see chumsky_adapter `TopItem::Property` arm). Unary
+        // properties keep today's single-state signature. Kani's
+        // preservation harness (kani.rs::emit_preservation_proofs) captures
+        // pre-state and dispatches the assertion arity on `prop.class`.
+        let is_binary = prop.class == crate::check::PropertyClass::Binary;
+        let sig = if is_binary {
+            format!("fn {}(pre: &State, post: &State) -> bool", prop.name)
+        } else {
+            format!("fn {}(s: &State) -> bool", prop.name)
+        };
+        // Stubs (unsupported quantifier path) underscore the params so the
+        // body `true` doesn't trip `unused_variables`.
+        let stub_sig = if is_binary {
+            format!("fn {}(_pre: &State, _post: &State) -> bool", prop.name)
+        } else {
+            format!("fn {}(_s: &State) -> bool", prop.name)
+        };
         if crate::check::rust_expr_is_unsupported(&rust_expr) {
             // Body contains `forall`/`exists`. Emit the function with a
             // `unimplemented!()` that cites the limitation — the harness
             // preamble (see kani.rs) skips calling into these predicates.
-            out.push_str(&format!("fn {}(_s: &State) -> bool {{\n", prop.name));
+            out.push_str(&format!("{} {{\n", stub_sig));
             out.push_str(&format!(
                 "    // {} — property uses a quantifier; lower at the harness level.\n",
                 rust_expr.trim()
@@ -872,7 +892,7 @@ pub fn emit_property_predicates_with(
             out.push_str("    true\n");
             out.push_str("}\n\n");
         } else {
-            out.push_str(&format!("fn {}(s: &State) -> bool {{\n", prop.name));
+            out.push_str(&format!("{} {{\n", sig));
             out.push_str(&format!("    {}\n", rust_expr));
             out.push_str("}\n\n");
         }
