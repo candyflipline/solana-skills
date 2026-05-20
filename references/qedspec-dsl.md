@@ -392,12 +392,8 @@ handler transfer_sol { ... }
 | `aborts_total` | Handler must reject on all guard failures | `aborts_total` |
 | `invariant name` | Preserve a global invariant (assume pre, assert post) | `invariant conservation` |
 | `establishes name` | Establish a global invariant at post-state without assuming it pre-state. Use for init / one-shot handlers. | `establishes root_set` |
-| `include schema` | Include a schema's clauses | `include base_validation` |
 | `permissionless` | Opt out of the `no_access_control` lint (v2.7) | see below |
 | `takes { ... }` | Parameters (sugar, prefer signature) | `takes amount : U64` |
-| `on ident` | Instruction selector (sugar) | `on cancel` |
-| `when ident` | Pre-state (sugar, prefer signature) | `when Open` |
-| `then ident` | Post-state (sugar, prefer signature) | `then Closed` |
 
 ### `accounts` block
 
@@ -543,22 +539,6 @@ handler liquidate (i : AccountIdx) : State.Active -> State.Active {
 Each arm becomes its own case in the generated transition function and its
 own preservation obligation per property — vacuous cases close trivially,
 the real cases need proofs.
-
-### `schema` block
-
-Reusable clause fragments. Handlers include them with `include`.
-
-```fsharp
-schema base_validation {
-  requires accounts.count >= 3 else InvalidAccountCount
-  requires user.data_len == 0 else UserDataLen
-}
-
-handler initialize : State.Uninitialized -> State.Active {
-  include base_validation
-  // additional clauses...
-}
-```
 
 ## Expressions
 
