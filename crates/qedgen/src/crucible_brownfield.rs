@@ -23,9 +23,11 @@
 //!   account flags and arg types extracted via regex are too noisy to
 //!   ship; the maintainer-authored Codama IDL is the trusted source.
 //! - **Native / sBPF** — deferred (errors with a clear message). Native
-//!   programs follow the same gate: Shank IDL discovery is the v2.23
-//!   target. sBPF brownfield fuzz is parked indefinitely (no
-//!   AccountInfo abstraction at source level).
+//!   programs follow the same gate: Shank IDL discovery is the next
+//!   target after v2.23 (v2.23 shipped the pre/post property lowering
+//!   trust fix + brownfield first-contact onboarding flow instead).
+//!   sBPF brownfield fuzz is parked indefinitely (no AccountInfo
+//!   abstraction at source level).
 
 use anyhow::{anyhow, bail, Context, Result};
 use regex::Regex;
@@ -74,10 +76,11 @@ pub fn synthesize_spec(project_root: &Path, runtime: Runtime) -> Result<Brownfie
         }
         Runtime::Pinocchio => synthesize_pinocchio(project_root),
         Runtime::Native | Runtime::Sbpf | Runtime::Unknown => bail!(
-            "Crucible brownfield mode (`--fuzz --root`) on `{runtime:?}` is tracked for v2.23+. \
-             v2.22 covers Anchor / Quasar / qedgen-codegen / Pinocchio. Until then, fall back \
-             to `qedgen probe --program <path>` for the site-catalogue audit envelope. \
-             Pass `--runtime <name>` to override detection if needed."
+            "Crucible brownfield mode (`--fuzz --root`) on `{runtime:?}` is tracked for v2.24+. \
+             v2.22 covers Anchor / Quasar / qedgen-codegen / Pinocchio (v2.23 shipped pre/post \
+             property lowering + brownfield first-contact instead of touching this gate). \
+             Until then, fall back to `qedgen probe --program <path>` for the site-catalogue \
+             audit envelope. Pass `--runtime <name>` to override detection if needed."
         ),
     }
 }
@@ -143,7 +146,7 @@ fn synthesize_pinocchio(project_root: &Path) -> Result<BrownfieldSynthesis> {
     // codebase. A hand-validated Codama IDL is the trusted source.
     //
     // Future runtimes follow the same gate: Shank for legacy native
-    // Rust programs (v2.23+); custom dispatchers carry a Codama IDL via
+    // Rust programs (v2.24+); custom dispatchers carry a Codama IDL via
     // codama-cli or are out of scope.
     let idl_text = discover_pinocchio_idl(project_root)?.ok_or_else(|| {
         anyhow!(
@@ -754,8 +757,8 @@ pub mod my_prog {
             let err = synthesize_spec(tmp.path(), rt).unwrap_err();
             let msg = format!("{err:#}");
             assert!(
-                msg.contains("v2.23"),
-                "{label} bail should cite v2.23 deferral, got: {msg}"
+                msg.contains("v2.24"),
+                "{label} bail should cite v2.24+ deferral, got: {msg}"
             );
         }
     }

@@ -148,6 +148,8 @@ cd formal_verification && lake build
 
 `qedgen adapt` carries forward what it can read from the source: handler names, argument types, the `Context<X>` accounts struct, and a pointer to the actual handler body in your repo. Lifecycle, requires, effects, and transfers stay as TODOs for you or your agent to fill in. `qedgen spec --idl <path>` is the IDL-only fallback when you don't have source.
 
+**Audit-first alternative (v2.23 — recommended for first contact).** Rather than filling adapt's TODOs from a cold start, route through `/qedgen-auditor` first; the auditor surfaces real findings in your existing code, and then `/qedgen` converts those findings into spec properties that lock them in as permanent regression guards. See `examples/rust/brownfield-onboarding/` for an end-to-end walkthrough on a real bug class, plus `skills/qedgen-auditor/references/finding_to_spec.md` for the per-category conversion table.
+
 ### Existing Pinocchio / native / sBPF programs (audit-first brownfield)
 
 For non-Anchor runtimes the entry point is the probe + ratify flow,

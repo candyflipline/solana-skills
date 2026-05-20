@@ -260,6 +260,14 @@ suppressed-silent appendix and ratified-intent reference.
 User can extend (`continue`, `look at X handler again`) or accept and
 move to spec-writing.
 
+The "move to spec-writing" path is covered by the
+**"Handoff to `/qedgen` for spec scaffold"** section in the
+auditor SKILL.md and by the family-by-family conversion table at
+`references/finding_to_spec.md` (v2.23 Slice 8). Once at least one
+MED+ repro has fired, the agent offers the user the audit→specify
+handoff with the pitch *"I helped find so many bugs, now let's get
+you to specify them so they never come back."*
+
 ---
 
 ## What this walkthrough shows (pattern-match literally)
