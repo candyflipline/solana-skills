@@ -913,9 +913,18 @@ impl ParsedHandlerAccount {
         if is_state_account {
             if let Some(ref who) = handler.who {
                 if state_account_has_field(self, spec, who) {
-                    if is_multi_variant_adt_with_field_in_variant(spec, who) {
-                        // Auth check skipped — see fn-level doc above.
-                    } else {
+                    // v2.24.0 follow-up: only suppress on Anchor.
+                    // Anchor's wrapper-struct + inner-enum emission
+                    // (S5b) hides variant-payload fields from
+                    // `wrapper.X`; `has_one` can't reach them.
+                    // Quasar's flat-struct emission still has every
+                    // variant-payload field at top level, so
+                    // `has_one = field` works there as before.
+                    let suppress_for_anchor_variant = matches!(
+                        target,
+                        crate::Target::Anchor
+                    ) && is_multi_variant_adt_with_field_in_variant(spec, who);
+                    if !suppress_for_anchor_variant {
                         parts.push(format!("has_one = {}", who));
                     }
                 }
