@@ -1994,27 +1994,28 @@ fn mechanize_effect(
     if !simple_rhs {
         return None;
     }
-    // v2.24 S5c — if the LHS root matches a multi-variant ADT
-    // variant name (e.g. `Active.balance`), the flat
-    // `self.<acct>.<field>` lowering doesn't apply. The wrapper +
-    // inner-enum shape from S5b requires `match &mut self.<acct>.inner
-    // { Inner::Active { balance, .. } => *balance = … }` instead.
-    // The variant-state lowering at `emit_variant_state_handler_body`
-    // handles same-variant; cross-variant (init/promote) currently
-    // bails out — which is where this guard comes in. Returning
-    // `None` here surfaces the effect as a `// Spec effect (needs
-    // fill)` comment + a trailing `todo!()` so the user notices
-    // they need to fill the promotion, instead of getting a silent
-    // miscompile like `self.vault.Active.balance = initial;`.
-    if field.contains('.') {
-        let head = field.split('.').next().unwrap_or("");
-        let is_variant = spec
-            .account_types
-            .iter()
-            .any(|a| a.variants.iter().any(|v| v.name == head));
-        if is_variant {
-            return None;
-        }
+    // v2.24 S5c — under multi-variant ADT state on the Anchor
+    // target, the flat `self.<acct>.<field>` lowering doesn't apply.
+    // The wrapper-struct + inner-enum emission from S5b means the
+    // wrapper carries only `inner` (the variant payload) and `bump`
+    // — there's no top-level `<field>` to write. Bail so the
+    // per-effect path surfaces a `// Spec effect (needs fill)` line
+    // + a trailing `todo!()` rather than a silent miscompile like
+    // `self.escrow.initializer_amount = …`.
+    //
+    // Two cases trigger:
+    //   1. Variant-prefixed LHS (`Active.balance := …`): cross-
+    //      variant emitter `emit_variant_state_handler_body` handles
+    //      same-variant + cross-variant when it can; this path is
+    //      the bail-out for cases it can't (missing post-variant
+    //      fields, payload-carrying pre, etc.).
+    //   2. Bare-field LHS (`balance := …`): a pre-v2.24 spec
+    //      hasn't been migrated to `Variant.field` syntax yet. The
+    //      `bare_field_on_multi_variant_state` lint (S5c) surfaces
+    //      this as guidance; the codegen bails so the migration
+    //      need is unmissable.
+    if is_multi_variant_adt_state(spec) && matches!(target, Target::Anchor) {
+        return None;
     }
 
     // Anchor / Quasar handler bodies bind state as `self.<acct>.<field>`,
