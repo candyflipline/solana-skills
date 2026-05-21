@@ -2298,6 +2298,19 @@ pub fn adapt(spec: &a::Spec) -> ParsedSpec {
                     // handlers are known (matches pest parity).
                     a::PreservedBy::All => vec!["all".to_string()],
                     a::PreservedBy::Some(xs) => xs.clone(),
+                    // v2.24 #3 — `preserved_by all except [h1, h2, ...]`.
+                    // Tagged with a `!` prefix per name so the second-pass
+                    // expansion (which runs after all handlers are known)
+                    // can subtract these from the full handler list. Bare
+                    // handler names with literal `!` prefix aren't legal
+                    // identifiers, so this tag is collision-free.
+                    a::PreservedBy::AllExcept(xs) => {
+                        let mut tagged = vec!["all".to_string()];
+                        for x in xs {
+                            tagged.push(format!("!{}", x));
+                        }
+                        tagged
+                    }
                 };
                 // When the body is a single `forall <binder> : <T>, inner`
                 // with a binder type wider than U8/I8 (so the standard
@@ -2580,8 +2593,28 @@ pub fn adapt(spec: &a::Spec) -> ParsedSpec {
     }
 
     // Expand `preserved_by all` to the full handler-name list (pest parity).
+    // v2.24 #3 — `preserved_by all except [h1, h2, ...]` arrives here as
+    // `["all", "!h1", "!h2"]`; expand `all` then subtract the
+    // `!`-prefixed excludes.
     let all_handler_names: Vec<String> = out.handlers.iter().map(|h| h.name.clone()).collect();
     for prop in &mut out.properties {
+        if prop.preserved_by.first().map(|s| s.as_str()) == Some("all") {
+            let excludes: std::collections::HashSet<String> = prop
+                .preserved_by
+                .iter()
+                .filter_map(|s| s.strip_prefix('!').map(String::from))
+                .collect();
+            if excludes.is_empty() && prop.preserved_by.len() == 1 {
+                prop.preserved_by = all_handler_names.clone();
+            } else {
+                prop.preserved_by = all_handler_names
+                    .iter()
+                    .filter(|n| !excludes.contains(n.as_str()))
+                    .cloned()
+                    .collect();
+            }
+            continue;
+        }
         if prop.preserved_by.len() == 1 && prop.preserved_by[0] == "all" {
             prop.preserved_by = all_handler_names.clone();
         }
@@ -3111,6 +3144,75 @@ mod tests {
 
     const PERCOLATOR_SPEC: &str =
         include_str!("../../../examples/rust/percolator/percolator.qedspec");
+
+    /// v2.24 #3 — `preserved_by all except [h1, h2]` expands to the
+    /// full handler list minus the excluded names. Common pattern for
+    /// "every handler other than the one whose job is to break it"
+    /// (e.g. a `lock` handler that intentionally flips a flag the
+    /// rest of the spec preserves).
+    #[test]
+    fn preserved_by_all_except_expands_to_complement() {
+        let src = r#"spec ExceptDemo
+program_id "11111111111111111111111111111111"
+
+type State
+  | Active of { balance : U64, paused : U8 }
+
+type Error
+  | MathOverflow
+
+handler deposit (amount : U64) : State.Active -> State.Active {
+  permissionless
+  requires amount > 0 else MathOverflow
+  effect { Active.balance += amount }
+}
+
+handler pause : State.Active -> State.Active {
+  permissionless
+  effect { Active.paused := 1 }
+}
+
+handler unpause : State.Active -> State.Active {
+  permissionless
+  effect { Active.paused := 0 }
+}
+
+property still_unpaused :
+  state.paused == 0
+  preserved_by all except [pause]
+"#;
+        let spec = parse_str(src).expect("parse");
+        let prop = spec
+            .properties
+            .iter()
+            .find(|p| p.name == "still_unpaused")
+            .expect("property still_unpaused");
+        let names: std::collections::HashSet<&str> = prop
+            .preserved_by
+            .iter()
+            .map(String::as_str)
+            .collect();
+        assert!(
+            names.contains("deposit"),
+            "expected deposit in preserved_by; got: {:?}",
+            prop.preserved_by
+        );
+        assert!(
+            names.contains("unpause"),
+            "expected unpause in preserved_by; got: {:?}",
+            prop.preserved_by
+        );
+        assert!(
+            !names.contains("pause"),
+            "pause should be excluded; got: {:?}",
+            prop.preserved_by
+        );
+        assert!(
+            !names.contains("all"),
+            "sentinel `all` should be expanded away; got: {:?}",
+            prop.preserved_by
+        );
+    }
 
     /// v2.17: both `invariant Foo` and `establishes Foo` handler clauses parse
     /// and route to the right `ParsedHandler` field.

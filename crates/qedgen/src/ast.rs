@@ -828,6 +828,11 @@ pub struct PropertyDecl {
 pub enum PreservedBy {
     All,
     Some(Vec<String>),
+    /// v2.24 #3 — `preserved_by all except [h1, h2, ...]` shorthand
+    /// for "every handler other than the listed ones". The adapter
+    /// expands this against the spec's full handler list, producing
+    /// a concrete `Some(Vec<String>)` for downstream consumers.
+    AllExcept(Vec<String>),
 }
 
 #[derive(Debug, Clone)]

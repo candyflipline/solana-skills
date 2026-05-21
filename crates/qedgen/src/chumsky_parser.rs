@@ -1459,19 +1459,31 @@ fn handler_decl<'a>() -> impl Parser<'a, &'a str, TopItem, Err<'a>> + Clone {
 
 // property name : expr preserved_by all | [a, b, ...]
 fn property_decl<'a>() -> impl Parser<'a, &'a str, TopItem, Err<'a>> + Clone {
+    // v2.24 #3 — `preserved_by all except [h1, h2, ...]` shorthand
+    // for "every handler other than the listed ones". The bare `all`
+    // form is unchanged; the `except` clause expands at adapt time
+    // against the full handler list. Try the longer form first so
+    // bare `all` doesn't greedy-match and leave `except` hanging.
+    let list = just('[')
+        .then_ignore(wsc())
+        .ignore_then(
+            non_keyword_ident()
+                .then_ignore(wsc())
+                .separated_by(just(',').then_ignore(wsc()))
+                .collect::<Vec<String>>(),
+        )
+        .then_ignore(wsc())
+        .then_ignore(just(']'));
+    let all_except = just("all")
+        .then_ignore(wsc())
+        .then_ignore(just("except"))
+        .then_ignore(wsc())
+        .ignore_then(list.clone())
+        .map(PreservedBy::AllExcept);
     let preserved = just("preserved_by").then_ignore(wsc()).ignore_then(choice((
+        all_except,
         just("all").to(PreservedBy::All),
-        just('[')
-            .then_ignore(wsc())
-            .ignore_then(
-                non_keyword_ident()
-                    .then_ignore(wsc())
-                    .separated_by(just(',').then_ignore(wsc()))
-                    .collect::<Vec<String>>(),
-            )
-            .then_ignore(wsc())
-            .then_ignore(just(']'))
-            .map(PreservedBy::Some),
+        list.map(PreservedBy::Some),
     )));
 
     doc_comments()
