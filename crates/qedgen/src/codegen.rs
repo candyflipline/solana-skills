@@ -2063,12 +2063,8 @@ fn mechanize_effect(
     } else {
         "MathOverflow"
     };
-    let overflow_variant = on_error
-        .or(pragma_overflow)
-        .unwrap_or("MathOverflow");
-    let underflow_variant = on_error
-        .or(pragma_underflow)
-        .unwrap_or(builtin_underflow);
+    let overflow_variant = on_error.or(pragma_overflow).unwrap_or("MathOverflow");
+    let underflow_variant = on_error.or(pragma_underflow).unwrap_or(builtin_underflow);
     // Quasar's `#[account]` macro auto-wraps integer state fields in their
     // Pod companions (u64 → PodU64). Plain `=` and `wrapping_*` between a
     // `u64` rhs and a `PodU64` lhs fail to type-check, so on Quasar:
@@ -2208,26 +2204,14 @@ fn mechanize_effect_destructured(
             "            {} = {}.checked_add({}).ok_or({}::{})?;\n",
             lhs, read, rhs, err_enum, overflow_variant
         ),
-        "add_sat" => format!(
-            "            {} = {}.saturating_add({});\n",
-            lhs, read, rhs
-        ),
-        "add_wrap" => format!(
-            "            {} = {}.wrapping_add({});\n",
-            lhs, read, rhs
-        ),
+        "add_sat" => format!("            {} = {}.saturating_add({});\n", lhs, read, rhs),
+        "add_wrap" => format!("            {} = {}.wrapping_add({});\n", lhs, read, rhs),
         "sub" => format!(
             "            {} = {}.checked_sub({}).ok_or({}::{})?;\n",
             lhs, read, rhs, err_enum, underflow_variant
         ),
-        "sub_sat" => format!(
-            "            {} = {}.saturating_sub({});\n",
-            lhs, read, rhs
-        ),
-        "sub_wrap" => format!(
-            "            {} = {}.wrapping_sub({});\n",
-            lhs, read, rhs
-        ),
+        "sub_sat" => format!("            {} = {}.saturating_sub({});\n", lhs, read, rhs),
+        "sub_wrap" => format!("            {} = {}.wrapping_sub({});\n", lhs, read, rhs),
         _ => return None,
     };
     Some(line)
@@ -2294,10 +2278,7 @@ fn emit_variant_state_handler_body(
 
     let acct = spec.account_types.first()?;
     let post_variant = acct.variants.iter().find(|v| v.name == post)?;
-    let inner_name = format!(
-        "{}AccountInner",
-        to_pascal_case(&spec.program_name)
-    );
+    let inner_name = format!("{}AccountInner", to_pascal_case(&spec.program_name));
     let err_enum = format!("{}Error", to_pascal_case(&spec.program_name));
     let acct_binder = &state_acct.name;
 
@@ -2323,8 +2304,7 @@ fn emit_variant_state_handler_body(
     // LHS of any effect (after stripping `<Variant>.` prefix and
     // any `[…]` indexing). These go into the match destructure
     // pattern so the inner block can rebind them.
-    let mut mutated_fields: std::collections::BTreeSet<String> =
-        std::collections::BTreeSet::new();
+    let mut mutated_fields: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for (lhs, _, _) in &handler.effects {
         let stripped = strip_variant_prefix(lhs, spec);
         let bare = strip_array_index_suffix(&stripped);
@@ -2343,10 +2323,7 @@ fn emit_variant_state_handler_body(
         // variant — the guard layer doesn't catch variant drift on
         // its own.
         let mut out = String::new();
-        out.push_str(&format!(
-            "        match self.{}.inner {{\n",
-            acct_binder
-        ));
+        out.push_str(&format!("        match self.{}.inner {{\n", acct_binder));
         out.push_str(&format!(
             "            {}::{} {{ .. }} => {{}}\n",
             inner_name, post
@@ -2375,10 +2352,7 @@ fn emit_variant_state_handler_body(
         inner_name, post, destructure
     ));
     for (idx, effect) in handler.effects.iter().enumerate() {
-        let on_error = handler
-            .effect_on_error
-            .get(idx)
-            .and_then(|o| o.as_deref());
+        let on_error = handler.effect_on_error.get(idx).and_then(|o| o.as_deref());
         let line = mechanize_effect_destructured(effect, on_error, handler, spec)?;
         out.push_str(&line);
     }
@@ -2433,11 +2407,7 @@ fn resolve_cross_variant_rhs(
     // `<account>.pubkey` shape — map to the Anchor key() accessor on
     // the handler's account binding.
     if let Some(account_name) = raw.strip_suffix(".pubkey") {
-        if handler
-            .accounts
-            .iter()
-            .any(|a| a.name == account_name)
-        {
+        if handler.accounts.iter().any(|a| a.name == account_name) {
             return Some(format!("self.{}.key()", account_name));
         }
     }
@@ -2866,8 +2836,8 @@ fn render_handler_scaffold(
     // emitter first; on `None`, fall through to the per-effect
     // path (which will emit `// Spec effect (needs fill)` + the
     // trailing `todo!()` for cross-variant / non-mechanical shapes).
-    let variant_body = state_acct
-        .and_then(|sa| emit_variant_state_handler_body(handler, spec, target, sa));
+    let variant_body =
+        state_acct.and_then(|sa| emit_variant_state_handler_body(handler, spec, target, sa));
     if let Some(body) = variant_body {
         out.push_str(&body);
     } else {
@@ -2875,10 +2845,7 @@ fn render_handler_scaffold(
             // v2.24 §S1a — per-site error-variant override, indexed parallel
             // to `effects`. Missing entry = `None` (silent fallback to pragma
             // / built-in default inside mechanize_effect).
-            let on_error = handler
-                .effect_on_error
-                .get(idx)
-                .and_then(|o| o.as_deref());
+            let on_error = handler.effect_on_error.get(idx).and_then(|o| o.as_deref());
             let mechanized = state_acct
                 .and_then(|sa| mechanize_effect(effect, on_error, sa, handler, spec, target));
             match mechanized {
@@ -4162,7 +4129,9 @@ handler initialize (amount : U64) : State.Uninitialized -> State.Open {
         // Inner enum carries the actual variants. No-payload variants
         // stay unit-style; payload variants get struct-style fields.
         assert!(
-            state.contains("#[derive(AnchorSerialize, AnchorDeserialize, InitSpace, Clone, Debug, PartialEq)]"),
+            state.contains(
+                "#[derive(AnchorSerialize, AnchorDeserialize, InitSpace, Clone, Debug, PartialEq)]"
+            ),
             "inner enum should carry Borsh + Clone + Debug + PartialEq derives; got:\n{state}"
         );
         assert!(
@@ -4247,8 +4216,7 @@ handler deposit (amount : U64) : State.Active -> State.Active {
         generate_lib(&spec, &fp, &out_dir, Target::Anchor).unwrap();
         generate_instructions(&spec, &fp, &spec_path, &out_dir, Target::Anchor).unwrap();
 
-        let deposit =
-            std::fs::read_to_string(out_dir.join("src/instructions/deposit.rs")).unwrap();
+        let deposit = std::fs::read_to_string(out_dir.join("src/instructions/deposit.rs")).unwrap();
 
         // Match-wrapped body lands.
         assert!(
@@ -4333,9 +4301,7 @@ handler deposit (amount : U64) : State.Active -> State.Active {
 
         let guards = std::fs::read_to_string(out_dir.join("src/guards.rs")).unwrap();
         assert!(
-            guards.contains(
-                "if !matches!(ctx.vault.inner, VaultAccountInner::Active { .. })"
-            ),
+            guards.contains("if !matches!(ctx.vault.inner, VaultAccountInner::Active { .. })"),
             "expected `matches!` lifecycle check; got:\n{guards}"
         );
         assert!(
@@ -4516,8 +4482,7 @@ handler create (initial : U64) : State.Uninitialized -> State.Active {
         generate_lib(&spec, &fp, &out_dir, Target::Anchor).unwrap();
         generate_instructions(&spec, &fp, &spec_path, &out_dir, Target::Anchor).unwrap();
 
-        let create =
-            std::fs::read_to_string(out_dir.join("src/instructions/create.rs")).unwrap();
+        let create = std::fs::read_to_string(out_dir.join("src/instructions/create.rs")).unwrap();
 
         // Assignment shape lands. Note: declared field order matters
         // — `owner` first, then `balance` — to match the variant
@@ -4592,8 +4557,7 @@ handler create (initial : U64) : State.Uninitialized -> State.Active {
         generate_lib(&spec, &fp, &out_dir, Target::Anchor).unwrap();
         generate_instructions(&spec, &fp, &spec_path, &out_dir, Target::Anchor).unwrap();
 
-        let create =
-            std::fs::read_to_string(out_dir.join("src/instructions/create.rs")).unwrap();
+        let create = std::fs::read_to_string(out_dir.join("src/instructions/create.rs")).unwrap();
 
         // Missing `owner` field → cross-variant emitter bails.
         assert!(
@@ -5052,10 +5016,7 @@ handler bump (n : U64) : State.Active -> State.Active {
 
     // ----- v2.24 §S1a/b/c: per-site override + pragma + underflow default -----
 
-    fn mechanize_first_effect(
-        src: &str,
-        handler_name: &str,
-    ) -> String {
+    fn mechanize_first_effect(src: &str, handler_name: &str) -> String {
         let spec = crate::chumsky_adapter::parse_str(src).unwrap();
         let handler = spec
             .handlers
@@ -5064,10 +5025,7 @@ handler bump (n : U64) : State.Active -> State.Active {
             .expect("handler not found");
         let state_acct = find_state_account(handler).expect("state account");
         let effect = handler.effects.first().expect("at least one effect");
-        let on_error = handler
-            .effect_on_error
-            .first()
-            .and_then(|o| o.as_deref());
+        let on_error = handler.effect_on_error.first().and_then(|o| o.as_deref());
         mechanize_effect(effect, on_error, state_acct, handler, &spec, Target::Anchor)
             .expect("mechanized")
     }

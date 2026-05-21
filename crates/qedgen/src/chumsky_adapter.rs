@@ -2568,8 +2568,7 @@ pub fn adapt(spec: &a::Spec) -> ParsedSpec {
                 // assignment. Push raw; lint validates the key against the
                 // known set and the value against declared `type Error`
                 // variants.
-                out.pragma_assignments
-                    .push((name.clone(), value.clone()));
+                out.pragma_assignments.push((name.clone(), value.clone()));
             }
             TopItem::Schema(s) => {
                 // v2.24 #1 — collect schema blocks so handlers can
@@ -2582,12 +2581,7 @@ pub fn adapt(spec: &a::Spec) -> ParsedSpec {
                     .iter()
                     .map(|(guard, on_fail)| ParsedRequires {
                         lean_expr: expr_to_lean(&guard.node, Ctx::Guard, consts, &env),
-                        rust_expr: expr_to_rust(
-                            &guard.node,
-                            Ctx::Guard,
-                            consts,
-                            opts_native(&env),
-                        ),
+                        rust_expr: expr_to_rust(&guard.node, Ctx::Guard, consts, opts_native(&env)),
                         rust_expr_pod: expr_to_rust(
                             &guard.node,
                             Ctx::Guard,
@@ -3316,7 +3310,11 @@ type Error
             spec.sum_types.iter().map(|s| &s.name).collect::<Vec<_>>()
         );
         // And the unit-only check passes (all variants payload-free).
-        let af = spec.sum_types.iter().find(|s| s.name == "AddressField").unwrap();
+        let af = spec
+            .sum_types
+            .iter()
+            .find(|s| s.name == "AddressField")
+            .unwrap();
         assert!(
             af.variants.iter().all(|v| v.fields.is_empty()),
             "AddressField should be unit-only"
@@ -3361,10 +3359,7 @@ handler liquidate (loss : U64) : State.Active -> State.Active {
             .iter()
             .filter(|h| h.name.starts_with("liquidate"))
             .collect();
-        let with_call: Vec<_> = synths
-            .iter()
-            .filter(|h| !h.calls.is_empty())
-            .collect();
+        let with_call: Vec<_> = synths.iter().filter(|h| !h.calls.is_empty()).collect();
         assert_eq!(
             with_call.len(),
             1,
@@ -3488,7 +3483,9 @@ handler withdraw (amount : U64) : State.Active -> State.Active {
                 h.requires.iter().map(|r| &r.lean_expr).collect::<Vec<_>>()
             );
             assert!(
-                h.requires.iter().any(|r| r.error_name.as_deref() == Some("Paused")),
+                h.requires
+                    .iter()
+                    .any(|r| r.error_name.as_deref() == Some("Paused")),
                 "handler {handler_name} should pick up the schema's Paused error; got: {:?}",
                 h.requires.iter().map(|r| &r.error_name).collect::<Vec<_>>()
             );
@@ -3548,11 +3545,8 @@ property still_unpaused :
             .iter()
             .find(|p| p.name == "still_unpaused")
             .expect("property still_unpaused");
-        let names: std::collections::HashSet<&str> = prop
-            .preserved_by
-            .iter()
-            .map(String::as_str)
-            .collect();
+        let names: std::collections::HashSet<&str> =
+            prop.preserved_by.iter().map(String::as_str).collect();
         assert!(
             names.contains("deposit"),
             "expected deposit in preserved_by; got: {:?}",

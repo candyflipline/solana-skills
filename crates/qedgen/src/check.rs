@@ -1460,10 +1460,7 @@ fn resolve_and_merge_imports(
         // an explicit block, contradicting the DSL ref's "No
         // `interface` keyword needed — every handler in the imported
         // spec is public."
-        let explicit = imported
-            .interfaces
-            .iter()
-            .find(|i| i.name == r.bound_name);
+        let explicit = imported.interfaces.iter().find(|i| i.name == r.bound_name);
         let synthesized: Option<ParsedInterface> = if explicit.is_none() {
             synthesize_interface_from_imported(&r.bound_name, &imported)
         } else {
@@ -2348,10 +2345,8 @@ pub fn check_completeness(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
     // names. Maps variant name → fields declared in that variant's
     // payload. Empty when no account type has variants (single-record
     // specs are unaffected).
-    let mut variant_fields: std::collections::BTreeMap<
-        String,
-        std::collections::BTreeSet<String>,
-    > = std::collections::BTreeMap::new();
+    let mut variant_fields: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        std::collections::BTreeMap::new();
     for acct in &spec.account_types {
         for variant in &acct.variants {
             let entry = variant_fields.entry(variant.name.clone()).or_default();
@@ -2578,8 +2573,7 @@ pub fn check_completeness(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
                 }
                 // Match `<fname>.` (record-nested) or `<fname>[` (Map-indexed)
                 // as effective writes of the named field.
-                lhs.starts_with(&format!("{}.", fname))
-                    || lhs.starts_with(&format!("{}[", fname))
+                lhs.starts_with(&format!("{}.", fname)) || lhs.starts_with(&format!("{}[", fname))
             })
         });
         if !modified {
@@ -2956,9 +2950,7 @@ pub fn check_completeness(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
             // `Active.pool` → Some("pool"); `Active.x[i]` → Some("x");
             // `Active` (no separator) → None.
             let bytes = path.as_bytes();
-            let first = bytes
-                .iter()
-                .position(|c| *c == b'.' || *c == b'[')?;
+            let first = bytes.iter().position(|c| *c == b'.' || *c == b'[')?;
             // Only `.<ident>` is the form we care about for variant lookup.
             if bytes[first] != b'.' {
                 return None;
@@ -3322,7 +3314,7 @@ pub fn check_completeness(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
                 // `accounts`, `fee_credits`. Pure ident segments only;
                 // skip the `[…]` indexing form.
                 for seg in normalized
-                    .split(|c: char| c == '.' || c == '[' || c == ']')
+                    .split(['.', '[', ']'])
                     .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_alphanumeric() || c == '_'))
                 {
                     written_fields.insert(seg.to_string());
@@ -4091,8 +4083,7 @@ fn check_checked_arith_needs_math_overflow(spec: &ParsedSpec) -> Vec<Completenes
     // Collect handlers whose builtin-default lowering would reference a
     // variant the spec didn't declare. Per-site overrides skip this lint
     // (their variant check lives in `check_unknown_error_variant`).
-    let mut missing: std::collections::BTreeSet<&'static str> =
-        std::collections::BTreeSet::new();
+    let mut missing: std::collections::BTreeSet<&'static str> = std::collections::BTreeSet::new();
     let mut handlers_missing: Vec<String> = Vec::new();
 
     for h in &spec.handlers {
@@ -4180,8 +4171,7 @@ fn check_unknown_error_variant(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
 
     // Pragma references — fire once per pragma, not once per handler.
     for (key, value) in &spec.pragma_assignments {
-        if (key == "checked_overflow_error" || key == "checked_underflow_error")
-            && !has_decl(value)
+        if (key == "checked_overflow_error" || key == "checked_underflow_error") && !has_decl(value)
         {
             warnings.push(CompletenessWarning {
                 rule: "unknown_error_variant".to_string(),
@@ -8449,9 +8439,7 @@ handler deposit (n : U64) : State.Active -> State.Active {
         let warnings = check_completeness(&spec);
         // With the U64_MAX guard, unguarded_arithmetic should be silent.
         assert!(
-            !warnings
-                .iter()
-                .any(|w| w.rule == "unguarded_arithmetic"),
+            !warnings.iter().any(|w| w.rule == "unguarded_arithmetic"),
             "U64_MAX builtin should satisfy unguarded_arithmetic; got: {warnings:#?}"
         );
     }

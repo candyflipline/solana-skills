@@ -123,7 +123,10 @@ pub enum TopItem {
     /// built-in `MathOverflow` / `MathUnderflow` defaults that
     /// `mechanize_effect` lowers `+=` / `-=` against. Per-effect `or
     /// <Variant>` (see `EffectStmt.on_error`) still wins over the pragma.
-    PragmaAssign { name: String, value: String },
+    PragmaAssign {
+        name: String,
+        value: String,
+    },
     /// `schema name { requires expr else Err … }` — v2.24 #1. Reusable
     /// cross-cutting guard set. Handlers reference it via `uses name`
     /// (HandlerClause::Uses) and the adapter expands every requires

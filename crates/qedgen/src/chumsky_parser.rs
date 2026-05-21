@@ -308,7 +308,12 @@ fn path<'a>() -> impl Parser<'a, &'a str, Path, Err<'a>> + Clone {
     // handles bare-ident indices via the existing
     // `rewrite_index_to_usize` + state-binder resolution pass.
     let dotted_index = ident()
-        .then(just('.').ignore_then(ident()).repeated().collect::<Vec<String>>())
+        .then(
+            just('.')
+                .ignore_then(ident())
+                .repeated()
+                .collect::<Vec<String>>(),
+        )
         .map(|(head, rest)| {
             if rest.is_empty() {
                 head
@@ -713,7 +718,14 @@ fn expr<'a>() -> impl Parser<'a, &'a str, Node<Expr>, Err<'a>> + Clone {
         // `.boxed()` tames the type complexity that otherwise trips Apple's
         // linker on overlong symbol names.
         let group_a = choice((int, bool_lit, old, let_in, if_then_else, sum, quant)).boxed();
-        let group_b = choice((now_atom, current_epoch_atom, mul_div_floor_atom, mul_div_ceil_atom, match_expr)).boxed();
+        let group_b = choice((
+            now_atom,
+            current_epoch_atom,
+            mul_div_floor_atom,
+            mul_div_ceil_atom,
+            match_expr,
+        ))
+        .boxed();
         // `record_update` must precede `ctor` (leading `.` distinguishes
         // them, but this ordering is clearer). `app_expr` must precede
         // `path_expr` (both start with ident; app commits only when `(`
