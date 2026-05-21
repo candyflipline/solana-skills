@@ -61,6 +61,14 @@ pub struct ParsedAccountType {
     pub lifecycle: Vec<String>,
     /// Reference to a PDA name (if this account is PDA-derived)
     pub pda_ref: Option<String>,
+    /// v2.24 S5: variant structure for multi-variant ADT state. Empty for
+    /// single-record account types (declared via `account { … }` or a
+    /// single-variant ADT). When non-empty, codegen emits a real
+    /// `pub enum <Name> { Variant { … }, … }` instead of the flattened
+    /// struct, and `fields` stays populated as the union of variant
+    /// fields (back-compat view for readers not yet migrated).
+    #[allow(dead_code)] // consumed by S5b codegen pass, not yet wired
+    pub variants: Vec<ParsedVariant>,
 }
 
 /// Plain record type (no variants). Declared as `type T = { field : Type, ... }`.
@@ -2210,6 +2218,39 @@ pub fn check_completeness(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
         .map(|(n, _)| n.as_str())
         .unwrap_or("authority");
 
+    // v2.24 S5c: variant index for `Variant.field` LHS normalization.
+    // Built once and consumed by every effect-LHS lint (unused_field,
+    // write_without_read, undeclared_state_field_in_effect) so the
+    // variant prefix is stripped before comparing against bare field
+    // names. Maps variant name → fields declared in that variant's
+    // payload. Empty when no account type has variants (single-record
+    // specs are unaffected).
+    let mut variant_fields: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeSet<String>,
+    > = std::collections::BTreeMap::new();
+    for acct in &spec.account_types {
+        for variant in &acct.variants {
+            let entry = variant_fields.entry(variant.name.clone()).or_default();
+            for (fname, _) in &variant.fields {
+                entry.insert(fname.clone());
+            }
+        }
+    }
+    // Normalize an effect LHS string by stripping a leading
+    // `Variant.` prefix when the variant is a known multi-variant ADT
+    // payload. `Active.pool` → `pool`; `accounts[i].cap` → unchanged;
+    // `pool` → unchanged. Borrows the map so the closure stays cheap.
+    let normalize_lhs = |lhs: &str| -> String {
+        if let Some(dot) = lhs.find('.') {
+            let head = &lhs[..dot];
+            if variant_fields.contains_key(head) {
+                return lhs[dot + 1..].to_string();
+            }
+        }
+        lhs.to_string()
+    };
+
     for op in &spec.handlers {
         // v2.7 G4: `auth X` and `permissionless` are mutually exclusive — one
         // declares who can call, the other declares "anyone can call." Both
@@ -2397,10 +2438,11 @@ pub fn check_completeness(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
         if ftype == "Pubkey" {
             continue;
         }
-        let modified = spec
-            .handlers
-            .iter()
-            .any(|op| op.effects.iter().any(|(f, _, _)| f == fname));
+        let modified = spec.handlers.iter().any(|op| {
+            op.effects
+                .iter()
+                .any(|(f, _, _)| normalize_lhs(f) == *fname)
+        });
         if !modified {
             let mutating_ops: Vec<&str> = spec
                 .handlers
@@ -2765,6 +2807,34 @@ pub fn check_completeness(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
             path[..end].to_string()
         };
 
+        // v2.24 S5c: `Variant.field` LHS forms (e.g. `Active.pool := …`)
+        // bind the root to a state ADT variant name, not a field. The
+        // `variant_fields` map (built at the top of this fn) is reused
+        // so the variant index stays consistent across every effect-LHS
+        // lint.
+        let second_seg = |path: &str| -> Option<String> {
+            // Read the segment between the first and second separator.
+            // `Active.pool` → Some("pool"); `Active.x[i]` → Some("x");
+            // `Active` (no separator) → None.
+            let bytes = path.as_bytes();
+            let first = bytes
+                .iter()
+                .position(|c| *c == b'.' || *c == b'[')?;
+            // Only `.<ident>` is the form we care about for variant lookup.
+            if bytes[first] != b'.' {
+                return None;
+            }
+            let rest = &path[first + 1..];
+            let mut end = rest.len();
+            for (i, c) in rest.char_indices() {
+                if c == '.' || c == '[' {
+                    end = i;
+                    break;
+                }
+            }
+            Some(rest[..end].to_string())
+        };
+
         // (a) LHS check
         for op in &spec.handlers {
             for (lhs, _kind, _rhs) in &op.effects {
@@ -2785,6 +2855,25 @@ pub fn check_completeness(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
                 // Synthetic handlers (`_case_N`, `_otherwise`) inherit
                 // their parent's effects; flagging twice would be noisy.
                 if op.name.contains("_case_") || op.name.ends_with("_otherwise") {
+                    continue;
+                }
+                // v2.24 S5c: `Variant.field` LHS — the variant name as
+                // the path root is legal in a multi-variant ADT state.
+                // Re-target P7 at segments[0] (the actual field) and
+                // check it against that variant's payload.
+                if let Some(variant_payload) = variant_fields.get(&root) {
+                    if let Some(field) = second_seg(lhs) {
+                        if !variant_payload.contains(&field) && !declared.contains(&field) {
+                            push_p7(
+                                &mut warnings,
+                                &op.name,
+                                "LHS",
+                                &format!("{}.{}", root, field),
+                            );
+                        }
+                    }
+                    // Path root is a known variant — never push the
+                    // variant name itself as "undeclared field".
                     continue;
                 }
                 push_p7(&mut warnings, &op.name, "LHS", &root);
@@ -3063,13 +3152,17 @@ pub fn check_completeness(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
 
     // Rule 13: write_without_read — state field written in effects but never read in guards/properties
     {
-        let mut written_fields = std::collections::HashSet::new();
+        // v2.24 S5c: normalize variant-prefixed LHS forms
+        // (`Active.pool` → `pool`) so the read-match below can find
+        // them in property bodies that reference the bare `pool`.
+        let mut written_fields: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         for op in &spec.handlers {
             for (field, _, _) in &op.effects {
-                written_fields.insert(field.as_str());
+                written_fields.insert(normalize_lhs(field));
             }
         }
-        let mut read_fields = std::collections::HashSet::new();
+        let mut read_fields: std::collections::HashSet<String> = std::collections::HashSet::new();
         for op in &spec.handlers {
             if let Some(ref guard) = op.guard_str {
                 for field in &written_fields {
@@ -3077,7 +3170,7 @@ pub fn check_completeness(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
                         || guard.contains(&format!("state.{}", field))
                         || contains_word(guard, field)
                     {
-                        read_fields.insert(*field);
+                        read_fields.insert(field.clone());
                     }
                 }
             }
@@ -3089,7 +3182,7 @@ pub fn check_completeness(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
                         || expr.contains(&format!("state.{}", field))
                         || contains_word(expr, field)
                     {
-                        read_fields.insert(*field);
+                        read_fields.insert(field.clone());
                     }
                 }
             }
@@ -3104,7 +3197,7 @@ pub fn check_completeness(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
                         "state field '{}' is written in effects but never referenced in any guard or property",
                         field
                     ),
-                    subject: Some(field.to_string()),
+                    subject: Some(field.clone()),
                     fix: format!(
                         "Add '{}' to a property expression or guard, or verify that writing it without reading is intentional",
                         field
@@ -5742,12 +5835,14 @@ mod tests {
                     fields: vec![("total_deposits".to_string(), "U64".to_string())],
                     lifecycle: vec!["Active".to_string()],
                     pda_ref: None,
+                    variants: vec![],
                 },
                 ParsedAccountType {
                     name: "Loan".to_string(),
                     fields: vec![("loan_amount".to_string(), "U64".to_string())],
                     lifecycle: vec!["Empty".to_string(), "Active".to_string()],
                     pda_ref: None,
+                    variants: vec![],
                 },
             ],
             state_fields: vec![("total_deposits".to_string(), "U64".to_string())],
@@ -6043,6 +6138,7 @@ mod tests {
                 fields: vec![],
                 lifecycle: vec!["Active".to_string(), "Frozen".to_string()],
                 pda_ref: None,
+                variants: vec![],
             }],
             lifecycle_states: vec![
                 "Uninitialized".to_string(),
@@ -8146,6 +8242,7 @@ handler activate : State.Setup -> State.Active {
             fields: vec![("balance".into(), "U64".into())],
             lifecycle: vec![],
             pda_ref: None,
+            variants: vec![],
         });
         spec.handlers.push(ParsedHandler {
             name: "outer_case_0".into(),
@@ -8315,6 +8412,190 @@ property positive_balance :
                 .iter()
                 .map(|w| (&w.rule, &w.message))
                 .collect::<Vec<_>>(),
+        );
+    }
+
+    // ========================================================================
+    // v2.24 S5b — ParsedAccountType.variants populated for multi-variant ADTs
+    // ========================================================================
+
+    #[test]
+    fn multi_variant_adt_populates_account_variants() {
+        // Two-variant state ADT. Flat `fields` view stays the union (first
+        // occurrence wins). `variants` carries the per-variant shape so
+        // S5b codegen can emit `pub enum State { Setup{...}, Active{...} }`.
+        let src = r#"spec Multi
+program_id "11111111111111111111111111111111"
+
+type State
+  | Setup of { owner : Pubkey }
+  | Active of {
+      owner : Pubkey,
+      pool  : U64,
+    }
+
+property pool_nonneg :
+  state.pool >= 0
+  preserved_by all
+"#;
+        let spec = crate::chumsky_adapter::parse_str(src).expect("parse");
+        let state = spec
+            .account_types
+            .iter()
+            .find(|a| a.name == "State")
+            .expect("state account type present");
+
+        assert_eq!(
+            state.variants.len(),
+            2,
+            "two-variant ADT should produce two ParsedVariant entries"
+        );
+        assert_eq!(state.variants[0].name, "Setup");
+        assert_eq!(state.variants[1].name, "Active");
+        assert_eq!(state.variants[0].fields.len(), 1);
+        assert_eq!(state.variants[1].fields.len(), 2);
+        // Flat view stays populated as the union (back-compat).
+        assert!(state.fields.iter().any(|(n, _)| n == "owner"));
+        assert!(state.fields.iter().any(|(n, _)| n == "pool"));
+    }
+
+    #[test]
+    fn no_payload_variant_keeps_empty_field_list() {
+        // A unit-style variant (no payload) should still appear in
+        // `variants` with an empty field list so codegen can emit
+        // `pub enum State { Inactive, Active{...} }`.
+        let src = r#"spec NoPayload
+program_id "11111111111111111111111111111111"
+
+type State
+  | Inactive
+  | Active of { pool : U64 }
+
+property pool_nonneg :
+  state.pool >= 0
+  preserved_by all
+"#;
+        let spec = crate::chumsky_adapter::parse_str(src).expect("parse");
+        let state = spec
+            .account_types
+            .iter()
+            .find(|a| a.name == "State")
+            .expect("state account type present");
+        assert_eq!(state.variants.len(), 2);
+        let inactive = state
+            .variants
+            .iter()
+            .find(|v| v.name == "Inactive")
+            .expect("unit variant retained");
+        assert!(
+            inactive.fields.is_empty(),
+            "no-payload variant has zero fields"
+        );
+    }
+
+    // ========================================================================
+    // v2.24 S5c — variant-prefixed effect LHS doesn't false-positive lints
+    // ========================================================================
+
+    #[test]
+    fn variant_prefixed_lhs_passes_all_effect_lints() {
+        // `Active.pool := amount` on a multi-variant ADT state must NOT
+        // trigger any of: undeclared_state_field_in_effect (P7 LHS),
+        // write_without_read (Rule 13), unused_field (Rule 4). All three
+        // walked the LHS string assuming the path root was a field name
+        // before S5c — variant prefixes confused them.
+        let src = r#"spec MultiVar
+program_id "11111111111111111111111111111111"
+
+type State
+  | Setup of { owner : Pubkey }
+  | Active of {
+      owner : Pubkey,
+      pool  : U64,
+    }
+
+type Error
+  | MathOverflow
+
+handler activate (amount : U64) : State.Setup -> State.Active {
+  auth owner
+  requires amount > 0
+  effect {
+    Active.pool := amount
+  }
+}
+
+property pool_nonneg :
+  state.pool >= 0
+  preserved_by all
+"#;
+        let spec = crate::chumsky_adapter::parse_str(src).expect("parse");
+        let warnings = check_completeness(&spec);
+        let rules: Vec<&str> = warnings.iter().map(|w| w.rule.as_str()).collect();
+
+        assert!(
+            !rules.contains(&"undeclared_state_field_in_effect"),
+            "P7 should not fire on `Active.pool := amount` (Active is a variant, pool is its field) — got: {:?}",
+            rules
+        );
+        assert!(
+            !rules.contains(&"write_without_read"),
+            "write_without_read should match `pool` (read by property) to `Active.pool` (written) — got: {:?}",
+            rules
+        );
+        assert!(
+            !rules.contains(&"unused_field"),
+            "unused_field should see `pool` as modified via `Active.pool := amount` — got: {:?}",
+            rules
+        );
+    }
+
+    #[test]
+    fn variant_prefixed_lhs_still_catches_unknown_field() {
+        // A real bug: `Active.poool := amount` (typo). P7 should fire
+        // with subject `activate.Active.poool` — the variant prefix is
+        // legal, the field name behind it isn't declared anywhere.
+        let src = r#"spec MultiVarTypo
+program_id "11111111111111111111111111111111"
+
+type State
+  | Setup of { owner : Pubkey }
+  | Active of {
+      owner : Pubkey,
+      pool  : U64,
+    }
+
+type Error
+  | MathOverflow
+
+handler activate (amount : U64) : State.Setup -> State.Active {
+  auth owner
+  requires amount > 0
+  effect {
+    Active.poool := amount
+  }
+}
+
+property pool_nonneg :
+  state.pool >= 0
+  preserved_by all
+"#;
+        let spec = crate::chumsky_adapter::parse_str(src).expect("parse");
+        let warnings = check_completeness(&spec);
+        let p7s: Vec<&CompletenessWarning> = warnings
+            .iter()
+            .filter(|w| w.rule == "undeclared_state_field_in_effect")
+            .collect();
+        assert_eq!(
+            p7s.len(),
+            1,
+            "expected exactly one P7 hit on the misspelled `poool`, got: {:?}",
+            warnings.iter().map(|w| &w.rule).collect::<Vec<_>>()
+        );
+        assert!(
+            p7s[0].subject.as_deref().unwrap_or("").contains("poool"),
+            "P7 subject should name the misspelled field, got: {:?}",
+            p7s[0].subject
         );
     }
 

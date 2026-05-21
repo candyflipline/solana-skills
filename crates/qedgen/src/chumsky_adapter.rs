@@ -2240,11 +2240,31 @@ pub fn adapt(spec: &a::Spec) -> ParsedSpec {
                             }
                         }
                     }
+                    // v2.24 S5b: preserve per-variant structure alongside the
+                    // flattened `fields` view. Codegen consumers that want
+                    // real `pub enum` emission read `variants`; the flat
+                    // view stays for back-compat with readers not yet
+                    // migrated. Empty variants (zero-payload constructors
+                    // like `| Inactive`) are kept so the enum can emit
+                    // unit-style variants in v2.24 S5b's codegen pass.
+                    let parsed_variants: Vec<ParsedVariant> = adt
+                        .variants
+                        .iter()
+                        .map(|v| ParsedVariant {
+                            name: v.name.clone(),
+                            fields: v
+                                .fields
+                                .iter()
+                                .map(|f| (f.name.clone(), type_ref_to_string(&f.ty)))
+                                .collect(),
+                        })
+                        .collect();
                     out.account_types.push(ParsedAccountType {
                         name: adt.name.clone(),
                         fields,
                         lifecycle,
                         pda_ref: None,
+                        variants: parsed_variants,
                     });
                 }
             }
