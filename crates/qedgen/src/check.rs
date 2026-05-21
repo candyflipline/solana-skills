@@ -3006,6 +3006,17 @@ pub fn check_completeness(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
         if !op.ensures.is_empty() {
             continue;
         }
+        // v2.24 #12 — a `call X.handler(...)` (CPI) or a declared
+        // `modifies [field, ...]` clause IS the handler's effect.
+        // The lint pre-fix didn't see these and fired
+        // `[P2] missing_effect` on every CPI-only handler (Token
+        // init / metadata create / close shapes), forcing spec
+        // authors to add fictional state writes or accept the noise.
+        // `transfers` blocks are token movements declared at spec
+        // level; same treatment.
+        if !op.calls.is_empty() || !op.transfers.is_empty() || op.modifies.is_some() {
+            continue;
+        }
         // Match-arm aborts: when the parser expands a handler's `match` into
         // synthetic per-arm handlers (`<parent>_case_<N>`, `<parent>_otherwise`)
         // the abort arms have no effect by construction. The qed(verified)
@@ -5874,6 +5885,59 @@ mod tests {
         assert!(
             warnings.iter().any(|w| w.rule == "missing_effect"),
             "expected missing_effect, got: {:?}",
+            warnings.iter().map(|w| &w.rule).collect::<Vec<_>>()
+        );
+    }
+
+    /// v2.24 #12 — `call X.handler(...)` (CPI) or `transfers { … }`
+    /// or `modifies [...]` all count as effect-satisfying. Pre-fix
+    /// the lint required an `effect { … }` block specifically and
+    /// fired on CPI-only handlers (Token init / metadata-create /
+    /// close shapes) where state writes are the wrong abstraction.
+    #[test]
+    fn test_missing_effect_skips_when_handler_has_only_calls() {
+        let mut h = make_handler("init_mint");
+        h.takes_params = vec![("decimals".to_string(), "U64".to_string())];
+        h.guard_str = Some("decimals > 0".to_string());
+        h.calls = vec![ParsedCall {
+            target_interface: "Token".to_string(),
+            target_handler: "initialize_mint".to_string(),
+            args: vec![],
+        }];
+        let spec = ParsedSpec {
+            handlers: vec![h],
+            state_fields: vec![("balance".to_string(), "U64".to_string())],
+            lifecycle_states: vec!["Active".to_string()],
+            ..empty_spec()
+        };
+        let warnings = check_completeness(&spec);
+        assert!(
+            !warnings.iter().any(|w| w.rule == "missing_effect"),
+            "missing_effect should not fire when handler has CPI calls; got: {:?}",
+            warnings.iter().map(|w| &w.rule).collect::<Vec<_>>()
+        );
+    }
+
+    /// v2.24 #12 — `modifies [field, ...]` is the frame-condition
+    /// shape used by handlers whose effect is "writes one or more of
+    /// these fields but in a way the spec doesn't model further".
+    /// Pre-fix the lint demanded a full `effect { … }` block.
+    #[test]
+    fn test_missing_effect_skips_when_handler_has_modifies() {
+        let mut h = make_handler("opaque_update");
+        h.takes_params = vec![("payload".to_string(), "U64".to_string())];
+        h.guard_str = Some("payload > 0".to_string());
+        h.modifies = Some(vec!["balance".to_string()]);
+        let spec = ParsedSpec {
+            handlers: vec![h],
+            state_fields: vec![("balance".to_string(), "U64".to_string())],
+            lifecycle_states: vec!["Active".to_string()],
+            ..empty_spec()
+        };
+        let warnings = check_completeness(&spec);
+        assert!(
+            !warnings.iter().any(|w| w.rule == "missing_effect"),
+            "missing_effect should not fire when handler declares `modifies`; got: {:?}",
             warnings.iter().map(|w| &w.rule).collect::<Vec<_>>()
         );
     }
