@@ -5015,6 +5015,19 @@ fn check_map_and_subscript(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
 
     let const_names: HashSet<&str> = spec.constants.iter().map(|(n, _)| n.as_str()).collect();
     let record_names: HashSet<&str> = spec.records.iter().map(|r| r.name.as_str()).collect();
+    // v2.24 #20 — enum-typed Map bounds (`Map[AddressField] T`) where
+    // the bound names a sum type that has only unit (no-payload)
+    // variants. One slot per variant — the natural shape for
+    // per-variant PDAs (e.g. one AddressUpdateProposal per
+    // AddressField). Mixed-variant sums (some payload, some unit)
+    // are rejected by the second pass so the slot shape stays
+    // homogeneous.
+    let unit_only_sum_names: HashSet<&str> = spec
+        .sum_types
+        .iter()
+        .filter(|s| s.variants.iter().all(|v| v.fields.is_empty()))
+        .map(|s| s.name.as_str())
+        .collect();
 
     // Collect Map-typed fields across all account types, keyed by field name.
     let mut map_fields: HashMap<&str, (&str, &str, &str)> = HashMap::new(); // field → (owner, bound, inner)
@@ -5022,18 +5035,19 @@ fn check_map_and_subscript(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
     for acct in &spec.account_types {
         for (fname, ftype) in &acct.fields {
             if let FieldTypeShape::Map { bound, inner } = classify_field_type(ftype) {
-                // Rule: bound must be a declared const
-                if !const_names.contains(bound) {
+                // Rule: bound must be a declared const OR a unit-only
+                // sum type (v2.24 #20).
+                if !const_names.contains(bound) && !unit_only_sum_names.contains(bound) {
                     warnings.push(CompletenessWarning {
                         rule: "map_bound_not_const".to_string(),
                         severity: Severity::Error,
                         priority: 0,
                         message: format!(
-                            "field '{}.{}' uses Map[{}] but '{}' is not declared as `const`",
+                            "field '{}.{}' uses Map[{}] but '{}' is neither a declared `const` nor a unit-only enum type",
                             acct.name, fname, bound, bound
                         ),
                         subject: Some(fname.clone()),
-                        fix: format!("Add `const {} = <size>` at the top of the spec", bound),
+                        fix: format!("Add `const {} = <size>` or declare `type {} | Variant1 | Variant2 | …` at the top of the spec", bound, bound),
                         example: Some(format!("  const {} = 1024", bound)),
                         counterexample: None,
                         fix_options: vec![],

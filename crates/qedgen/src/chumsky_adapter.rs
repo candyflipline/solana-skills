@@ -1218,13 +1218,20 @@ fn path_to_rust(p: &a::Path, _ctx: Ctx, consts: ConstTable, opts: RustOpts<'_, '
 /// in any record or state ADT variant anywhere in `spec`. Sum types that
 /// qualify get inductive Lean codegen; other ADTs stay on the flatten path.
 fn is_map_value_sum_type(name: &str, spec: &a::Spec) -> bool {
-    // Check all record fields and ADT variant fields for `Map[N] <name>`.
-    fn type_ref_uses_map_value(t: &a::TypeRef, name: &str) -> bool {
+    // Check all record fields and ADT variant fields for `Map[N] <name>`,
+    // OR — v2.24 #20 — `Map[<name>] T` (enum used as key).
+    fn type_ref_mentions(t: &a::TypeRef, name: &str) -> bool {
         match t {
-            a::TypeRef::Map { inner, .. } => match inner.as_ref() {
-                a::TypeRef::Named(n) => n == name,
-                _ => false,
-            },
+            a::TypeRef::Map { inner, bound } => {
+                // Used as the Map's VALUE (pre-fix sole condition)
+                let value_match = matches!(inner.as_ref(), a::TypeRef::Named(n) if n == name);
+                // v2.24 #20 — used as the Map's KEY (the bound). The
+                // bound is stored as a raw ident string; resolution
+                // happens later, so a bare name match is the
+                // routing signal.
+                let key_match = bound == name;
+                value_match || key_match
+            }
             _ => false,
         }
     }
@@ -1232,7 +1239,7 @@ fn is_map_value_sum_type(name: &str, spec: &a::Spec) -> bool {
         match node {
             TopItem::Record(r) => {
                 for f in &r.fields {
-                    if type_ref_uses_map_value(&f.ty, name) {
+                    if type_ref_mentions(&f.ty, name) {
                         return true;
                     }
                 }
@@ -1240,7 +1247,7 @@ fn is_map_value_sum_type(name: &str, spec: &a::Spec) -> bool {
             TopItem::Adt(adt) => {
                 for v in &adt.variants {
                     for f in &v.fields {
-                        if type_ref_uses_map_value(&f.ty, name) {
+                        if type_ref_mentions(&f.ty, name) {
                             return true;
                         }
                     }
@@ -3271,6 +3278,50 @@ mod tests {
 
     const PERCOLATOR_SPEC: &str =
         include_str!("../../../examples/rust/percolator/percolator.qedspec");
+
+    /// v2.24 #20 — `Map[<EnumType>] T` is recognized when the bound
+    /// names a unit-only enum (sum type whose variants all have no
+    /// payload). Pre-fix the `map_bound_not_const` lint hard-errored
+    /// because only `const` bounds were accepted; spec authors with
+    /// one-PDA-per-enum-variant patterns (e.g. Hylo's
+    /// AddressUpdateProposal per AddressField) had to fall back to
+    /// per-variant flat fields.
+    #[test]
+    fn map_keyed_by_enum_routes_to_sum_types() {
+        let src = r#"spec EnumMap
+program_id "11111111111111111111111111111111"
+
+type AddressField
+  | Owner
+  | Manager
+  | Treasury
+
+type ProposalSlot = { proposed : Pubkey, deadline : U64, }
+
+type State
+  | Active of {
+      proposals : Map[AddressField] ProposalSlot,
+    }
+
+type Error
+  | NoMatch
+"#;
+        let spec = parse_str(src).expect("parse");
+        // AddressField should route to sum_types (not account_types)
+        // because it's used as a Map key.
+        let has_sum = spec.sum_types.iter().any(|s| s.name == "AddressField");
+        assert!(
+            has_sum,
+            "AddressField should land in sum_types when used as a Map key; got sum_types: {:?}",
+            spec.sum_types.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        // And the unit-only check passes (all variants payload-free).
+        let af = spec.sum_types.iter().find(|s| s.name == "AddressField").unwrap();
+        assert!(
+            af.variants.iter().all(|v| v.fields.is_empty()),
+            "AddressField should be unit-only"
+        );
+    }
 
     /// v2.24 #9 — `call Interface.handler(...)` is now legal inside
     /// a match arm body, alongside `abort` / `effect`. The expander
