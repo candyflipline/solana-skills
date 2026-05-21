@@ -20,6 +20,7 @@ mod crucible_gen;
 mod crucible_probe;
 mod deps;
 mod drift;
+mod feedback;
 mod fill;
 mod fingerprint;
 mod handler_intent;
@@ -908,6 +909,51 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+
+    /// File a GitHub issue with the last failure's context.
+    ///
+    /// Bundles qedgen version, OS/arch, detected runtime, the most recent
+    /// command's stderr (from `.qed/last-error.log`), and the relevant
+    /// `.qedspec` excerpt into a Markdown body. Writes a local copy to
+    /// `.qed/feedback/<timestamp>.md`, previews the issue, asks for
+    /// confirmation, then files via `gh issue create` (falling back to a
+    /// pre-filled GitHub URL if `gh` is unavailable). Override the target
+    /// repo with `QEDGEN_FEEDBACK_REPO=owner/repo`.
+    Feedback {
+        /// Free-form description of what happened. Appears at the top of
+        /// the issue body. Helpful but not required — defaults to a
+        /// "describe what happened" placeholder when omitted.
+        #[arg(long)]
+        note: Option<String>,
+
+        /// Override the auto-derived issue title (default: "[qedgen
+        /// <version>] <command> failed: <first-stderr-line>").
+        #[arg(long)]
+        title: Option<String>,
+
+        /// Path to the `.qedspec` to excerpt. Default: parse the spec
+        /// path out of the last error's stderr, or fall back to the
+        /// single `.qedspec` in the current directory.
+        #[arg(long)]
+        spec: Option<PathBuf>,
+
+        /// Render the title and body to stdout and exit. No local
+        /// artifact, no remote submission. Useful for piping into other
+        /// tools.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Skip the interactive confirmation prompt and submit straight
+        /// away. Required in non-interactive shells (CI) — without it the
+        /// submit defaults to no.
+        #[arg(long)]
+        yes: bool,
+
+        /// Suppress the post-submit browser open when falling back to the
+        /// pre-filled URL. The URL is still printed to stdout.
+        #[arg(long)]
+        no_open: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1481,8 +1527,53 @@ fn narrow_shank_handler(
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    let command_name = command_name_of(&cli.command).to_string();
+    let cwd_for_capture = std::env::current_dir().ok();
 
-    match cli.command {
+    let result = dispatch(cli.command).await;
+
+    // Persist the failing command's stderr so the next `qedgen feedback`
+    // invocation has real context to bundle. Skip when `feedback` itself
+    // is what failed — overwriting the error it would have reported on
+    // is exactly the wrong outcome.
+    if command_name != "feedback" {
+        if let (Err(e), Some(cwd)) = (result.as_ref(), cwd_for_capture.as_ref()) {
+            let _ = feedback::capture_last_error(cwd, &command_name, e);
+        }
+    }
+
+    result
+}
+
+/// Top-level subcommand name for telemetry and the last-error log
+/// header. Aristotle's sub-verbs collapse to the single `"aristotle"`
+/// label — that's the user-facing surface they invoked.
+fn command_name_of(c: &Commands) -> &'static str {
+    match c {
+        Commands::Generate { .. } => "generate",
+        Commands::FillSorry { .. } => "fill-sorry",
+        Commands::Adapt { .. } => "adapt",
+        Commands::Interface { .. } => "interface",
+        Commands::Probe { .. } => "probe",
+        Commands::Ratify { .. } => "ratify",
+        Commands::Spec { .. } => "spec",
+        Commands::Consolidate { .. } => "consolidate",
+        Commands::Asm2Lean { .. } => "asm2lean",
+        Commands::Setup { .. } => "setup",
+        Commands::Init { .. } => "init",
+        Commands::Check { .. } => "check",
+        Commands::Verify { .. } => "verify",
+        Commands::Readiness { .. } => "readiness",
+        Commands::CheckUpgrade { .. } => "check-upgrade",
+        Commands::Codegen { .. } => "codegen",
+        Commands::Aristotle(_) => "aristotle",
+        Commands::Reconcile { .. } => "reconcile",
+        Commands::Feedback { .. } => "feedback",
+    }
+}
+
+async fn dispatch(cmd: Commands) -> Result<()> {
+    match cmd {
         Commands::Generate {
             prompt_file,
             output_dir,
@@ -2952,6 +3043,27 @@ async fn main() -> Result<()> {
             if report.has_drift() {
                 std::process::exit(1);
             }
+        }
+
+        // ==================================================================
+        // feedback — bundle last-error context into a GitHub issue
+        // ==================================================================
+        Commands::Feedback {
+            note,
+            title,
+            spec,
+            dry_run,
+            yes,
+            no_open,
+        } => {
+            feedback::run(
+                spec.as_deref(),
+                note.as_deref(),
+                title.as_deref(),
+                dry_run,
+                yes,
+                no_open,
+            )?;
         }
     }
 

@@ -415,6 +415,23 @@ qedgen consolidate \
   --output-dir my_program/formal_verification
 ```
 
+### File feedback as a GitHub issue
+
+When `check`, `codegen`, or `verify` fails in a way you didn't expect — or you're stuck and want a maintainer to see your context — `qedgen feedback` bundles the last command's stderr, your environment, and the relevant `.qedspec` excerpt into a GitHub issue.
+
+```bash
+# Walk you through filing the last failure as an issue.
+qedgen feedback --note "lint flags MathOverflow but my spec already declares it"
+
+# Print the title/body to stdout without filing anything.
+qedgen feedback --dry-run
+
+# Skip the interactive prompt (CI, scripts).
+qedgen feedback --yes
+```
+
+Submits via `gh issue create` if you're logged into GitHub CLI; otherwise prints a pre-filled URL. Override the target repo with `QEDGEN_FEEDBACK_REPO=owner/repo` (forks, internal mirrors). A local copy is always written to `.qed/feedback/<timestamp>.md` so nothing is lost if you skip the remote step.
+
 ### Generate CI workflow
 
 ```bash

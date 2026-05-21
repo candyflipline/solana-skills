@@ -79,6 +79,15 @@ LEARNINGS_*.md
 # not.
 .qed/findings/
 
+# Transient feedback artifacts. `qedgen feedback` writes local drafts to
+# `.qed/feedback/<ts>.md` before submission; `main()`'s error path captures
+# the most recent failure's stderr to `.qed/last-error.{log,json}` so the
+# next `qedgen feedback` invocation has context. Both are user-machine
+# state, not repo content. (`*.log` above already covers .log; the JSON
+# and the feedback directory need explicit entries.)
+.qed/feedback/
+.qed/last-error.json
+
 # Local agent/editor state
 .agents/
 .claude/

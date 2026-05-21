@@ -213,9 +213,52 @@ demonstrating the end-to-end flow.
   Demo asymmetry — "red then green" not "stays green" — documented
   in README and the release-gate context note.
 
+### Slice 9 — Structured feedback (`qedgen feedback`)
+
+Last-mile addition: when users hit qedgen itself (parser errors,
+codegen regressions, lint false-positives they can't work around),
+they need a way to surface that to maintainers without losing the
+context.
+
+- **`qedgen feedback` subcommand.** Bundles qedgen version, OS/arch,
+  detected runtime, the most recent failure's stderr, and a
+  `.qedspec` excerpt centered on the parsed line hint into a Markdown
+  body. Writes a local copy to `.qed/feedback/<timestamp>.md`
+  (silent, per `[[feedback_tactile_tooling]]`), previews the issue,
+  asks for explicit y/N before submitting. Submits via
+  `gh issue create` when available; falls back to a pre-filled
+  GitHub URL otherwise. Repo overridable via `QEDGEN_FEEDBACK_REPO`.
+
+- **Automatic last-error capture.** `main()`'s error path writes the
+  failing command's name + stderr to `.qed/last-error.{log,json}`.
+  No user action required; the next `qedgen feedback` invocation
+  reads these automatically. Self-skip on `feedback` itself so a
+  failing feedback run doesn't overwrite the error it was supposed
+  to report.
+
+- **Flags.** `--note <text>` (free-form description), `--title <text>`
+  (override the auto-derived title), `--spec <path>` (excerpt
+  override), `--dry-run` (stdout only — no local artifact, no remote
+  submit), `--yes` (skip the interactive prompt; required in
+  non-interactive shells), `--no-open` (suppress the browser open on
+  URL fallback).
+
+- **Agent guidance.** `references/skill-operations.md` gains a
+  "Filing Feedback" section: agent suggests `qedgen feedback`
+  proactively when the same lint/codegen error fires twice without
+  progress, on internal qedgen errors / panics, or on conversational
+  frustration signals. Skip when the failure is clearly user-side.
+
 ## What's not in (carries to follow-up)
 
-(None — Slice 8 sub-slices S8.1–S8.4 all shipped above.)
+- **Per-effect overflow error names.** `pool += amount or LstAdditionOverflow`
+  syntax and `pragma checked_overflow_error = …` default were proposed
+  alongside Slice 9 and deferred to v2.24 (see
+  `[[project_v224_per_effect_errors]]`). Today's codegen continues to
+  emit `<ProgramName>Error::MathOverflow` for every checked effect;
+  the existing `MathOverflow`-must-be-declared lint stays in place.
+
+Slice 8 sub-slices S8.1–S8.4 all shipped above.
 
 ## Migration
 
