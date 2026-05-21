@@ -104,6 +104,7 @@ fn empty_handler(name: String) -> ParsedHandler {
         aborts_total: false,
         permissionless: true,
         effects: vec![],
+        effect_on_error: vec![],
         accounts: vec![],
         transfers: vec![],
         emits: vec![],

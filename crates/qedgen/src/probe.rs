@@ -1684,6 +1684,7 @@ mod tests {
             aborts_total: false,
             permissionless,
             effects: vec![],
+            effect_on_error: vec![],
             accounts: vec![],
             transfers: vec![],
             emits: vec![],

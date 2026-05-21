@@ -117,6 +117,13 @@ pub enum TopItem {
     /// inference reads `ParsedSpec.pragmas` — presence of `sbpf` selects
     /// the assembly target with no explicit `target` keyword.
     Pragma(PragmaDecl),
+    /// `pragma <name> = <ident>` — top-level key=value assignment. v2.24
+    /// introduces this for `checked_overflow_error = MintOverflow` /
+    /// `checked_underflow_error = BurnUnderflow`, which override the
+    /// built-in `MathOverflow` / `MathUnderflow` defaults that
+    /// `mechanize_effect` lowers `+=` / `-=` against. Per-effect `or
+    /// <Variant>` (see `EffectStmt.on_error`) still wins over the pragma.
+    PragmaAssign { name: String, value: String },
 }
 
 /// Platform-specific namespace. Parser accepts arbitrary `TopItem`s inside;
@@ -492,6 +499,17 @@ pub struct EffectStmt {
     pub lhs: Path,
     pub op: EffectOp,
     pub rhs: Node<Expr>,
+    /// v2.24 §S1a — per-site error-variant override on checked `+=` / `-=`.
+    /// `pool += amount else MintOverflow` parses with `on_error =
+    /// Some("MintOverflow")`. The keyword is `else` (same as `requires X
+    /// else Err`), not `or` — `or` would collide with the boolean infix
+    /// `or` already parsed by `expr()`. None means "fall back to the
+    /// `pragma checked_overflow_error` / `pragma checked_underflow_error`
+    /// default, then the built-in `MathOverflow` / `MathUnderflow`."
+    /// Always None for saturating (`+=!`) / wrapping (`+=?`) / `Set` —
+    /// those can't fail, so the adapter drops any override even if the
+    /// parser captured one.
+    pub on_error: Option<String>,
 }
 
 /// v2.20 §S1.2 — a single statement inside `effect { … }`. Either a leaf

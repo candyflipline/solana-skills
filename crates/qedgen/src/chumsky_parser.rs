@@ -1060,13 +1060,31 @@ fn effect_stmt<'a>() -> impl Parser<'a, &'a str, EffectStmt, Err<'a>> + Clone {
         just(":=").to(EffectOp::Set),
         just('=').to(EffectOp::Set),
     ));
+    // v2.24 §S1a — optional `else <Variant>` suffix on checked `+=` / `-=`.
+    // Saturating / wrapping variants reject this at the AST-build stage
+    // (they can't fail). The keyword is `else` — same shape as `requires
+    // <expr> else <Err>` — chosen over the gist's suggested `or` because
+    // `or` conflicts with the boolean infix `or` inside `expr()`. Adapter
+    // / lint enforce per-op applicability; parser stays permissive so the
+    // error message points at the postfix, not at `else`.
+    let on_error = just("else")
+        .then_ignore(wsc())
+        .ignore_then(non_keyword_ident())
+        .or_not();
     path()
         .then_ignore(wsc())
         .then(op)
         .then_ignore(wsc())
         .then(expr())
         .then_ignore(wsc())
-        .map(|((lhs, op), rhs)| EffectStmt { lhs, op, rhs })
+        .then(on_error)
+        .then_ignore(wsc())
+        .map(|(((lhs, op), rhs), on_error)| EffectStmt {
+            lhs,
+            op,
+            rhs,
+            on_error,
+        })
 }
 
 /// v2.20 §S1.2 — one item inside an `effect { … }` body: either a leaf
@@ -2331,6 +2349,24 @@ fn pragma_decl<'a>() -> impl Parser<'a, &'a str, TopItem, Err<'a>> + Clone {
         .map(|((doc, name), items)| TopItem::Pragma(PragmaDecl { name, doc, items }))
 }
 
+/// v2.24 §S1b — `pragma <key> = <value>` top-level assignment.
+///
+/// Currently used for `checked_overflow_error` / `checked_underflow_error`
+/// to override the built-in `MathOverflow` / `MathUnderflow` defaults that
+/// `mechanize_effect` lowers `+=` / `-=` against. Distinct grammar from
+/// the existing `pragma <name> { … }` namespace form — disambiguated by
+/// lookahead on `=` vs `{` at the call site. Unknown keys parse but are
+/// flagged at lint time so we can add new keys without breaking specs.
+fn pragma_assign_decl<'a>() -> impl Parser<'a, &'a str, TopItem, Err<'a>> + Clone {
+    kw("pragma")
+        .ignore_then(non_keyword_ident())
+        .then_ignore(wsc())
+        .then_ignore(just('='))
+        .then_ignore(wsc())
+        .then(non_keyword_ident())
+        .map(|(name, value)| TopItem::PragmaAssign { name, value })
+}
+
 // ----------------------------------------------------------------------------
 // import <Name> from "<dep_key>" — manifest-based import (v2.8 G1).
 //
@@ -2383,7 +2419,16 @@ fn top_item<'a>() -> impl Parser<'a, &'a str, Node<TopItem>, Err<'a>> + Clone {
     // sugar are platform-specific and only parse inside
     // `pragma sbpf { ... }`. Use `type Error | A | B | ...` for errors at
     // the core-DSL level. The platform-agnostic top level is the point.
-    let group_c = choice((interface_decl(), pragma_decl(), import_decl()));
+    // pragma_assign_decl tried before pragma_decl: both start with `kw("pragma")
+    // <ident>` and diverge on `=` (assign) vs `{` (namespace). chumsky's
+    // choice() backtracks on parse failure, so the assign branch fails fast
+    // on `{` and the namespace branch picks up.
+    let group_c = choice((
+        interface_decl(),
+        pragma_assign_decl(),
+        pragma_decl(),
+        import_decl(),
+    ));
     choice((group_a, group_b, group_c)).map_with(|item, e| Node::new(item, e.span().into_range()))
 }
 
@@ -2816,6 +2861,7 @@ property conservation :
                 TopItem::Instruction(_) => "instruction",
                 TopItem::Interface(_) => "interface",
                 TopItem::Pragma(_) => "pragma",
+                TopItem::PragmaAssign { .. } => "pragma_assign",
                 TopItem::Import { .. } => "import",
             })
             .fold(

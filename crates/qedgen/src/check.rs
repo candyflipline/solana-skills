@@ -214,6 +214,13 @@ pub struct ParsedOperation {
     pub has_effect: bool,
     pub takes_params: Vec<(String, String)>,
     pub effects: Vec<(String, String, String)>,
+    /// v2.24 §S1a — per-site `or <ErrorVariant>` overrides, parallel to
+    /// `effects`. `effect_on_error[i]` is the override for `effects[i]`.
+    /// `None` for effects without an explicit `or` (and for all
+    /// saturating / wrapping / `Set` effects, where overrides are
+    /// meaningless). Parallel array (not extended tuple) keeps the ~30
+    /// existing destructure sites untouched.
+    pub effect_on_error: Vec<Option<String>>,
     pub calls_accounts: Vec<(String, String)>,
     pub calls_discriminator: Option<String>,
     pub emits: Vec<String>,
@@ -518,6 +525,9 @@ pub struct ParsedHandler {
     /// "add"/"sub" are the checked defaults (v2.7 G3); `_sat` / `_wrap` tags
     /// carry the explicit saturating / wrapping opt-in from `+=!` / `+=?`.
     pub effects: Vec<(String, String, String)>,
+    /// v2.24 §S1a — per-site `or <ErrorVariant>` overrides, parallel to
+    /// `effects`. See `ParsedOperation::effect_on_error`.
+    pub effect_on_error: Vec<Option<String>>,
     /// IDL-level account descriptors.
     pub accounts: Vec<ParsedHandlerAccount>,
     /// Token transfer intents.
@@ -571,6 +581,14 @@ pub struct ParsedEffectArm {
     /// `true` for a wildcard arm.
     pub is_wildcard: bool,
     pub effects: Vec<(String, String, String)>,
+    /// v2.24 §S1a — per-site `or <ErrorVariant>` overrides, parallel to
+    /// `effects`. See `ParsedOperation::effect_on_error`. Populated for
+    /// symmetry with the union view, but no consumer currently reads it
+    /// at the arm level — Anchor codegen reads the flat `ParsedHandler
+    /// .effect_on_error` (mirror union), and proptest/kani don't lower
+    /// error variants.
+    #[allow(dead_code)]
+    pub effect_on_error: Vec<Option<String>>,
 }
 
 /// A resolved `call Target.handler(...)` site inside a handler body. The
@@ -1000,6 +1018,20 @@ pub struct ParsedSpec {
     /// platform-scoped feature flags in backends.
     pub pragmas: Vec<String>,
 
+    /// v2.24 §S1b — `pragma <key> = <value>` top-level assignments. Stored
+    /// as `(key, value)` so new keys don't require ParsedSpec edits. Current
+    /// known keys:
+    ///
+    /// - `checked_overflow_error`  — variant name to use as the error
+    ///   variant when checked `+=` overflows. Overrides the built-in
+    ///   `MathOverflow` default.
+    /// - `checked_underflow_error` — variant name to use when checked `-=`
+    ///   underflows. Overrides the built-in `MathUnderflow` default.
+    ///
+    /// Lookup goes through `ParsedSpec::pragma_value(key)`. Per-site
+    /// `EffectStmt.on_error` still wins over the pragma.
+    pub pragma_assignments: Vec<(String, String)>,
+
     /// Uninterpreted helper functions referenced by name in
     /// `requires` / `ensures` / effect-RHS / property bodies but not
     /// declared structurally in the spec. For each, we capture an
@@ -1025,6 +1057,15 @@ impl ParsedSpec {
     /// Quasar/Anchor (the default). Single source of truth.
     pub fn is_assembly_target(&self) -> bool {
         self.has_pragma("sbpf")
+    }
+
+    /// v2.24 §S1b — look up a `pragma <key> = <value>` assignment.
+    /// Returns the value as `&str` if present, `None` otherwise.
+    pub fn pragma_value(&self, key: &str) -> Option<&str> {
+        self.pragma_assignments
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
     }
 }
 
@@ -2276,6 +2317,27 @@ pub fn check_completeness(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
                     continue;
                 }
 
+                // v2.24 §S2c: cumulative bound. The user wrote a guard like
+                // `requires state.x + a + b <= U64_MAX`, which logically
+                // bounds both `state.x += a` and `state.x += b` in the
+                // same block, but the strict per-pair patterns above only
+                // match the first additive term. Accept the guard when
+                // the field appears in an additive expression *and* the
+                // effect's RHS appears as a bare word elsewhere in the
+                // same guard string — captures cumulative bounds without
+                // re-parsing the guard.
+                let field_in_add = [
+                    format!("state.{} +", field),
+                    format!("s.{} +", field),
+                    format!("+ state.{}", field),
+                    format!("+ s.{}", field),
+                ]
+                .iter()
+                .any(|pat| all_guards.contains(pat.as_str()));
+                if field_in_add && contains_word(&all_guards, val) {
+                    continue;
+                }
+
                 let field_type = find_field_type(spec, op, field);
                 let type_max = match field_type.as_deref() {
                     Some("U8") => "U8_MAX (255)",
@@ -2708,6 +2770,16 @@ pub fn check_completeness(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
             for (lhs, _kind, _rhs) in &op.effects {
                 let root = strip_root(lhs);
                 if root.is_empty() || declared.contains(&root) {
+                    continue;
+                }
+                // v2.24 §S2b: `state := <expr>` is the variant-promotion /
+                // whole-record-assignment form (e.g.
+                // `state := .Active { … }`). `state` here is a binder,
+                // not a field name — flagging it as "undeclared field"
+                // is the false positive surfaced in the v2.22 gist (#2).
+                // The RHS check below still scrutinizes any field
+                // references inside the variant payload.
+                if root == "state" {
                     continue;
                 }
                 // Synthetic handlers (`_case_N`, `_otherwise`) inherit
@@ -3371,6 +3443,11 @@ pub fn check_completeness(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
     // at `qedgen check` rather than at `cargo build`.
     warnings.extend(check_checked_arith_needs_math_overflow(spec));
 
+    // v2.24 §S1d — per-site `or X` overrides or `pragma checked_overflow_error
+    // = X` / `pragma checked_underflow_error = X` referencing variants that
+    // aren't declared in `type Error | …` would also fail cargo build.
+    warnings.extend(check_unknown_error_variant(spec));
+
     // v2.16: opt-in non-default arithmetic (`+=?` / `-=?` wrapping or `+=!`
     // / `-=!` saturating) is a spec-authoring concern that needs surfacing
     // but isn't reproducible from the spec alone. Demoted from `qedgen
@@ -3715,45 +3792,171 @@ fn make_old_in_single_state_warning(
 
 /// v2.8 F8: emit a `[missing_math_overflow]` warning when a spec uses
 /// checked arithmetic effects (`+=` / `-=` lower to `checked_add` /
-/// `checked_sub`, which return `<ProgramName>Error::MathOverflow` on
-/// overflow) but the spec's `type Error | …` block doesn't declare a
-/// `MathOverflow` variant. Without the declaration, `cargo build` of
-/// the generated code fails with "unknown variant MathOverflow". Surfacing
-/// this at lint time keeps the pre-flight cycle tight.
+/// `checked_sub`, which return `<ProgramName>Error::MathOverflow` /
+/// `::MathUnderflow` on overflow) but the spec's `type Error | …` block
+/// doesn't declare the variant the lowering would reference. Without the
+/// declaration, `cargo build` of the generated code fails with "unknown
+/// variant". Surfacing this at lint time keeps the pre-flight cycle tight.
+///
+/// v2.24 §S1c: extended to consider per-effect overrides (`pool += x or X`)
+/// and pragma defaults (`pragma checked_overflow_error = X`). When an
+/// override or pragma is set, this lint defers to
+/// `check_unknown_error_variant`. The back-compat fallback (spec declares
+/// `MathOverflow` but not `MathUnderflow` → `-=` raises `MathOverflow`)
+/// is honored here so existing specs continue to lint-clean.
 fn check_checked_arith_needs_math_overflow(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
-    let has_math_overflow = spec.error_codes.iter().any(|c| c == "MathOverflow");
-    if has_math_overflow {
+    let has_decl = |name: &str| spec.error_codes.iter().any(|c| c == name);
+    let has_overflow = has_decl("MathOverflow");
+    let has_underflow = has_decl("MathUnderflow");
+    let pragma_overflow = spec.pragma_value("checked_overflow_error");
+    let pragma_underflow = spec.pragma_value("checked_underflow_error");
+
+    // Collect handlers whose builtin-default lowering would reference a
+    // variant the spec didn't declare. Per-site overrides skip this lint
+    // (their variant check lives in `check_unknown_error_variant`).
+    let mut missing: std::collections::BTreeSet<&'static str> =
+        std::collections::BTreeSet::new();
+    let mut handlers_missing: Vec<String> = Vec::new();
+
+    for h in &spec.handlers {
+        let mut handler_fires = false;
+        for (idx, (_, op_kind, _)) in h.effects.iter().enumerate() {
+            let on_error = h.effect_on_error.get(idx).and_then(|o| o.as_deref());
+            if on_error.is_some() {
+                continue; // per-site override handled elsewhere
+            }
+            match op_kind.as_str() {
+                "add" => {
+                    if pragma_overflow.is_some() {
+                        continue;
+                    }
+                    if !has_overflow {
+                        missing.insert("MathOverflow");
+                        handler_fires = true;
+                    }
+                }
+                "sub" => {
+                    if pragma_underflow.is_some() {
+                        continue;
+                    }
+                    // S1c back-compat: declared MathOverflow but not
+                    // MathUnderflow → `-=` falls back to MathOverflow. Spec
+                    // is fine; don't fire.
+                    if has_underflow {
+                        continue;
+                    }
+                    if has_overflow {
+                        continue; // back-compat path
+                    }
+                    missing.insert("MathUnderflow");
+                    handler_fires = true;
+                }
+                _ => {}
+            }
+        }
+        if handler_fires {
+            handlers_missing.push(h.name.clone());
+        }
+    }
+
+    if missing.is_empty() {
         return Vec::new();
     }
-    let handlers_with_checked: Vec<String> = spec
-        .handlers
+    let names = handlers_missing.join(", ");
+    let variants_list: Vec<String> = missing.iter().map(|s| s.to_string()).collect();
+    let variants = variants_list.join(" / ");
+    let fix_block = variants_list
         .iter()
-        .filter(|h| {
-            h.effects
-                .iter()
-                .any(|(_, op_kind, _)| op_kind == "add" || op_kind == "sub")
-        })
-        .map(|h| h.name.clone())
-        .collect();
-    if handlers_with_checked.is_empty() {
-        return Vec::new();
-    }
-    let names = handlers_with_checked.join(", ");
+        .map(|v| format!("      | {}", v))
+        .collect::<Vec<_>>()
+        .join("\n");
     vec![CompletenessWarning {
         rule: "missing_math_overflow".to_string(),
         severity: Severity::Warning,
         priority: 2,
         message: format!(
-            "handler(s) [{}] use checked-arithmetic effects (`+=` / `-=`), but `type Error` doesn't declare a `MathOverflow` variant. The generated Rust references `{}Error::MathOverflow` and won't compile without it.",
+            "handler(s) [{}] use checked-arithmetic effects (`+=` / `-=`), but `type Error` doesn't declare a `{}` variant. The generated Rust references `{}Error::{}` and won't compile without it.",
             names,
+            variants,
             crate::codegen::to_pascal_case(&spec.program_name),
+            variants,
         ),
         subject: None,
-        fix: "Add `MathOverflow` to your `type Error | …` block. Example:\n\n    type Error\n      | MathOverflow\n      | …\n\nOr opt out of checked semantics per-effect with `+=!` (saturating) or `+=?` (wrapping).".to_string(),
+        fix: format!(
+            "Add `{}` to your `type Error | …` block. Example:\n\n    type Error\n{}\n      | …\n\nOr opt out of checked semantics per-effect with `+=!` (saturating) or `+=?` (wrapping), or override the variant inline with `pool += amount else MyVariant`.",
+            variants, fix_block,
+        ),
         example: None,
         counterexample: None,
         fix_options: vec![],
     }]
+}
+
+/// v2.24 §S1d — fire `unknown_error_variant` when a per-site `or X` override
+/// or a `pragma checked_overflow_error = X` / `pragma checked_underflow_error
+/// = X` references a variant that isn't declared in `type Error | …`.
+/// Without the declaration, the generated Rust references
+/// `<ProgramName>Error::X` and won't compile.
+fn check_unknown_error_variant(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
+    let has_decl = |name: &str| spec.error_codes.iter().any(|c| c == name);
+    let mut warnings = Vec::new();
+
+    // Pragma references — fire once per pragma, not once per handler.
+    for (key, value) in &spec.pragma_assignments {
+        if (key == "checked_overflow_error" || key == "checked_underflow_error")
+            && !has_decl(value)
+        {
+            warnings.push(CompletenessWarning {
+                rule: "unknown_error_variant".to_string(),
+                severity: Severity::Warning,
+                priority: 2,
+                message: format!(
+                    "`pragma {} = {}` references a variant absent from `type Error | …`. Generated Rust references `{}Error::{}` and won't compile.",
+                    key,
+                    value,
+                    crate::codegen::to_pascal_case(&spec.program_name),
+                    value,
+                ),
+                subject: Some(value.clone()),
+                fix: format!(
+                    "Add `{}` to your `type Error | …` block, drop the pragma, or replace it with a declared variant name.",
+                    value,
+                ),
+                example: None,
+                counterexample: None,
+                fix_options: vec![],
+            });
+        }
+    }
+
+    // Per-site `or X` references.
+    for h in &spec.handlers {
+        for on_error in h.effect_on_error.iter().flatten() {
+            if !has_decl(on_error) {
+                warnings.push(CompletenessWarning {
+                    rule: "unknown_error_variant".to_string(),
+                    severity: Severity::Warning,
+                    priority: 2,
+                    message: format!(
+                        "handler '{}' has an effect with `else {}` referencing a variant absent from `type Error | …`. Generated Rust references `{}Error::{}` and won't compile.",
+                        h.name,
+                        on_error,
+                        crate::codegen::to_pascal_case(&spec.program_name),
+                        on_error,
+                    ),
+                    subject: Some(h.name.clone()),
+                    fix: format!(
+                        "Add `{}` to your `type Error | …` block, drop the `else {}` suffix to fall back to the default, or use a declared variant.",
+                        on_error, on_error,
+                    ),
+                    example: None,
+                    counterexample: None,
+                    fix_options: vec![],
+                });
+            }
+        }
+    }
+    warnings
 }
 
 /// `[wrapping_arithmetic]` / `[saturating_arithmetic]` — handler effect uses
@@ -5429,6 +5632,7 @@ mod tests {
             aborts_total: false,
             permissionless: false,
             effects: vec![],
+            effect_on_error: vec![],
             accounts: vec![],
             transfers: vec![],
             emits: vec![],
@@ -6987,6 +7191,142 @@ handler clear : State.Active -> State.Active {
         );
     }
 
+    // ----- v2.24 §S1c: -= raises MathUnderflow (with back-compat) -----
+
+    #[test]
+    fn missing_math_overflow_fires_on_sub_without_underflow_or_overflow() {
+        // Pure `-=` use with neither MathOverflow nor MathUnderflow declared
+        // → fires for MathUnderflow (the v2.24 default for `-=`).
+        let spec = crate::chumsky_adapter::parse_str(
+            r#"spec Pool
+program_id "11111111111111111111111111111111"
+type State | Active of { balance : U64 }
+type Error | InvalidAmount
+
+handler withdraw (n : U64) : State.Active -> State.Active {
+  permissionless
+  effect { balance -= n }
+}
+"#,
+        )
+        .unwrap();
+        let warnings = check_completeness(&spec);
+        let hit = warnings
+            .iter()
+            .find(|w| w.rule == "missing_math_overflow")
+            .expect("expected missing_math_overflow warning for MathUnderflow");
+        assert!(
+            hit.message.contains("MathUnderflow"),
+            "v2.24: `-=` defaults to MathUnderflow; message was {:?}",
+            hit.message
+        );
+    }
+
+    #[test]
+    fn missing_math_overflow_silent_on_sub_with_only_overflow_declared() {
+        // v2.24 §S1c back-compat: declared MathOverflow but not
+        // MathUnderflow → `-=` falls back to MathOverflow. Lint stays
+        // silent; existing pre-v2.24 specs continue building.
+        let spec = crate::chumsky_adapter::parse_str(
+            r#"spec Pool
+program_id "11111111111111111111111111111111"
+type State | Active of { balance : U64 }
+type Error | MathOverflow
+
+handler withdraw (n : U64) : State.Active -> State.Active {
+  permissionless
+  effect { balance -= n }
+}
+"#,
+        )
+        .unwrap();
+        let warnings = check_completeness(&spec);
+        assert!(
+            !warnings.iter().any(|w| w.rule == "missing_math_overflow"),
+            "back-compat: only MathOverflow declared → -= falls back; no warning"
+        );
+    }
+
+    // ----- v2.24 §S1d: unknown_error_variant lint -----
+
+    #[test]
+    fn unknown_error_variant_fires_on_per_site_override_with_undeclared() {
+        let spec = crate::chumsky_adapter::parse_str(
+            r#"spec Pool
+program_id "11111111111111111111111111111111"
+type State | Active of { balance : U64 }
+type Error | MathOverflow | MathUnderflow
+
+handler deposit (n : U64) : State.Active -> State.Active {
+  permissionless
+  effect { balance += n else MintOverflow }
+}
+"#,
+        )
+        .unwrap();
+        let warnings = check_completeness(&spec);
+        let hit = warnings
+            .iter()
+            .find(|w| w.rule == "unknown_error_variant")
+            .expect("expected unknown_error_variant warning");
+        assert!(hit.message.contains("MintOverflow"));
+        assert!(hit.message.contains("deposit"));
+    }
+
+    #[test]
+    fn unknown_error_variant_fires_on_pragma_with_undeclared() {
+        let spec = crate::chumsky_adapter::parse_str(
+            r#"spec Pool
+program_id "11111111111111111111111111111111"
+type State | Active of { balance : U64 }
+type Error | MathOverflow | MathUnderflow
+
+pragma checked_overflow_error = MintOverflow
+
+handler deposit (n : U64) : State.Active -> State.Active {
+  permissionless
+  effect { balance += n }
+}
+"#,
+        )
+        .unwrap();
+        let warnings = check_completeness(&spec);
+        let hit = warnings
+            .iter()
+            .find(|w| w.rule == "unknown_error_variant")
+            .expect("expected unknown_error_variant warning for pragma");
+        assert!(hit.message.contains("checked_overflow_error"));
+        assert!(hit.message.contains("MintOverflow"));
+    }
+
+    #[test]
+    fn unknown_error_variant_silent_when_override_is_declared() {
+        let spec = crate::chumsky_adapter::parse_str(
+            r#"spec Pool
+program_id "11111111111111111111111111111111"
+type State | Active of { balance : U64 }
+type Error | MathOverflow | MintOverflow
+
+handler deposit (n : U64) : State.Active -> State.Active {
+  permissionless
+  effect { balance += n else MintOverflow }
+}
+"#,
+        )
+        .unwrap();
+        let warnings = check_completeness(&spec);
+        assert!(
+            !warnings.iter().any(|w| w.rule == "unknown_error_variant"),
+            "per-site override referencing a declared variant should not fire"
+        );
+        // The site provides an override, so missing_math_overflow defers
+        // (the `+=` doesn't fall back to the builtin default).
+        assert!(
+            !warnings.iter().any(|w| w.rule == "missing_math_overflow"),
+            "per-site override defers missing_math_overflow"
+        );
+    }
+
     // ----- v2.8 G1: import resolution + interface merge -----
 
     #[test]
@@ -7700,6 +8040,102 @@ handler add : State.Active -> State.Active {
     }
 
     #[test]
+    fn unguarded_arithmetic_accepts_cumulative_bound_across_multiple_adds() {
+        // v2.24 §S2c: a single `requires state.x + a + b <= U64_MAX`
+        // logically bounds both `state.x += a` and `state.x += b`. Pre-v2.24
+        // the lint only matched per-pair patterns and fired on the second
+        // add. v2.24 accepts the cumulative form.
+        let spec = crate::chumsky_adapter::parse_str(
+            r#"spec Pool
+program_id "11111111111111111111111111111111"
+type State | Active of { balance : U64 }
+type Error | MathOverflow
+
+handler deposit (a : U64) (b : U64) : State.Active -> State.Active {
+  permissionless
+  requires state.balance + a + b <= U64_MAX
+  effect {
+    balance += a
+    balance += b
+  }
+}
+"#,
+        )
+        .expect("cumulative-bound spec must parse");
+        let warnings = check_completeness(&spec);
+        let arith_hits: Vec<_> = warnings
+            .iter()
+            .filter(|w| w.rule == "unguarded_arithmetic")
+            .collect();
+        assert!(
+            arith_hits.is_empty(),
+            "cumulative bound should satisfy unguarded_arithmetic for all adds; got: {arith_hits:#?}"
+        );
+    }
+
+    #[test]
+    fn u64_max_builtin_resolves_in_requires_clause() {
+        // v2.24 §S2d: `U64_MAX` (and friends) are seeded as builtin consts
+        // so users don't have to declare `const U64_MAX = …` per spec.
+        // unguarded_arithmetic's suggestion already references U64_MAX as
+        // if it were a builtin; this aligns the impl with the suggestion.
+        let spec = crate::chumsky_adapter::parse_str(
+            r#"spec Pool
+program_id "11111111111111111111111111111111"
+type State | Active of { balance : U64 }
+type Error | MathOverflow
+
+handler deposit (n : U64) : State.Active -> State.Active {
+  permissionless
+  requires state.balance + n <= U64_MAX
+  effect { balance += n }
+}
+"#,
+        )
+        .expect("U64_MAX should resolve as a builtin");
+        let warnings = check_completeness(&spec);
+        // With the U64_MAX guard, unguarded_arithmetic should be silent.
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.rule == "unguarded_arithmetic"),
+            "U64_MAX builtin should satisfy unguarded_arithmetic; got: {warnings:#?}"
+        );
+    }
+
+    #[test]
+    fn p7_does_not_fire_on_state_variant_promotion() {
+        // v2.24 §S2b: `state := .Variant { ... }` is the documented
+        // variant-promotion / whole-state-assignment form. Pre-v2.24,
+        // P7 stripped the LHS root and flagged `state` as an undeclared
+        // field. That was the false positive surfaced in the v2.22 gist (#2).
+        let spec = crate::chumsky_adapter::parse_str(
+            r#"spec Lifecycle
+program_id "11111111111111111111111111111111"
+type State
+  | Setup of { x : U64 }
+  | Active of { x : U64 }
+type Error | E
+
+handler activate : State.Setup -> State.Active {
+  permissionless
+  effect {
+    state := .Active { x := 0 }
+  }
+}
+"#,
+        )
+        .expect("variant-promotion spec must parse");
+        let warnings = check_completeness(&spec);
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.rule == "undeclared_state_field_in_effect"),
+            "P7 must not fire on `state := .Variant {{...}}`; got: {warnings:#?}"
+        );
+    }
+
+    #[test]
     fn p7_ignores_synthetic_match_arm_handlers() {
         // `_case_N` / `_otherwise` synthetic handlers inherit their
         // parent's effects — they don't get a second P7 hit because
@@ -7745,6 +8181,7 @@ handler add : State.Active -> State.Active {
             aborts_total: false,
             permissionless: false,
             effects: vec![],
+            effect_on_error: vec![],
             accounts: vec![],
             transfers: vec![],
             emits: vec![],

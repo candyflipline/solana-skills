@@ -1855,8 +1855,16 @@ fn resolve_call_arg_for_amount(rust_expr: &str, handler: &ParsedHandler) -> Stri
 /// None when the RHS is too complex for mechanical expansion (match/arith/
 /// pre-rendered Lean form); the caller falls through to a `todo!()` so an
 /// LLM or human fills the body.
+///
+/// `on_error` is the v2.24 §S1a per-site override (`pool += amount or X`).
+/// When `Some(name)`, the generated `checked_add` / `checked_sub` uses
+/// `Name` as the error variant. When `None`, the lowering falls back to
+/// (in priority order) the `pragma checked_overflow_error =` /
+/// `pragma checked_underflow_error =` default, then the built-in
+/// `MathOverflow` / `MathUnderflow`. Always `None` for non-checked ops.
 fn mechanize_effect(
     effect: &(String, String, String),
+    on_error: Option<&str>,
     state_acct: &crate::check::ParsedHandlerAccount,
     handler: &ParsedHandler,
     spec: &ParsedSpec,
@@ -1898,11 +1906,33 @@ fn mechanize_effect(
     // which only worked when no effect actually exercised checked
     // arithmetic. Now we emit `<ProgramName>Error::MathOverflow`, which
     // matches the Anchor `#[error_code]` enum generated alongside.
-    // Specs that use `+=` / `-=` / `*=` should declare a `MathOverflow`
-    // variant in their `type Error | ...` block; the
-    // `effect_uses_checked_arith_without_math_overflow` lint surfaces
-    // missing declarations.
+    //
+    // v2.24 §S1a/b/c: variant-name resolution becomes three-tiered:
+    //   1. Per-site override:    `pool += amount or MintOverflow`
+    //   2. Pragma default:       `pragma checked_overflow_error = …`
+    //   3. Built-in default:     `MathOverflow` (for `+=`),
+    //                            `MathUnderflow` (for `-=`).
+    // S1c back-compat: specs declaring `MathOverflow` but not
+    // `MathUnderflow` keep the pre-v2.24 behavior of `-=` raising
+    // `MathOverflow`. The lint at check.rs surfaces missing declarations.
     let err_enum = format!("{}Error", to_pascal_case(&spec.program_name));
+    let has_decl = |name: &str| spec.error_codes.iter().any(|c| c == name);
+    let pragma_overflow = spec.pragma_value("checked_overflow_error");
+    let pragma_underflow = spec.pragma_value("checked_underflow_error");
+    // Built-in underflow default with back-compat: if MathOverflow is
+    // declared but MathUnderflow isn't, treat `-=` as raising MathOverflow
+    // (matches pre-v2.24 behavior). This keeps existing specs building.
+    let builtin_underflow = if has_decl("MathUnderflow") || !has_decl("MathOverflow") {
+        "MathUnderflow"
+    } else {
+        "MathOverflow"
+    };
+    let overflow_variant = on_error
+        .or(pragma_overflow)
+        .unwrap_or("MathOverflow");
+    let underflow_variant = on_error
+        .or(pragma_underflow)
+        .unwrap_or(builtin_underflow);
     // Quasar's `#[account]` macro auto-wraps integer state fields in their
     // Pod companions (u64 → PodU64). Plain `=` and `wrapping_*` between a
     // `u64` rhs and a `PodU64` lhs fail to type-check, so on Quasar:
@@ -1921,7 +1951,7 @@ fn mechanize_effect(
             }
         }
         "add" => format!(
-            "        self.{acct}.{field} = self.{acct}.{field}.checked_add({rhs}).ok_or({err_enum}::MathOverflow)?;\n"
+            "        self.{acct}.{field} = self.{acct}.{field}.checked_add({rhs}).ok_or({err_enum}::{overflow_variant})?;\n"
         ),
         "add_sat" => format!(
             "        self.{acct}.{field} = self.{acct}.{field}.saturating_add({rhs});\n"
@@ -1938,7 +1968,7 @@ fn mechanize_effect(
             }
         }
         "sub" => format!(
-            "        self.{acct}.{field} = self.{acct}.{field}.checked_sub({rhs}).ok_or({err_enum}::MathOverflow)?;\n"
+            "        self.{acct}.{field} = self.{acct}.{field}.checked_sub({rhs}).ok_or({err_enum}::{underflow_variant})?;\n"
         ),
         "sub_sat" => format!(
             "        self.{acct}.{field} = self.{acct}.{field}.saturating_sub({rhs});\n"
@@ -2201,9 +2231,16 @@ fn render_handler_scaffold(
     // and forces a trailing `todo!()` so the user / an LLM (M4) fills it in.
     let state_acct = find_state_account(handler);
     let mut any_unmechanized = false;
-    for effect in &handler.effects {
-        let mechanized =
-            state_acct.and_then(|sa| mechanize_effect(effect, sa, handler, spec, target));
+    for (idx, effect) in handler.effects.iter().enumerate() {
+        // v2.24 §S1a — per-site error-variant override, indexed parallel
+        // to `effects`. Missing entry = `None` (silent fallback to pragma
+        // / built-in default inside mechanize_effect).
+        let on_error = handler
+            .effect_on_error
+            .get(idx)
+            .and_then(|o| o.as_deref());
+        let mechanized = state_acct
+            .and_then(|sa| mechanize_effect(effect, on_error, sa, handler, spec, target));
         match mechanized {
             Some(line) => out.push_str(&line),
             None => {
@@ -3832,7 +3869,7 @@ handler bump (n : U64) : State.Active -> State.Active {
         let handler = spec.handlers.iter().find(|h| h.name == "bump").unwrap();
         let state_acct = find_state_account(handler).expect("state account");
         let effect = handler.effects.first().unwrap();
-        let rendered = mechanize_effect(effect, state_acct, handler, &spec, Target::Anchor)
+        let rendered = mechanize_effect(effect, None, state_acct, handler, &spec, Target::Anchor)
             .expect("mechanized");
         // Pre-F8 this said `ErrorCode::MathOverflow` (a non-existent enum).
         // F8: it now says `<ProgramName>Error::MathOverflow`, matching the
@@ -3844,6 +3881,129 @@ handler bump (n : U64) : State.Active -> State.Active {
         assert!(
             !rendered.contains("ErrorCode::MathOverflow"),
             "should not reference the legacy non-existent ErrorCode enum; got:\n{rendered}"
+        );
+    }
+
+    // ----- v2.24 §S1a/b/c: per-site override + pragma + underflow default -----
+
+    fn mechanize_first_effect(
+        src: &str,
+        handler_name: &str,
+    ) -> String {
+        let spec = crate::chumsky_adapter::parse_str(src).unwrap();
+        let handler = spec
+            .handlers
+            .iter()
+            .find(|h| h.name == handler_name)
+            .expect("handler not found");
+        let state_acct = find_state_account(handler).expect("state account");
+        let effect = handler.effects.first().expect("at least one effect");
+        let on_error = handler
+            .effect_on_error
+            .first()
+            .and_then(|o| o.as_deref());
+        mechanize_effect(effect, on_error, state_acct, handler, &spec, Target::Anchor)
+            .expect("mechanized")
+    }
+
+    #[test]
+    fn per_site_else_overrides_default_variant_for_checked_add() {
+        let rendered = mechanize_first_effect(
+            r#"spec Mint
+program_id "11111111111111111111111111111111"
+type State | Active of { pool : U64 }
+type Error | MathOverflow | MintOverflow
+
+handler deposit (n : U64) : State.Active -> State.Active {
+  permissionless
+  accounts { state : writable }
+  effect { pool += n else MintOverflow }
+}
+"#,
+            "deposit",
+        );
+        assert!(
+            rendered.contains("MintError::MintOverflow"),
+            "v2.24 §S1a: `else MintOverflow` should lower to MintError::MintOverflow; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("MintError::MathOverflow"),
+            "should not use the default; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn pragma_overrides_default_variant_when_no_per_site_override() {
+        let rendered = mechanize_first_effect(
+            r#"spec Mint
+program_id "11111111111111111111111111111111"
+type State | Active of { pool : U64 }
+type Error | MathOverflow | MintOverflow
+
+pragma checked_overflow_error = MintOverflow
+
+handler deposit (n : U64) : State.Active -> State.Active {
+  permissionless
+  accounts { state : writable }
+  effect { pool += n }
+}
+"#,
+            "deposit",
+        );
+        assert!(
+            rendered.contains("MintError::MintOverflow"),
+            "v2.24 §S1b: pragma checked_overflow_error should override the default; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn checked_sub_defaults_to_math_underflow_when_declared() {
+        let rendered = mechanize_first_effect(
+            r#"spec Pool
+program_id "11111111111111111111111111111111"
+type State | Active of { balance : U64 }
+type Error | MathOverflow | MathUnderflow
+
+handler withdraw (n : U64) : State.Active -> State.Active {
+  permissionless
+  accounts { state : writable }
+  effect { balance -= n }
+}
+"#,
+            "withdraw",
+        );
+        assert!(
+            rendered.contains("PoolError::MathUnderflow"),
+            "v2.24 §S1c: -= should default to MathUnderflow when declared; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn checked_sub_falls_back_to_math_overflow_for_legacy_specs() {
+        // S1c back-compat: only MathOverflow declared, no MathUnderflow.
+        // `-=` keeps raising MathOverflow (pre-v2.24 behavior) so existing
+        // specs continue to build without spec edits.
+        let rendered = mechanize_first_effect(
+            r#"spec Pool
+program_id "11111111111111111111111111111111"
+type State | Active of { balance : U64 }
+type Error | MathOverflow
+
+handler withdraw (n : U64) : State.Active -> State.Active {
+  permissionless
+  accounts { state : writable }
+  effect { balance -= n }
+}
+"#,
+            "withdraw",
+        );
+        assert!(
+            rendered.contains("PoolError::MathOverflow"),
+            "v2.24 §S1c back-compat: legacy spec falls back to MathOverflow; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("MathUnderflow"),
+            "back-compat path should not reference MathUnderflow; got:\n{rendered}"
         );
     }
 

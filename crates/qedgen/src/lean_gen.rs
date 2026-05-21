@@ -5550,6 +5550,7 @@ handler noop : State -> State {
         let handler = crate::check::ParsedHandler {
             name: "reset".to_string(),
             effects: vec![("counter".to_string(), "set".to_string(), "ZERO".to_string())],
+            effect_on_error: vec![None],
             doc: None,
             who: None,
             on_account: None,

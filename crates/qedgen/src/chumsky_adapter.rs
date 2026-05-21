@@ -1279,11 +1279,16 @@ fn resolve_type_alias<'a>(
 // Effect rendering: (field_name, op, value_string)
 // ============================================================================
 
+/// Render an `EffectStmt` to the `(field, op, value)` triple consumed by
+/// every backend, plus the per-site error-variant override (v2.24 §S1a)
+/// that codegen reads when lowering checked `+=` / `-=`. Override is
+/// always `None` for non-checked ops — the parser permits `or X` on those
+/// permissively for nicer error positioning, and the adapter normalizes.
 fn render_effect(
     stmt: &a::EffectStmt,
     params: &[(String, String)],
     consts: ConstTable,
-) -> (String, String, String) {
+) -> ((String, String, String), Option<String>) {
     // Field name: preserve subscript syntax as-is (e.g., `accounts[i].capital`).
     // Both Lean and Rust consumers read this string; Rust-side `as usize`
     // index casting is applied at the codegen.rs::mechanize_effect site
@@ -1382,7 +1387,15 @@ fn render_effect(
             expr_to_lean(other, Ctx::Guard, consts, &env)
         }
     };
-    (field, op.to_string(), value)
+    // v2.24 §S1a — only keep the per-site override for ops that can fail
+    // (checked Add / Sub). Saturating / wrapping / Set can never trigger
+    // an error variant; the parser still accepts `or X` on those for
+    // positioning, but we drop it here so codegen never sees it.
+    let on_error = match stmt.op {
+        a::EffectOp::Add | a::EffectOp::Sub => stmt.on_error.clone(),
+        _ => None,
+    };
+    ((field, op.to_string(), value), on_error)
 }
 
 /// Best-effort reconstruction of a `TypeRef` from its rendered string form,
@@ -2128,6 +2141,16 @@ pub fn adapt(spec: &a::Spec) -> ParsedSpec {
     // First pass: collect constants so guard rendering can substitute them.
     let mut consts_map: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
+    // v2.24 §S2d — integer-max builtins. Lint suggestions reference these
+    // as bare identifiers; users used to have to declare them as `const`s
+    // explicitly. Builtin seeding lets `requires state.x + n <= U64_MAX`
+    // resolve out of the box. User-defined `const` shadows the builtin
+    // (insert order: builtins first, then user consts via the loop below).
+    consts_map.insert("U64_MAX".to_string(), u64::MAX.to_string());
+    consts_map.insert("U32_MAX".to_string(), u32::MAX.to_string());
+    consts_map.insert("U128_MAX".to_string(), u128::MAX.to_string());
+    consts_map.insert("I64_MAX".to_string(), i64::MAX.to_string());
+    consts_map.insert("I128_MAX".to_string(), i128::MAX.to_string());
     for Node { node, .. } in &spec.items {
         if let TopItem::Const { name, value } = node {
             consts_map.insert(name.clone(), value.to_string());
@@ -2483,6 +2506,14 @@ pub fn adapt(spec: &a::Spec) -> ParsedSpec {
                     as_name: as_name.clone(),
                 });
             }
+            TopItem::PragmaAssign { name, value } => {
+                // v2.24 §S1b — `pragma <key> = <value>` top-level
+                // assignment. Push raw; lint validates the key against the
+                // known set and the value against declared `type Error`
+                // variants.
+                out.pragma_assignments
+                    .push((name.clone(), value.clone()));
+            }
             TopItem::Pragma(p) => {
                 // Record the pragma name for target inference. Any given
                 // pragma may appear at most once per spec; duplicates are
@@ -2652,9 +2683,9 @@ fn expand_handler(
             }
             a::MatchBody::Effect(stmts) => {
                 for Node { node: stmt, .. } in stmts {
-                    synth
-                        .effects
-                        .push(render_effect(stmt, &base.takes_params, consts));
+                    let (triple, on_error) = render_effect(stmt, &base.takes_params, consts);
+                    synth.effects.push(triple);
+                    synth.effect_on_error.push(on_error);
                 }
             }
             a::MatchBody::Noop => {}
@@ -2702,6 +2733,7 @@ fn adapt_handler(h: &a::HandlerDecl, consts: ConstTable, env: &TypeEnv) -> Parse
         aborts_total: false,
         permissionless: false,
         effects: Vec::new(),
+        effect_on_error: Vec::new(),
         accounts: Vec::new(),
         transfers: Vec::new(),
         emits: Vec::new(),
@@ -2781,21 +2813,27 @@ fn adapt_handler(h: &a::HandlerDecl, consts: ConstTable, env: &TypeEnv) -> Parse
                 for Node { node: block, .. } in blocks {
                     match block {
                         a::EffectBlock::Stmt(stmt) => {
-                            handler.effects.push(render_effect(stmt, &params, consts));
+                            let (triple, on_error) = render_effect(stmt, &params, consts);
+                            handler.effects.push(triple);
+                            handler.effect_on_error.push(on_error);
                         }
                         a::EffectBlock::Match { scrutinee, arms } => {
                             let mut parsed_arms: Vec<crate::check::ParsedEffectArm> = Vec::new();
                             for arm in arms {
                                 let mut arm_effects = Vec::new();
+                                let mut arm_on_error: Vec<Option<String>> = Vec::new();
                                 for nested in &arm.body {
                                     let mut leaves = Vec::new();
                                     nested.node.collect_leaves(&mut leaves);
                                     for stmt in leaves {
-                                        let rendered = render_effect(stmt, &params, consts);
+                                        let (triple, on_error) =
+                                            render_effect(stmt, &params, consts);
                                         // Mirror into union so flat readers
                                         // see this potential write.
-                                        handler.effects.push(rendered.clone());
-                                        arm_effects.push(rendered);
+                                        handler.effects.push(triple.clone());
+                                        handler.effect_on_error.push(on_error.clone());
+                                        arm_effects.push(triple);
+                                        arm_on_error.push(on_error);
                                     }
                                 }
                                 let (pattern_rust, pattern_lean, is_wildcard) = match &arm.pattern {
@@ -2811,6 +2849,7 @@ fn adapt_handler(h: &a::HandlerDecl, consts: ConstTable, env: &TypeEnv) -> Parse
                                     pattern_lean,
                                     is_wildcard,
                                     effects: arm_effects,
+                                    effect_on_error: arm_on_error,
                                 });
                             }
                             branches = Some(crate::check::ParsedEffectBranches {
