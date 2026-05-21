@@ -282,9 +282,12 @@ handler (drop it from `preserved_by`).
 
 ## Footer
 
-- **Source.** `solana-payment-channels/.qed/plan/findings/001-temporal-marker-loss-in-proptest-lowering.md`
-  — the brownfield onboarding session that surfaced the bug class
-  on a real spec. v2.23 closes finding 001 structurally.
+- **Bug class.** Surfaced during a brownfield onboarding session on
+  a real spec: `old(...)` in a `property` body was lowering to a
+  structural tautology because the property fingerprint collapsed
+  both `state.x` and `old(state.x)` to the same Rust expression.
+  v2.23 closes the class structurally via binary lowering plus the
+  `vacuous_property_lowering` lint as a regression guard.
 - **Lean precedent.** `chumsky_adapter::path_to_lean` at line 598
   has always honored `inside_old` correctly. The Rust side now
   matches.
