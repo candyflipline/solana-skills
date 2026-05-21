@@ -2437,15 +2437,21 @@ fn emit_cross_variant_promotion(
     inner_name: &str,
     err_enum: &str,
 ) -> Option<String> {
-    // Restrict to unit-style pre. Payload-carrying pre would need a
-    // separate destructure + capture-into-post step.
+    // v2.24.0 follow-up: lift the unit-pre-only restriction. Three
+    // cross-variant promotion patterns are now valid:
+    //   1. unit pre → payload post  (init: Uninitialized → Active)
+    //   2. payload pre → unit post  (terminate: Open → Closed; the cancel case)
+    //   3. unit pre → unit post     (rare; harmless: just set the variant)
+    // Payload-pre → payload-post is still rejected — it would need
+    // a destructure-then-rebuild pass to capture pre's fields, and
+    // the current RHS resolver doesn't see the pre as a binding.
     let pre_variant = spec
         .account_types
         .first()?
         .variants
         .iter()
         .find(|v| v.name == pre)?;
-    if !pre_variant.fields.is_empty() {
+    if !pre_variant.fields.is_empty() && !post_variant.fields.is_empty() {
         return None;
     }
 
@@ -2471,7 +2477,9 @@ fn emit_cross_variant_promotion(
 
     // Every post-variant field must have an RHS. We don't fill
     // defaults — silent defaults hide bugs (a zeroed pubkey is a
-    // famously bad bug).
+    // famously bad bug). For unit-style post variants, this loop
+    // iterates zero times — the assignment lands as a bare
+    // variant constructor with no braces.
     for (fname, _) in &post_variant.fields {
         if !field_rhs.contains_key(fname) {
             return None;
@@ -2482,28 +2490,44 @@ fn emit_cross_variant_promotion(
     // the pre variant. Init handlers (`Uninitialized`/`Empty`) skip
     // this since the `#[account(init, …)]` constraint zeroes the
     // account before our code runs — there's no prior payload to
-    // mismatch on. Other unit-style pres still get the gate.
+    // mismatch on. Other pres still get the gate. Payload pres
+    // use `Inner::Pre { .. }` to match without binding fields.
     let is_init_pre = matches!(pre, "Uninitialized" | "Empty");
     let mut out = String::new();
     if !is_init_pre {
+        let pre_pattern = if pre_variant.fields.is_empty() {
+            format!("{}::{}", inner_name, pre)
+        } else {
+            format!("{}::{} {{ .. }}", inner_name, pre)
+        };
         out.push_str(&format!(
-            "        if !matches!(self.{}.inner, {}::{}) {{ return Err({}::WrongState.into()); }}\n",
-            acct_binder, inner_name, pre, err_enum
+            "        if !matches!(self.{}.inner, {}) {{ return Err({}::WrongState.into()); }}\n",
+            acct_binder, pre_pattern, err_enum
         ));
     }
-    out.push_str(&format!(
-        "        self.{}.inner = {}::{} {{\n",
-        acct_binder, inner_name, post_variant.name
-    ));
-    // Emit fields in the variant's declared order so the assembled
-    // initializer reads the way a user would write it. The map is
-    // sorted by name for lookup; iterating the variant's
-    // `fields` here preserves the source-declared order.
-    for (fname, _) in &post_variant.fields {
-        let rhs = &field_rhs[fname];
-        out.push_str(&format!("            {}: {},\n", fname, rhs));
+    // Unit-style post: emit `... = Inner::Closed;` without the
+    // empty `{}` braces. Payload post: emit the brace-wrapped
+    // field-by-field initializer in declared order.
+    if post_variant.fields.is_empty() {
+        out.push_str(&format!(
+            "        self.{}.inner = {}::{};\n",
+            acct_binder, inner_name, post_variant.name
+        ));
+    } else {
+        out.push_str(&format!(
+            "        self.{}.inner = {}::{} {{\n",
+            acct_binder, inner_name, post_variant.name
+        ));
+        // Emit fields in the variant's declared order so the
+        // assembled initializer reads the way a user would write
+        // it. The map is sorted by name for lookup; iterating the
+        // variant's `fields` here preserves source-declared order.
+        for (fname, _) in &post_variant.fields {
+            let rhs = &field_rhs[fname];
+            out.push_str(&format!("            {}: {},\n", fname, rhs));
+        }
+        out.push_str("        };\n");
     }
-    out.push_str("        };\n");
     Some(out)
 }
 
@@ -2690,11 +2714,26 @@ fn render_handler_scaffold(
     // `<Pascal>Error::MathOverflow`. Bring the error enum into scope so
     // the rendered scaffold body compiles. Saturating / wrapping
     // (`+=!` / `+=?`) don't reference the enum.
-    let body_uses_error_enum = !spec.error_codes.is_empty()
+    //
+    // v2.24.0 follow-up: variant-state cross-variant promotion also
+    // emits `MiniEscrowError::WrongState` (the pre-variant gate)
+    // even when the handler has no checked-arith effects. Bring the
+    // enum in whenever the spec is multi-variant ADT on Anchor and
+    // the handler has a non-init pre — the same condition under
+    // which `emit_cross_variant_promotion` emits the `matches!`
+    // check that references the error variant.
+    let uses_wrong_state_check = is_multi_variant_adt_state(spec)
+        && matches!(target, Target::Anchor)
         && handler
-            .effects
-            .iter()
-            .any(|(_, op_kind, _)| op_kind == "add" || op_kind == "sub");
+            .pre_status
+            .as_deref()
+            .is_some_and(|p| !matches!(p, "Uninitialized" | "Empty"));
+    let body_uses_error_enum = !spec.error_codes.is_empty()
+        && (uses_wrong_state_check
+            || handler
+                .effects
+                .iter()
+                .any(|(_, op_kind, _)| op_kind == "add" || op_kind == "sub"));
     if body_uses_error_enum {
         out.push_str("use crate::errors::*;\n");
     }

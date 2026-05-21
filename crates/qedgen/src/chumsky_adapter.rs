@@ -2299,7 +2299,6 @@ pub fn adapt(spec: &a::Spec) -> ParsedSpec {
                 out.handlers.extend(expanded);
             }
             TopItem::Property(p) => {
-                let lean = expr_to_lean(&p.body.node, Ctx::Guard, consts, &env);
                 // v2.23 Slice 3: pick state_mode by the property's class.
                 // Unary properties render today's way (`s.x`). Binary
                 // properties — bodies containing `old(...)` — render with
@@ -2308,7 +2307,24 @@ pub fn adapt(spec: &a::Spec) -> ParsedSpec {
                 // harness shape that `emit_preservation_tests_for` emits.
                 // Pre-v2.23 both classes rendered identically, collapsing
                 // every `old(...)` into a structural tautology.
-                let property_state_mode = match classify_property_body(&p.body) {
+                //
+                // v2.24.0 follow-up: extend the same split to the Lean
+                // side. Pre-fix the lean_expr was always rendered in
+                // `Ctx::Guard`, which lowered both `state.x` and
+                // `old(state.x)` to bare `s.x` — every binary
+                // preservation property in `render_properties_adt`
+                // emitted as a structural tautology (`s.x ≥ s.x`).
+                // Using `Ctx::Ensures` for binary bodies gives `s'.x`
+                // for `state.x` and `s.x` for `old(state.x)`, matching
+                // the `(s s' : State) : Prop` shape the inductive
+                // property emitter now uses.
+                let property_class = classify_property_body(&p.body);
+                let lean_ctx = match property_class {
+                    crate::check::PropertyClass::Unary => Ctx::Guard,
+                    crate::check::PropertyClass::Binary => Ctx::Ensures,
+                };
+                let lean = expr_to_lean(&p.body.node, lean_ctx, consts, &env);
+                let property_state_mode = match property_class {
                     crate::check::PropertyClass::Unary => StateMode::Unary,
                     crate::check::PropertyClass::Binary => StateMode::Binary,
                 };

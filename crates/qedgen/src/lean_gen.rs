@@ -2609,16 +2609,38 @@ fn render_properties_adt(
             } else {
                 expr.clone()
             };
-            out.push_str(&format!(
-                "def {} (s : {}) : Prop := {}\n\n",
-                prop.name, state_type, body
-            ));
+            // v2.24.0 follow-up: binary properties (body uses `old(...)`)
+            // need both pre and post states in scope. The chumsky_adapter
+            // now renders such bodies in Ctx::Ensures so `state.x` lowers
+            // to `s'.x` and `old(state.x)` to `s.x` — keep both names
+            // bound in the def signature.
+            match prop.class {
+                crate::check::PropertyClass::Unary => {
+                    out.push_str(&format!(
+                        "def {} (s : {}) : Prop := {}\n\n",
+                        prop.name, state_type, body
+                    ));
+                }
+                crate::check::PropertyClass::Binary => {
+                    out.push_str(&format!(
+                        "def {} (s s' : {}) : Prop := {}\n\n",
+                        prop.name, state_type, body
+                    ));
+                }
+            }
         }
 
         let covered_ops: Vec<&&crate::check::ParsedHandler> = ops
             .iter()
             .filter(|op| prop.preserved_by.contains(&op.name))
             .collect();
+        // v2.24.0 follow-up: binary properties take `(s s' : State)`
+        // and the per-handler obligation is `prop s s'` — the
+        // relation between pre and post state. No h_inv assumption
+        // (the relation IS the obligation). Unary properties keep
+        // the existing `prop s' := by sorry` shape with h_inv on
+        // pre-state.
+        let is_binary = matches!(prop.class, crate::check::PropertyClass::Binary);
         for op in &covered_ops {
             let trans_name = safe_name(&format!("{}Transition", op.name));
             let param_sig = param_sig_str(&op.takes_params);
@@ -2627,13 +2649,22 @@ fn render_properties_adt(
                 "theorem {} (s s' : {}) (signer : Pubkey){}\n",
                 sub_lemma_name, state_type, param_sig
             ));
-            out.push_str(&format!(
-                "    (h_inv : {} s) (h : {} s signer{} = some s') :\n",
-                prop.name,
-                trans_name,
-                param_args_str(&op.takes_params)
-            ));
-            out.push_str(&format!("    {} s' := by sorry\n", prop.name));
+            if is_binary {
+                out.push_str(&format!(
+                    "    (h : {} s signer{} = some s') :\n",
+                    trans_name,
+                    param_args_str(&op.takes_params)
+                ));
+                out.push_str(&format!("    {} s s' := by sorry\n", prop.name));
+            } else {
+                out.push_str(&format!(
+                    "    (h_inv : {} s) (h : {} s signer{} = some s') :\n",
+                    prop.name,
+                    trans_name,
+                    param_args_str(&op.takes_params)
+                ));
+                out.push_str(&format!("    {} s' := by sorry\n", prop.name));
+            }
         }
 
         if !covered_ops.is_empty() {
@@ -2641,10 +2672,17 @@ fn render_properties_adt(
                 "/-- {} is preserved by every operation. Auto-proven by case split. -/\n",
                 prop.name
             ));
-            out.push_str(&format!(
-                "theorem {}_inductive (s s' : {}) (signer : Pubkey) (op : Operation)\n    (h_inv : {} s) (h : applyOp s signer op = some s') : {} s' := by\n",
-                prop.name, state_type, prop.name, prop.name
-            ));
+            if is_binary {
+                out.push_str(&format!(
+                    "theorem {}_inductive (s s' : {}) (signer : Pubkey) (op : Operation)\n    (h : applyOp s signer op = some s') : {} s s' := by\n",
+                    prop.name, state_type, prop.name
+                ));
+            } else {
+                out.push_str(&format!(
+                    "theorem {}_inductive (s s' : {}) (signer : Pubkey) (op : Operation)\n    (h_inv : {} s) (h : applyOp s signer op = some s') : {} s' := by\n",
+                    prop.name, state_type, prop.name, prop.name
+                ));
+            }
             out.push_str("  cases op with\n");
             for op in ops {
                 let ctor = safe_name(&op.name);
@@ -2657,10 +2695,17 @@ fn render_properties_adt(
                 };
                 if prop.preserved_by.contains(&op.name) {
                     let ref_name = safe_name(&format!("{}_preserved_by_{}", prop.name, op.name));
-                    out.push_str(&format!(
-                        "  | {}{} => exact {} s s' signer{} h_inv h\n",
-                        ctor, param_bind, ref_name, param_bind
-                    ));
+                    if is_binary {
+                        out.push_str(&format!(
+                            "  | {}{} => exact {} s s' signer{} h\n",
+                            ctor, param_bind, ref_name, param_bind
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "  | {}{} => exact {} s s' signer{} h_inv h\n",
+                            ctor, param_bind, ref_name, param_bind
+                        ));
+                    }
                 } else {
                     out.push_str(&format!("  | {}{} => sorry\n", ctor, param_bind));
                 }
@@ -3741,10 +3786,19 @@ fn render_overflow_obligations(
             .collect();
 
         // Collect invariant hypotheses: all properties that cover this operation
+        // v2.24.0 follow-up: only single-state (Unary) properties can
+        // appear as `h_inv_X : prop s` hypotheses. Binary properties
+        // have shape `prop s s'` — they describe a transition
+        // relation, not a single-state invariant — so they don't
+        // belong in the overflow theorem's pre-assumption list.
         let inv_hyps: Vec<String> = spec
             .properties
             .iter()
-            .filter(|p| p.preserved_by.contains(&op.name) && p.expression.is_some())
+            .filter(|p| {
+                p.preserved_by.contains(&op.name)
+                    && p.expression.is_some()
+                    && matches!(p.class, crate::check::PropertyClass::Unary)
+            })
             .map(|p| p.name.clone())
             .collect();
 
@@ -3846,10 +3900,19 @@ fn render_overflow_obligations_adt(
             .map(|(n, t)| format!("{} s'.{}", valid_fn(t), safe_name(n)))
             .collect();
 
+        // v2.24.0 follow-up: only single-state (Unary) properties can
+        // appear as `h_inv_X : prop s` hypotheses. Binary properties
+        // have shape `prop s s'` — they describe a transition
+        // relation, not a single-state invariant — so they don't
+        // belong in the overflow theorem's pre-assumption list.
         let inv_hyps: Vec<String> = spec
             .properties
             .iter()
-            .filter(|p| p.preserved_by.contains(&op.name) && p.expression.is_some())
+            .filter(|p| {
+                p.preserved_by.contains(&op.name)
+                    && p.expression.is_some()
+                    && matches!(p.class, crate::check::PropertyClass::Unary)
+            })
             .map(|p| p.name.clone())
             .collect();
 
