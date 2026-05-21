@@ -725,7 +725,17 @@ fn render_transitions(
                 if op_kind == "set" && is_account_binding_pubkey_ref(value, &op.accounts) {
                     continue;
                 }
-                let sf = safe_name(field);
+                // v2.24 S5h — Lean's `State` mirrors the spec's flat
+                // union-of-variant-fields, with the variant tracked
+                // via the `status : Status` discriminator. A
+                // `Variant.field := …` effect must strip the variant
+                // prefix so `{ s with field := … }` resolves; otherwise
+                // Lean rejects `s.Active.field` (no nested `Active`
+                // record under `State`).
+                let stripped = crate::rust_codegen_util::strip_variant_prefix_for_flat_state(
+                    field, spec,
+                );
+                let sf = safe_name(&stripped);
                 match op_kind.as_str() {
                     "add" => with_parts.push(format!("{} := s.{} + {}", sf, sf, value)),
                     "sub" => with_parts.push(format!("{} := s.{} - {}", sf, sf, value)),
