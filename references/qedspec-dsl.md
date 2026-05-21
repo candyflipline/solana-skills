@@ -465,11 +465,19 @@ effect {
   total_deposits      += amount
   balance             -= fee
   counter             += 1
-  accounts[i].capital += amount    // indexed LHS
+  accounts[i].capital += amount    // indexed LHS (per-field)
+  accounts[i] := { active := 1, balance := 0 }   // indexed LHS (whole-record)
   state               := .Active { authority, V := 0, I := 0, F := 0,
                                    accounts := empty_map }   // constructor RHS
 }
 ```
+
+The indexed-LHS forms cover both per-field updates (`accounts[i].capital
++= amount` — change one field of an existing slot) and whole-record
+replacement (`accounts[i] := { … }` — overwrite the whole slot). Use the
+whole-record form to register a new Map entry from scratch; partial
+record literals on the RHS require every field of the slot's record type
+to be set, mirroring Rust's `let x: T = T { … }` exhaustiveness.
 
 Values on the RHS may be integer literals, qualified paths, arithmetic
 expressions, constructor applications (`.Variant payload`), record literals,
