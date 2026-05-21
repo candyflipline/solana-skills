@@ -2797,17 +2797,39 @@ async fn dispatch(cmd: Commands) -> Result<()> {
             fill_tests,
         } => {
             require_git_repo()?;
-            if matches!(target, Target::Pinocchio) {
+            // v2.24.x: Pinocchio reserves the Rust-scaffold CLI surface
+            // but has no scaffold implementation yet. Verification
+            // backends (Kani / proptest / Lean / integration_test /
+            // CI / crucible) are spec-driven and target-agnostic —
+            // they reason about spec semantics, not the runtime
+            // representation — so they run cleanly for Pinocchio
+            // specs even without a Rust scaffold. Skip the
+            // `codegen::generate` step on Pinocchio when the user
+            // asked for at least one backend flag (or `--all`).
+            // Bail loudly only when the user requested the scaffold
+            // alone (no backend flags) and Pinocchio is the chosen
+            // target — that's the unambiguous "I want a Pinocchio
+            // Rust program" case the scaffold can't satisfy.
+            let any_backend = kani || proptest || lean || test || integration || ci || crucible;
+            let pinocchio_no_scaffold = matches!(target, Target::Pinocchio);
+            if pinocchio_no_scaffold && !any_backend && !all {
                 anyhow::bail!(
-                    "`--target pinocchio` is not yet implemented. \
-                     `--target anchor` and `--target quasar` are \
-                     supported."
+                    "`--target pinocchio` is not yet implemented for Rust scaffold codegen. \
+                     `--target anchor` and `--target quasar` are supported for scaffold. \
+                     To generate just the verification backends (Kani / proptest / Lean / etc.) \
+                     for a Pinocchio spec, pass `--kani`, `--proptest`, `--lean`, or `--all` \
+                     alongside `--target pinocchio` — the scaffold step will be skipped and \
+                     the backends will run against the spec directly."
                 );
             }
             let cwd = std::env::current_dir()?;
             let spec = init::resolve_spec_path(spec.as_deref(), &cwd)?;
-            // Rust skeleton (always)
-            codegen::generate(&spec, &output_dir, target)?;
+            // Rust skeleton — Anchor and Quasar emit; Pinocchio skips
+            // (handled above + here so `--all` on Pinocchio still
+            // works for the backend artifacts).
+            if !pinocchio_no_scaffold {
+                codegen::generate(&spec, &output_dir, target)?;
+            }
 
             if kani || all {
                 // Codegen is pure text generation; missing cargo-kani only
