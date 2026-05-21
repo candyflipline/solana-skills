@@ -2217,12 +2217,20 @@ fn interface_handler_clause<'a>(
         .ignore_then(choice((string_lit(), non_keyword_ident())))
         .map(InterfaceHandlerClause::Discriminant);
 
+    // v2.24 #14 — interface accounts now accept optional commas
+    // between descriptors, matching the top-level `accounts { … }`
+    // grammar. Pre-fix the interface form only allowed
+    // newline-separated descriptors, which was inconsistent and
+    // surprised authors copying top-level patterns into an
+    // `interface { … }` block.
     let accounts = just("accounts")
         .then_ignore(wsc())
         .ignore_then(just('{'))
         .then_ignore(wsc())
         .ignore_then(
             account_descriptor()
+                .then_ignore(wsc())
+                .then_ignore(just(',').or_not())
                 .then_ignore(wsc())
                 .repeated()
                 .collect::<Vec<AccountDescriptor>>(),
