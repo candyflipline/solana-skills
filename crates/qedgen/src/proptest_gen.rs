@@ -78,7 +78,7 @@ fn strategy_for_field(
             if let Some(close) = rest.find(']') {
                 let bound_src = rest[..close].trim();
                 let inner_src = rest[close + 1..].trim();
-                let n = resolve_map_bound_local(bound_src, &spec.constants)?;
+                let n = resolve_map_bound_local(bound_src, spec)?;
                 let inner_strategy = strategy_for_field(inner_src, spec, mode, None)?;
                 return Ok(format!(
                     "prop::collection::vec({inner_strategy}, {n}..={n}).prop_map(|v| v.try_into().ok().unwrap())"
@@ -179,7 +179,7 @@ pub(crate) fn default_value_for_field(dsl_type: &str, spec: &ParsedSpec) -> Opti
             if let Some(close) = rest.find(']') {
                 let bound_src = rest[..close].trim();
                 let inner_src = rest[close + 1..].trim();
-                if let Ok(n) = resolve_map_bound_local(bound_src, &spec.constants) {
+                if let Ok(n) = resolve_map_bound_local(bound_src, spec) {
                     let inner_default = default_value_for_field(inner_src, spec)?;
                     return Some(format!("[{}; {}]", inner_default, n));
                 }
@@ -224,19 +224,28 @@ pub(crate) fn default_value_for_field(dsl_type: &str, spec: &ParsedSpec) -> Opti
 }
 
 /// Local copy of codegen::resolve_map_bound (private there) — same rule: bound
-/// is either a numeric literal or a declared spec constant.
-fn resolve_map_bound_local(bound: &str, constants: &[(String, String)]) -> Result<String> {
+/// is either a numeric literal, a declared spec constant, or a unit-only
+/// enum type (v2.24 #20).
+fn resolve_map_bound_local(bound: &str, spec: &ParsedSpec) -> Result<String> {
     let bound = bound.trim();
     if bound.chars().all(|c| c.is_ascii_digit()) && !bound.is_empty() {
         return Ok(bound.to_string());
     }
-    match constants.iter().find(|(n, _)| n == bound) {
-        Some((_, value)) => Ok(value.clone()),
-        None => anyhow::bail!(
-            "Map bound `{}` is not a numeric literal and not declared as a `const` in the spec",
-            bound
-        ),
+    if let Some((_, value)) = spec.constants.iter().find(|(n, _)| n == bound) {
+        return Ok(value.clone());
     }
+    // v2.24 #20 — enum-typed Map bound. Use the variant count as the
+    // array size. Stays consistent with the codegen-side resolver so
+    // the proptest model and the Anchor codegen agree on shape.
+    if let Some(sum) = spec.sum_types.iter().find(|s| s.name == bound) {
+        if sum.variants.iter().all(|v| v.fields.is_empty()) {
+            return Ok(sum.variants.len().to_string());
+        }
+    }
+    anyhow::bail!(
+        "Map bound `{}` is not a numeric literal, not declared as a `const`, and not a unit-only enum type",
+        bound
+    )
 }
 
 /// Emit a `prop_compose!` strategy block per spec record — the generator

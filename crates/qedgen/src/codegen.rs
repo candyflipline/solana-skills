@@ -452,7 +452,7 @@ fn map_type_with_context(
             if let Some(close) = rest.find(']') {
                 let bound_src = rest[..close].trim();
                 let inner_src = rest[close + 1..].trim();
-                let n = resolve_map_bound(bound_src, &spec.constants)?;
+                let n = resolve_map_bound(bound_src, spec)?;
                 let inner_rust = map_type_with_context(inner_src, spec, context)?;
                 return Ok(format!("[{inner_rust}; {n}]"));
             }
@@ -588,20 +588,34 @@ fn primitive_map(dsl_type: &str, context: TypeMapContext) -> Option<&'static str
 }
 
 /// Resolve the bound expression inside `Map[BOUND] T`. Accepts either a
-/// numeric literal (e.g. `Map[16] U64`) or a constant declared in the spec
-/// (e.g. `Map[MAX_ACCOUNTS] U64`).
-fn resolve_map_bound(bound: &str, constants: &[(String, String)]) -> Result<String> {
+/// numeric literal (e.g. `Map[16] U64`), a constant declared in the spec
+/// (e.g. `Map[MAX_ACCOUNTS] U64`), or — v2.24 #20 — a unit-only sum type
+/// (e.g. `Map[AddressField] ProposalSlot` where every variant has no
+/// payload). The enum-bounded form lowers to a fixed-size array whose
+/// length equals the variant count; downstream readers index into it
+/// using the variant's source-declared ordinal (Owner = 0, Manager = 1,
+/// …). Mixed-variant sums (some unit, some payload) are still rejected
+/// at the lint side; the codegen never sees them.
+fn resolve_map_bound(bound: &str, spec: &ParsedSpec) -> Result<String> {
     let bound = bound.trim();
     if bound.chars().all(|c| c.is_ascii_digit()) && !bound.is_empty() {
         return Ok(bound.to_string());
     }
-    match constants.iter().find(|(n, _)| n == bound) {
-        Some((_, value)) => Ok(value.clone()),
-        None => anyhow::bail!(
-            "Map bound `{}` is not a numeric literal and not declared as a `const` in the spec",
-            bound
-        ),
+    if let Some((_, value)) = spec.constants.iter().find(|(n, _)| n == bound) {
+        return Ok(value.clone());
     }
+    // v2.24 #20 — enum-typed Map bound. Use the variant count as the
+    // array size. Unit-only check mirrors the lint at check.rs so the
+    // codegen never silently widens what the lint accepts.
+    if let Some(sum) = spec.sum_types.iter().find(|s| s.name == bound) {
+        if sum.variants.iter().all(|v| v.fields.is_empty()) {
+            return Ok(sum.variants.len().to_string());
+        }
+    }
+    anyhow::bail!(
+        "Map bound `{}` is not a numeric literal, not declared as a `const`, and not a unit-only enum type",
+        bound
+    )
 }
 
 /// Sanitize a field-path string (e.g. `accounts[i].active`) into a legal
