@@ -1286,10 +1286,17 @@ fn emit_overflow_tests_for(
     properties: &[ParsedProperty],
 ) -> Result<()> {
     for op in overflow_ops {
-        for (field, kind, _value) in &op.effects {
+        for (field_raw, kind, _value) in &op.effects {
             if kind != "add" {
                 continue;
             }
+            // v2.24 S5d — strip variant prefix so `Active.balance`
+            // resolves to `balance` for the flat-State proptest model
+            // (both in the generated function name and the field
+            // lookup).
+            let field_owned =
+                rust_codegen_util::strip_variant_prefix_for_flat_state(field_raw, spec);
+            let field = field_owned.as_str();
 
             let dsl_type = all_fields
                 .iter()
@@ -1667,6 +1674,67 @@ mod tests {
             }],
             ..ParsedSpec::default()
         }
+    }
+
+    /// v2.24 S5d — proptest's overflow-detection test name no longer
+    /// embeds the variant prefix. Without the strip, `Active.balance`
+    /// would yield an invalid Rust function identifier
+    /// `deposit_no_overflow_on_Active.balance`. Pre-fix, this was the
+    /// canonical failure mode that surfaced the gap.
+    #[test]
+    fn overflow_test_name_strips_variant_prefix_for_flat_state() {
+        let src = r#"spec Vault
+program_id "11111111111111111111111111111111"
+
+type State
+  | Uninitialized
+  | Active of {
+      owner   : Pubkey,
+      balance : U64,
+    }
+
+type Error
+  | MathOverflow
+
+handler deposit (amount : U64) : State.Active -> State.Active {
+  permissionless
+  accounts {
+    vault : writable
+  }
+  requires amount > 0 else MathOverflow
+  effect {
+    Active.balance += amount
+  }
+}
+
+property balance_nonneg :
+  state.balance >= 0
+  preserved_by all
+"#;
+        let spec = crate::chumsky_adapter::parse_str(src).expect("parse");
+        let dir = tempfile::tempdir().unwrap();
+        let spec_path = dir.path().join("vault.qedspec");
+        let out_path = dir.path().join("tests/proptest.rs");
+        std::fs::write(&spec_path, src).unwrap();
+        generate(&spec_path, &out_path).unwrap();
+        let body = std::fs::read_to_string(&out_path).unwrap();
+        let _ = spec; // suppress unused
+
+        // Function names land as bare-field, not variant-prefixed.
+        assert!(
+            body.contains("fn deposit_no_overflow_on_balance"),
+            "expected variant-prefix stripped from test name; got:\n{body}"
+        );
+        // No `Active.` substring anywhere in the proptest body —
+        // every effect line should refer to bare `s.balance`.
+        assert!(
+            !body.contains("Active.balance"),
+            "variant prefix leaked into proptest body:\n{body}"
+        );
+        assert!(
+            !body.contains("Active.owner"),
+            "variant prefix leaked into proptest body:\n{body}"
+        );
     }
 
     #[test]
