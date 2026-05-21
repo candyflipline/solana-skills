@@ -920,10 +920,8 @@ impl ParsedHandlerAccount {
                     // Quasar's flat-struct emission still has every
                     // variant-payload field at top level, so
                     // `has_one = field` works there as before.
-                    let suppress_for_anchor_variant = matches!(
-                        target,
-                        crate::Target::Anchor
-                    ) && is_multi_variant_adt_with_field_in_variant(spec, who);
+                    let suppress_for_anchor_variant = matches!(target, crate::Target::Anchor)
+                        && is_multi_variant_adt_with_field_in_variant(spec, who);
                     if !suppress_for_anchor_variant {
                         parts.push(format!("has_one = {}", who));
                     }
