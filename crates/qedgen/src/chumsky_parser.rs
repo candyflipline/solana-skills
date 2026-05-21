@@ -296,8 +296,31 @@ fn qualified_path<'a>() -> impl Parser<'a, &'a str, QualifiedPath, Err<'a>> + Cl
 
 fn path<'a>() -> impl Parser<'a, &'a str, Path, Err<'a>> + Clone {
     let field_seg = just('.').ignore_then(ident()).map(PathSeg::Field);
+    // v2.24 #4: allow dotted-path index expressions
+    // (e.g. `lsts[state.lst_count].mint`). Pre-fix the index slot
+    // only accepted a bare identifier, forcing spec authors to
+    // bind a state-field read into a local before the indexing
+    // step. The dotted form joins segments with `.` and stores the
+    // result as a single `PathSeg::Index(String)`; downstream
+    // codegen handles `state.X` index expressions the same way it
+    // handles bare-ident indices via the existing
+    // `rewrite_index_to_usize` + state-binder resolution pass.
+    let dotted_index = ident()
+        .then(just('.').ignore_then(ident()).repeated().collect::<Vec<String>>())
+        .map(|(head, rest)| {
+            if rest.is_empty() {
+                head
+            } else {
+                let mut s = head;
+                for seg in rest {
+                    s.push('.');
+                    s.push_str(&seg);
+                }
+                s
+            }
+        });
     let index_seg = just('[')
-        .ignore_then(ident())
+        .ignore_then(dotted_index)
         .then_ignore(just(']'))
         .map(PathSeg::Index);
     let seg = choice((field_seg, index_seg));
@@ -2543,6 +2566,69 @@ mod tests {
                 panic!("parse failed");
             }
         }
+    }
+
+    /// v2.24 #4 — index expressions inside a Map slot reference now
+    /// accept dotted state-field paths. Pre-fix `lsts[state.lst_count]`
+    /// parse-errored at the `.`, forcing spec authors to bind the
+    /// state field into a local var first.
+    #[test]
+    fn map_index_accepts_dotted_state_field() {
+        let src = r#"spec MapIndex
+program_id "11111111111111111111111111111111"
+
+type Slot = { active : U8, balance : U64, }
+
+type State
+  | Active of {
+      lst_count : U64,
+      lsts      : Map[MAX] Slot,
+    }
+
+const MAX = 8
+
+type Error
+  | MathOverflow
+
+handler register : State.Active -> State.Active {
+  permissionless
+  effect {
+    lsts[state.lst_count].active := 1
+  }
+}
+"#;
+        let _ = parse_ok(src);
+    }
+
+    /// v2.24 #4 — also accept deep dotted index expressions
+    /// (`accounts[a.b.c].field`). Defensive: the parser shouldn't
+    /// special-case depth-1 vs depth-N.
+    #[test]
+    fn map_index_accepts_deep_dotted_path() {
+        let src = r#"spec DeepIndex
+program_id "11111111111111111111111111111111"
+
+type Inner = { idx : U64, }
+type Outer = { inner : Inner, }
+type State
+  | Active of {
+      outer : Outer,
+      items : Map[MAX] U64,
+    }
+
+const MAX = 8
+
+type Error
+  | MathOverflow
+
+handler t : State.Active -> State.Active {
+  permissionless
+  effect {
+    items[state.outer.inner.idx] := 1
+  }
+}
+"#;
+        let _ = parse_ok(src);
     }
 
     #[test]
