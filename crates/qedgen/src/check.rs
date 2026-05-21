@@ -2471,10 +2471,26 @@ pub fn check_completeness(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
         if ftype == "Pubkey" {
             continue;
         }
+        // v2.24 #16: a Map / record field is "modified" not just when
+        // it appears as a whole-field LHS, but also when an effect
+        // writes through it via indexing or nested field access.
+        // `accounts[i].active := 1` writes the `accounts` map field;
+        // `pool.balance += amount` writes the `pool` record field.
+        // Pre-fix the lint only matched whole-field LHS, so any
+        // through-indexing write to a Map produced a false-positive
+        // `[P4] unused_field` (~once per Map field on percolator /
+        // Hylo specs).
         let modified = spec.handlers.iter().any(|op| {
-            op.effects
-                .iter()
-                .any(|(f, _, _)| normalize_lhs(f) == *fname)
+            op.effects.iter().any(|(f, _, _)| {
+                let lhs = normalize_lhs(f);
+                if lhs == *fname {
+                    return true;
+                }
+                // Match `<fname>.` (record-nested) or `<fname>[` (Map-indexed)
+                // as effective writes of the named field.
+                lhs.starts_with(&format!("{}.", fname))
+                    || lhs.starts_with(&format!("{}[", fname))
+            })
         });
         if !modified {
             let mutating_ops: Vec<&str> = spec
@@ -3188,35 +3204,69 @@ pub fn check_completeness(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
         // v2.24 S5c: normalize variant-prefixed LHS forms
         // (`Active.pool` → `pool`) so the read-match below can find
         // them in property bodies that reference the bare `pool`.
+        // v2.24 #16: ALSO emit leaf names for nested paths. A LHS
+        // like `accounts[i].fee_credits` indexes-then-writes `accounts`
+        // AND writes `fee_credits` — both should count as "written"
+        // so the lint can match against bare-leaf reads in
+        // properties / requires bodies.
         let mut written_fields: std::collections::HashSet<String> =
             std::collections::HashSet::new();
         for op in &spec.handlers {
             for (field, _, _) in &op.effects {
-                written_fields.insert(normalize_lhs(field));
+                let normalized = normalize_lhs(field);
+                written_fields.insert(normalized.clone());
+                // Also seed every dotted segment / index root so
+                // nested-path writes count for the read-side bare-
+                // leaf search. `accounts[i].fee_credits` →
+                // `accounts`, `fee_credits`. Pure ident segments only;
+                // skip the `[…]` indexing form.
+                for seg in normalized
+                    .split(|c: char| c == '.' || c == '[' || c == ']')
+                    .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_alphanumeric() || c == '_'))
+                {
+                    written_fields.insert(seg.to_string());
+                }
             }
         }
-        let mut read_fields: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Gather every text that might mention a state field. Pre-
+        // v2.24 #16 the lint only consulted the legacy `guard_str`
+        // slot, which modern specs leave as `None` — every requires-
+        // only / property-only / invariant-only read was invisible
+        // to the lint, producing ~30 false-positive `write_without_read`
+        // hits on real specs (Hylo / percolator). Now we scan every
+        // requires / ensures / property body / invariant the spec
+        // declares.
+        let mut texts: Vec<&str> = Vec::new();
         for op in &spec.handlers {
             if let Some(ref guard) = op.guard_str {
-                for field in &written_fields {
-                    if guard.contains(&format!("s.{}", field))
-                        || guard.contains(&format!("state.{}", field))
-                        || contains_word(guard, field)
-                    {
-                        read_fields.insert(field.clone());
-                    }
-                }
+                texts.push(guard.as_str());
+            }
+            for req in &op.requires {
+                texts.push(req.lean_expr.as_str());
+                texts.push(req.rust_expr.as_str());
+            }
+            for ens in &op.ensures {
+                texts.push(ens.lean_expr.as_str());
             }
         }
         for prop in &spec.properties {
             if let Some(ref expr) = prop.expression {
-                for field in &written_fields {
-                    if expr.contains(&format!("s.{}", field))
-                        || expr.contains(&format!("state.{}", field))
-                        || contains_word(expr, field)
-                    {
-                        read_fields.insert(field.clone());
-                    }
+                texts.push(expr.as_str());
+            }
+        }
+        for inv in &spec.invariants {
+            if let Some(ref e) = inv.lean_expr {
+                texts.push(e.as_str());
+            }
+        }
+        let mut read_fields: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for text in &texts {
+            for field in &written_fields {
+                if text.contains(&format!("s.{}", field))
+                    || text.contains(&format!("state.{}", field))
+                    || contains_word(text, field)
+                {
+                    read_fields.insert(field.clone());
                 }
             }
         }
