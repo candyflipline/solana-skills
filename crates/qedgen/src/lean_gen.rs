@@ -1580,6 +1580,7 @@ impl WitnessState {
         handler: &crate::check::ParsedHandler,
         param_values: &[(String, String)],
         constants: &[(String, String)],
+        spec: &crate::check::ParsedSpec,
     ) {
         // Apply effects
         for (field, op_kind, value) in &handler.effects {
@@ -1591,22 +1592,30 @@ impl WitnessState {
             if op_kind == "set" && is_account_binding_pubkey_ref(value, &handler.accounts) {
                 continue;
             }
+            // v2.24 S5j — variant-prefixed LHS lowers to the bare
+            // field name in `self.fields` (the flat union view). Strip
+            // here so cover-witness state evolution stays consistent
+            // with the Lean transition body's `{ s with field := … }`
+            // emission (which already strips via S5h).
             let resolved = self.resolve_value(value, param_values, constants);
+            let stripped =
+                crate::rust_codegen_util::strip_variant_prefix_for_flat_state(field, spec);
+            let field_key = stripped.as_str();
             match op_kind.as_str() {
                 "set" => {
-                    if let Some(f) = self.fields.iter_mut().find(|(n, _)| n == field) {
+                    if let Some(f) = self.fields.iter_mut().find(|(n, _)| n == field_key) {
                         f.1 = resolved;
                     }
                 }
                 "add" => {
-                    if let Some(f) = self.fields.iter_mut().find(|(n, _)| n == field) {
+                    if let Some(f) = self.fields.iter_mut().find(|(n, _)| n == field_key) {
                         let cur: u128 = f.1.parse().unwrap_or(0);
                         let add: u128 = resolved.parse().unwrap_or(0);
                         f.1 = (cur + add).to_string();
                     }
                 }
                 "sub" => {
-                    if let Some(f) = self.fields.iter_mut().find(|(n, _)| n == field) {
+                    if let Some(f) = self.fields.iter_mut().find(|(n, _)| n == field_key) {
                         let cur: u128 = f.1.parse().unwrap_or(0);
                         let sub: u128 = resolved.parse().unwrap_or(0);
                         f.1 = cur.saturating_sub(sub).to_string();
@@ -1728,7 +1737,7 @@ fn cover_trace_proof(
             status: state.status.clone(),
         };
 
-        state.apply(handler, &param_values, &spec.constants);
+        state.apply(handler, &param_values, &spec.constants, spec);
 
         steps.push((op_name.clone(), param_values, state_before));
     }
@@ -1753,7 +1762,7 @@ fn cover_trace_proof(
             let mut s = WitnessState::new(fields, lifecycle);
             for step in steps.iter().take(i + 1) {
                 let handler = spec.handlers.iter().find(|o| o.name == step.0)?;
-                s.apply(handler, &step.1, &spec.constants);
+                s.apply(handler, &step.1, &spec.constants, spec);
             }
             proof.push_str(&format!("  let s{} : State := {}\n", i + 1, s.to_lean()));
         }
@@ -5586,7 +5595,8 @@ handler noop : State -> State {
             effect_branches: None,
         };
         let constants = vec![("ZERO".to_string(), "0".to_string())];
-        ws.apply(&handler, &[], &constants);
+        let test_spec = crate::check::ParsedSpec::default();
+        ws.apply(&handler, &[], &constants, &test_spec);
         let val = &ws.fields.iter().find(|(n, _)| n == "counter").unwrap().1;
         assert_eq!(
             val.as_str(),
