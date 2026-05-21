@@ -339,6 +339,15 @@ pub fn resolve_value(
         value.to_string()
     } else if let Some((_, const_val)) = spec.constants.iter().find(|(n, _)| n == value) {
         const_val.clone()
+    } else if op
+        .calls
+        .iter()
+        .any(|c| c.result_binding.as_deref() == Some(value))
+    {
+        // v2.24 #11 — `let <name> = call …` binding is in scope for
+        // subsequent effects / requires. Render as the bare ident
+        // so the generated Rust references the let-bound local.
+        value.to_string()
     } else if let Some(binder) = state_binder {
         if is_state_field(value, spec) {
             format!("{}{}", binder, value)

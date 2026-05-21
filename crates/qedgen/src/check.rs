@@ -1200,6 +1200,13 @@ pub struct ParsedInterfaceHandler {
     pub accounts: Vec<ParsedHandlerAccount>,
     pub requires: Vec<ParsedRequires>,
     pub ensures: Vec<ParsedEnsures>,
+    /// v2.24 #11 — declared return type (e.g. `-> U64`). When present,
+    /// callers using `let x = call Foo.handler(...)` get a typed
+    /// binding via Solana's `get_return_data` syscall. `None`
+    /// (typical for Tier-0 / SPL Token handlers) means the call is
+    /// terminal and any caller-side `let` binding is dropped with a
+    /// warning.
+    pub return_type: Option<String>,
 }
 
 /// v2.24 #1 — parsed `schema` block. A named bundle of `requires`
@@ -1541,6 +1548,12 @@ fn synthesize_interface_from_imported(
             accounts: h.accounts.clone(),
             requires: h.requires.clone(),
             ensures: h.ensures.clone(),
+            // v2.24 #11 — synthesized interfaces inherit no
+            // return type today. Top-level handlers can't carry a
+            // declared return until the handler grammar grows one;
+            // for now Tier-2 callers using `let x = call …` will
+            // see the binding dropped with a lint warning.
+            return_type: None,
         })
         .collect();
     Some(ParsedInterface {

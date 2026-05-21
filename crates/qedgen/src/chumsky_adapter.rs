@@ -3220,6 +3220,7 @@ fn adapt_interface_handler<'a>(
         accounts: Vec::new(),
         requires: Vec::new(),
         ensures: Vec::new(),
+        return_type: h.return_type.as_ref().map(type_ref_to_string),
     };
 
     for Node { node: clause, .. } in &h.clauses {

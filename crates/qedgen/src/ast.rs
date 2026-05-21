@@ -452,6 +452,12 @@ pub struct InterfaceHandlerDecl {
     pub name: String,
     pub doc: Option<String>,
     pub params: Vec<TypedField>,
+    /// v2.24 #11 — optional `-> Type` return-type declaration. When
+    /// `Some`, callers can write `let x = call Foo.handler(...)` and
+    /// the codegen lowers to `let x = T::try_from_slice(&ret_bytes)?`
+    /// after the CPI via Solana's `get_return_data` syscall. `None`
+    /// keeps the existing terminal-statement shape.
+    pub return_type: Option<TypeRef>,
     pub clauses: Vec<Node<InterfaceHandlerClause>>,
 }
 

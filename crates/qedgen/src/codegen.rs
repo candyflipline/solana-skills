@@ -1591,7 +1591,7 @@ fn try_emit_anchor_cpi(
     // Every other Anchor program gets the generic `invoke` shape
     // (v2.9 G3): sighash discriminator + Borsh-serialized args +
     // AccountMeta synthesis from the interface's accounts block.
-    emit_generic_anchor_cpi(call, handler, iface)
+    emit_generic_anchor_cpi(call, handler, iface, spec)
 }
 
 /// SPL Token dispatcher. Routes to the right `anchor_spl::token` helper
@@ -1787,6 +1787,7 @@ fn emit_generic_anchor_cpi(
     call: &crate::check::ParsedCall,
     handler: &ParsedHandler,
     iface: &crate::check::ParsedInterface,
+    spec: &ParsedSpec,
 ) -> Option<String> {
     let program_id = iface.program_id.as_deref()?;
     let iface_handler = iface
@@ -1858,8 +1859,13 @@ fn emit_generic_anchor_cpi(
     out.push_str("            ];\n\n");
 
     out.push_str("            let ix = Instruction {\n");
+    // v2.24.0 follow-up: use `Pubkey::from_str` instead of the
+    // `pubkey!` macro. The macro lives at different paths across
+    // Anchor versions (and isn't reexported under
+    // `anchor_lang::solana_program` in 0.32.x); `from_str` is
+    // stable on the `Pubkey` type itself.
     out.push_str(&format!(
-        "                program_id: anchor_lang::solana_program::pubkey!(\"{}\"),\n",
+        "                program_id: <anchor_lang::prelude::Pubkey as std::str::FromStr>::from_str(\"{}\").unwrap(),\n",
         program_id,
     ));
     out.push_str("                accounts,\n");
@@ -1879,6 +1885,43 @@ fn emit_generic_anchor_cpi(
         program_acct.name,
     ));
     out.push_str("            ])?;\n");
+
+    // v2.24 #11 — when the caller wrote `let X = call …` and the
+    // interface declares a return type, capture the callee's return
+    // data via Solana's `get_return_data` syscall + Borsh decode.
+    // The block opens with `let X = { … }` instead of bare `{ … }`,
+    // and the closing emits the binding's value as the block's
+    // result. Without a declared return type, the binding name is
+    // dropped (matched at the caller side via lint warning at
+    // adapt time — TODO v2.25.1).
+    if let (Some(bind), Some(ret_dsl_type)) = (&call.result_binding, &iface_handler.return_type) {
+        let ret_rust = match map_type(ret_dsl_type, spec) {
+            Ok(t) => t,
+            Err(_) => return None,
+        };
+        out.push_str("            use anchor_lang::AnchorDeserialize;\n");
+        out.push_str("            use anchor_lang::solana_program::program::get_return_data;\n");
+        out.push_str("            use anchor_lang::solana_program::program_error::ProgramError;\n");
+        out.push_str(
+            "            let (_, ret_bytes) = get_return_data().ok_or(ProgramError::InvalidAccountData)?;\n",
+        );
+        out.push_str(&format!(
+            "            <{ret} as AnchorDeserialize>::deserialize(&mut ret_bytes.as_slice()).map_err(|_| ProgramError::InvalidAccountData)?\n",
+            ret = ret_rust,
+        ));
+        // Close the block and use it as the RHS of the let-binding.
+        out.push_str("        };\n");
+        // Prepend the `let <bind> = ` to the front of `out` (after
+        // the leading indent), since we opened with `        {` and
+        // the binding wants `let X = {`.
+        let prefix = format!("        let {} = {{\n", bind);
+        let body_without_open = out
+            .strip_prefix("        {\n")
+            .map(String::from)
+            .unwrap_or(out.clone());
+        return Some(format!("{}{}", prefix, body_without_open));
+    }
+
     out.push_str("        }\n");
     Some(out)
 }
@@ -2031,6 +2074,14 @@ fn mechanize_effect(
     if is_multi_variant_adt_state(spec) && matches!(target, Target::Anchor) {
         return None;
     }
+    // v2.24.0 follow-up: single-variant ADT specs also accept the
+    // `Variant.field` LHS form for forward-compat. The flat-struct
+    // emission has no `Variant.` prefix in the actual struct, so
+    // strip it here. Without this, `Active.total_burned := X`
+    // would lower to `self.acct.Active.total_burned = X` which
+    // doesn't compile (Active isn't a field on the wrapper).
+    let field = strip_variant_prefix(field, spec);
+    let field = field.as_str();
 
     // Anchor / Quasar handler bodies bind state as `self.<acct>.<field>`,
     // so a bare state-field RHS (e.g. `bid_buyer := state.rfp_buyer` after
@@ -2876,6 +2927,48 @@ fn render_handler_scaffold(
         out.push_str(&format!("        let {} = {};\n", binding_name, rust_expr));
     }
 
+    // v2.24 #11 — `let X = call …` bindings must be in scope when
+    // subsequent effects / requires reference them. Emit bound calls
+    // BEFORE the effect block. Unbound calls keep firing at the
+    // tail (after effects) per the pre-v2.24 convention. Track
+    // emitted-here calls so the tail emission skips them.
+    let mut emitted_call_indices = std::collections::HashSet::new();
+    let mut any_unmechanized_call_pre = false;
+    for (idx, c) in handler.calls.iter().enumerate() {
+        if c.result_binding.is_none() {
+            continue;
+        }
+        match try_emit_anchor_cpi(c, handler, spec) {
+            Some(rendered) => {
+                out.push_str(&format!(
+                    "        // Spec call: {}.{} (binding: {})\n",
+                    c.target_interface,
+                    c.target_handler,
+                    c.result_binding.as_deref().unwrap_or("_")
+                ));
+                out.push_str(&rendered);
+                emitted_call_indices.insert(idx);
+            }
+            None => {
+                let args = c
+                    .args
+                    .iter()
+                    .map(|a| format!("{}={}", a.name, a.rust_expr))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                out.push_str(&format!(
+                    "        // Spec call: {}.{}({}) (binding: {}) — needs fill\n",
+                    c.target_interface,
+                    c.target_handler,
+                    args,
+                    c.result_binding.as_deref().unwrap_or("_")
+                ));
+                any_unmechanized_call_pre = true;
+                emitted_call_indices.insert(idx);
+            }
+        }
+    }
+
     // Mechanical-effect expansion (v2.4-M3). For each spec effect we try to
     // emit a real Rust statement; anything non-mechanical stays as a comment
     // and forces a trailing `todo!()` so the user / an LLM (M4) fills it in.
@@ -2943,7 +3036,14 @@ fn render_handler_scaffold(
     // site remained unmechanized so the tail `todo!()` only fires for
     // those.
     let mut any_unmechanized_call = false;
-    for c in &handler.calls {
+    for (idx, c) in handler.calls.iter().enumerate() {
+        // v2.24 #11 — bound calls (result_binding = Some(_)) were
+        // already emitted before the effect block so the binding
+        // would be in scope for subsequent effects / requires.
+        // Skip them here so we don't double-emit.
+        if emitted_call_indices.contains(&idx) {
+            continue;
+        }
         match try_emit_anchor_cpi(c, handler, spec) {
             Some(rendered) => {
                 out.push_str(&format!(
@@ -2968,7 +3068,11 @@ fn render_handler_scaffold(
         }
     }
 
-    let needs_fill = any_unmechanized || has_events || has_transfers || any_unmechanized_call;
+    let needs_fill = any_unmechanized
+        || has_events
+        || has_transfers
+        || any_unmechanized_call
+        || any_unmechanized_call_pre;
     if needs_fill {
         out.push_str("        todo!(\"fill non-mechanical effects, events, transfers, calls\")\n");
     } else {
@@ -5027,6 +5131,73 @@ handler send : State.Active -> State.Active {
         );
         // Borsh-serialized amount arg.
         assert!(rendered.contains("AnchorSerialize::serialize"));
+    }
+
+    /// v2.24 #11 — `let X = call Foo.handler(...)` lowers to a Rust
+    /// let-binding capturing the callee's return value via Solana's
+    /// `get_return_data` syscall, when the interface declares a
+    /// return type (`-> U64` etc.).
+    #[test]
+    fn cpi_emits_let_binding_when_interface_declares_return_type() {
+        let spec = crate::chumsky_adapter::parse_str(
+            r#"spec Caller
+program_id "11111111111111111111111111111111"
+
+interface Pool {
+  program_id "22222222222222222222222222222222"
+  handler absorb_loss (loss : U64) -> U64 {
+    accounts { vault : writable }
+  }
+}
+
+type State | Active of { total_burned : U64 }
+type Error | MathOverflow | E
+
+handler liquidate (loss : U64) : State.Active -> State.Active {
+  permissionless
+  accounts {
+    vault         : writable
+    pool_program  : program
+  }
+  let burned = call Pool.absorb_loss(vault = vault, loss = loss)
+}
+"#,
+        )
+        .unwrap();
+        let handler = spec
+            .handlers
+            .iter()
+            .find(|h| h.name == "liquidate")
+            .unwrap();
+        let call = handler.calls.first().expect("call site");
+        assert_eq!(
+            call.result_binding.as_deref(),
+            Some("burned"),
+            "result_binding should land in ParsedCall"
+        );
+        let rendered = try_emit_anchor_cpi(call, handler, &spec)
+            .expect("must emit a generic CPI with let-binding capture");
+        // Block opens as a `let burned = { … }` expression.
+        assert!(
+            rendered.starts_with("        let burned = {\n"),
+            "expected let-binding open; got prefix:\n{}",
+            &rendered[..200.min(rendered.len())]
+        );
+        // The CPI invoke happens inside.
+        assert!(rendered.contains("invoke(&ix"));
+        // get_return_data captures the callee's return.
+        assert!(rendered.contains("get_return_data"));
+        // The return type maps to u64; deserialize is typed.
+        assert!(
+            rendered.contains("<u64 as AnchorDeserialize>"),
+            "expected typed deserialize for U64 return; got:\n{rendered}"
+        );
+        // Block closes with `};` (let-binding terminator).
+        assert!(
+            rendered.ends_with("        };\n"),
+            "expected let-binding close; got suffix:\n{}",
+            &rendered[rendered.len().saturating_sub(200)..]
+        );
     }
 
     // ----- v2.8 F8: Error-sum threading via mechanize_effect -----

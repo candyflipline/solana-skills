@@ -2468,6 +2468,13 @@ fn interface_handler_clause<'a>(
 
 // handler h(params)* { discriminant, accounts, requires, ensures }  — inside an interface block.
 fn interface_handler_decl<'a>() -> impl Parser<'a, &'a str, InterfaceHandlerDecl, Err<'a>> + Clone {
+    // v2.24 #11 — optional `-> Type` return-type after the params.
+    // When present, callers can write `let x = call Foo.handler(...)`
+    // and the codegen lowers the binding to a `get_return_data` read.
+    let return_type = just("->")
+        .then_ignore(wsc())
+        .ignore_then(type_ref())
+        .then_ignore(wsc());
     doc_comments()
         .then_ignore(kw("handler"))
         .then(non_keyword_ident())
@@ -2478,6 +2485,8 @@ fn interface_handler_decl<'a>() -> impl Parser<'a, &'a str, InterfaceHandlerDecl
                 .repeated()
                 .collect::<Vec<TypedField>>(),
         )
+        .then_ignore(wsc())
+        .then(return_type.or_not())
         .then_ignore(wsc())
         .then_ignore(just('{'))
         .then_ignore(wsc())
@@ -2490,12 +2499,15 @@ fn interface_handler_decl<'a>() -> impl Parser<'a, &'a str, InterfaceHandlerDecl
         )
         .then_ignore(wsc())
         .then_ignore(just('}'))
-        .map(|(((doc, name), params), clauses)| InterfaceHandlerDecl {
-            name,
-            doc,
-            params,
-            clauses,
-        })
+        .map(
+            |((((doc, name), params), return_type), clauses)| InterfaceHandlerDecl {
+                name,
+                doc,
+                params,
+                return_type,
+                clauses,
+            },
+        )
 }
 
 fn interface_decl<'a>() -> impl Parser<'a, &'a str, TopItem, Err<'a>> + Clone {
