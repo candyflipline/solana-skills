@@ -1416,28 +1416,40 @@ fn resolve_and_merge_imports(
             )
         })?;
 
-        // Imported source must declare an `interface <source_name>`.
-        // `r.bound_name` here is the source-side name (the first ident
-        // in `import X from "y" [as Z]`); the local alias, if any, is
-        // applied at merge time below.
-        let iface = imported
+        // v2.24 #13 — imported source may declare an explicit
+        // `interface <name>` block OR may rely on implicit synthesis
+        // from top-level handlers. Pre-fix the resolver hard-required
+        // an explicit block, contradicting the DSL ref's "No
+        // `interface` keyword needed — every handler in the imported
+        // spec is public."
+        let explicit = imported
             .interfaces
             .iter()
-            .find(|i| i.name == r.bound_name)
-            .ok_or_else(|| {
+            .find(|i| i.name == r.bound_name);
+        let synthesized: Option<ParsedInterface> = if explicit.is_none() {
+            synthesize_interface_from_imported(&r.bound_name, &imported)
+        } else {
+            None
+        };
+        let iface = match (explicit, &synthesized) {
+            (Some(i), _) => i,
+            (None, Some(i)) => i,
+            (None, None) => {
                 let where_clause = if r.sources.len() == 1 {
                     format!("at {}", r.sources[0].0.display())
                 } else {
                     format!("(merged from {} fragments)", r.sources.len())
                 };
-                anyhow::anyhow!(
-                    "import `{}` from `{}` — imported source {} declares no `interface {}` block",
+                anyhow::bail!(
+                    "import `{}` from `{}` — imported source {} declares no `interface {}` block and has no top-level handlers to synthesize one from. Add either an `interface {} {{ ... }}` block or at least one top-level `handler` to the imported spec.",
                     r.bound_name,
                     r.dep_key,
                     where_clause,
                     r.bound_name,
-                )
-            })?;
+                    r.bound_name,
+                );
+            }
+        };
 
         // Build the lock entry while we have everything in scope: the
         // resolved import (sources + commit), the manifest dep descriptor
@@ -1463,6 +1475,46 @@ fn resolve_and_merge_imports(
     crate::qed_lock::handle_lock(manifest_dir, &lock, lock_mode)?;
 
     Ok(())
+}
+
+/// v2.24 #13 — synthesize a `ParsedInterface` from the imported
+/// spec's top-level handlers when no explicit `interface { … }`
+/// block is declared. Closes the docs-vs-implementation gap:
+///
+/// > DSL ref: "No `interface` keyword needed — every handler in
+/// > the imported spec is public."
+///
+/// Tier-2 contract: requires / ensures come from the imported
+/// handlers' clauses, accounts from each handler's accounts block.
+/// Returns `None` when the imported spec has no top-level
+/// handlers (caller emits a clearer error).
+fn synthesize_interface_from_imported(
+    bound_name: &str,
+    imported: &ParsedSpec,
+) -> Option<ParsedInterface> {
+    if imported.handlers.is_empty() {
+        return None;
+    }
+    let handlers = imported
+        .handlers
+        .iter()
+        .map(|h| ParsedInterfaceHandler {
+            name: h.name.clone(),
+            doc: h.doc.clone(),
+            params: h.takes_params.clone(),
+            discriminant: None,
+            accounts: h.accounts.clone(),
+            requires: h.requires.clone(),
+            ensures: h.ensures.clone(),
+        })
+        .collect();
+    Some(ParsedInterface {
+        name: bound_name.to_string(),
+        doc: None,
+        program_id: imported.program_id.clone(),
+        upstream: None,
+        handlers,
+    })
 }
 
 /// Parse the source bytes for one resolved import. Single-file deps go
