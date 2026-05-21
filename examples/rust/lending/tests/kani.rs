@@ -130,16 +130,17 @@ fn verify_deposit_rejects_invalid() {
 #[kani::unwind(2)]
 #[kani::solver(cadical)]
 fn verify_init_pool_preserves_pool_solvency() {
-    let mut s = State {
+    let pre = State {
         authority: [0u8; 32],
         total_deposits: 0,
         total_borrows: 0,
         interest_rate: 0,
         status: Status::Uninitialized,
     };
+    let mut post = pre;
     let rate: u64 = kani::any();
-    if init_pool(&mut s, rate) {
-        assert!(pool_solvency(&s),
+    if init_pool(&mut post, rate) {
+        assert!(pool_solvency(&post),
             "pool_solvency must hold after init_pool");
     }
 }
@@ -148,18 +149,19 @@ fn verify_init_pool_preserves_pool_solvency() {
 #[kani::unwind(2)]
 #[kani::solver(cadical)]
 fn verify_deposit_preserves_pool_solvency() {
-    let mut s = State {
+    let pre = State {
         authority: kani::any(),
         total_deposits: kani::any(),
         total_borrows: kani::any(),
         interest_rate: kani::any(),
         status: kani::any(),
     };
-    kani::assume(s.status == Status::Active);
-    kani::assume(pool_solvency(&s));
+    kani::assume(pre.status == Status::Active);
+    kani::assume(pool_solvency(&pre));
+    let mut post = pre;
     let amount: u64 = kani::any();
-    if deposit(&mut s, amount) {
-        assert!(pool_solvency(&s),
+    if deposit(&mut post, amount) {
+        assert!(pool_solvency(&post),
             "pool_solvency must hold after deposit");
     }
 }

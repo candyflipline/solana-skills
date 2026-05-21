@@ -105,15 +105,16 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn init_pool_preserves_pool_solvency(rate in 0u64..=u64::MAX) {
-        let mut s = State {
+        let mut post = State {
             authority: [0u8; 32],
             total_deposits: 0,
             total_borrows: 0,
             interest_rate: 0,
             status: Status::Uninitialized,
         };
-        if init_pool(&mut s, rate) {
-            prop_assert!(pool_solvency(&s),
+        let pre = post;
+        if init_pool(&mut post, rate) {
+            prop_assert!(pool_solvency(&post),
                 "pool_solvency must hold after init_pool");
         }
     }
@@ -123,10 +124,11 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn deposit_preserves_pool_solvency(s in arb_state(), amount in 0u64..=u64::MAX) {
-        let mut s = s;
-        prop_assume!(pool_solvency(&s));
-        if deposit(&mut s, amount) {
-            prop_assert!(pool_solvency(&s),
+        let pre = s.clone();
+        let mut post = s;
+        prop_assume!(pool_solvency(&pre));
+        if deposit(&mut post, amount) {
+            prop_assert!(pool_solvency(&post),
                 "pool_solvency must hold after deposit");
         }
     }

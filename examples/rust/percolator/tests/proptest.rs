@@ -334,12 +334,13 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn add_user_preserves_conservation(s in arb_state(), i in 0usize..=usize::MAX) {
-        let mut s = s;
-        prop_assume!(conservation(&s));
-        prop_assume!(vault_bounded(&s));
-        prop_assume!(account_solvent(&s));
-        if add_user(&mut s, i) {
-            prop_assert!(conservation(&s),
+        let pre = s.clone();
+        let mut post = s;
+        prop_assume!(conservation(&pre));
+        prop_assume!(vault_bounded(&pre));
+        prop_assume!(account_solvent(&pre));
+        if add_user(&mut post, i) {
+            prop_assert!(conservation(&post),
                 "conservation must hold after add_user");
         }
     }
@@ -349,12 +350,13 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn add_lp_preserves_conservation(s in arb_state(), i in 0usize..=usize::MAX) {
-        let mut s = s;
-        prop_assume!(conservation(&s));
-        prop_assume!(vault_bounded(&s));
-        prop_assume!(account_solvent(&s));
-        if add_lp(&mut s, i) {
-            prop_assert!(conservation(&s),
+        let pre = s.clone();
+        let mut post = s;
+        prop_assume!(conservation(&pre));
+        prop_assume!(vault_bounded(&pre));
+        prop_assume!(account_solvent(&pre));
+        if add_lp(&mut post, i) {
+            prop_assert!(conservation(&post),
                 "conservation must hold after add_lp");
         }
     }
@@ -364,12 +366,13 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn reclaim_empty_account_preserves_conservation(s in arb_state(), i in 0usize..=usize::MAX) {
-        let mut s = s;
-        prop_assume!(conservation(&s));
-        prop_assume!(vault_bounded(&s));
-        prop_assume!(account_solvent(&s));
-        if reclaim_empty_account(&mut s, i) {
-            prop_assert!(conservation(&s),
+        let pre = s.clone();
+        let mut post = s;
+        prop_assume!(conservation(&pre));
+        prop_assume!(vault_bounded(&pre));
+        prop_assume!(account_solvent(&pre));
+        if reclaim_empty_account(&mut post, i) {
+            prop_assert!(conservation(&post),
                 "conservation must hold after reclaim_empty_account");
         }
     }
@@ -379,12 +382,13 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn close_account_preserves_conservation(s in arb_state(), i in 0usize..=usize::MAX) {
-        let mut s = s;
-        prop_assume!(conservation(&s));
-        prop_assume!(vault_bounded(&s));
-        prop_assume!(account_solvent(&s));
-        if close_account(&mut s, i) {
-            prop_assert!(conservation(&s),
+        let pre = s.clone();
+        let mut post = s;
+        prop_assume!(conservation(&pre));
+        prop_assume!(vault_bounded(&pre));
+        prop_assume!(account_solvent(&pre));
+        if close_account(&mut post, i) {
+            prop_assert!(conservation(&post),
                 "conservation must hold after close_account");
         }
     }
@@ -394,12 +398,13 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn deposit_preserves_conservation(s in arb_state(), i in 0usize..=usize::MAX, amount in 0u128..=u128::MAX) {
-        let mut s = s;
-        prop_assume!(conservation(&s));
-        prop_assume!(vault_bounded(&s));
-        prop_assume!(account_solvent(&s));
-        if deposit(&mut s, i, amount) {
-            prop_assert!(conservation(&s),
+        let pre = s.clone();
+        let mut post = s;
+        prop_assume!(conservation(&pre));
+        prop_assume!(vault_bounded(&pre));
+        prop_assume!(account_solvent(&pre));
+        if deposit(&mut post, i, amount) {
+            prop_assert!(conservation(&post),
                 "conservation must hold after deposit");
         }
     }
@@ -409,12 +414,13 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn withdraw_preserves_conservation(s in arb_state(), i in 0usize..=usize::MAX, amount in 0u128..=u128::MAX) {
-        let mut s = s;
-        prop_assume!(conservation(&s));
-        prop_assume!(vault_bounded(&s));
-        prop_assume!(account_solvent(&s));
-        if withdraw(&mut s, i, amount) {
-            prop_assert!(conservation(&s),
+        let pre = s.clone();
+        let mut post = s;
+        prop_assume!(conservation(&pre));
+        prop_assume!(vault_bounded(&pre));
+        prop_assume!(account_solvent(&pre));
+        if withdraw(&mut post, i, amount) {
+            prop_assert!(conservation(&post),
                 "conservation must hold after withdraw");
         }
     }
@@ -424,12 +430,13 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn top_up_insurance_preserves_conservation(s in arb_state(), amount in 0u128..=u128::MAX) {
-        let mut s = s;
-        prop_assume!(conservation(&s));
-        prop_assume!(vault_bounded(&s));
-        prop_assume!(account_solvent(&s));
-        if top_up_insurance(&mut s, amount) {
-            prop_assert!(conservation(&s),
+        let pre = s.clone();
+        let mut post = s;
+        prop_assume!(conservation(&pre));
+        prop_assume!(vault_bounded(&pre));
+        prop_assume!(account_solvent(&pre));
+        if top_up_insurance(&mut post, amount) {
+            prop_assert!(conservation(&post),
                 "conservation must hold after top_up_insurance");
         }
     }
@@ -439,12 +446,13 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn deposit_fee_credits_preserves_conservation(s in arb_state(), i in 0usize..=usize::MAX, amount in 0u128..=u128::MAX) {
-        let mut s = s;
-        prop_assume!(conservation(&s));
-        prop_assume!(vault_bounded(&s));
-        prop_assume!(account_solvent(&s));
-        if deposit_fee_credits(&mut s, i, amount) {
-            prop_assert!(conservation(&s),
+        let pre = s.clone();
+        let mut post = s;
+        prop_assume!(conservation(&pre));
+        prop_assume!(vault_bounded(&pre));
+        prop_assume!(account_solvent(&pre));
+        if deposit_fee_credits(&mut post, i, amount) {
+            prop_assert!(conservation(&post),
                 "conservation must hold after deposit_fee_credits");
         }
     }
@@ -454,12 +462,13 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn convert_released_pnl_preserves_conservation(s in arb_state(), i in 0usize..=usize::MAX, x in 0u128..=u128::MAX) {
-        let mut s = s;
-        prop_assume!(conservation(&s));
-        prop_assume!(vault_bounded(&s));
-        prop_assume!(account_solvent(&s));
-        if convert_released_pnl(&mut s, i, x) {
-            prop_assert!(conservation(&s),
+        let pre = s.clone();
+        let mut post = s;
+        prop_assume!(conservation(&pre));
+        prop_assume!(vault_bounded(&pre));
+        prop_assume!(account_solvent(&pre));
+        if convert_released_pnl(&mut post, i, x) {
+            prop_assert!(conservation(&post),
                 "conservation must hold after convert_released_pnl");
         }
     }
@@ -469,12 +478,13 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn execute_trade_preserves_conservation(s in arb_state(), a in 0usize..=usize::MAX, b in 0usize..=usize::MAX, size_q in 0i128..=i128::MAX, exec_price in 0u64..=u64::MAX) {
-        let mut s = s;
-        prop_assume!(conservation(&s));
-        prop_assume!(vault_bounded(&s));
-        prop_assume!(account_solvent(&s));
-        if execute_trade(&mut s, a, b, size_q, exec_price) {
-            prop_assert!(conservation(&s),
+        let pre = s.clone();
+        let mut post = s;
+        prop_assume!(conservation(&pre));
+        prop_assume!(vault_bounded(&pre));
+        prop_assume!(account_solvent(&pre));
+        if execute_trade(&mut post, a, b, size_q, exec_price) {
+            prop_assert!(conservation(&post),
                 "conservation must hold after execute_trade");
         }
     }
@@ -484,12 +494,13 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn liquidate_case_0_preserves_conservation(s in arb_state(), i in 0usize..=usize::MAX) {
-        let mut s = s;
-        prop_assume!(conservation(&s));
-        prop_assume!(vault_bounded(&s));
-        prop_assume!(account_solvent(&s));
-        if liquidate_case_0(&mut s, i) {
-            prop_assert!(conservation(&s),
+        let pre = s.clone();
+        let mut post = s;
+        prop_assume!(conservation(&pre));
+        prop_assume!(vault_bounded(&pre));
+        prop_assume!(account_solvent(&pre));
+        if liquidate_case_0(&mut post, i) {
+            prop_assert!(conservation(&post),
                 "conservation must hold after liquidate_case_0");
         }
     }
@@ -499,12 +510,13 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn liquidate_case_1_preserves_conservation(s in arb_state(), i in 0usize..=usize::MAX) {
-        let mut s = s;
-        prop_assume!(conservation(&s));
-        prop_assume!(vault_bounded(&s));
-        prop_assume!(account_solvent(&s));
-        if liquidate_case_1(&mut s, i) {
-            prop_assert!(conservation(&s),
+        let pre = s.clone();
+        let mut post = s;
+        prop_assume!(conservation(&pre));
+        prop_assume!(vault_bounded(&pre));
+        prop_assume!(account_solvent(&pre));
+        if liquidate_case_1(&mut post, i) {
+            prop_assert!(conservation(&post),
                 "conservation must hold after liquidate_case_1");
         }
     }
@@ -514,12 +526,13 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn liquidate_otherwise_preserves_conservation(s in arb_state(), i in 0usize..=usize::MAX) {
-        let mut s = s;
-        prop_assume!(conservation(&s));
-        prop_assume!(vault_bounded(&s));
-        prop_assume!(account_solvent(&s));
-        if liquidate_otherwise(&mut s, i) {
-            prop_assert!(conservation(&s),
+        let pre = s.clone();
+        let mut post = s;
+        prop_assume!(conservation(&pre));
+        prop_assume!(vault_bounded(&pre));
+        prop_assume!(account_solvent(&pre));
+        if liquidate_otherwise(&mut post, i) {
+            prop_assert!(conservation(&post),
                 "conservation must hold after liquidate_otherwise");
         }
     }
@@ -529,12 +542,13 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn settle_account_preserves_conservation(s in arb_state(), i in 0usize..=usize::MAX) {
-        let mut s = s;
-        prop_assume!(conservation(&s));
-        prop_assume!(vault_bounded(&s));
-        prop_assume!(account_solvent(&s));
-        if settle_account(&mut s, i) {
-            prop_assert!(conservation(&s),
+        let pre = s.clone();
+        let mut post = s;
+        prop_assume!(conservation(&pre));
+        prop_assume!(vault_bounded(&pre));
+        prop_assume!(account_solvent(&pre));
+        if settle_account(&mut post, i) {
+            prop_assert!(conservation(&post),
                 "conservation must hold after settle_account");
         }
     }
@@ -544,12 +558,13 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn trigger_adl_preserves_conservation(s in arb_state()) {
-        let mut s = s;
-        prop_assume!(conservation(&s));
-        prop_assume!(vault_bounded(&s));
-        prop_assume!(account_solvent(&s));
-        if trigger_adl(&mut s) {
-            prop_assert!(conservation(&s),
+        let pre = s.clone();
+        let mut post = s;
+        prop_assume!(conservation(&pre));
+        prop_assume!(vault_bounded(&pre));
+        prop_assume!(account_solvent(&pre));
+        if trigger_adl(&mut post) {
+            prop_assert!(conservation(&post),
                 "conservation must hold after trigger_adl");
         }
     }
@@ -559,12 +574,13 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn complete_drain_preserves_conservation(s in arb_state()) {
-        let mut s = s;
-        prop_assume!(conservation(&s));
-        prop_assume!(vault_bounded(&s));
-        prop_assume!(account_solvent(&s));
-        if complete_drain(&mut s) {
-            prop_assert!(conservation(&s),
+        let pre = s.clone();
+        let mut post = s;
+        prop_assume!(conservation(&pre));
+        prop_assume!(vault_bounded(&pre));
+        prop_assume!(account_solvent(&pre));
+        if complete_drain(&mut post) {
+            prop_assert!(conservation(&post),
                 "conservation must hold after complete_drain");
         }
     }
@@ -574,12 +590,13 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn reset_preserves_conservation(s in arb_state()) {
-        let mut s = s;
-        prop_assume!(conservation(&s));
-        prop_assume!(vault_bounded(&s));
-        prop_assume!(account_solvent(&s));
-        if reset(&mut s) {
-            prop_assert!(conservation(&s),
+        let pre = s.clone();
+        let mut post = s;
+        prop_assume!(conservation(&pre));
+        prop_assume!(vault_bounded(&pre));
+        prop_assume!(account_solvent(&pre));
+        if reset(&mut post) {
+            prop_assert!(conservation(&post),
                 "conservation must hold after reset");
         }
     }
@@ -589,12 +606,13 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn deposit_preserves_vault_bounded(s in arb_state(), i in 0usize..=usize::MAX, amount in 0u128..=u128::MAX) {
-        let mut s = s;
-        prop_assume!(conservation(&s));
-        prop_assume!(vault_bounded(&s));
-        prop_assume!(account_solvent(&s));
-        if deposit(&mut s, i, amount) {
-            prop_assert!(vault_bounded(&s),
+        let pre = s.clone();
+        let mut post = s;
+        prop_assume!(conservation(&pre));
+        prop_assume!(vault_bounded(&pre));
+        prop_assume!(account_solvent(&pre));
+        if deposit(&mut post, i, amount) {
+            prop_assert!(vault_bounded(&post),
                 "vault_bounded must hold after deposit");
         }
     }
@@ -604,12 +622,13 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn top_up_insurance_preserves_vault_bounded(s in arb_state(), amount in 0u128..=u128::MAX) {
-        let mut s = s;
-        prop_assume!(conservation(&s));
-        prop_assume!(vault_bounded(&s));
-        prop_assume!(account_solvent(&s));
-        if top_up_insurance(&mut s, amount) {
-            prop_assert!(vault_bounded(&s),
+        let pre = s.clone();
+        let mut post = s;
+        prop_assume!(conservation(&pre));
+        prop_assume!(vault_bounded(&pre));
+        prop_assume!(account_solvent(&pre));
+        if top_up_insurance(&mut post, amount) {
+            prop_assert!(vault_bounded(&post),
                 "vault_bounded must hold after top_up_insurance");
         }
     }
@@ -619,12 +638,13 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn deposit_fee_credits_preserves_vault_bounded(s in arb_state(), i in 0usize..=usize::MAX, amount in 0u128..=u128::MAX) {
-        let mut s = s;
-        prop_assume!(conservation(&s));
-        prop_assume!(vault_bounded(&s));
-        prop_assume!(account_solvent(&s));
-        if deposit_fee_credits(&mut s, i, amount) {
-            prop_assert!(vault_bounded(&s),
+        let pre = s.clone();
+        let mut post = s;
+        prop_assume!(conservation(&pre));
+        prop_assume!(vault_bounded(&pre));
+        prop_assume!(account_solvent(&pre));
+        if deposit_fee_credits(&mut post, i, amount) {
+            prop_assert!(vault_bounded(&post),
                 "vault_bounded must hold after deposit_fee_credits");
         }
     }
@@ -634,12 +654,13 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn add_user_preserves_account_solvent(s in arb_state(), i in 0usize..=usize::MAX) {
-        let mut s = s;
-        prop_assume!(conservation(&s));
-        prop_assume!(vault_bounded(&s));
-        prop_assume!(account_solvent_at(&s, i));
-        if add_user(&mut s, i) {
-            prop_assert!(account_solvent_at(&s, i),
+        let pre = s.clone();
+        let mut post = s;
+        prop_assume!(conservation(&pre));
+        prop_assume!(vault_bounded(&pre));
+        prop_assume!(account_solvent_at(&pre, i));
+        if add_user(&mut post, i) {
+            prop_assert!(account_solvent_at(&post, i),
                 "account_solvent must hold after add_user");
         }
     }
@@ -649,12 +670,13 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn add_lp_preserves_account_solvent(s in arb_state(), i in 0usize..=usize::MAX) {
-        let mut s = s;
-        prop_assume!(conservation(&s));
-        prop_assume!(vault_bounded(&s));
-        prop_assume!(account_solvent_at(&s, i));
-        if add_lp(&mut s, i) {
-            prop_assert!(account_solvent_at(&s, i),
+        let pre = s.clone();
+        let mut post = s;
+        prop_assume!(conservation(&pre));
+        prop_assume!(vault_bounded(&pre));
+        prop_assume!(account_solvent_at(&pre, i));
+        if add_lp(&mut post, i) {
+            prop_assert!(account_solvent_at(&post, i),
                 "account_solvent must hold after add_lp");
         }
     }
@@ -664,12 +686,13 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn reclaim_empty_account_preserves_account_solvent(s in arb_state(), i in 0usize..=usize::MAX) {
-        let mut s = s;
-        prop_assume!(conservation(&s));
-        prop_assume!(vault_bounded(&s));
-        prop_assume!(account_solvent_at(&s, i));
-        if reclaim_empty_account(&mut s, i) {
-            prop_assert!(account_solvent_at(&s, i),
+        let pre = s.clone();
+        let mut post = s;
+        prop_assume!(conservation(&pre));
+        prop_assume!(vault_bounded(&pre));
+        prop_assume!(account_solvent_at(&pre, i));
+        if reclaim_empty_account(&mut post, i) {
+            prop_assert!(account_solvent_at(&post, i),
                 "account_solvent must hold after reclaim_empty_account");
         }
     }
@@ -679,12 +702,13 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn close_account_preserves_account_solvent(s in arb_state(), i in 0usize..=usize::MAX) {
-        let mut s = s;
-        prop_assume!(conservation(&s));
-        prop_assume!(vault_bounded(&s));
-        prop_assume!(account_solvent_at(&s, i));
-        if close_account(&mut s, i) {
-            prop_assert!(account_solvent_at(&s, i),
+        let pre = s.clone();
+        let mut post = s;
+        prop_assume!(conservation(&pre));
+        prop_assume!(vault_bounded(&pre));
+        prop_assume!(account_solvent_at(&pre, i));
+        if close_account(&mut post, i) {
+            prop_assert!(account_solvent_at(&post, i),
                 "account_solvent must hold after close_account");
         }
     }
@@ -694,12 +718,13 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn deposit_preserves_account_solvent(s in arb_state(), i in 0usize..=usize::MAX, amount in 0u128..=u128::MAX) {
-        let mut s = s;
-        prop_assume!(conservation(&s));
-        prop_assume!(vault_bounded(&s));
-        prop_assume!(account_solvent_at(&s, i));
-        if deposit(&mut s, i, amount) {
-            prop_assert!(account_solvent_at(&s, i),
+        let pre = s.clone();
+        let mut post = s;
+        prop_assume!(conservation(&pre));
+        prop_assume!(vault_bounded(&pre));
+        prop_assume!(account_solvent_at(&pre, i));
+        if deposit(&mut post, i, amount) {
+            prop_assert!(account_solvent_at(&post, i),
                 "account_solvent must hold after deposit");
         }
     }
@@ -709,12 +734,13 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn withdraw_preserves_account_solvent(s in arb_state(), i in 0usize..=usize::MAX, amount in 0u128..=u128::MAX) {
-        let mut s = s;
-        prop_assume!(conservation(&s));
-        prop_assume!(vault_bounded(&s));
-        prop_assume!(account_solvent_at(&s, i));
-        if withdraw(&mut s, i, amount) {
-            prop_assert!(account_solvent_at(&s, i),
+        let pre = s.clone();
+        let mut post = s;
+        prop_assume!(conservation(&pre));
+        prop_assume!(vault_bounded(&pre));
+        prop_assume!(account_solvent_at(&pre, i));
+        if withdraw(&mut post, i, amount) {
+            prop_assert!(account_solvent_at(&post, i),
                 "account_solvent must hold after withdraw");
         }
     }
@@ -724,12 +750,13 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn top_up_insurance_preserves_account_solvent(s in arb_state(), amount in 0u128..=u128::MAX, i in 0usize..=1024usize) {
-        let mut s = s;
-        prop_assume!(conservation(&s));
-        prop_assume!(vault_bounded(&s));
-        prop_assume!(account_solvent_at(&s, i));
-        if top_up_insurance(&mut s, amount) {
-            prop_assert!(account_solvent_at(&s, i),
+        let pre = s.clone();
+        let mut post = s;
+        prop_assume!(conservation(&pre));
+        prop_assume!(vault_bounded(&pre));
+        prop_assume!(account_solvent_at(&pre, i));
+        if top_up_insurance(&mut post, amount) {
+            prop_assert!(account_solvent_at(&post, i),
                 "account_solvent must hold after top_up_insurance");
         }
     }
@@ -739,12 +766,13 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn deposit_fee_credits_preserves_account_solvent(s in arb_state(), i in 0usize..=usize::MAX, amount in 0u128..=u128::MAX) {
-        let mut s = s;
-        prop_assume!(conservation(&s));
-        prop_assume!(vault_bounded(&s));
-        prop_assume!(account_solvent_at(&s, i));
-        if deposit_fee_credits(&mut s, i, amount) {
-            prop_assert!(account_solvent_at(&s, i),
+        let pre = s.clone();
+        let mut post = s;
+        prop_assume!(conservation(&pre));
+        prop_assume!(vault_bounded(&pre));
+        prop_assume!(account_solvent_at(&pre, i));
+        if deposit_fee_credits(&mut post, i, amount) {
+            prop_assert!(account_solvent_at(&post, i),
                 "account_solvent must hold after deposit_fee_credits");
         }
     }
@@ -754,12 +782,13 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn convert_released_pnl_preserves_account_solvent(s in arb_state(), i in 0usize..=usize::MAX, x in 0u128..=u128::MAX) {
-        let mut s = s;
-        prop_assume!(conservation(&s));
-        prop_assume!(vault_bounded(&s));
-        prop_assume!(account_solvent_at(&s, i));
-        if convert_released_pnl(&mut s, i, x) {
-            prop_assert!(account_solvent_at(&s, i),
+        let pre = s.clone();
+        let mut post = s;
+        prop_assume!(conservation(&pre));
+        prop_assume!(vault_bounded(&pre));
+        prop_assume!(account_solvent_at(&pre, i));
+        if convert_released_pnl(&mut post, i, x) {
+            prop_assert!(account_solvent_at(&post, i),
                 "account_solvent must hold after convert_released_pnl");
         }
     }
@@ -769,12 +798,13 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn execute_trade_preserves_account_solvent(s in arb_state(), a in 0usize..=usize::MAX, b in 0usize..=usize::MAX, size_q in 0i128..=i128::MAX, exec_price in 0u64..=u64::MAX, i in 0usize..=1024usize) {
-        let mut s = s;
-        prop_assume!(conservation(&s));
-        prop_assume!(vault_bounded(&s));
-        prop_assume!(account_solvent_at(&s, i));
-        if execute_trade(&mut s, a, b, size_q, exec_price) {
-            prop_assert!(account_solvent_at(&s, i),
+        let pre = s.clone();
+        let mut post = s;
+        prop_assume!(conservation(&pre));
+        prop_assume!(vault_bounded(&pre));
+        prop_assume!(account_solvent_at(&pre, i));
+        if execute_trade(&mut post, a, b, size_q, exec_price) {
+            prop_assert!(account_solvent_at(&post, i),
                 "account_solvent must hold after execute_trade");
         }
     }
@@ -784,12 +814,13 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn liquidate_case_0_preserves_account_solvent(s in arb_state(), i in 0usize..=usize::MAX) {
-        let mut s = s;
-        prop_assume!(conservation(&s));
-        prop_assume!(vault_bounded(&s));
-        prop_assume!(account_solvent_at(&s, i));
-        if liquidate_case_0(&mut s, i) {
-            prop_assert!(account_solvent_at(&s, i),
+        let pre = s.clone();
+        let mut post = s;
+        prop_assume!(conservation(&pre));
+        prop_assume!(vault_bounded(&pre));
+        prop_assume!(account_solvent_at(&pre, i));
+        if liquidate_case_0(&mut post, i) {
+            prop_assert!(account_solvent_at(&post, i),
                 "account_solvent must hold after liquidate_case_0");
         }
     }
@@ -799,12 +830,13 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn liquidate_case_1_preserves_account_solvent(s in arb_state(), i in 0usize..=usize::MAX) {
-        let mut s = s;
-        prop_assume!(conservation(&s));
-        prop_assume!(vault_bounded(&s));
-        prop_assume!(account_solvent_at(&s, i));
-        if liquidate_case_1(&mut s, i) {
-            prop_assert!(account_solvent_at(&s, i),
+        let pre = s.clone();
+        let mut post = s;
+        prop_assume!(conservation(&pre));
+        prop_assume!(vault_bounded(&pre));
+        prop_assume!(account_solvent_at(&pre, i));
+        if liquidate_case_1(&mut post, i) {
+            prop_assert!(account_solvent_at(&post, i),
                 "account_solvent must hold after liquidate_case_1");
         }
     }
@@ -814,12 +846,13 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn liquidate_otherwise_preserves_account_solvent(s in arb_state(), i in 0usize..=usize::MAX) {
-        let mut s = s;
-        prop_assume!(conservation(&s));
-        prop_assume!(vault_bounded(&s));
-        prop_assume!(account_solvent_at(&s, i));
-        if liquidate_otherwise(&mut s, i) {
-            prop_assert!(account_solvent_at(&s, i),
+        let pre = s.clone();
+        let mut post = s;
+        prop_assume!(conservation(&pre));
+        prop_assume!(vault_bounded(&pre));
+        prop_assume!(account_solvent_at(&pre, i));
+        if liquidate_otherwise(&mut post, i) {
+            prop_assert!(account_solvent_at(&post, i),
                 "account_solvent must hold after liquidate_otherwise");
         }
     }
@@ -829,12 +862,13 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn settle_account_preserves_account_solvent(s in arb_state(), i in 0usize..=usize::MAX) {
-        let mut s = s;
-        prop_assume!(conservation(&s));
-        prop_assume!(vault_bounded(&s));
-        prop_assume!(account_solvent_at(&s, i));
-        if settle_account(&mut s, i) {
-            prop_assert!(account_solvent_at(&s, i),
+        let pre = s.clone();
+        let mut post = s;
+        prop_assume!(conservation(&pre));
+        prop_assume!(vault_bounded(&pre));
+        prop_assume!(account_solvent_at(&pre, i));
+        if settle_account(&mut post, i) {
+            prop_assert!(account_solvent_at(&post, i),
                 "account_solvent must hold after settle_account");
         }
     }
@@ -844,12 +878,13 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn trigger_adl_preserves_account_solvent(s in arb_state(), i in 0usize..=1024usize) {
-        let mut s = s;
-        prop_assume!(conservation(&s));
-        prop_assume!(vault_bounded(&s));
-        prop_assume!(account_solvent_at(&s, i));
-        if trigger_adl(&mut s) {
-            prop_assert!(account_solvent_at(&s, i),
+        let pre = s.clone();
+        let mut post = s;
+        prop_assume!(conservation(&pre));
+        prop_assume!(vault_bounded(&pre));
+        prop_assume!(account_solvent_at(&pre, i));
+        if trigger_adl(&mut post) {
+            prop_assert!(account_solvent_at(&post, i),
                 "account_solvent must hold after trigger_adl");
         }
     }
@@ -859,12 +894,13 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn complete_drain_preserves_account_solvent(s in arb_state(), i in 0usize..=1024usize) {
-        let mut s = s;
-        prop_assume!(conservation(&s));
-        prop_assume!(vault_bounded(&s));
-        prop_assume!(account_solvent_at(&s, i));
-        if complete_drain(&mut s) {
-            prop_assert!(account_solvent_at(&s, i),
+        let pre = s.clone();
+        let mut post = s;
+        prop_assume!(conservation(&pre));
+        prop_assume!(vault_bounded(&pre));
+        prop_assume!(account_solvent_at(&pre, i));
+        if complete_drain(&mut post) {
+            prop_assert!(account_solvent_at(&post, i),
                 "account_solvent must hold after complete_drain");
         }
     }
@@ -874,12 +910,13 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn reset_preserves_account_solvent(s in arb_state(), i in 0usize..=1024usize) {
-        let mut s = s;
-        prop_assume!(conservation(&s));
-        prop_assume!(vault_bounded(&s));
-        prop_assume!(account_solvent_at(&s, i));
-        if reset(&mut s) {
-            prop_assert!(account_solvent_at(&s, i),
+        let pre = s.clone();
+        let mut post = s;
+        prop_assume!(conservation(&pre));
+        prop_assume!(vault_bounded(&pre));
+        prop_assume!(account_solvent_at(&pre, i));
+        if reset(&mut post) {
+            prop_assert!(account_solvent_at(&post, i),
                 "account_solvent must hold after reset");
         }
     }

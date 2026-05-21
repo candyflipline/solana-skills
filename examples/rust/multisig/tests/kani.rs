@@ -329,7 +329,7 @@ fn verify_remove_member_rejects_invalid() {
 #[kani::unwind(2)]
 #[kani::solver(cadical)]
 fn verify_create_vault_preserves_threshold_bounded() {
-    let mut s = State {
+    let pre = State {
         creator: [0u8; 32],
         threshold: 0,
         member_count: 0,
@@ -339,10 +339,11 @@ fn verify_create_vault_preserves_threshold_bounded() {
         rejection_count: 0,
         status: Status::Uninitialized,
     };
+    let mut post = pre;
     let threshold: u8 = kani::any();
     let member_count: u8 = kani::any();
-    if create_vault(&mut s, threshold, member_count) {
-        assert!(threshold_bounded(&s),
+    if create_vault(&mut post, threshold, member_count) {
+        assert!(threshold_bounded(&post),
             "threshold_bounded must hold after create_vault");
     }
 }
@@ -351,7 +352,7 @@ fn verify_create_vault_preserves_threshold_bounded() {
 #[kani::unwind(2)]
 #[kani::solver(cadical)]
 fn verify_propose_preserves_threshold_bounded() {
-    let mut s = State {
+    let pre = State {
         creator: kani::any(),
         threshold: kani::any(),
         member_count: kani::any(),
@@ -361,12 +362,13 @@ fn verify_propose_preserves_threshold_bounded() {
         rejection_count: kani::any(),
         status: kani::any(),
     };
-    kani::assume(s.status == Status::Active);
-    kani::assume(threshold_bounded(&s));
-    kani::assume(votes_bounded(&s));
-    kani::assume(s.member_count <= MAX_MEMBERS);
-    if propose(&mut s) {
-        assert!(threshold_bounded(&s),
+    kani::assume(pre.status == Status::Active);
+    kani::assume(threshold_bounded(&pre));
+    kani::assume(votes_bounded(&pre));
+    kani::assume(pre.member_count <= MAX_MEMBERS);
+    let mut post = pre;
+    if propose(&mut post) {
+        assert!(threshold_bounded(&post),
             "threshold_bounded must hold after propose");
     }
 }
@@ -375,7 +377,7 @@ fn verify_propose_preserves_threshold_bounded() {
 #[kani::unwind(2)]
 #[kani::solver(cadical)]
 fn verify_approve_preserves_threshold_bounded() {
-    let mut s = State {
+    let pre = State {
         creator: kani::any(),
         threshold: kani::any(),
         member_count: kani::any(),
@@ -385,13 +387,14 @@ fn verify_approve_preserves_threshold_bounded() {
         rejection_count: kani::any(),
         status: kani::any(),
     };
-    kani::assume(s.status == Status::HasProposal);
-    kani::assume(threshold_bounded(&s));
-    kani::assume(votes_bounded(&s));
-    kani::assume(s.member_count <= MAX_MEMBERS);
+    kani::assume(pre.status == Status::HasProposal);
+    kani::assume(threshold_bounded(&pre));
+    kani::assume(votes_bounded(&pre));
+    kani::assume(pre.member_count <= MAX_MEMBERS);
+    let mut post = pre;
     let member_index: u8 = kani::any();
-    if approve(&mut s, member_index) {
-        assert!(threshold_bounded(&s),
+    if approve(&mut post, member_index) {
+        assert!(threshold_bounded(&post),
             "threshold_bounded must hold after approve");
     }
 }
@@ -400,7 +403,7 @@ fn verify_approve_preserves_threshold_bounded() {
 #[kani::unwind(2)]
 #[kani::solver(cadical)]
 fn verify_reject_preserves_threshold_bounded() {
-    let mut s = State {
+    let pre = State {
         creator: kani::any(),
         threshold: kani::any(),
         member_count: kani::any(),
@@ -410,14 +413,15 @@ fn verify_reject_preserves_threshold_bounded() {
         rejection_count: kani::any(),
         status: kani::any(),
     };
-    kani::assume(s.status == Status::HasProposal);
-    kani::assume(threshold_bounded(&s));
-    kani::assume(votes_bounded(&s));
-    kani::assume(s.member_count <= MAX_MEMBERS);
+    kani::assume(pre.status == Status::HasProposal);
+    kani::assume(threshold_bounded(&pre));
+    kani::assume(votes_bounded(&pre));
+    kani::assume(pre.member_count <= MAX_MEMBERS);
+    let mut post = pre;
     let member_index: u8 = kani::any();
-    kani::assume(s.rejection_count < s.member_count); // strict bound: rejection_count increments
-    if reject(&mut s, member_index) {
-        assert!(threshold_bounded(&s),
+    kani::assume(pre.rejection_count < pre.member_count); // strict bound: rejection_count increments
+    if reject(&mut post, member_index) {
+        assert!(threshold_bounded(&post),
             "threshold_bounded must hold after reject");
     }
 }
@@ -426,7 +430,7 @@ fn verify_reject_preserves_threshold_bounded() {
 #[kani::unwind(2)]
 #[kani::solver(cadical)]
 fn verify_execute_preserves_threshold_bounded() {
-    let mut s = State {
+    let pre = State {
         creator: kani::any(),
         threshold: kani::any(),
         member_count: kani::any(),
@@ -436,13 +440,14 @@ fn verify_execute_preserves_threshold_bounded() {
         rejection_count: kani::any(),
         status: kani::any(),
     };
-    kani::assume(s.status == Status::HasProposal);
-    kani::assume(threshold_bounded(&s));
-    kani::assume(votes_bounded(&s));
-    kani::assume(s.member_count <= MAX_MEMBERS);
+    kani::assume(pre.status == Status::HasProposal);
+    kani::assume(threshold_bounded(&pre));
+    kani::assume(votes_bounded(&pre));
+    kani::assume(pre.member_count <= MAX_MEMBERS);
+    let mut post = pre;
     let member_index: u8 = kani::any();
-    if execute(&mut s, member_index) {
-        assert!(threshold_bounded(&s),
+    if execute(&mut post, member_index) {
+        assert!(threshold_bounded(&post),
             "threshold_bounded must hold after execute");
     }
 }
@@ -451,7 +456,7 @@ fn verify_execute_preserves_threshold_bounded() {
 #[kani::unwind(2)]
 #[kani::solver(cadical)]
 fn verify_cancel_proposal_preserves_threshold_bounded() {
-    let mut s = State {
+    let pre = State {
         creator: kani::any(),
         threshold: kani::any(),
         member_count: kani::any(),
@@ -461,12 +466,13 @@ fn verify_cancel_proposal_preserves_threshold_bounded() {
         rejection_count: kani::any(),
         status: kani::any(),
     };
-    kani::assume(s.status == Status::HasProposal);
-    kani::assume(threshold_bounded(&s));
-    kani::assume(votes_bounded(&s));
-    kani::assume(s.member_count <= MAX_MEMBERS);
-    if cancel_proposal(&mut s) {
-        assert!(threshold_bounded(&s),
+    kani::assume(pre.status == Status::HasProposal);
+    kani::assume(threshold_bounded(&pre));
+    kani::assume(votes_bounded(&pre));
+    kani::assume(pre.member_count <= MAX_MEMBERS);
+    let mut post = pre;
+    if cancel_proposal(&mut post) {
+        assert!(threshold_bounded(&post),
             "threshold_bounded must hold after cancel_proposal");
     }
 }
@@ -475,7 +481,7 @@ fn verify_cancel_proposal_preserves_threshold_bounded() {
 #[kani::unwind(2)]
 #[kani::solver(cadical)]
 fn verify_add_member_preserves_threshold_bounded() {
-    let mut s = State {
+    let pre = State {
         creator: kani::any(),
         threshold: kani::any(),
         member_count: kani::any(),
@@ -485,14 +491,15 @@ fn verify_add_member_preserves_threshold_bounded() {
         rejection_count: kani::any(),
         status: kani::any(),
     };
-    kani::assume(s.status == Status::Active);
-    kani::assume(threshold_bounded(&s));
-    kani::assume(votes_bounded(&s));
-    kani::assume(s.member_count <= MAX_MEMBERS);
+    kani::assume(pre.status == Status::Active);
+    kani::assume(threshold_bounded(&pre));
+    kani::assume(votes_bounded(&pre));
+    kani::assume(pre.member_count <= MAX_MEMBERS);
+    let mut post = pre;
     let member_index: u8 = kani::any();
     let member_pubkey: [u8; 32] = kani::any();
-    if add_member(&mut s, member_index, member_pubkey) {
-        assert!(threshold_bounded(&s),
+    if add_member(&mut post, member_index, member_pubkey) {
+        assert!(threshold_bounded(&post),
             "threshold_bounded must hold after add_member");
     }
 }
@@ -501,7 +508,7 @@ fn verify_add_member_preserves_threshold_bounded() {
 #[kani::unwind(2)]
 #[kani::solver(cadical)]
 fn verify_remove_member_preserves_threshold_bounded() {
-    let mut s = State {
+    let pre = State {
         creator: kani::any(),
         threshold: kani::any(),
         member_count: kani::any(),
@@ -511,12 +518,13 @@ fn verify_remove_member_preserves_threshold_bounded() {
         rejection_count: kani::any(),
         status: kani::any(),
     };
-    kani::assume(s.status == Status::Active);
-    kani::assume(threshold_bounded(&s));
-    kani::assume(votes_bounded(&s));
-    kani::assume(s.member_count <= MAX_MEMBERS);
-    if remove_member(&mut s) {
-        assert!(threshold_bounded(&s),
+    kani::assume(pre.status == Status::Active);
+    kani::assume(threshold_bounded(&pre));
+    kani::assume(votes_bounded(&pre));
+    kani::assume(pre.member_count <= MAX_MEMBERS);
+    let mut post = pre;
+    if remove_member(&mut post) {
+        assert!(threshold_bounded(&post),
             "threshold_bounded must hold after remove_member");
     }
 }
@@ -525,7 +533,7 @@ fn verify_remove_member_preserves_threshold_bounded() {
 #[kani::unwind(2)]
 #[kani::solver(cadical)]
 fn verify_create_vault_preserves_votes_bounded() {
-    let mut s = State {
+    let pre = State {
         creator: [0u8; 32],
         threshold: 0,
         member_count: 0,
@@ -535,10 +543,11 @@ fn verify_create_vault_preserves_votes_bounded() {
         rejection_count: 0,
         status: Status::Uninitialized,
     };
+    let mut post = pre;
     let threshold: u8 = kani::any();
     let member_count: u8 = kani::any();
-    if create_vault(&mut s, threshold, member_count) {
-        assert!(votes_bounded(&s),
+    if create_vault(&mut post, threshold, member_count) {
+        assert!(votes_bounded(&post),
             "votes_bounded must hold after create_vault");
     }
 }
@@ -547,7 +556,7 @@ fn verify_create_vault_preserves_votes_bounded() {
 #[kani::unwind(2)]
 #[kani::solver(cadical)]
 fn verify_propose_preserves_votes_bounded() {
-    let mut s = State {
+    let pre = State {
         creator: kani::any(),
         threshold: kani::any(),
         member_count: kani::any(),
@@ -557,12 +566,13 @@ fn verify_propose_preserves_votes_bounded() {
         rejection_count: kani::any(),
         status: kani::any(),
     };
-    kani::assume(s.status == Status::Active);
-    kani::assume(threshold_bounded(&s));
-    kani::assume(votes_bounded(&s));
-    kani::assume(s.member_count <= MAX_MEMBERS);
-    if propose(&mut s) {
-        assert!(votes_bounded(&s),
+    kani::assume(pre.status == Status::Active);
+    kani::assume(threshold_bounded(&pre));
+    kani::assume(votes_bounded(&pre));
+    kani::assume(pre.member_count <= MAX_MEMBERS);
+    let mut post = pre;
+    if propose(&mut post) {
+        assert!(votes_bounded(&post),
             "votes_bounded must hold after propose");
     }
 }
@@ -571,7 +581,7 @@ fn verify_propose_preserves_votes_bounded() {
 #[kani::unwind(2)]
 #[kani::solver(cadical)]
 fn verify_execute_preserves_votes_bounded() {
-    let mut s = State {
+    let pre = State {
         creator: kani::any(),
         threshold: kani::any(),
         member_count: kani::any(),
@@ -581,13 +591,14 @@ fn verify_execute_preserves_votes_bounded() {
         rejection_count: kani::any(),
         status: kani::any(),
     };
-    kani::assume(s.status == Status::HasProposal);
-    kani::assume(threshold_bounded(&s));
-    kani::assume(votes_bounded(&s));
-    kani::assume(s.member_count <= MAX_MEMBERS);
+    kani::assume(pre.status == Status::HasProposal);
+    kani::assume(threshold_bounded(&pre));
+    kani::assume(votes_bounded(&pre));
+    kani::assume(pre.member_count <= MAX_MEMBERS);
+    let mut post = pre;
     let member_index: u8 = kani::any();
-    if execute(&mut s, member_index) {
-        assert!(votes_bounded(&s),
+    if execute(&mut post, member_index) {
+        assert!(votes_bounded(&post),
             "votes_bounded must hold after execute");
     }
 }
@@ -596,7 +607,7 @@ fn verify_execute_preserves_votes_bounded() {
 #[kani::unwind(2)]
 #[kani::solver(cadical)]
 fn verify_cancel_proposal_preserves_votes_bounded() {
-    let mut s = State {
+    let pre = State {
         creator: kani::any(),
         threshold: kani::any(),
         member_count: kani::any(),
@@ -606,12 +617,13 @@ fn verify_cancel_proposal_preserves_votes_bounded() {
         rejection_count: kani::any(),
         status: kani::any(),
     };
-    kani::assume(s.status == Status::HasProposal);
-    kani::assume(threshold_bounded(&s));
-    kani::assume(votes_bounded(&s));
-    kani::assume(s.member_count <= MAX_MEMBERS);
-    if cancel_proposal(&mut s) {
-        assert!(votes_bounded(&s),
+    kani::assume(pre.status == Status::HasProposal);
+    kani::assume(threshold_bounded(&pre));
+    kani::assume(votes_bounded(&pre));
+    kani::assume(pre.member_count <= MAX_MEMBERS);
+    let mut post = pre;
+    if cancel_proposal(&mut post) {
+        assert!(votes_bounded(&post),
             "votes_bounded must hold after cancel_proposal");
     }
 }
@@ -620,7 +632,7 @@ fn verify_cancel_proposal_preserves_votes_bounded() {
 #[kani::unwind(2)]
 #[kani::solver(cadical)]
 fn verify_remove_member_preserves_votes_bounded() {
-    let mut s = State {
+    let pre = State {
         creator: kani::any(),
         threshold: kani::any(),
         member_count: kani::any(),
@@ -630,12 +642,13 @@ fn verify_remove_member_preserves_votes_bounded() {
         rejection_count: kani::any(),
         status: kani::any(),
     };
-    kani::assume(s.status == Status::Active);
-    kani::assume(threshold_bounded(&s));
-    kani::assume(votes_bounded(&s));
-    kani::assume(s.member_count <= MAX_MEMBERS);
-    if remove_member(&mut s) {
-        assert!(votes_bounded(&s),
+    kani::assume(pre.status == Status::Active);
+    kani::assume(threshold_bounded(&pre));
+    kani::assume(votes_bounded(&pre));
+    kani::assume(pre.member_count <= MAX_MEMBERS);
+    let mut post = pre;
+    if remove_member(&mut post) {
+        assert!(votes_bounded(&post),
             "votes_bounded must hold after remove_member");
     }
 }

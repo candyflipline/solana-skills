@@ -199,7 +199,7 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn create_vault_preserves_threshold_bounded(threshold in 0u8..=u8::MAX, member_count in 0u8..=u8::MAX) {
-        let mut s = State {
+        let mut post = State {
             creator: [0u8; 32],
             threshold: 0,
             member_count: 0,
@@ -209,8 +209,9 @@ proptest! {
             rejection_count: 0,
             status: Status::Uninitialized,
         };
-        if create_vault(&mut s, threshold, member_count) {
-            prop_assert!(threshold_bounded(&s),
+        let pre = post;
+        if create_vault(&mut post, threshold, member_count) {
+            prop_assert!(threshold_bounded(&post),
                 "threshold_bounded must hold after create_vault");
         }
     }
@@ -220,11 +221,12 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn propose_preserves_threshold_bounded(s in arb_state()) {
-        let mut s = s;
-        prop_assume!(threshold_bounded(&s));
-        prop_assume!(votes_bounded(&s));
-        if propose(&mut s) {
-            prop_assert!(threshold_bounded(&s),
+        let pre = s.clone();
+        let mut post = s;
+        prop_assume!(threshold_bounded(&pre));
+        prop_assume!(votes_bounded(&pre));
+        if propose(&mut post) {
+            prop_assert!(threshold_bounded(&post),
                 "threshold_bounded must hold after propose");
         }
     }
@@ -234,11 +236,12 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn approve_preserves_threshold_bounded(s in arb_state(), member_index in 0u8..=u8::MAX) {
-        let mut s = s;
-        prop_assume!(threshold_bounded(&s));
-        prop_assume!(votes_bounded(&s));
-        if approve(&mut s, member_index) {
-            prop_assert!(threshold_bounded(&s),
+        let pre = s.clone();
+        let mut post = s;
+        prop_assume!(threshold_bounded(&pre));
+        prop_assume!(votes_bounded(&pre));
+        if approve(&mut post, member_index) {
+            prop_assert!(threshold_bounded(&post),
                 "threshold_bounded must hold after approve");
         }
     }
@@ -248,12 +251,13 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn reject_preserves_threshold_bounded(s in arb_state(), member_index in 0u8..=u8::MAX) {
-        let mut s = s;
-        prop_assume!(threshold_bounded(&s));
-        prop_assume!(votes_bounded(&s));
-        prop_assume!(s.rejection_count < s.member_count); // strict bound for add
-        if reject(&mut s, member_index) {
-            prop_assert!(threshold_bounded(&s),
+        let pre = s.clone();
+        let mut post = s;
+        prop_assume!(threshold_bounded(&pre));
+        prop_assume!(votes_bounded(&pre));
+        prop_assume!(pre.rejection_count < pre.member_count); // strict bound for add
+        if reject(&mut post, member_index) {
+            prop_assert!(threshold_bounded(&post),
                 "threshold_bounded must hold after reject");
         }
     }
@@ -263,11 +267,12 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn execute_preserves_threshold_bounded(s in arb_state(), member_index in 0u8..=u8::MAX) {
-        let mut s = s;
-        prop_assume!(threshold_bounded(&s));
-        prop_assume!(votes_bounded(&s));
-        if execute(&mut s, member_index) {
-            prop_assert!(threshold_bounded(&s),
+        let pre = s.clone();
+        let mut post = s;
+        prop_assume!(threshold_bounded(&pre));
+        prop_assume!(votes_bounded(&pre));
+        if execute(&mut post, member_index) {
+            prop_assert!(threshold_bounded(&post),
                 "threshold_bounded must hold after execute");
         }
     }
@@ -277,11 +282,12 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn cancel_proposal_preserves_threshold_bounded(s in arb_state()) {
-        let mut s = s;
-        prop_assume!(threshold_bounded(&s));
-        prop_assume!(votes_bounded(&s));
-        if cancel_proposal(&mut s) {
-            prop_assert!(threshold_bounded(&s),
+        let pre = s.clone();
+        let mut post = s;
+        prop_assume!(threshold_bounded(&pre));
+        prop_assume!(votes_bounded(&pre));
+        if cancel_proposal(&mut post) {
+            prop_assert!(threshold_bounded(&post),
                 "threshold_bounded must hold after cancel_proposal");
         }
     }
@@ -291,11 +297,12 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn add_member_preserves_threshold_bounded(s in arb_state(), member_index in 0u8..=u8::MAX, member_pubkey in 0[u8; 32]..=[u8; 32]::MAX) {
-        let mut s = s;
-        prop_assume!(threshold_bounded(&s));
-        prop_assume!(votes_bounded(&s));
-        if add_member(&mut s, member_index, member_pubkey) {
-            prop_assert!(threshold_bounded(&s),
+        let pre = s.clone();
+        let mut post = s;
+        prop_assume!(threshold_bounded(&pre));
+        prop_assume!(votes_bounded(&pre));
+        if add_member(&mut post, member_index, member_pubkey) {
+            prop_assert!(threshold_bounded(&post),
                 "threshold_bounded must hold after add_member");
         }
     }
@@ -305,11 +312,12 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn remove_member_preserves_threshold_bounded(s in arb_state()) {
-        let mut s = s;
-        prop_assume!(threshold_bounded(&s));
-        prop_assume!(votes_bounded(&s));
-        if remove_member(&mut s) {
-            prop_assert!(threshold_bounded(&s),
+        let pre = s.clone();
+        let mut post = s;
+        prop_assume!(threshold_bounded(&pre));
+        prop_assume!(votes_bounded(&pre));
+        if remove_member(&mut post) {
+            prop_assert!(threshold_bounded(&post),
                 "threshold_bounded must hold after remove_member");
         }
     }
@@ -319,7 +327,7 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn create_vault_preserves_votes_bounded(threshold in 0u8..=u8::MAX, member_count in 0u8..=u8::MAX) {
-        let mut s = State {
+        let mut post = State {
             creator: [0u8; 32],
             threshold: 0,
             member_count: 0,
@@ -329,8 +337,9 @@ proptest! {
             rejection_count: 0,
             status: Status::Uninitialized,
         };
-        if create_vault(&mut s, threshold, member_count) {
-            prop_assert!(votes_bounded(&s),
+        let pre = post;
+        if create_vault(&mut post, threshold, member_count) {
+            prop_assert!(votes_bounded(&post),
                 "votes_bounded must hold after create_vault");
         }
     }
@@ -340,11 +349,12 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn propose_preserves_votes_bounded(s in arb_state()) {
-        let mut s = s;
-        prop_assume!(threshold_bounded(&s));
-        prop_assume!(votes_bounded(&s));
-        if propose(&mut s) {
-            prop_assert!(votes_bounded(&s),
+        let pre = s.clone();
+        let mut post = s;
+        prop_assume!(threshold_bounded(&pre));
+        prop_assume!(votes_bounded(&pre));
+        if propose(&mut post) {
+            prop_assert!(votes_bounded(&post),
                 "votes_bounded must hold after propose");
         }
     }
@@ -354,11 +364,12 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn execute_preserves_votes_bounded(s in arb_state(), member_index in 0u8..=u8::MAX) {
-        let mut s = s;
-        prop_assume!(threshold_bounded(&s));
-        prop_assume!(votes_bounded(&s));
-        if execute(&mut s, member_index) {
-            prop_assert!(votes_bounded(&s),
+        let pre = s.clone();
+        let mut post = s;
+        prop_assume!(threshold_bounded(&pre));
+        prop_assume!(votes_bounded(&pre));
+        if execute(&mut post, member_index) {
+            prop_assert!(votes_bounded(&post),
                 "votes_bounded must hold after execute");
         }
     }
@@ -368,11 +379,12 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn cancel_proposal_preserves_votes_bounded(s in arb_state()) {
-        let mut s = s;
-        prop_assume!(threshold_bounded(&s));
-        prop_assume!(votes_bounded(&s));
-        if cancel_proposal(&mut s) {
-            prop_assert!(votes_bounded(&s),
+        let pre = s.clone();
+        let mut post = s;
+        prop_assume!(threshold_bounded(&pre));
+        prop_assume!(votes_bounded(&pre));
+        if cancel_proposal(&mut post) {
+            prop_assert!(votes_bounded(&post),
                 "votes_bounded must hold after cancel_proposal");
         }
     }
@@ -382,11 +394,12 @@ proptest! {
     #![proptest_config(ProptestConfig { max_global_rejects: 65536, ..ProptestConfig::with_cases(256) })]
     #[test]
     fn remove_member_preserves_votes_bounded(s in arb_state()) {
-        let mut s = s;
-        prop_assume!(threshold_bounded(&s));
-        prop_assume!(votes_bounded(&s));
-        if remove_member(&mut s) {
-            prop_assert!(votes_bounded(&s),
+        let pre = s.clone();
+        let mut post = s;
+        prop_assume!(threshold_bounded(&pre));
+        prop_assume!(votes_bounded(&pre));
+        if remove_member(&mut post) {
+            prop_assert!(votes_bounded(&post),
                 "votes_bounded must hold after remove_member");
         }
     }
