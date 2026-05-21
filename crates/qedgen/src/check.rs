@@ -724,7 +724,7 @@ impl ParsedHandler {
 /// `has_one` looks up `wrapper.<field>`, which fails for fields buried
 /// in `wrapper.inner.<variant>`. See `ParsedHandlerAccount::account_attr`
 /// for the gating logic.
-fn is_multi_variant_adt_with_field_in_variant(spec: &ParsedSpec, field: &str) -> bool {
+pub fn is_multi_variant_adt_with_field_in_variant(spec: &ParsedSpec, field: &str) -> bool {
     let Some(acct) = spec.account_types.first() else {
         return false;
     };

@@ -2283,14 +2283,6 @@ fn emit_variant_state_handler_body(
     }
     let pre = handler.pre_status.as_deref()?;
     let post = handler.post_status.as_deref()?;
-    // Cross-variant promotion is more involved (need to assemble
-    // every field of the post variant, often from CPI / event /
-    // param sources). Same-variant lowering is the common case
-    // and lands first; cross-variant returns `None` so the caller
-    // falls through to the per-effect `todo!()` path.
-    if pre != post {
-        return None;
-    }
     // WrongState is the error variant returned on a variant
     // mismatch. Demand it's declared so codegen doesn't emit a
     // dangling reference to an undeclared error variant.
@@ -2307,6 +2299,24 @@ fn emit_variant_state_handler_body(
     );
     let err_enum = format!("{}Error", to_pascal_case(&spec.program_name));
     let acct_binder = &state_acct.name;
+
+    // Cross-variant promotion (init / promote handlers,
+    // `pre != post`) routes through a separate emitter: destructure
+    // the pre (if it carries payload) + assemble the post-variant
+    // payload + assign `self.<acct>.inner = <Inner>::<Post>{ … }`.
+    // Same-variant continues with the in-place match destructure
+    // below.
+    if pre != post {
+        return emit_cross_variant_promotion(
+            handler,
+            spec,
+            acct_binder,
+            pre,
+            post_variant,
+            &inner_name,
+            &err_enum,
+        );
+    }
 
     // Collect the unique set of bare field names referenced on the
     // LHS of any effect (after stripping `<Variant>.` prefix and
@@ -2378,6 +2388,218 @@ fn emit_variant_state_handler_body(
     ));
     out.push_str("        }\n");
     Some(out)
+}
+
+/// v2.24 S5c — render an effect RHS for the cross-variant promotion
+/// emitter. Pre-variant fields aren't in scope here (no destructure
+/// has happened yet), so the legal RHS shapes are restricted:
+///
+///   - bare param (handler `takes_params`) → bare identifier
+///   - bare const (spec `constants`) → bare identifier (Rust resolves)
+///   - integer literal → bare integer
+///   - `<account>.pubkey` where `<account>` is bound on the handler
+///     and is a signer / writable account → `self.<account>.key()`
+///
+/// Anything else returns `None`, which bails the whole cross-variant
+/// emitter back to the per-effect `todo!()` path so the agent fills
+/// the gap manually instead of getting a silent miscompile.
+fn resolve_cross_variant_rhs(
+    raw: &str,
+    handler: &ParsedHandler,
+    spec: &ParsedSpec,
+) -> Option<String> {
+    if raw.is_empty() {
+        return None;
+    }
+    // Integer literal — render_effect emits `Expr::Int(v)` as its
+    // decimal form.
+    if raw.chars().all(|c| c.is_ascii_digit() || c == '-') {
+        return Some(raw.to_string());
+    }
+    // Bare param or const — no dot, no bracket, matches a known name.
+    if !raw.contains('.') && !raw.contains('[') {
+        if handler.takes_params.iter().any(|(n, _)| n == raw) {
+            return Some(raw.to_string());
+        }
+        if spec.constants.iter().any(|(n, _)| n == raw) {
+            return Some(raw.to_string());
+        }
+        // Unknown bare ident — could be a param shadowed by a state
+        // field of the same name; that's a spec smell. Bail loud
+        // (via `None`) rather than guess.
+        return None;
+    }
+    // `<account>.pubkey` shape — map to the Anchor key() accessor on
+    // the handler's account binding.
+    if let Some(account_name) = raw.strip_suffix(".pubkey") {
+        if handler
+            .accounts
+            .iter()
+            .any(|a| a.name == account_name)
+        {
+            return Some(format!("self.{}.key()", account_name));
+        }
+    }
+    None
+}
+
+/// v2.24 S5c — emit cross-variant promotion (init / promote) for a
+/// multi-variant ADT state. Assembles every post-variant field
+/// from the handler's effect lines and assigns the new variant via
+/// `self.<acct>.inner = <Inner>::<Post> { … };`.
+///
+/// Bail-out conditions (each falls back to the per-effect
+/// `todo!()` path):
+///   - Pre is a payload-carrying variant (the destructure would
+///     need to capture pre fields that may flow into post; for
+///     v2.24 we keep cross-variant scoped to unit-style pre).
+///   - Any post-variant field has no matching effect line (we don't
+///     guess defaults for unspecified fields).
+///   - Any effect RHS can't be resolved by `resolve_cross_variant_rhs`
+///     (complex shapes — match / record / arith — fall through).
+fn emit_cross_variant_promotion(
+    handler: &ParsedHandler,
+    spec: &ParsedSpec,
+    acct_binder: &str,
+    pre: &str,
+    post_variant: &crate::check::ParsedVariant,
+    inner_name: &str,
+    err_enum: &str,
+) -> Option<String> {
+    // Restrict to unit-style pre. Payload-carrying pre would need a
+    // separate destructure + capture-into-post step.
+    let pre_variant = spec
+        .account_types
+        .first()?
+        .variants
+        .iter()
+        .find(|v| v.name == pre)?;
+    if !pre_variant.fields.is_empty() {
+        return None;
+    }
+
+    // Build a {field → RHS-rust} map from the handler's effects.
+    // For cross-variant we only accept the `:= <rhs>` form (effect
+    // op kind "set"); checked-arith ops don't make sense in a
+    // promotion (no pre value to read).
+    let mut field_rhs: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    for (lhs, op_kind, rhs) in &handler.effects {
+        if op_kind != "set" {
+            return None;
+        }
+        let stripped = strip_variant_prefix(lhs, spec);
+        let bare = strip_array_index_suffix(&stripped);
+        // Field must live on the post variant.
+        if !post_variant.fields.iter().any(|(n, _)| n == &bare) {
+            return None;
+        }
+        let resolved = resolve_cross_variant_rhs(rhs, handler, spec)?;
+        field_rhs.insert(bare, resolved);
+    }
+
+    // Every post-variant field must have an RHS. We don't fill
+    // defaults — silent defaults hide bugs (a zeroed pubkey is a
+    // famously bad bug).
+    for (fname, _) in &post_variant.fields {
+        if !field_rhs.contains_key(fname) {
+            return None;
+        }
+    }
+
+    // Assemble the assignment. Pre-check: ensure the wrapper is in
+    // the pre variant. Init handlers (`Uninitialized`/`Empty`) skip
+    // this since the `#[account(init, …)]` constraint zeroes the
+    // account before our code runs — there's no prior payload to
+    // mismatch on. Other unit-style pres still get the gate.
+    let is_init_pre = matches!(pre, "Uninitialized" | "Empty");
+    let mut out = String::new();
+    if !is_init_pre {
+        out.push_str(&format!(
+            "        if !matches!(self.{}.inner, {}::{}) {{ return Err({}::WrongState.into()); }}\n",
+            acct_binder, inner_name, pre, err_enum
+        ));
+    }
+    out.push_str(&format!(
+        "        self.{}.inner = {}::{} {{\n",
+        acct_binder, inner_name, post_variant.name
+    ));
+    // Emit fields in the variant's declared order so the assembled
+    // initializer reads the way a user would write it. The map is
+    // sorted by name for lookup; iterating the variant's
+    // `fields` here preserves the source-declared order.
+    for (fname, _) in &post_variant.fields {
+        let rhs = &field_rhs[fname];
+        out.push_str(&format!("            {}: {},\n", fname, rhs));
+    }
+    out.push_str("        };\n");
+    Some(out)
+}
+
+/// v2.24 S5c — emit a destructure-then-compare auth guard for a
+/// handler whose `auth X` field lives in a variant payload. Returns
+/// the empty string when the conditions don't apply (single-variant
+/// state, no `auth X`, X is on the wrapper not in a variant payload,
+/// no matching signer account, or `Unauthorized` not declared in
+/// `type Error`). The guard fires after the lifecycle pre-check, so
+/// the destructure is guaranteed to bind.
+fn emit_variant_auth_guard(handler: &ParsedHandler, spec: &ParsedSpec) -> String {
+    let Some(ref who) = handler.who else {
+        return String::new();
+    };
+    if !crate::check::is_multi_variant_adt_with_field_in_variant(spec, who) {
+        return String::new();
+    }
+    let Some(ref pre) = handler.pre_status else {
+        return String::new();
+    };
+    if matches!(pre.as_str(), "Uninitialized" | "Empty") {
+        return String::new();
+    }
+    let Some(acct) = spec.account_types.first() else {
+        return String::new();
+    };
+    let Some(variant) = acct.variants.iter().find(|v| v.name == *pre) else {
+        return String::new();
+    };
+    if !variant.fields.iter().any(|(n, _)| n == who) {
+        return String::new();
+    }
+    // Need a signer account in the handler with the same name as
+    // the auth field, so the auth comparison can resolve
+    // `ctx.<signer>.key()` without renaming dance.
+    let Some(signer_acct) = handler
+        .accounts
+        .iter()
+        .find(|a| a.is_signer && a.name == *who)
+    else {
+        return String::new();
+    };
+    if !spec.error_codes.iter().any(|c| c == "Unauthorized") {
+        return String::new();
+    }
+    let Some(state_acct) = find_state_account(handler) else {
+        return String::new();
+    };
+
+    let inner_name = format!("{}AccountInner", to_pascal_case(&spec.program_name));
+    let err_enum = format!("{}Error", to_pascal_case(&spec.program_name));
+    // Pin the auth-field destructure binding to a stable local name
+    // (`auth_field`) to avoid shadowing param names that might match
+    // the field's name in user code. The rest of the variant payload
+    // gets ignored via `..`.
+    format!(
+        "    // auth: variant payload {pre}.{who} == ctx.{signer}.key()\n\
+         \x20   let {inner}::{pre} {{ {who}: auth_field, .. }} = &ctx.{acct}.inner\n\
+         \x20   else {{ return Err({err}::InvalidLifecycle.into()); }};\n\
+         \x20   if auth_field != &ctx.{signer}.key() {{ return Err({err}::Unauthorized.into()); }}\n",
+        inner = inner_name,
+        pre = pre,
+        who = who,
+        signer = signer_acct.name,
+        acct = state_acct.name,
+        err = err_enum,
+    )
 }
 
 /// Render the `#[derive(Accounts)] pub struct X<'info>? { fields }`
@@ -2947,6 +3169,27 @@ fn generate_guards(
         let lifecycle_post_write = lifecycle_check_line(handler, spec, true, &surface);
         if !lifecycle_pre_check.is_empty() {
             out.push_str(&lifecycle_pre_check);
+        }
+
+        // v2.24 S5c — auth guard for fields that live in a variant
+        // payload. R25's `auth X → has_one = X` suppresses the
+        // Anchor `has_one` attribute under multi-variant ADT
+        // because the macro can't reach `wrapper.inner.<variant>.X`
+        // (see `is_multi_variant_adt_with_field_in_variant` in
+        // check.rs). Replace it with an explicit destructure-then-
+        // compare guard so the auth check still fires at runtime.
+        // Requires:
+        //   - multi-variant ADT spec
+        //   - handler declares `auth X` where X is a variant-payload
+        //     field on the pre-variant
+        //   - handler binds a signer account named `X`
+        //   - the spec declares `Unauthorized` in `type Error`
+        // Missing any condition: silently skip — the auth gap shows
+        // up as a `qedgen check` warning (`no_access_control` / R25
+        // friend) rather than a compile error.
+        let auth_guard = emit_variant_auth_guard(handler, spec);
+        if !auth_guard.is_empty() {
+            out.push_str(&auth_guard);
         }
 
         let err_enum_name_r28 = format!("{}Error", to_pascal_case(&spec.program_name));
@@ -4106,15 +4349,212 @@ handler deposit (amount : U64) : State.Active -> State.Active {
         );
     }
 
-    /// v2.24 S5c — cross-variant (init / promote) handlers are not
-    /// yet covered by the variant-state lowering; today they fall
-    /// back to the per-effect path, which surfaces the unmechanized
-    /// effects as `// Spec effect (needs fill)` comments + a trailing
-    /// `todo!()`. Locks the bail-out shape so a future regression
-    /// that *silently* miscompiles cross-variant handlers fails fast
-    /// (loud todo > silent miscompile).
+    /// v2.24 S5c-auth — when `has_one` is suppressed under multi-variant
+    /// ADT (the auth field lives in a variant payload, see
+    /// 01dc057), guards.rs picks up a destructure-then-compare
+    /// auth check so the security gap is closed at runtime.
+    /// Without this the wrapper-side `has_one = owner` is silently
+    /// dropped and any signer can call the handler.
     #[test]
-    fn variant_state_bails_out_on_cross_variant_handler() {
+    fn variant_state_guards_emit_auth_check_when_has_one_suppressed() {
+        let src = r#"spec Vault
+
+type State
+  | Uninitialized
+  | Active of {
+      owner   : Pubkey,
+      balance : U64,
+    }
+
+type Error
+  | MathOverflow
+  | WrongState
+  | InvalidLifecycle
+  | Unauthorized
+
+handler deposit (amount : U64) : State.Active -> State.Active {
+  auth owner
+  accounts {
+    vault : writable
+    owner : signer
+  }
+  requires amount > 0 else MathOverflow
+  effect {
+    Active.balance += amount
+  }
+}
+"#;
+        let spec = crate::chumsky_adapter::parse_str(src).unwrap();
+        let fp = crate::fingerprint::compute_fingerprint(&spec);
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path().join("programs");
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        generate_lib(&spec, &fp, &out_dir, Target::Anchor).unwrap();
+        generate_guards(&spec, &fp, &out_dir, Target::Anchor).unwrap();
+
+        let guards = std::fs::read_to_string(out_dir.join("src/guards.rs")).unwrap();
+
+        // Destructure-then-compare guard fires.
+        assert!(
+            guards.contains(
+                "let VaultAccountInner::Active { owner: auth_field, .. } = &ctx.vault.inner"
+            ),
+            "expected destructure binding of variant-payload auth field; got:\n{guards}"
+        );
+        assert!(
+            guards.contains("if auth_field != &ctx.owner.key()"),
+            "expected key comparison against signer account; got:\n{guards}"
+        );
+        assert!(
+            guards.contains("return Err(VaultError::Unauthorized.into())"),
+            "expected Unauthorized error on auth mismatch; got:\n{guards}"
+        );
+    }
+
+    /// v2.24 S5c-auth — when `Unauthorized` isn't declared in
+    /// `type Error`, the auth guard suppresses itself rather than
+    /// emitting a dangling reference. The `has_one` is already
+    /// suppressed too (separate gate), so the spec needs a manual
+    /// auth check elsewhere — which the lint side surfaces via
+    /// `no_access_control` / R25-friend warnings. Locks the
+    /// silent-skip behavior.
+    #[test]
+    fn variant_state_auth_guard_skips_when_unauthorized_undeclared() {
+        let src = r#"spec Vault
+
+type State
+  | Uninitialized
+  | Active of {
+      owner   : Pubkey,
+      balance : U64,
+    }
+
+type Error
+  | MathOverflow
+  | WrongState
+  | InvalidLifecycle
+
+handler deposit (amount : U64) : State.Active -> State.Active {
+  auth owner
+  accounts {
+    vault : writable
+    owner : signer
+  }
+  requires amount > 0 else MathOverflow
+  effect {
+    Active.balance += amount
+  }
+}
+"#;
+        let spec = crate::chumsky_adapter::parse_str(src).unwrap();
+        let fp = crate::fingerprint::compute_fingerprint(&spec);
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path().join("programs");
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        generate_lib(&spec, &fp, &out_dir, Target::Anchor).unwrap();
+        generate_guards(&spec, &fp, &out_dir, Target::Anchor).unwrap();
+
+        let guards = std::fs::read_to_string(out_dir.join("src/guards.rs")).unwrap();
+        assert!(
+            !guards.contains("Unauthorized"),
+            "auth guard should not emit reference to undeclared Unauthorized variant; got:\n{guards}"
+        );
+        assert!(
+            !guards.contains("owner: auth_field"),
+            "auth destructure should not appear when Unauthorized is undeclared; got:\n{guards}"
+        );
+    }
+
+    /// v2.24 S5c — cross-variant (init / promote) handlers now lower
+    /// to an explicit `self.<acct>.inner = <Inner>::<Post> { … };`
+    /// assignment. Pre-variant must be unit-style (no payload); every
+    /// post-variant field must have a matching `Active.field := <rhs>`
+    /// effect. Bail-outs (payload-carrying pre, missing fields,
+    /// complex RHS) fall through to the per-effect `todo!()` path —
+    /// a separate test covers those.
+    #[test]
+    fn variant_state_lowers_cross_variant_init_to_set_inner() {
+        let src = r#"spec Vault
+
+type State
+  | Uninitialized
+  | Active of {
+      owner   : Pubkey,
+      balance : U64,
+    }
+
+type Error
+  | MathOverflow
+  | WrongState
+  | InvalidLifecycle
+  | Unauthorized
+
+handler create (initial : U64) : State.Uninitialized -> State.Active {
+  auth owner
+  accounts {
+    vault : writable
+    owner : signer
+  }
+  requires initial > 0 else MathOverflow
+  effect {
+    Active.balance := initial
+    Active.owner := owner.pubkey
+  }
+}
+"#;
+        let spec = crate::chumsky_adapter::parse_str(src).unwrap();
+        let fp = crate::fingerprint::compute_fingerprint(&spec);
+        let dir = tempfile::tempdir().unwrap();
+        let spec_path = dir.path().join("vault.qedspec");
+        let out_dir = dir.path().join("programs");
+        std::fs::write(&spec_path, src).unwrap();
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        generate_lib(&spec, &fp, &out_dir, Target::Anchor).unwrap();
+        generate_instructions(&spec, &fp, &spec_path, &out_dir, Target::Anchor).unwrap();
+
+        let create =
+            std::fs::read_to_string(out_dir.join("src/instructions/create.rs")).unwrap();
+
+        // Assignment shape lands. Note: declared field order matters
+        // — `owner` first, then `balance` — to match the variant
+        // declaration in the spec.
+        assert!(
+            create.contains("self.vault.inner = VaultAccountInner::Active {"),
+            "expected variant assignment; got:\n{create}"
+        );
+        assert!(
+            create.contains("owner: self.owner.key(),"),
+            "expected `.pubkey` RHS to lower to `self.<acct>.key()`; got:\n{create}"
+        );
+        assert!(
+            create.contains("balance: initial,"),
+            "expected param RHS to lower as bare ident; got:\n{create}"
+        );
+
+        // No leftover `todo!()` — fully mechanized.
+        assert!(
+            !create.contains("todo!("),
+            "cross-variant init should be fully mechanized, no todo!(); got:\n{create}"
+        );
+
+        // Init handlers (`Uninitialized` pre) elide the
+        // `matches!(.., Pre)` pre-check since `#[account(init, …)]`
+        // zeroes the account before the body runs.
+        assert!(
+            !create.contains("if !matches!(self.vault.inner, VaultAccountInner::Uninitialized"),
+            "init handler should skip the pre-variant check; got:\n{create}"
+        );
+    }
+
+    /// v2.24 S5c — cross-variant emitter bails (returns `None`) when
+    /// any post-variant field has no corresponding effect line. Silent
+    /// defaults would hide bugs (e.g. a zeroed Pubkey owner). The
+    /// fallback per-effect path then surfaces a clear `todo!()`.
+    #[test]
+    fn variant_state_bails_on_cross_variant_missing_field() {
         let src = r#"spec Vault
 
 type State
@@ -4154,15 +4594,14 @@ handler create (initial : U64) : State.Uninitialized -> State.Active {
         let create =
             std::fs::read_to_string(out_dir.join("src/instructions/create.rs")).unwrap();
 
-        // Cross-variant — no match block.
+        // Missing `owner` field → cross-variant emitter bails.
         assert!(
-            !create.contains("match &mut self.vault.inner"),
-            "cross-variant lowering not yet supported; should fall back to per-effect path; got:\n{create}"
+            !create.contains("self.vault.inner = VaultAccountInner::Active {"),
+            "cross-variant emitter should bail on missing post-variant field; got:\n{create}"
         );
-        // Trailing todo!() so the user knows what's left.
         assert!(
             create.contains("todo!("),
-            "cross-variant fallback should emit a trailing todo!(); got:\n{create}"
+            "fallback should surface a todo!() for the user to fill; got:\n{create}"
         );
     }
 
