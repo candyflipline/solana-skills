@@ -2811,6 +2811,51 @@ fn expand_handler(
                     synth.effect_on_error.push(on_error);
                 }
             }
+            // v2.24 #9 — synth handler issues the CPI plus any
+            // alongside effects. Mirrors the per-handler `Call`
+            // lowering at the top-level handler clause site so
+            // backends see the same ParsedCall shape regardless of
+            // whether the call came from a top-level `call` clause
+            // or from inside a match arm.
+            a::MatchBody::Call(call, effects) => {
+                let segs = &call.target.0;
+                let (iface, handler_name) = match segs.as_slice() {
+                    [] => (String::new(), String::new()),
+                    [only] => (String::new(), only.clone()),
+                    [head, tail @ ..] => (head.clone(), tail.join(".")),
+                };
+                let args = call
+                    .args
+                    .iter()
+                    .map(|arg| ParsedCallArg {
+                        name: arg.name.clone(),
+                        lean_expr: expr_to_lean(&arg.value.node, Ctx::Guard, consts, env),
+                        rust_expr: expr_to_rust(
+                            &arg.value.node,
+                            Ctx::Guard,
+                            consts,
+                            opts_native(env),
+                        ),
+                        rust_expr_pod: expr_to_rust(
+                            &arg.value.node,
+                            Ctx::Guard,
+                            consts,
+                            opts_pod(env),
+                        ),
+                    })
+                    .collect();
+                synth.calls.push(ParsedCall {
+                    target_interface: iface,
+                    target_handler: handler_name,
+                    args,
+                    result_binding: call.result_binding.clone(),
+                });
+                for Node { node: stmt, .. } in effects {
+                    let (triple, on_error) = render_effect(stmt, &base.takes_params, consts);
+                    synth.effects.push(triple);
+                    synth.effect_on_error.push(on_error);
+                }
+            }
             a::MatchBody::Noop => {}
         }
 
@@ -3226,6 +3271,59 @@ mod tests {
 
     const PERCOLATOR_SPEC: &str =
         include_str!("../../../examples/rust/percolator/percolator.qedspec");
+
+    /// v2.24 #9 — `call Interface.handler(...)` is now legal inside
+    /// a match arm body, alongside `abort` / `effect`. The expander
+    /// produces one synthetic handler per arm; the call-arm synth
+    /// gets the CPI captured on its `calls` slot (same shape as a
+    /// top-level call clause).
+    #[test]
+    fn match_arm_accepts_call_body() {
+        let src = r#"spec MatchCall
+program_id "11111111111111111111111111111111"
+
+interface Pool {
+  program_id "11111111111111111111111111111111"
+  handler absorb_loss (amount : U64) {
+    accounts { vault : writable }
+  }
+}
+
+type State
+  | Active of { pnl : I64 }
+
+type Error
+  | NoMatch
+
+handler liquidate (loss : U64) : State.Active -> State.Active {
+  permissionless
+  match
+    | state.pnl < 0 => call Pool.absorb_loss(amount = loss)
+    | _ => abort NoMatch
+}
+"#;
+        let spec = parse_str(src).expect("parse");
+        // The match clause expands into one synth handler per arm.
+        // The call-arm synth should have one ParsedCall on it.
+        let synths: Vec<_> = spec
+            .handlers
+            .iter()
+            .filter(|h| h.name.starts_with("liquidate"))
+            .collect();
+        let with_call: Vec<_> = synths
+            .iter()
+            .filter(|h| !h.calls.is_empty())
+            .collect();
+        assert_eq!(
+            with_call.len(),
+            1,
+            "expected exactly one synth handler with a call body; got {} synths total, {} with calls",
+            synths.len(),
+            with_call.len()
+        );
+        assert_eq!(with_call[0].calls[0].target_interface, "Pool");
+        assert_eq!(with_call[0].calls[0].target_handler, "absorb_loss");
+    }
 
     /// v2.24 #11 — `let X = call Foo.handler(...)` parses and the
     /// adapter records the binding name on `ParsedCall.result_binding`.

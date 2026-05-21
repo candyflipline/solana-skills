@@ -499,6 +499,13 @@ pub enum MatchBody {
     Effect(Vec<Node<EffectStmt>>),
     /// Empty body — case is a no-op (state unchanged, no error).
     Noop,
+    /// v2.24 #9 — `call Interface.handler(...)` — case maps to a
+    /// synthetic handler that issues this CPI (and nothing else).
+    /// Used for outcome-conditional CPI patterns where the match
+    /// arm picks between different external calls instead of
+    /// different state mutations. Optional effect block alongside
+    /// the call for cases that do both.
+    Call(CallExpr, Vec<Node<EffectStmt>>),
 }
 
 #[derive(Debug, Clone)]

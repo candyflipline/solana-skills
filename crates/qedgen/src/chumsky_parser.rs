@@ -1321,11 +1321,49 @@ fn handler_clause<'a>() -> impl Parser<'a, &'a str, HandlerClause, Err<'a>> + Cl
     //   case <expr>: effect { ... }
     //   otherwise:   abort ErrName
     // }
+    // v2.24 #9 — `call Interface.handler(args, ...)` inside a match
+    // arm body. Captured as `MatchBody::Call`, expanded into a
+    // synthetic handler issuing the CPI just like `MatchBody::Effect`
+    // expands to a per-arm effect handler. Closes the gist's
+    // "outcome-conditional CPI" modeling gap — pre-fix the only
+    // workaround was splitting the parent handler per outcome.
+    let match_call_args = non_keyword_ident()
+        .then_ignore(wsc())
+        .then_ignore(just('='))
+        .then_ignore(wsc())
+        .then(expr())
+        .map(|(name, value)| CallArg { name, value })
+        .then_ignore(wsc())
+        .separated_by(just(',').then_ignore(wsc()))
+        .allow_trailing()
+        .collect::<Vec<CallArg>>();
+    let match_call = just("call")
+        .then_ignore(wsc())
+        .ignore_then(qualified_path())
+        .then_ignore(wsc())
+        .then_ignore(just('('))
+        .then_ignore(wsc())
+        .then(match_call_args)
+        .then_ignore(wsc())
+        .then_ignore(just(')'))
+        .map(|(target, args)| {
+            MatchBody::Call(
+                CallExpr {
+                    target,
+                    args,
+                    result_binding: None,
+                },
+                Vec::new(),
+            )
+        });
+
     let match_body = choice((
         // abort ErrName
         kw("abort")
             .ignore_then(non_keyword_ident())
             .map(MatchBody::Abort),
+        // call Interface.handler(...)  (v2.24 #9)
+        match_call,
         // effect { ... }
         kw("effect")
             .ignore_then(just('{'))
