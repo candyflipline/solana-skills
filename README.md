@@ -73,33 +73,57 @@ CPI calls are axiomatic — we verify the program passes correct parameters. SPL
 ```bash
 # 1. Install
 npx skills add qedgen/solana-skills
+```
 
-# 2. Initialize the project — records the spec path in .qed/config.json
+Two paths from here — pick the one that matches what you have:
+
+### A. Existing program (brownfield) — audit first, spec second
+
+The v2.23 first-contact flow. Works on Anchor, Pinocchio, native, and
+sBPF. Pitch: _"Find the bugs that are already there, then turn each
+finding into a spec property that locks it in."_
+
+```bash
+# In Claude Code / Codex / Cursor, invoke the auditor subagent on the
+# program you're onboarding:
+#   /qedgen-auditor
+
+# The auditor surfaces fired findings under .qed/findings/. When you
+# re-enter /qedgen, the conversion table at
+# skills/qedgen-auditor/references/finding_to_spec.md maps each finding
+# class to the spec construct (property, requires, invariant, lifecycle)
+# that locks it in. Walk through examples/rust/brownfield-onboarding/
+# for an end-to-end demo on a real bug class.
+
+# Already have a spec sketch and want to skip the audit?
+qedgen adapt --program ./programs/my_program           # Anchor source → spec
+qedgen spec --idl target/idl/my_program.json           # Anchor IDL → spec
+qedgen probe --program ./my_program --emit-spec-candidates \
+  --audit-dir .qed/audit/$(date +%F)                   # native / Pinocchio / sBPF
+qedgen ratify --audit-dir .qed/audit/$(date +%F) \
+  --out my_program.qedspec
+```
+
+### B. New program (greenfield) — start from spec
+
+```bash
+# 1. Initialize the project — records the spec path in .qed/config.json
 qedgen init --name my_program --spec my_program.qedspec --target anchor
 
-# 3. Validate and generate artifacts (no --spec needed from inside the project)
+# 2. Validate and generate artifacts (no --spec needed from inside the project)
 qedgen check
 qedgen codegen --all
 
-# 4. Fill generated Rust handler TODOs, then run backend verification
+# 3. Fill generated Rust handler TODOs, then run backend verification
 qedgen verify
+```
 
-# 5. Audit a brownfield project before adopting a spec — emits the
-#    auditor work list (per-handler categories) consumed by the
-#    `qedgen-auditor` agent skill, or run spec-aware against an
-#    existing .qedspec for category-coverage findings.
-qedgen probe --spec my_program.qedspec
+### Stuck? File feedback
 
-# 6. Drive a scaffold-to-spec interview (v2.19) — probe with
-#    --emit-spec-candidates writes interview.md / clusters.json /
-#    skeleton.qedspec under .qed/audit/<ts>/; the auditor agent
-#    surfaces the interview, you check accept/narrow/reject/bug
-#    per cluster, then ratify merges the chosen clauses into a
-#    parseable .qedspec.
-qedgen probe --program ./my_program --emit-spec-candidates \
-  --audit-dir .qed/audit/2026-05-16
-qedgen ratify --audit-dir .qed/audit/2026-05-16 \
-  --out my_program.qedspec
+```bash
+# Bundles the most recent failure's context (stderr, env, spec excerpt)
+# into a GitHub issue. Local copy always saved to .qed/feedback/.
+qedgen feedback --note "what went wrong"
 ```
 
 `.qed/config.json` pins the spec location so subsequent commands don't need
@@ -122,41 +146,39 @@ export ARISTOTLE_API_KEY=your_key_here                  # sign up at https://ari
 
 ## Usage
 
-### Existing Anchor programs (brownfield)
+### Brownfield — audit-first first contact (v2.23, recommended)
 
-`qedgen adapt` and `qedgen spec --idl` both target Anchor today;
-brownfield ingest for Quasar isn't yet wired (Quasar greenfield via
-`qedgen init --target quasar` is fully supported — see below).
+Works across Anchor, Pinocchio, native, and sBPF. Spec-writing from a cold start is unmotivated work; the audit gives you something to write the spec _about_.
 
-```bash
-# Option A — from an Anchor IDL (program ABI only)
-qedgen spec --idl target/idl/my_program.json
+In your harness (Claude Code, Codex, Cursor), invoke the auditor:
 
-# Option B — from the Anchor program's source (recommended)
-# Walks src/lib.rs, finds the #[program] mod, follows each forwarder
-# (inline / free fn / Type::method / ctx.accounts.method), and emits
-# a .qedspec skeleton with one handler block per instruction plus a
-# breadcrumb to where each handler body lives.
-qedgen adapt --program ./programs/my_program
-
-# Review and complete the TODO items in the generated .qedspec
-# Then use the same pipeline as greenfield:
-qedgen init --name my_program
-qedgen codegen --spec my_program.qedspec --lean
-cd formal_verification && lake build
+```text
+/qedgen-auditor
 ```
 
-`qedgen adapt` carries forward what it can read from the source: handler names, argument types, the `Context<X>` accounts struct, and a pointer to the actual handler body in your repo. Lifecycle, requires, effects, and transfers stay as TODOs for you or your agent to fill in. `qedgen spec --idl <path>` is the IDL-only fallback when you don't have source.
+The auditor surfaces fired findings under `.qed/findings/`. Each finding ships with a reproducer (Mollusk transaction trace, Kani counterexample, proptest seed, or Miri repro) — no advisory-tier output, only bugs with a concrete witness. When you re-enter `/qedgen`, the conversion table at `skills/qedgen-auditor/references/finding_to_spec.md` maps each finding family (authorization, arithmetic, lifecycle, paired validators, intent drift, …) to the spec construct that locks it in as a regression guard.
 
-**Audit-first alternative (v2.23 — recommended for first contact).** Rather than filling adapt's TODOs from a cold start, route through `/qedgen-auditor` first; the auditor surfaces real findings in your existing code, and then `/qedgen` converts those findings into spec properties that lock them in as permanent regression guards. See `examples/rust/brownfield-onboarding/` for an end-to-end walkthrough on a real bug class, plus `skills/qedgen-auditor/references/finding_to_spec.md` for the per-category conversion table.
+End-to-end walkthrough on a real bug class: `examples/rust/brownfield-onboarding/`.
 
-### Existing Pinocchio / native / sBPF programs (audit-first brownfield)
+### Brownfield — spec-sketch ingest (when you already know what you want)
 
-For non-Anchor runtimes the entry point is the probe + ratify flow,
-not `adapt`. `qedgen probe --program <root>` runtime-detects from the
-`Cargo.toml` (`pinocchio` dep → Pinocchio mode; otherwise falls back
-to the generic bootstrap envelope). Override with `--runtime
-pinocchio|anchor|quasar|native|sbpf` if detection misses.
+Skip the audit if you've already mapped the program's intent and just need a parseable spec to iterate on.
+
+**Anchor.** `qedgen adapt --program` is the source-driven path; `qedgen spec --idl` is the IDL-only fallback. Quasar brownfield ingest isn't wired today (Quasar greenfield via `qedgen init --target quasar` is fully supported).
+
+```bash
+# From the Anchor source — walks src/lib.rs, finds #[program],
+# follows each forwarder, emits a .qedspec skeleton with handler
+# blocks plus a breadcrumb to where each body lives in your repo.
+qedgen adapt --program ./programs/my_program
+
+# IDL-only fallback when source isn't available.
+qedgen spec --idl target/idl/my_program.json
+```
+
+`adapt` carries forward what it can read from source: handler names, argument types, the `Context<X>` accounts struct, and pointers to handler bodies. Lifecycle, requires, effects, and transfers stay as TODOs for you or your agent to fill in.
+
+**Pinocchio / native / sBPF.** No framework convention to anchor an extractor on, so the entry point is probe + ratify. `qedgen probe --program <root>` runtime-detects from `Cargo.toml` (`pinocchio` dep → Pinocchio mode; otherwise the generic bootstrap envelope). Override with `--runtime pinocchio|anchor|quasar|native|sbpf` when detection misses.
 
 ```bash
 # Pinocchio: enumerate `unsafe`-serde / arithmetic sites, parse
@@ -170,14 +192,13 @@ qedgen verify --miri
 
 # Lift findings into a ratifiable spec (works across runtimes):
 qedgen probe --program ./programs/my_program --emit-spec-candidates \
-  --audit-dir .qed/audit/2026-05-16
-qedgen ratify --audit-dir .qed/audit/2026-05-16 --out my_program.qedspec
+  --audit-dir .qed/audit/$(date +%F)
+qedgen ratify --audit-dir .qed/audit/$(date +%F) --out my_program.qedspec
 ```
 
-Native ships as preview — coverage is narrower than Anchor/Pinocchio
-because there are no framework conventions to anchor extractors on.
+Native ships as preview — coverage is narrower than Anchor/Pinocchio because there are no framework conventions to anchor extractors on.
 
-Once the spec is filled in, gate CI on it staying in sync with the program:
+Once the spec exists, gate CI on it staying in sync with the program:
 
 ```bash
 # Errors if the spec declares a handler that's not in the program
