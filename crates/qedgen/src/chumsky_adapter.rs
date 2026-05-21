@@ -536,6 +536,12 @@ fn expr_to_lean(e: &Expr, ctx: Ctx, consts: ConstTable, env: &TypeEnv) -> String
             if func == "now" && args.is_empty() {
                 return "now".to_string();
             }
+            // v2.24 #19: `current_epoch()` resolves the same way —
+            // axiomatized at `QEDGen.Solana.Valid.current_epoch : Nat`,
+            // not a per-spec uninterpreted helper.
+            if func == "current_epoch" && args.is_empty() {
+                return "current_epoch".to_string();
+            }
             // Lean function application: `f a b c` (space-separated, parenthesized
             // args). Leaves `func` as the raw name — downstream users declare
             // these as uninterpreted helpers (axioms or defs) in a support module.
@@ -1022,6 +1028,12 @@ fn expr_to_rust(e: &Expr, ctx: Ctx, consts: ConstTable, opts: RustOpts<'_, '_>) 
                 return "(solana_program::clock::Clock::get().unwrap().unix_timestamp as u64)"
                     .to_string();
             }
+            // v2.24 #19: `current_epoch()` reads `.epoch` (already u64)
+            // off the same Clock sysvar. No cast needed — `epoch` is
+            // u64 in solana_program::clock::Clock.
+            if func == "current_epoch" && args.is_empty() {
+                return "solana_program::clock::Clock::get().unwrap().epoch".to_string();
+            }
             let args_str: Vec<String> = args
                 .iter()
                 .map(|n| expr_to_rust(&n.node, ctx, consts, opts))
@@ -1206,13 +1218,20 @@ fn path_to_rust(p: &a::Path, _ctx: Ctx, consts: ConstTable, opts: RustOpts<'_, '
 /// in any record or state ADT variant anywhere in `spec`. Sum types that
 /// qualify get inductive Lean codegen; other ADTs stay on the flatten path.
 fn is_map_value_sum_type(name: &str, spec: &a::Spec) -> bool {
-    // Check all record fields and ADT variant fields for `Map[N] <name>`.
-    fn type_ref_uses_map_value(t: &a::TypeRef, name: &str) -> bool {
+    // Check all record fields and ADT variant fields for `Map[N] <name>`,
+    // OR — v2.24 #20 — `Map[<name>] T` (enum used as key).
+    fn type_ref_mentions(t: &a::TypeRef, name: &str) -> bool {
         match t {
-            a::TypeRef::Map { inner, .. } => match inner.as_ref() {
-                a::TypeRef::Named(n) => n == name,
-                _ => false,
-            },
+            a::TypeRef::Map { inner, bound } => {
+                // Used as the Map's VALUE (pre-fix sole condition)
+                let value_match = matches!(inner.as_ref(), a::TypeRef::Named(n) if n == name);
+                // v2.24 #20 — used as the Map's KEY (the bound). The
+                // bound is stored as a raw ident string; resolution
+                // happens later, so a bare name match is the
+                // routing signal.
+                let key_match = bound == name;
+                value_match || key_match
+            }
             _ => false,
         }
     }
@@ -1220,7 +1239,7 @@ fn is_map_value_sum_type(name: &str, spec: &a::Spec) -> bool {
         match node {
             TopItem::Record(r) => {
                 for f in &r.fields {
-                    if type_ref_uses_map_value(&f.ty, name) {
+                    if type_ref_mentions(&f.ty, name) {
                         return true;
                     }
                 }
@@ -1228,7 +1247,7 @@ fn is_map_value_sum_type(name: &str, spec: &a::Spec) -> bool {
             TopItem::Adt(adt) => {
                 for v in &adt.variants {
                     for f in &v.fields {
-                        if type_ref_uses_map_value(&f.ty, name) {
+                        if type_ref_mentions(&f.ty, name) {
                             return true;
                         }
                     }
@@ -1279,11 +1298,16 @@ fn resolve_type_alias<'a>(
 // Effect rendering: (field_name, op, value_string)
 // ============================================================================
 
+/// Render an `EffectStmt` to the `(field, op, value)` triple consumed by
+/// every backend, plus the per-site error-variant override (v2.24 §S1a)
+/// that codegen reads when lowering checked `+=` / `-=`. Override is
+/// always `None` for non-checked ops — the parser permits `or X` on those
+/// permissively for nicer error positioning, and the adapter normalizes.
 fn render_effect(
     stmt: &a::EffectStmt,
     params: &[(String, String)],
     consts: ConstTable,
-) -> (String, String, String) {
+) -> ((String, String, String), Option<String>) {
     // Field name: preserve subscript syntax as-is (e.g., `accounts[i].capital`).
     // Both Lean and Rust consumers read this string; Rust-side `as usize`
     // index casting is applied at the codegen.rs::mechanize_effect site
@@ -1382,7 +1406,15 @@ fn render_effect(
             expr_to_lean(other, Ctx::Guard, consts, &env)
         }
     };
-    (field, op.to_string(), value)
+    // v2.24 §S1a — only keep the per-site override for ops that can fail
+    // (checked Add / Sub). Saturating / wrapping / Set can never trigger
+    // an error variant; the parser still accepts `or X` on those for
+    // positioning, but we drop it here so codegen never sees it.
+    let on_error = match stmt.op {
+        a::EffectOp::Add | a::EffectOp::Sub => stmt.on_error.clone(),
+        _ => None,
+    };
+    ((field, op.to_string(), value), on_error)
 }
 
 /// Best-effort reconstruction of a `TypeRef` from its rendered string form,
@@ -1739,6 +1771,11 @@ fn walk_apps(
             // walk_apps emits `axiom now : Bool` which collides with the
             // support-library declaration at elaboration.
             if func == "now" && args.is_empty() {
+                return;
+            }
+            // v2.24 #19: `current_epoch()` resolves via the support
+            // library, same shape as `now`.
+            if func == "current_epoch" && args.is_empty() {
                 return;
             }
             let key = (func.clone(), args.len());
@@ -2128,6 +2165,16 @@ pub fn adapt(spec: &a::Spec) -> ParsedSpec {
     // First pass: collect constants so guard rendering can substitute them.
     let mut consts_map: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
+    // v2.24 §S2d — integer-max builtins. Lint suggestions reference these
+    // as bare identifiers; users used to have to declare them as `const`s
+    // explicitly. Builtin seeding lets `requires state.x + n <= U64_MAX`
+    // resolve out of the box. User-defined `const` shadows the builtin
+    // (insert order: builtins first, then user consts via the loop below).
+    consts_map.insert("U64_MAX".to_string(), u64::MAX.to_string());
+    consts_map.insert("U32_MAX".to_string(), u32::MAX.to_string());
+    consts_map.insert("U128_MAX".to_string(), u128::MAX.to_string());
+    consts_map.insert("I64_MAX".to_string(), i64::MAX.to_string());
+    consts_map.insert("I128_MAX".to_string(), i128::MAX.to_string());
     for Node { node, .. } in &spec.items {
         if let TopItem::Const { name, value } = node {
             consts_map.insert(name.clone(), value.to_string());
@@ -2217,11 +2264,31 @@ pub fn adapt(spec: &a::Spec) -> ParsedSpec {
                             }
                         }
                     }
+                    // v2.24 S5b: preserve per-variant structure alongside the
+                    // flattened `fields` view. Codegen consumers that want
+                    // real `pub enum` emission read `variants`; the flat
+                    // view stays for back-compat with readers not yet
+                    // migrated. Empty variants (zero-payload constructors
+                    // like `| Inactive`) are kept so the enum can emit
+                    // unit-style variants in v2.24 S5b's codegen pass.
+                    let parsed_variants: Vec<ParsedVariant> = adt
+                        .variants
+                        .iter()
+                        .map(|v| ParsedVariant {
+                            name: v.name.clone(),
+                            fields: v
+                                .fields
+                                .iter()
+                                .map(|f| (f.name.clone(), type_ref_to_string(&f.ty)))
+                                .collect(),
+                        })
+                        .collect();
                     out.account_types.push(ParsedAccountType {
                         name: adt.name.clone(),
                         fields,
                         lifecycle,
                         pda_ref: None,
+                        variants: parsed_variants,
                     });
                 }
             }
@@ -2232,7 +2299,6 @@ pub fn adapt(spec: &a::Spec) -> ParsedSpec {
                 out.handlers.extend(expanded);
             }
             TopItem::Property(p) => {
-                let lean = expr_to_lean(&p.body.node, Ctx::Guard, consts, &env);
                 // v2.23 Slice 3: pick state_mode by the property's class.
                 // Unary properties render today's way (`s.x`). Binary
                 // properties — bodies containing `old(...)` — render with
@@ -2241,7 +2307,24 @@ pub fn adapt(spec: &a::Spec) -> ParsedSpec {
                 // harness shape that `emit_preservation_tests_for` emits.
                 // Pre-v2.23 both classes rendered identically, collapsing
                 // every `old(...)` into a structural tautology.
-                let property_state_mode = match classify_property_body(&p.body) {
+                //
+                // v2.24.0 follow-up: extend the same split to the Lean
+                // side. Pre-fix the lean_expr was always rendered in
+                // `Ctx::Guard`, which lowered both `state.x` and
+                // `old(state.x)` to bare `s.x` — every binary
+                // preservation property in `render_properties_adt`
+                // emitted as a structural tautology (`s.x ≥ s.x`).
+                // Using `Ctx::Ensures` for binary bodies gives `s'.x`
+                // for `state.x` and `s.x` for `old(state.x)`, matching
+                // the `(s s' : State) : Prop` shape the inductive
+                // property emitter now uses.
+                let property_class = classify_property_body(&p.body);
+                let lean_ctx = match property_class {
+                    crate::check::PropertyClass::Unary => Ctx::Guard,
+                    crate::check::PropertyClass::Binary => Ctx::Ensures,
+                };
+                let lean = expr_to_lean(&p.body.node, lean_ctx, consts, &env);
+                let property_state_mode = match property_class {
                     crate::check::PropertyClass::Unary => StateMode::Unary,
                     crate::check::PropertyClass::Binary => StateMode::Binary,
                 };
@@ -2255,6 +2338,19 @@ pub fn adapt(spec: &a::Spec) -> ParsedSpec {
                     // handlers are known (matches pest parity).
                     a::PreservedBy::All => vec!["all".to_string()],
                     a::PreservedBy::Some(xs) => xs.clone(),
+                    // v2.24 #3 — `preserved_by all except [h1, h2, ...]`.
+                    // Tagged with a `!` prefix per name so the second-pass
+                    // expansion (which runs after all handlers are known)
+                    // can subtract these from the full handler list. Bare
+                    // handler names with literal `!` prefix aren't legal
+                    // identifiers, so this tag is collision-free.
+                    a::PreservedBy::AllExcept(xs) => {
+                        let mut tagged = vec!["all".to_string()];
+                        for x in xs {
+                            tagged.push(format!("!{}", x));
+                        }
+                        tagged
+                    }
                 };
                 // When the body is a single `forall <binder> : <T>, inner`
                 // with a binder type wider than U8/I8 (so the standard
@@ -2483,6 +2579,41 @@ pub fn adapt(spec: &a::Spec) -> ParsedSpec {
                     as_name: as_name.clone(),
                 });
             }
+            TopItem::PragmaAssign { name, value } => {
+                // v2.24 §S1b — `pragma <key> = <value>` top-level
+                // assignment. Push raw; lint validates the key against the
+                // known set and the value against declared `type Error`
+                // variants.
+                out.pragma_assignments.push((name.clone(), value.clone()));
+            }
+            TopItem::Schema(s) => {
+                // v2.24 #1 — collect schema blocks so handlers can
+                // expand them via `include <name>`. Adapt each
+                // requires expression eagerly using the shared
+                // `expr_to_lean` / `expr_to_rust` so the schema's
+                // guards land in the same shape as inline requires.
+                let requires = s
+                    .requires
+                    .iter()
+                    .map(|(guard, on_fail)| ParsedRequires {
+                        lean_expr: expr_to_lean(&guard.node, Ctx::Guard, consts, &env),
+                        rust_expr: expr_to_rust(&guard.node, Ctx::Guard, consts, opts_native(&env)),
+                        rust_expr_pod: expr_to_rust(
+                            &guard.node,
+                            Ctx::Guard,
+                            consts,
+                            opts_pod(&env),
+                        ),
+                        error_name: on_fail.clone(),
+                        ast_body: Some(guard.clone()),
+                    })
+                    .collect();
+                out.schemas.push(crate::check::ParsedSchema {
+                    name: s.name.clone(),
+                    doc: s.doc.clone(),
+                    requires,
+                });
+            }
             TopItem::Pragma(p) => {
                 // Record the pragma name for target inference. Any given
                 // pragma may appear at most once per spec; duplicates are
@@ -2529,8 +2660,28 @@ pub fn adapt(spec: &a::Spec) -> ParsedSpec {
     }
 
     // Expand `preserved_by all` to the full handler-name list (pest parity).
+    // v2.24 #3 — `preserved_by all except [h1, h2, ...]` arrives here as
+    // `["all", "!h1", "!h2"]`; expand `all` then subtract the
+    // `!`-prefixed excludes.
     let all_handler_names: Vec<String> = out.handlers.iter().map(|h| h.name.clone()).collect();
     for prop in &mut out.properties {
+        if prop.preserved_by.first().map(|s| s.as_str()) == Some("all") {
+            let excludes: std::collections::HashSet<String> = prop
+                .preserved_by
+                .iter()
+                .filter_map(|s| s.strip_prefix('!').map(String::from))
+                .collect();
+            if excludes.is_empty() && prop.preserved_by.len() == 1 {
+                prop.preserved_by = all_handler_names.clone();
+            } else {
+                prop.preserved_by = all_handler_names
+                    .iter()
+                    .filter(|n| !excludes.contains(n.as_str()))
+                    .cloned()
+                    .collect();
+            }
+            continue;
+        }
         if prop.preserved_by.len() == 1 && prop.preserved_by[0] == "all" {
             prop.preserved_by = all_handler_names.clone();
         }
@@ -2556,6 +2707,26 @@ pub fn adapt(spec: &a::Spec) -> ParsedSpec {
     // populated — the collector needs the full state_fields + records
     // + sum_types picture to infer argument types.
     out.uninterpreted_helpers = collect_uninterpreted_helpers(spec, &out);
+
+    // v2.24 #1 — expand `include <schema>` clauses on handlers. Done
+    // here as a post-pass so the schema lookup sees every declared
+    // schema regardless of source order, and so synthetic match-arm
+    // handlers (which inherit `schema_includes` from their parent
+    // via `expand_handler`) get the same expansion.
+    let schemas = out.schemas.clone();
+    for handler in &mut out.handlers {
+        if handler.schema_includes.is_empty() {
+            continue;
+        }
+        for include in &handler.schema_includes {
+            if let Some(schema) = schemas.iter().find(|s| s.name == *include) {
+                for r in &schema.requires {
+                    handler.requires.push(r.clone());
+                }
+            }
+        }
+    }
+
     out
 }
 
@@ -2652,9 +2823,54 @@ fn expand_handler(
             }
             a::MatchBody::Effect(stmts) => {
                 for Node { node: stmt, .. } in stmts {
-                    synth
-                        .effects
-                        .push(render_effect(stmt, &base.takes_params, consts));
+                    let (triple, on_error) = render_effect(stmt, &base.takes_params, consts);
+                    synth.effects.push(triple);
+                    synth.effect_on_error.push(on_error);
+                }
+            }
+            // v2.24 #9 — synth handler issues the CPI plus any
+            // alongside effects. Mirrors the per-handler `Call`
+            // lowering at the top-level handler clause site so
+            // backends see the same ParsedCall shape regardless of
+            // whether the call came from a top-level `call` clause
+            // or from inside a match arm.
+            a::MatchBody::Call(call, effects) => {
+                let segs = &call.target.0;
+                let (iface, handler_name) = match segs.as_slice() {
+                    [] => (String::new(), String::new()),
+                    [only] => (String::new(), only.clone()),
+                    [head, tail @ ..] => (head.clone(), tail.join(".")),
+                };
+                let args = call
+                    .args
+                    .iter()
+                    .map(|arg| ParsedCallArg {
+                        name: arg.name.clone(),
+                        lean_expr: expr_to_lean(&arg.value.node, Ctx::Guard, consts, env),
+                        rust_expr: expr_to_rust(
+                            &arg.value.node,
+                            Ctx::Guard,
+                            consts,
+                            opts_native(env),
+                        ),
+                        rust_expr_pod: expr_to_rust(
+                            &arg.value.node,
+                            Ctx::Guard,
+                            consts,
+                            opts_pod(env),
+                        ),
+                    })
+                    .collect();
+                synth.calls.push(ParsedCall {
+                    target_interface: iface,
+                    target_handler: handler_name,
+                    args,
+                    result_binding: call.result_binding.clone(),
+                });
+                for Node { node: stmt, .. } in effects {
+                    let (triple, on_error) = render_effect(stmt, &base.takes_params, consts);
+                    synth.effects.push(triple);
+                    synth.effect_on_error.push(on_error);
                 }
             }
             a::MatchBody::Noop => {}
@@ -2702,11 +2918,13 @@ fn adapt_handler(h: &a::HandlerDecl, consts: ConstTable, env: &TypeEnv) -> Parse
         aborts_total: false,
         permissionless: false,
         effects: Vec::new(),
+        effect_on_error: Vec::new(),
         accounts: Vec::new(),
         transfers: Vec::new(),
         emits: Vec::new(),
         invariants: Vec::new(),
         establishes: Vec::new(),
+        schema_includes: Vec::new(),
         properties: Vec::new(),
         calls: Vec::new(),
         effect_branches: None,
@@ -2781,21 +2999,27 @@ fn adapt_handler(h: &a::HandlerDecl, consts: ConstTable, env: &TypeEnv) -> Parse
                 for Node { node: block, .. } in blocks {
                     match block {
                         a::EffectBlock::Stmt(stmt) => {
-                            handler.effects.push(render_effect(stmt, &params, consts));
+                            let (triple, on_error) = render_effect(stmt, &params, consts);
+                            handler.effects.push(triple);
+                            handler.effect_on_error.push(on_error);
                         }
                         a::EffectBlock::Match { scrutinee, arms } => {
                             let mut parsed_arms: Vec<crate::check::ParsedEffectArm> = Vec::new();
                             for arm in arms {
                                 let mut arm_effects = Vec::new();
+                                let mut arm_on_error: Vec<Option<String>> = Vec::new();
                                 for nested in &arm.body {
                                     let mut leaves = Vec::new();
                                     nested.node.collect_leaves(&mut leaves);
                                     for stmt in leaves {
-                                        let rendered = render_effect(stmt, &params, consts);
+                                        let (triple, on_error) =
+                                            render_effect(stmt, &params, consts);
                                         // Mirror into union so flat readers
                                         // see this potential write.
-                                        handler.effects.push(rendered.clone());
-                                        arm_effects.push(rendered);
+                                        handler.effects.push(triple.clone());
+                                        handler.effect_on_error.push(on_error.clone());
+                                        arm_effects.push(triple);
+                                        arm_on_error.push(on_error);
                                     }
                                 }
                                 let (pattern_rust, pattern_lean, is_wildcard) = match &arm.pattern {
@@ -2811,6 +3035,7 @@ fn adapt_handler(h: &a::HandlerDecl, consts: ConstTable, env: &TypeEnv) -> Parse
                                     pattern_lean,
                                     is_wildcard,
                                     effects: arm_effects,
+                                    effect_on_error: arm_on_error,
                                 });
                             }
                             branches = Some(crate::check::ParsedEffectBranches {
@@ -2885,8 +3110,16 @@ fn adapt_handler(h: &a::HandlerDecl, consts: ConstTable, env: &TypeEnv) -> Parse
             a::HandlerClause::Permissionless => handler.permissionless = true,
             a::HandlerClause::Invariant(name) => handler.invariants.push(name.clone()),
             a::HandlerClause::Establishes(name) => handler.establishes.push(name.clone()),
-            a::HandlerClause::Include(_) => {
-                // Schema includes: forward-compat; ignored in phase 1.
+            a::HandlerClause::Include(schema_name) => {
+                // v2.24 #1 — record the schema reference here; the
+                // actual expansion (append schema.requires onto
+                // handler.requires) happens in a post-pass at the
+                // bottom of `adapt()` once every schema is known
+                // and every base handler is built. Storing the
+                // include-list on the handler lets the expansion
+                // survive the synthetic-match-arm expansion step
+                // (each arm sees the same parent's includes).
+                handler.schema_includes.push(schema_name.clone());
             }
             a::HandlerClause::Match(_) => {
                 // Branches are expanded into synthetic handlers by
@@ -2928,6 +3161,9 @@ fn adapt_handler(h: &a::HandlerDecl, consts: ConstTable, env: &TypeEnv) -> Parse
                     target_interface: iface,
                     target_handler: handler_name,
                     args,
+                    // v2.24 #11 — propagate optional `let <name> =`
+                    // binding through to downstream backends.
+                    result_binding: c.result_binding.clone(),
                 });
             }
         }
@@ -2984,6 +3220,7 @@ fn adapt_interface_handler<'a>(
         accounts: Vec::new(),
         requires: Vec::new(),
         ensures: Vec::new(),
+        return_type: h.return_type.as_ref().map(type_ref_to_string),
     };
 
     for Node { node: clause, .. } in &h.clauses {
@@ -3052,6 +3289,302 @@ mod tests {
 
     const PERCOLATOR_SPEC: &str =
         include_str!("../../../examples/rust/percolator/percolator.qedspec");
+
+    /// v2.24 #20 — `Map[<EnumType>] T` is recognized when the bound
+    /// names a unit-only enum (sum type whose variants all have no
+    /// payload). Pre-fix the `map_bound_not_const` lint hard-errored
+    /// because only `const` bounds were accepted; spec authors with
+    /// one-PDA-per-enum-variant patterns (e.g. Hylo's
+    /// AddressUpdateProposal per AddressField) had to fall back to
+    /// per-variant flat fields.
+    #[test]
+    fn map_keyed_by_enum_routes_to_sum_types() {
+        let src = r#"spec EnumMap
+program_id "11111111111111111111111111111111"
+
+type AddressField
+  | Owner
+  | Manager
+  | Treasury
+
+type ProposalSlot = { proposed : Pubkey, deadline : U64, }
+
+type State
+  | Active of {
+      proposals : Map[AddressField] ProposalSlot,
+    }
+
+type Error
+  | NoMatch
+"#;
+        let spec = parse_str(src).expect("parse");
+        // AddressField should route to sum_types (not account_types)
+        // because it's used as a Map key.
+        let has_sum = spec.sum_types.iter().any(|s| s.name == "AddressField");
+        assert!(
+            has_sum,
+            "AddressField should land in sum_types when used as a Map key; got sum_types: {:?}",
+            spec.sum_types.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        // And the unit-only check passes (all variants payload-free).
+        let af = spec
+            .sum_types
+            .iter()
+            .find(|s| s.name == "AddressField")
+            .unwrap();
+        assert!(
+            af.variants.iter().all(|v| v.fields.is_empty()),
+            "AddressField should be unit-only"
+        );
+    }
+
+    /// v2.24 #9 — `call Interface.handler(...)` is now legal inside
+    /// a match arm body, alongside `abort` / `effect`. The expander
+    /// produces one synthetic handler per arm; the call-arm synth
+    /// gets the CPI captured on its `calls` slot (same shape as a
+    /// top-level call clause).
+    #[test]
+    fn match_arm_accepts_call_body() {
+        let src = r#"spec MatchCall
+program_id "11111111111111111111111111111111"
+
+interface Pool {
+  program_id "11111111111111111111111111111111"
+  handler absorb_loss (amount : U64) {
+    accounts { vault : writable }
+  }
+}
+
+type State
+  | Active of { pnl : I64 }
+
+type Error
+  | NoMatch
+
+handler liquidate (loss : U64) : State.Active -> State.Active {
+  permissionless
+  match
+    | state.pnl < 0 => call Pool.absorb_loss(amount = loss)
+    | _ => abort NoMatch
+}
+"#;
+        let spec = parse_str(src).expect("parse");
+        // The match clause expands into one synth handler per arm.
+        // The call-arm synth should have one ParsedCall on it.
+        let synths: Vec<_> = spec
+            .handlers
+            .iter()
+            .filter(|h| h.name.starts_with("liquidate"))
+            .collect();
+        let with_call: Vec<_> = synths.iter().filter(|h| !h.calls.is_empty()).collect();
+        assert_eq!(
+            with_call.len(),
+            1,
+            "expected exactly one synth handler with a call body; got {} synths total, {} with calls",
+            synths.len(),
+            with_call.len()
+        );
+        assert_eq!(with_call[0].calls[0].target_interface, "Pool");
+        assert_eq!(with_call[0].calls[0].target_handler, "absorb_loss");
+    }
+
+    /// v2.24 #11 — `let X = call Foo.handler(...)` parses and the
+    /// adapter records the binding name on `ParsedCall.result_binding`.
+    /// Pre-fix `call` was strictly terminal; capturing a callee return
+    /// value (e.g. `absorb_loss` returning the actually-burned amount)
+    /// required out-of-band threading via params.
+    #[test]
+    fn call_with_let_binding_records_result_name() {
+        let src = r#"spec CallLet
+program_id "11111111111111111111111111111111"
+
+interface Pool {
+  program_id "11111111111111111111111111111111"
+  handler absorb_loss (amount : U64) {
+    accounts {
+      vault : writable
+    }
+  }
+}
+
+type State
+  | Active of { total_loss : U64 }
+
+type Error
+  | MathOverflow
+
+handler liquidate (loss : U64) : State.Active -> State.Active {
+  permissionless
+  let burned = call Pool.absorb_loss(amount = loss)
+  effect { Active.total_loss += loss }
+}
+
+handler unbound_call : State.Active -> State.Active {
+  permissionless
+  call Pool.absorb_loss(amount = 1)
+  effect { Active.total_loss += 1 }
+}
+"#;
+        let spec = parse_str(src).expect("parse");
+        let liquidate = spec
+            .handlers
+            .iter()
+            .find(|h| h.name == "liquidate")
+            .expect("liquidate handler");
+        let unbound = spec
+            .handlers
+            .iter()
+            .find(|h| h.name == "unbound_call")
+            .expect("unbound_call handler");
+        assert_eq!(liquidate.calls.len(), 1);
+        assert_eq!(
+            liquidate.calls[0].result_binding.as_deref(),
+            Some("burned"),
+            "result_binding should carry the `let` name; got: {:?}",
+            liquidate.calls[0].result_binding
+        );
+        assert_eq!(unbound.calls.len(), 1);
+        assert_eq!(
+            unbound.calls[0].result_binding, None,
+            "bare `call …` keeps result_binding None"
+        );
+    }
+
+    /// v2.24 #1 — top-level `schema name { requires … }` blocks parse,
+    /// and a handler's `include <schema>` clause expands every requires
+    /// from the schema into the handler's requires list at adapt time.
+    /// Closes the gist friction: pre-fix, the schema block parse-errored
+    /// and authors had to inline every cross-cutting guard.
+    #[test]
+    fn schema_include_expands_into_handler_requires() {
+        let src = r#"spec SchemaDemo
+program_id "11111111111111111111111111111111"
+
+type State
+  | Active of { balance : U64, paused : U8 }
+
+type Error
+  | Paused
+  | MathOverflow
+
+schema gated_by_pause {
+  requires state.paused == 0 else Paused
+}
+
+handler deposit (amount : U64) : State.Active -> State.Active {
+  permissionless
+  include gated_by_pause
+  requires amount > 0 else MathOverflow
+  effect { Active.balance += amount }
+}
+
+handler withdraw (amount : U64) : State.Active -> State.Active {
+  permissionless
+  include gated_by_pause
+  requires amount > 0 else MathOverflow
+  effect { Active.balance -= amount }
+}
+"#;
+        let spec = parse_str(src).expect("parse");
+        // Both handlers got the schema's `requires state.paused == 0`
+        // appended to their existing `amount > 0` clause.
+        for handler_name in ["deposit", "withdraw"] {
+            let h = spec
+                .handlers
+                .iter()
+                .find(|h| h.name == handler_name)
+                .unwrap_or_else(|| panic!("missing handler {handler_name}"));
+            assert!(
+                h.requires.iter().any(|r| r.lean_expr.contains("paused")),
+                "handler {handler_name} should pick up `paused` requires from gated_by_pause; got: {:?}",
+                h.requires.iter().map(|r| &r.lean_expr).collect::<Vec<_>>()
+            );
+            assert!(
+                h.requires
+                    .iter()
+                    .any(|r| r.error_name.as_deref() == Some("Paused")),
+                "handler {handler_name} should pick up the schema's Paused error; got: {:?}",
+                h.requires.iter().map(|r| &r.error_name).collect::<Vec<_>>()
+            );
+            assert!(
+                h.schema_includes.contains(&"gated_by_pause".to_string()),
+                "handler {handler_name} should remember its includes list"
+            );
+        }
+        // Schema is also surfaced on spec.schemas for downstream
+        // consumers (lint / docs / future tooling).
+        assert!(
+            spec.schemas.iter().any(|s| s.name == "gated_by_pause"),
+            "spec.schemas should list gated_by_pause; got: {:?}",
+            spec.schemas.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    /// v2.24 #3 — `preserved_by all except [h1, h2]` expands to the
+    /// full handler list minus the excluded names. Common pattern for
+    /// "every handler other than the one whose job is to break it"
+    /// (e.g. a `lock` handler that intentionally flips a flag the
+    /// rest of the spec preserves).
+    #[test]
+    fn preserved_by_all_except_expands_to_complement() {
+        let src = r#"spec ExceptDemo
+program_id "11111111111111111111111111111111"
+
+type State
+  | Active of { balance : U64, paused : U8 }
+
+type Error
+  | MathOverflow
+
+handler deposit (amount : U64) : State.Active -> State.Active {
+  permissionless
+  requires amount > 0 else MathOverflow
+  effect { Active.balance += amount }
+}
+
+handler pause : State.Active -> State.Active {
+  permissionless
+  effect { Active.paused := 1 }
+}
+
+handler unpause : State.Active -> State.Active {
+  permissionless
+  effect { Active.paused := 0 }
+}
+
+property still_unpaused :
+  state.paused == 0
+  preserved_by all except [pause]
+"#;
+        let spec = parse_str(src).expect("parse");
+        let prop = spec
+            .properties
+            .iter()
+            .find(|p| p.name == "still_unpaused")
+            .expect("property still_unpaused");
+        let names: std::collections::HashSet<&str> =
+            prop.preserved_by.iter().map(String::as_str).collect();
+        assert!(
+            names.contains("deposit"),
+            "expected deposit in preserved_by; got: {:?}",
+            prop.preserved_by
+        );
+        assert!(
+            names.contains("unpause"),
+            "expected unpause in preserved_by; got: {:?}",
+            prop.preserved_by
+        );
+        assert!(
+            !names.contains("pause"),
+            "pause should be excluded; got: {:?}",
+            prop.preserved_by
+        );
+        assert!(
+            !names.contains("all"),
+            "sentinel `all` should be expanded away; got: {:?}",
+            prop.preserved_by
+        );
+    }
 
     /// v2.17: both `invariant Foo` and `establishes Foo` handler clauses parse
     /// and route to the right `ParsedHandler` field.
@@ -3536,6 +4069,41 @@ handler refresh : State.Active -> State.Active {
         assert!(
             req.rust_expr.contains("Clock::get"),
             "rust expr should mention Clock::get; got: {}",
+            req.rust_expr
+        );
+    }
+
+    /// v2.24 #19 — `current_epoch()` parses as a zero-arg builtin
+    /// and lowers to `Clock::get().unwrap().epoch` in Rust and to
+    /// the bare ident `current_epoch` in Lean (axiomatized in the
+    /// support library at QEDGen.Solana.Valid).
+    #[test]
+    fn current_epoch_builtin_parses_in_requires() {
+        let src = r#"spec EpochReq
+type State | Active of { last_epoch : U64 }
+type Error | StaleEpoch
+handler refresh : State.Active -> State.Active {
+  permissionless
+  requires state.last_epoch < current_epoch() else StaleEpoch
+  effect { last_epoch := current_epoch() }
+}
+"#;
+        let spec = parse_str(src).expect("parse");
+        let h = spec.handlers.iter().find(|h| h.name == "refresh").unwrap();
+        let req = h.requires.first().expect("requires clause");
+        assert!(
+            req.lean_expr.contains("current_epoch"),
+            "lean expr should reference current_epoch; got: {}",
+            req.lean_expr
+        );
+        assert!(
+            req.rust_expr.contains("Clock::get"),
+            "rust expr should mention Clock::get; got: {}",
+            req.rust_expr
+        );
+        assert!(
+            req.rust_expr.contains(".epoch"),
+            "rust expr should read .epoch (not .unix_timestamp); got: {}",
             req.rust_expr
         );
     }

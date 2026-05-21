@@ -116,6 +116,8 @@ const KEYWORDS: &[&str] = &[
     "in",
     // v2.7 G4: handler-level opt-out of the no_access_control lint.
     "permissionless",
+    // v2.24 #1: top-level reusable guard block.
+    "schema",
     // v2.17 follow-up: handler-side clause asserting the named invariant
     // holds at POST-state without assuming it pre-state.
     "establishes",
@@ -296,8 +298,36 @@ fn qualified_path<'a>() -> impl Parser<'a, &'a str, QualifiedPath, Err<'a>> + Cl
 
 fn path<'a>() -> impl Parser<'a, &'a str, Path, Err<'a>> + Clone {
     let field_seg = just('.').ignore_then(ident()).map(PathSeg::Field);
+    // v2.24 #4: allow dotted-path index expressions
+    // (e.g. `lsts[state.lst_count].mint`). Pre-fix the index slot
+    // only accepted a bare identifier, forcing spec authors to
+    // bind a state-field read into a local before the indexing
+    // step. The dotted form joins segments with `.` and stores the
+    // result as a single `PathSeg::Index(String)`; downstream
+    // codegen handles `state.X` index expressions the same way it
+    // handles bare-ident indices via the existing
+    // `rewrite_index_to_usize` + state-binder resolution pass.
+    let dotted_index = ident()
+        .then(
+            just('.')
+                .ignore_then(ident())
+                .repeated()
+                .collect::<Vec<String>>(),
+        )
+        .map(|(head, rest)| {
+            if rest.is_empty() {
+                head
+            } else {
+                let mut s = head;
+                for seg in rest {
+                    s.push('.');
+                    s.push_str(&seg);
+                }
+                s
+            }
+        });
     let index_seg = just('[')
-        .ignore_then(ident())
+        .ignore_then(dotted_index)
         .then_ignore(just(']'))
         .map(PathSeg::Index);
     let seg = choice((field_seg, index_seg));
@@ -471,6 +501,35 @@ fn expr<'a>() -> impl Parser<'a, &'a str, Node<Expr>, Err<'a>> + Clone {
                 Node::new(
                     Expr::App {
                         func: "now".to_string(),
+                        args: vec![],
+                    },
+                    e.span().into_range(),
+                )
+            });
+
+        // v2.24 #19: `current_epoch()` — zero-arg builtin returning a
+        // fresh symbolic `u64` epoch. Lowers per-backend identically
+        // to `now()` except the Rust form reads `Clock::get().unwrap().epoch`
+        // instead of `unix_timestamp`. Lean axiomatizes
+        // `QEDGen.Solana.Valid.current_epoch : Nat`. Solana protocols
+        // use epoch for stake / vote / commission scheduling — having
+        // to thread `current_epoch : U64` as a handler param to every
+        // epoch-gated check was the v2.22 friction the gist called out.
+        let current_epoch_atom = just("current_epoch")
+            .then(
+                any::<&'a str, Err<'a>>()
+                    .filter(|c: &char| c.is_ascii_alphanumeric() || *c == '_')
+                    .rewind()
+                    .not(),
+            )
+            .then_ignore(wsc())
+            .ignore_then(just('('))
+            .then_ignore(wsc())
+            .then_ignore(just(')'))
+            .map_with(|_, e| {
+                Node::new(
+                    Expr::App {
+                        func: "current_epoch".to_string(),
                         args: vec![],
                     },
                     e.span().into_range(),
@@ -659,7 +718,14 @@ fn expr<'a>() -> impl Parser<'a, &'a str, Node<Expr>, Err<'a>> + Clone {
         // `.boxed()` tames the type complexity that otherwise trips Apple's
         // linker on overlong symbol names.
         let group_a = choice((int, bool_lit, old, let_in, if_then_else, sum, quant)).boxed();
-        let group_b = choice((now_atom, mul_div_floor_atom, mul_div_ceil_atom, match_expr)).boxed();
+        let group_b = choice((
+            now_atom,
+            current_epoch_atom,
+            mul_div_floor_atom,
+            mul_div_ceil_atom,
+            match_expr,
+        ))
+        .boxed();
         // `record_update` must precede `ctor` (leading `.` distinguishes
         // them, but this ordering is clearer). `app_expr` must precede
         // `path_expr` (both start with ident; app commits only when `(`
@@ -1060,13 +1126,31 @@ fn effect_stmt<'a>() -> impl Parser<'a, &'a str, EffectStmt, Err<'a>> + Clone {
         just(":=").to(EffectOp::Set),
         just('=').to(EffectOp::Set),
     ));
+    // v2.24 §S1a — optional `else <Variant>` suffix on checked `+=` / `-=`.
+    // Saturating / wrapping variants reject this at the AST-build stage
+    // (they can't fail). The keyword is `else` — same shape as `requires
+    // <expr> else <Err>` — chosen over the gist's suggested `or` because
+    // `or` conflicts with the boolean infix `or` inside `expr()`. Adapter
+    // / lint enforce per-op applicability; parser stays permissive so the
+    // error message points at the postfix, not at `else`.
+    let on_error = just("else")
+        .then_ignore(wsc())
+        .ignore_then(non_keyword_ident())
+        .or_not();
     path()
         .then_ignore(wsc())
         .then(op)
         .then_ignore(wsc())
         .then(expr())
         .then_ignore(wsc())
-        .map(|((lhs, op), rhs)| EffectStmt { lhs, op, rhs })
+        .then(on_error)
+        .then_ignore(wsc())
+        .map(|(((lhs, op), rhs), on_error)| EffectStmt {
+            lhs,
+            op,
+            rhs,
+            on_error,
+        })
 }
 
 /// v2.20 §S1.2 — one item inside an `effect { … }` body: either a leaf
@@ -1172,14 +1256,54 @@ fn handler_clause<'a>() -> impl Parser<'a, &'a str, HandlerClause, Err<'a>> + Cl
         .then_ignore(just(']'))
         .map(HandlerClause::Modifies);
 
+    // v2.24 #11 — `let <ident> = call Foo.handler(...)` binds the
+    // call's return value, OR `let <ident> = <expr>` is the existing
+    // handler-level let. The two forms diverge after the `=`; the
+    // call form is tried first so the parser doesn't commit to an
+    // expression and then choke on `call`. Local enum (anonymous via
+    // the closure capture) carries the disambiguated RHS form.
+    enum LetRhs {
+        Expr(Node<Expr>),
+        Call(QualifiedPath, Vec<CallArg>),
+    }
     let let_c = just("let")
         .then_ignore(wsc())
         .ignore_then(non_keyword_ident())
         .then_ignore(wsc())
         .then_ignore(just('='))
         .then_ignore(wsc())
-        .then(expr())
-        .map(|(name, value)| HandlerClause::Let { name, value });
+        .then(choice((
+            just("call")
+                .then_ignore(wsc())
+                .ignore_then(qualified_path())
+                .then_ignore(wsc())
+                .then_ignore(just('('))
+                .then_ignore(wsc())
+                .then(
+                    non_keyword_ident()
+                        .then_ignore(wsc())
+                        .then_ignore(just('='))
+                        .then_ignore(wsc())
+                        .then(expr())
+                        .map(|(name, value)| CallArg { name, value })
+                        .then_ignore(wsc())
+                        .separated_by(just(',').then_ignore(wsc()))
+                        .allow_trailing()
+                        .collect::<Vec<CallArg>>(),
+                )
+                .then_ignore(wsc())
+                .then_ignore(just(')'))
+                .map(|(target, args)| LetRhs::Call(target, args)),
+            expr().map(LetRhs::Expr),
+        )))
+        .map(|(name, rhs)| match rhs {
+            LetRhs::Expr(value) => HandlerClause::Let { name, value },
+            LetRhs::Call(target, args) => HandlerClause::Call(CallExpr {
+                target,
+                args,
+                result_binding: Some(name),
+            }),
+        });
 
     // v2.20 §S1.2 — `effect { … }` admits leaf stmts and `match` blocks.
     let effect = just("effect")
@@ -1209,11 +1333,49 @@ fn handler_clause<'a>() -> impl Parser<'a, &'a str, HandlerClause, Err<'a>> + Cl
     //   case <expr>: effect { ... }
     //   otherwise:   abort ErrName
     // }
+    // v2.24 #9 — `call Interface.handler(args, ...)` inside a match
+    // arm body. Captured as `MatchBody::Call`, expanded into a
+    // synthetic handler issuing the CPI just like `MatchBody::Effect`
+    // expands to a per-arm effect handler. Closes the gist's
+    // "outcome-conditional CPI" modeling gap — pre-fix the only
+    // workaround was splitting the parent handler per outcome.
+    let match_call_args = non_keyword_ident()
+        .then_ignore(wsc())
+        .then_ignore(just('='))
+        .then_ignore(wsc())
+        .then(expr())
+        .map(|(name, value)| CallArg { name, value })
+        .then_ignore(wsc())
+        .separated_by(just(',').then_ignore(wsc()))
+        .allow_trailing()
+        .collect::<Vec<CallArg>>();
+    let match_call = just("call")
+        .then_ignore(wsc())
+        .ignore_then(qualified_path())
+        .then_ignore(wsc())
+        .then_ignore(just('('))
+        .then_ignore(wsc())
+        .then(match_call_args)
+        .then_ignore(wsc())
+        .then_ignore(just(')'))
+        .map(|(target, args)| {
+            MatchBody::Call(
+                CallExpr {
+                    target,
+                    args,
+                    result_binding: None,
+                },
+                Vec::new(),
+            )
+        });
+
     let match_body = choice((
         // abort ErrName
         kw("abort")
             .ignore_then(non_keyword_ident())
             .map(MatchBody::Abort),
+        // call Interface.handler(...)  (v2.24 #9)
+        match_call,
         // effect { ... }
         kw("effect")
             .ignore_then(just('{'))
@@ -1366,22 +1528,49 @@ fn handler_clause<'a>() -> impl Parser<'a, &'a str, HandlerClause, Err<'a>> + Cl
         .then(expr())
         .map(|(name, value)| CallArg { name, value });
 
-    let call_c = just("call")
+    // v2.24 #11 — optional `let <ident> = ` prefix binds the call's
+    // return value. Without the prefix the call remains a terminal
+    // statement (existing shape). Interface handlers can declare a
+    // return type; without it the binding is opaque and downstream
+    // backends emit a placeholder until full lowering lands.
+    let call_let_prefix = kw("let")
+        .ignore_then(non_keyword_ident())
+        .then_ignore(wsc())
+        .then_ignore(just('='))
+        .then_ignore(wsc());
+    let call_args = call_kw_arg
+        .then_ignore(wsc())
+        .separated_by(just(',').then_ignore(wsc()))
+        .allow_trailing()
+        .collect::<Vec<CallArg>>();
+    let call_body = just("call")
         .then_ignore(wsc())
         .ignore_then(qualified_path())
         .then_ignore(wsc())
         .then_ignore(just('('))
         .then_ignore(wsc())
-        .then(
-            call_kw_arg
-                .then_ignore(wsc())
-                .separated_by(just(',').then_ignore(wsc()))
-                .allow_trailing()
-                .collect::<Vec<CallArg>>(),
-        )
+        .then(call_args.clone())
         .then_ignore(wsc())
-        .then_ignore(just(')'))
-        .map(|(target, args)| HandlerClause::Call(CallExpr { target, args }));
+        .then_ignore(just(')'));
+    let call_c = choice((
+        // Try the bound form first so the bare `call …` doesn't shadow it.
+        call_let_prefix
+            .then(call_body.clone())
+            .map(|(binding, (target, args))| {
+                HandlerClause::Call(CallExpr {
+                    target,
+                    args,
+                    result_binding: Some(binding),
+                })
+            }),
+        call_body.map(|(target, args)| {
+            HandlerClause::Call(CallExpr {
+                target,
+                args,
+                result_binding: None,
+            })
+        }),
+    ));
 
     // `choice()` has an arity limit; split into groups.
     let grp_a = choice((auth, accounts, requires, ensures, modifies, let_c, effect));
@@ -1441,19 +1630,31 @@ fn handler_decl<'a>() -> impl Parser<'a, &'a str, TopItem, Err<'a>> + Clone {
 
 // property name : expr preserved_by all | [a, b, ...]
 fn property_decl<'a>() -> impl Parser<'a, &'a str, TopItem, Err<'a>> + Clone {
+    // v2.24 #3 — `preserved_by all except [h1, h2, ...]` shorthand
+    // for "every handler other than the listed ones". The bare `all`
+    // form is unchanged; the `except` clause expands at adapt time
+    // against the full handler list. Try the longer form first so
+    // bare `all` doesn't greedy-match and leave `except` hanging.
+    let list = just('[')
+        .then_ignore(wsc())
+        .ignore_then(
+            non_keyword_ident()
+                .then_ignore(wsc())
+                .separated_by(just(',').then_ignore(wsc()))
+                .collect::<Vec<String>>(),
+        )
+        .then_ignore(wsc())
+        .then_ignore(just(']'));
+    let all_except = just("all")
+        .then_ignore(wsc())
+        .then_ignore(just("except"))
+        .then_ignore(wsc())
+        .ignore_then(list.clone())
+        .map(PreservedBy::AllExcept);
     let preserved = just("preserved_by").then_ignore(wsc()).ignore_then(choice((
+        all_except,
         just("all").to(PreservedBy::All),
-        just('[')
-            .then_ignore(wsc())
-            .ignore_then(
-                non_keyword_ident()
-                    .then_ignore(wsc())
-                    .separated_by(just(',').then_ignore(wsc()))
-                    .collect::<Vec<String>>(),
-            )
-            .then_ignore(wsc())
-            .then_ignore(just(']'))
-            .map(PreservedBy::Some),
+        list.map(PreservedBy::Some),
     )));
 
     doc_comments()
@@ -1540,6 +1741,42 @@ fn liveness_decl<'a>() -> impl Parser<'a, &'a str, TopItem, Err<'a>> + Clone {
 }
 
 // invariant name : expr  OR  invariant name "description"
+/// v2.24 #1 — top-level `schema name { requires expr else Err … }`.
+/// Reusable cross-cutting guard set. Pre-fix the parser rejected the
+/// whole construct, forcing spec authors to inline the same
+/// `requires not state.protocol_paused else ProtocolPaused` into
+/// every gated handler. Handlers reference a schema via the existing
+/// `include <name>` clause (no new keyword); the adapter expands
+/// every requires in the schema into the handler's requires list.
+fn schema_decl<'a>() -> impl Parser<'a, &'a str, TopItem, Err<'a>> + Clone {
+    let req = just("requires")
+        .then_ignore(wsc())
+        .ignore_then(expr())
+        .then_ignore(wsc())
+        .then(
+            just("else")
+                .then_ignore(wsc())
+                .ignore_then(non_keyword_ident())
+                .or_not(),
+        );
+    doc_comments()
+        .then_ignore(kw("schema"))
+        .then(non_keyword_ident())
+        .then_ignore(wsc())
+        .then_ignore(just('{'))
+        .then_ignore(wsc())
+        .then(req.then_ignore(wsc()).repeated().collect::<Vec<_>>())
+        .then_ignore(wsc())
+        .then_ignore(just('}'))
+        .map(|((doc, name), requires)| {
+            TopItem::Schema(SchemaDecl {
+                name,
+                doc,
+                requires,
+            })
+        })
+}
+
 fn invariant_decl<'a>() -> impl Parser<'a, &'a str, TopItem, Err<'a>> + Clone {
     kw("invariant")
         .ignore_then(non_keyword_ident())
@@ -2187,12 +2424,20 @@ fn interface_handler_clause<'a>(
         .ignore_then(choice((string_lit(), non_keyword_ident())))
         .map(InterfaceHandlerClause::Discriminant);
 
+    // v2.24 #14 — interface accounts now accept optional commas
+    // between descriptors, matching the top-level `accounts { … }`
+    // grammar. Pre-fix the interface form only allowed
+    // newline-separated descriptors, which was inconsistent and
+    // surprised authors copying top-level patterns into an
+    // `interface { … }` block.
     let accounts = just("accounts")
         .then_ignore(wsc())
         .ignore_then(just('{'))
         .then_ignore(wsc())
         .ignore_then(
             account_descriptor()
+                .then_ignore(wsc())
+                .then_ignore(just(',').or_not())
                 .then_ignore(wsc())
                 .repeated()
                 .collect::<Vec<AccountDescriptor>>(),
@@ -2223,6 +2468,13 @@ fn interface_handler_clause<'a>(
 
 // handler h(params)* { discriminant, accounts, requires, ensures }  — inside an interface block.
 fn interface_handler_decl<'a>() -> impl Parser<'a, &'a str, InterfaceHandlerDecl, Err<'a>> + Clone {
+    // v2.24 #11 — optional `-> Type` return-type after the params.
+    // When present, callers can write `let x = call Foo.handler(...)`
+    // and the codegen lowers the binding to a `get_return_data` read.
+    let return_type = just("->")
+        .then_ignore(wsc())
+        .ignore_then(type_ref())
+        .then_ignore(wsc());
     doc_comments()
         .then_ignore(kw("handler"))
         .then(non_keyword_ident())
@@ -2233,6 +2485,8 @@ fn interface_handler_decl<'a>() -> impl Parser<'a, &'a str, InterfaceHandlerDecl
                 .repeated()
                 .collect::<Vec<TypedField>>(),
         )
+        .then_ignore(wsc())
+        .then(return_type.or_not())
         .then_ignore(wsc())
         .then_ignore(just('{'))
         .then_ignore(wsc())
@@ -2245,12 +2499,15 @@ fn interface_handler_decl<'a>() -> impl Parser<'a, &'a str, InterfaceHandlerDecl
         )
         .then_ignore(wsc())
         .then_ignore(just('}'))
-        .map(|(((doc, name), params), clauses)| InterfaceHandlerDecl {
-            name,
-            doc,
-            params,
-            clauses,
-        })
+        .map(
+            |((((doc, name), params), return_type), clauses)| InterfaceHandlerDecl {
+                name,
+                doc,
+                params,
+                return_type,
+                clauses,
+            },
+        )
 }
 
 fn interface_decl<'a>() -> impl Parser<'a, &'a str, TopItem, Err<'a>> + Clone {
@@ -2331,6 +2588,24 @@ fn pragma_decl<'a>() -> impl Parser<'a, &'a str, TopItem, Err<'a>> + Clone {
         .map(|((doc, name), items)| TopItem::Pragma(PragmaDecl { name, doc, items }))
 }
 
+/// v2.24 §S1b — `pragma <key> = <value>` top-level assignment.
+///
+/// Currently used for `checked_overflow_error` / `checked_underflow_error`
+/// to override the built-in `MathOverflow` / `MathUnderflow` defaults that
+/// `mechanize_effect` lowers `+=` / `-=` against. Distinct grammar from
+/// the existing `pragma <name> { … }` namespace form — disambiguated by
+/// lookahead on `=` vs `{` at the call site. Unknown keys parse but are
+/// flagged at lint time so we can add new keys without breaking specs.
+fn pragma_assign_decl<'a>() -> impl Parser<'a, &'a str, TopItem, Err<'a>> + Clone {
+    kw("pragma")
+        .ignore_then(non_keyword_ident())
+        .then_ignore(wsc())
+        .then_ignore(just('='))
+        .then_ignore(wsc())
+        .then(non_keyword_ident())
+        .map(|(name, value)| TopItem::PragmaAssign { name, value })
+}
+
 // ----------------------------------------------------------------------------
 // import <Name> from "<dep_key>" — manifest-based import (v2.8 G1).
 //
@@ -2372,6 +2647,7 @@ fn top_item<'a>() -> impl Parser<'a, &'a str, Node<TopItem>, Err<'a>> + Clone {
         cover_decl(),
         liveness_decl(),
         invariant_decl(),
+        schema_decl(),
     ));
     let group_b = choice((
         pda_decl(),
@@ -2383,7 +2659,16 @@ fn top_item<'a>() -> impl Parser<'a, &'a str, Node<TopItem>, Err<'a>> + Clone {
     // sugar are platform-specific and only parse inside
     // `pragma sbpf { ... }`. Use `type Error | A | B | ...` for errors at
     // the core-DSL level. The platform-agnostic top level is the point.
-    let group_c = choice((interface_decl(), pragma_decl(), import_decl()));
+    // pragma_assign_decl tried before pragma_decl: both start with `kw("pragma")
+    // <ident>` and diverge on `=` (assign) vs `{` (namespace). chumsky's
+    // choice() backtracks on parse failure, so the assign branch fails fast
+    // on `{` and the namespace branch picks up.
+    let group_c = choice((
+        interface_decl(),
+        pragma_assign_decl(),
+        pragma_decl(),
+        import_decl(),
+    ));
     choice((group_a, group_b, group_c)).map_with(|item, e| Node::new(item, e.span().into_range()))
 }
 
@@ -2449,6 +2734,69 @@ mod tests {
                 panic!("parse failed");
             }
         }
+    }
+
+    /// v2.24 #4 — index expressions inside a Map slot reference now
+    /// accept dotted state-field paths. Pre-fix `lsts[state.lst_count]`
+    /// parse-errored at the `.`, forcing spec authors to bind the
+    /// state field into a local var first.
+    #[test]
+    fn map_index_accepts_dotted_state_field() {
+        let src = r#"spec MapIndex
+program_id "11111111111111111111111111111111"
+
+type Slot = { active : U8, balance : U64, }
+
+type State
+  | Active of {
+      lst_count : U64,
+      lsts      : Map[MAX] Slot,
+    }
+
+const MAX = 8
+
+type Error
+  | MathOverflow
+
+handler register : State.Active -> State.Active {
+  permissionless
+  effect {
+    lsts[state.lst_count].active := 1
+  }
+}
+"#;
+        let _ = parse_ok(src);
+    }
+
+    /// v2.24 #4 — also accept deep dotted index expressions
+    /// (`accounts[a.b.c].field`). Defensive: the parser shouldn't
+    /// special-case depth-1 vs depth-N.
+    #[test]
+    fn map_index_accepts_deep_dotted_path() {
+        let src = r#"spec DeepIndex
+program_id "11111111111111111111111111111111"
+
+type Inner = { idx : U64, }
+type Outer = { inner : Inner, }
+type State
+  | Active of {
+      outer : Outer,
+      items : Map[MAX] U64,
+    }
+
+const MAX = 8
+
+type Error
+  | MathOverflow
+
+handler t : State.Active -> State.Active {
+  permissionless
+  effect {
+    items[state.outer.inner.idx] := 1
+  }
+}
+"#;
+        let _ = parse_ok(src);
     }
 
     #[test]
@@ -2816,7 +3164,9 @@ property conservation :
                 TopItem::Instruction(_) => "instruction",
                 TopItem::Interface(_) => "interface",
                 TopItem::Pragma(_) => "pragma",
+                TopItem::PragmaAssign { .. } => "pragma_assign",
                 TopItem::Import { .. } => "import",
+                TopItem::Schema(_) => "schema",
             })
             .fold(
                 std::collections::BTreeMap::<&str, usize>::new(),

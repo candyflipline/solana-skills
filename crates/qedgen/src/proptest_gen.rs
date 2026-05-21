@@ -78,7 +78,7 @@ fn strategy_for_field(
             if let Some(close) = rest.find(']') {
                 let bound_src = rest[..close].trim();
                 let inner_src = rest[close + 1..].trim();
-                let n = resolve_map_bound_local(bound_src, &spec.constants)?;
+                let n = resolve_map_bound_local(bound_src, spec)?;
                 let inner_strategy = strategy_for_field(inner_src, spec, mode, None)?;
                 return Ok(format!(
                     "prop::collection::vec({inner_strategy}, {n}..={n}).prop_map(|v| v.try_into().ok().unwrap())"
@@ -179,7 +179,7 @@ pub(crate) fn default_value_for_field(dsl_type: &str, spec: &ParsedSpec) -> Opti
             if let Some(close) = rest.find(']') {
                 let bound_src = rest[..close].trim();
                 let inner_src = rest[close + 1..].trim();
-                if let Ok(n) = resolve_map_bound_local(bound_src, &spec.constants) {
+                if let Ok(n) = resolve_map_bound_local(bound_src, spec) {
                     let inner_default = default_value_for_field(inner_src, spec)?;
                     return Some(format!("[{}; {}]", inner_default, n));
                 }
@@ -224,19 +224,28 @@ pub(crate) fn default_value_for_field(dsl_type: &str, spec: &ParsedSpec) -> Opti
 }
 
 /// Local copy of codegen::resolve_map_bound (private there) — same rule: bound
-/// is either a numeric literal or a declared spec constant.
-fn resolve_map_bound_local(bound: &str, constants: &[(String, String)]) -> Result<String> {
+/// is either a numeric literal, a declared spec constant, or a unit-only
+/// enum type (v2.24 #20).
+fn resolve_map_bound_local(bound: &str, spec: &ParsedSpec) -> Result<String> {
     let bound = bound.trim();
     if bound.chars().all(|c| c.is_ascii_digit()) && !bound.is_empty() {
         return Ok(bound.to_string());
     }
-    match constants.iter().find(|(n, _)| n == bound) {
-        Some((_, value)) => Ok(value.clone()),
-        None => anyhow::bail!(
-            "Map bound `{}` is not a numeric literal and not declared as a `const` in the spec",
-            bound
-        ),
+    if let Some((_, value)) = spec.constants.iter().find(|(n, _)| n == bound) {
+        return Ok(value.clone());
     }
+    // v2.24 #20 — enum-typed Map bound. Use the variant count as the
+    // array size. Stays consistent with the codegen-side resolver so
+    // the proptest model and the Anchor codegen agree on shape.
+    if let Some(sum) = spec.sum_types.iter().find(|s| s.name == bound) {
+        if sum.variants.iter().all(|v| v.fields.is_empty()) {
+            return Ok(sum.variants.len().to_string());
+        }
+    }
+    anyhow::bail!(
+        "Map bound `{}` is not a numeric literal, not declared as a `const`, and not a unit-only enum type",
+        bound
+    )
 }
 
 /// Emit a `prop_compose!` strategy block per spec record — the generator
@@ -1286,10 +1295,17 @@ fn emit_overflow_tests_for(
     properties: &[ParsedProperty],
 ) -> Result<()> {
     for op in overflow_ops {
-        for (field, kind, _value) in &op.effects {
+        for (field_raw, kind, _value) in &op.effects {
             if kind != "add" {
                 continue;
             }
+            // v2.24 S5d — strip variant prefix so `Active.balance`
+            // resolves to `balance` for the flat-State proptest model
+            // (both in the generated function name and the field
+            // lookup).
+            let field_owned =
+                rust_codegen_util::strip_variant_prefix_for_flat_state(field_raw, spec);
+            let field = field_owned.as_str();
 
             let dsl_type = all_fields
                 .iter()
@@ -1667,6 +1683,67 @@ mod tests {
             }],
             ..ParsedSpec::default()
         }
+    }
+
+    /// v2.24 S5d — proptest's overflow-detection test name no longer
+    /// embeds the variant prefix. Without the strip, `Active.balance`
+    /// would yield an invalid Rust function identifier
+    /// `deposit_no_overflow_on_Active.balance`. Pre-fix, this was the
+    /// canonical failure mode that surfaced the gap.
+    #[test]
+    fn overflow_test_name_strips_variant_prefix_for_flat_state() {
+        let src = r#"spec Vault
+program_id "11111111111111111111111111111111"
+
+type State
+  | Uninitialized
+  | Active of {
+      owner   : Pubkey,
+      balance : U64,
+    }
+
+type Error
+  | MathOverflow
+
+handler deposit (amount : U64) : State.Active -> State.Active {
+  permissionless
+  accounts {
+    vault : writable
+  }
+  requires amount > 0 else MathOverflow
+  effect {
+    Active.balance += amount
+  }
+}
+
+property balance_nonneg :
+  state.balance >= 0
+  preserved_by all
+"#;
+        let spec = crate::chumsky_adapter::parse_str(src).expect("parse");
+        let dir = tempfile::tempdir().unwrap();
+        let spec_path = dir.path().join("vault.qedspec");
+        let out_path = dir.path().join("tests/proptest.rs");
+        std::fs::write(&spec_path, src).unwrap();
+        generate(&spec_path, &out_path).unwrap();
+        let body = std::fs::read_to_string(&out_path).unwrap();
+        let _ = spec; // suppress unused
+
+        // Function names land as bare-field, not variant-prefixed.
+        assert!(
+            body.contains("fn deposit_no_overflow_on_balance"),
+            "expected variant-prefix stripped from test name; got:\n{body}"
+        );
+        // No `Active.` substring anywhere in the proptest body —
+        // every effect line should refer to bare `s.balance`.
+        assert!(
+            !body.contains("Active.balance"),
+            "variant prefix leaked into proptest body:\n{body}"
+        );
+        assert!(
+            !body.contains("Active.owner"),
+            "variant prefix leaked into proptest body:\n{body}"
+        );
     }
 
     #[test]

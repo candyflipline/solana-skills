@@ -421,6 +421,40 @@ Account attributes:
 - `authority ident` — token authority reference
 - `pda [seeds]` — PDA derivation inline
 
+#### `<account>.pubkey` accessor
+
+Inside effect / requires / ensures bodies, `<account_name>.pubkey` reads the
+account's `Pubkey`. Use it to capture a signer's address into state or to
+compare against a stored authority.
+
+```fsharp
+handler create (initial : U64) : State.Uninitialized -> State.Active {
+  accounts {
+    owner : signer
+    vault : writable
+  }
+  effect {
+    Active.owner   := owner.pubkey       // captures the signer's key
+    Active.balance := initial
+  }
+}
+
+handler deposit (amount : U64) : State.Active -> State.Active {
+  auth owner
+  accounts {
+    owner : signer
+    vault : writable
+  }
+  requires state.owner == owner.pubkey else Unauthorized
+  // …
+}
+```
+
+`<account>.pubkey` lowers to `ctx.<account>.key()` in Anchor handlers and to
+the symbolic `Pubkey` slot in proptest / Kani. Inside a Lean transition
+body it disappears — account-pubkey writes are dropped from the Lean
+model (the proof obligation is about account identity, not byte value).
+
 ### `effect` block
 
 State mutations using `:=` (assignment), `+=` (increment), `-=` (decrement).
@@ -431,11 +465,19 @@ effect {
   total_deposits      += amount
   balance             -= fee
   counter             += 1
-  accounts[i].capital += amount    // indexed LHS
+  accounts[i].capital += amount    // indexed LHS (per-field)
+  accounts[i] := { active := 1, balance := 0 }   // indexed LHS (whole-record)
   state               := .Active { authority, V := 0, I := 0, F := 0,
                                    accounts := empty_map }   // constructor RHS
 }
 ```
+
+The indexed-LHS forms cover both per-field updates (`accounts[i].capital
++= amount` — change one field of an existing slot) and whole-record
+replacement (`accounts[i] := { … }` — overwrite the whole slot). Use the
+whole-record form to register a new Map entry from scratch; partial
+record literals on the RHS require every field of the slot's record type
+to be set, mirroring Rust's `let x: T = T { … }` exhaustiveness.
 
 Values on the RHS may be integer literals, qualified paths, arithmetic
 expressions, constructor applications (`.Variant payload`), record literals,
@@ -737,6 +779,10 @@ non-path base produces `Expr::Field`.
 Generates per-handler sub-lemmas + a master inductive theorem. `preserved_by`
 names the handler scope.
 
+> **Syntax — positional order matters.** The form is
+> `property <name> : <expr> preserved_by <scope>`. Writing the scope before
+> the body (`property name preserved_by [...] : expr`) parse-errors.
+
 ```fsharp
 // Preserved by all handlers
 property conservation :
@@ -749,6 +795,13 @@ property conservation :
 property vault_bounded :
   state.V <= MAX_VAULT_TVL
   preserved_by [deposit, top_up_insurance, deposit_fee_credits]
+
+// v2.24: preserved by every handler except the listed ones — the common
+// "every handler other than the one whose job is to break it" pattern.
+// Expands at adapt time to the full handler list minus the excludes.
+property still_unpaused :
+  state.paused == 0
+  preserved_by all except [pause]
 
 // Quantified over a type
 property account_solvent :

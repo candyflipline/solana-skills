@@ -61,6 +61,14 @@ pub struct ParsedAccountType {
     pub lifecycle: Vec<String>,
     /// Reference to a PDA name (if this account is PDA-derived)
     pub pda_ref: Option<String>,
+    /// v2.24 S5: variant structure for multi-variant ADT state. Empty for
+    /// single-record account types (declared via `account { … }` or a
+    /// single-variant ADT). When non-empty, codegen emits a real
+    /// `pub enum <Name> { Variant { … }, … }` instead of the flattened
+    /// struct, and `fields` stays populated as the union of variant
+    /// fields (back-compat view for readers not yet migrated).
+    #[allow(dead_code)] // consumed by S5b codegen pass, not yet wired
+    pub variants: Vec<ParsedVariant>,
 }
 
 /// Plain record type (no variants). Declared as `type T = { field : Type, ... }`.
@@ -214,6 +222,13 @@ pub struct ParsedOperation {
     pub has_effect: bool,
     pub takes_params: Vec<(String, String)>,
     pub effects: Vec<(String, String, String)>,
+    /// v2.24 §S1a — per-site `or <ErrorVariant>` overrides, parallel to
+    /// `effects`. `effect_on_error[i]` is the override for `effects[i]`.
+    /// `None` for effects without an explicit `or` (and for all
+    /// saturating / wrapping / `Set` effects, where overrides are
+    /// meaningless). Parallel array (not extended tuple) keeps the ~30
+    /// existing destructure sites untouched.
+    pub effect_on_error: Vec<Option<String>>,
     pub calls_accounts: Vec<(String, String)>,
     pub calls_discriminator: Option<String>,
     pub emits: Vec<String>,
@@ -518,6 +533,9 @@ pub struct ParsedHandler {
     /// "add"/"sub" are the checked defaults (v2.7 G3); `_sat` / `_wrap` tags
     /// carry the explicit saturating / wrapping opt-in from `+=!` / `+=?`.
     pub effects: Vec<(String, String, String)>,
+    /// v2.24 §S1a — per-site `or <ErrorVariant>` overrides, parallel to
+    /// `effects`. See `ParsedOperation::effect_on_error`.
+    pub effect_on_error: Vec<Option<String>>,
     /// IDL-level account descriptors.
     pub accounts: Vec<ParsedHandlerAccount>,
     /// Token transfer intents.
@@ -533,6 +551,12 @@ pub struct ParsedHandler {
     /// these like `invariants` for the post-assertion but skips the
     /// `kani::assume` / `prop_assume!` pre-state guard.
     pub establishes: Vec<String>,
+    /// v2.24 #1 — names of `include <schema>` clauses on this handler.
+    /// The adapter's post-pass walks this list and appends each
+    /// referenced schema's `requires` onto `self.requires`. Stored
+    /// (not just expanded inline) so synthetic match-arm handlers
+    /// inherit the same expansion without duplicating the lookup.
+    pub schema_includes: Vec<String>,
     /// Per-handler properties (from inline property/invariant clauses).
     pub properties: Vec<String>,
     /// `call Interface.handler(name = expr, ...)` sites — CPI invocations
@@ -571,6 +595,14 @@ pub struct ParsedEffectArm {
     /// `true` for a wildcard arm.
     pub is_wildcard: bool,
     pub effects: Vec<(String, String, String)>,
+    /// v2.24 §S1a — per-site `or <ErrorVariant>` overrides, parallel to
+    /// `effects`. See `ParsedOperation::effect_on_error`. Populated for
+    /// symmetry with the union view, but no consumer currently reads it
+    /// at the arm level — Anchor codegen reads the flat `ParsedHandler
+    /// .effect_on_error` (mirror union), and proptest/kani don't lower
+    /// error variants.
+    #[allow(dead_code)]
+    pub effect_on_error: Vec<Option<String>>,
 }
 
 /// A resolved `call Target.handler(...)` site inside a handler body. The
@@ -582,6 +614,14 @@ pub struct ParsedCall {
     pub target_interface: String,
     pub target_handler: String,
     pub args: Vec<ParsedCallArg>,
+    /// v2.24 #11 — set when the call appeared as
+    /// `let <name> = call …`. Downstream backends bind the
+    /// callee's return value to this identifier so subsequent
+    /// effects / requires can reference it. Tier-1/2 interfaces
+    /// that declare a handler return type fully drive the
+    /// resulting Rust / Lean shape; Tier-0 interfaces fall back
+    /// to an opaque placeholder.
+    pub result_binding: Option<String>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -652,6 +692,7 @@ impl ParsedHandler {
                         rust_expr_pod: t.authority.clone().unwrap_or_default(),
                     },
                 ],
+                result_binding: None,
             })
             .collect();
         out.extend(self.calls.iter().cloned());
@@ -689,6 +730,25 @@ impl ParsedHandler {
     pub fn has_bumps(&self) -> bool {
         self.accounts.iter().any(|a| a.pda_seeds.is_some())
     }
+}
+
+/// True iff the spec is a multi-variant ADT *and* the named field lives
+/// inside one or more variant payloads (not directly on the wrapper).
+/// Used by R25's `auth X → has_one = X` lowering to skip the `has_one`
+/// attribute when the field can't be reached from the Anchor wrapper —
+/// `has_one` looks up `wrapper.<field>`, which fails for fields buried
+/// in `wrapper.inner.<variant>`. See `ParsedHandlerAccount::account_attr`
+/// for the gating logic.
+pub fn is_multi_variant_adt_with_field_in_variant(spec: &ParsedSpec, field: &str) -> bool {
+    let Some(acct) = spec.account_types.first() else {
+        return false;
+    };
+    if acct.variants.len() <= 1 {
+        return false;
+    }
+    acct.variants
+        .iter()
+        .any(|v| v.fields.iter().any(|(n, _)| n == field))
 }
 
 /// True if the parsed state struct that backs this handler-account has a
@@ -840,10 +900,24 @@ impl ParsedHandlerAccount {
         // someone"). Closes the percolator-CRIT, multisig::remove_member
         // CRIT, and the lending init_pool/borrow/repay HIGHs in one
         // emit. Anchor and Quasar both accept `has_one = field`.
+        //
+        // v2.24 S5c: with multi-variant ADT state, the auth field often
+        // lives in a variant payload (e.g. `Active.owner`), not directly
+        // on the wrapper struct. Anchor's `has_one` macro can't reach
+        // into the inner enum, so the attribute is silently invalid
+        // ("no field `owner` on `Account<…, VaultAccount>`"). Skip
+        // emission in that case — the auth gap surfaces via a TODO
+        // line emitted next to the handler body (rather than dropped
+        // silently). A follow-up slice (v2.24.x) will generate the
+        // explicit destructure-then-check guard.
         if is_state_account {
             if let Some(ref who) = handler.who {
                 if state_account_has_field(self, spec, who) {
-                    parts.push(format!("has_one = {}", who));
+                    if is_multi_variant_adt_with_field_in_variant(spec, who) {
+                        // Auth check skipped — see fn-level doc above.
+                    } else {
+                        parts.push(format!("has_one = {}", who));
+                    }
                 }
             }
         }
@@ -1000,6 +1074,29 @@ pub struct ParsedSpec {
     /// platform-scoped feature flags in backends.
     pub pragmas: Vec<String>,
 
+    /// v2.24 §S1b — `pragma <key> = <value>` top-level assignments. Stored
+    /// as `(key, value)` so new keys don't require ParsedSpec edits. Current
+    /// known keys:
+    ///
+    /// - `checked_overflow_error`  — variant name to use as the error
+    ///   variant when checked `+=` overflows. Overrides the built-in
+    ///   `MathOverflow` default.
+    /// - `checked_underflow_error` — variant name to use when checked `-=`
+    ///   underflows. Overrides the built-in `MathUnderflow` default.
+    ///
+    /// Lookup goes through `ParsedSpec::pragma_value(key)`. Per-site
+    /// `EffectStmt.on_error` still wins over the pragma.
+    pub pragma_assignments: Vec<(String, String)>,
+
+    /// v2.24 #1 — top-level `schema name { requires expr else Err … }`
+    /// blocks. Each schema bundles a reusable set of guards. Handlers
+    /// reference them via `include <schema_name>` clauses, which the
+    /// adapter expands into the handler's `requires` list at parse
+    /// time so downstream lints / codegen see the union as if the
+    /// handler had inlined the guards itself.
+    #[allow(dead_code)]
+    pub schemas: Vec<ParsedSchema>,
+
     /// Uninterpreted helper functions referenced by name in
     /// `requires` / `ensures` / effect-RHS / property bodies but not
     /// declared structurally in the spec. For each, we capture an
@@ -1025,6 +1122,15 @@ impl ParsedSpec {
     /// Quasar/Anchor (the default). Single source of truth.
     pub fn is_assembly_target(&self) -> bool {
         self.has_pragma("sbpf")
+    }
+
+    /// v2.24 §S1b — look up a `pragma <key> = <value>` assignment.
+    /// Returns the value as `&str` if present, `None` otherwise.
+    pub fn pragma_value(&self, key: &str) -> Option<&str> {
+        self.pragma_assignments
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
     }
 }
 
@@ -1094,6 +1200,27 @@ pub struct ParsedInterfaceHandler {
     pub accounts: Vec<ParsedHandlerAccount>,
     pub requires: Vec<ParsedRequires>,
     pub ensures: Vec<ParsedEnsures>,
+    /// v2.24 #11 — declared return type (e.g. `-> U64`). When present,
+    /// callers using `let x = call Foo.handler(...)` get a typed
+    /// binding via Solana's `get_return_data` syscall. `None`
+    /// (typical for Tier-0 / SPL Token handlers) means the call is
+    /// terminal and any caller-side `let` binding is dropped with a
+    /// warning.
+    pub return_type: Option<String>,
+}
+
+/// v2.24 #1 — parsed `schema` block. A named bundle of `requires`
+/// clauses that handlers reference via `include <name>` to share
+/// cross-cutting guards (e.g. pause gating, time-window checks).
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct ParsedSchema {
+    pub name: String,
+    pub doc: Option<String>,
+    /// The schema's body — one entry per `requires expr else Err`
+    /// clause. Identical shape to `ParsedHandler.requires` so the
+    /// adapter can just clone-and-append.
+    pub requires: Vec<ParsedRequires>,
 }
 
 /// Check spec coverage: which properties have proofs, which have sorry, which are missing.
@@ -1334,28 +1461,37 @@ fn resolve_and_merge_imports(
             )
         })?;
 
-        // Imported source must declare an `interface <source_name>`.
-        // `r.bound_name` here is the source-side name (the first ident
-        // in `import X from "y" [as Z]`); the local alias, if any, is
-        // applied at merge time below.
-        let iface = imported
-            .interfaces
-            .iter()
-            .find(|i| i.name == r.bound_name)
-            .ok_or_else(|| {
+        // v2.24 #13 — imported source may declare an explicit
+        // `interface <name>` block OR may rely on implicit synthesis
+        // from top-level handlers. Pre-fix the resolver hard-required
+        // an explicit block, contradicting the DSL ref's "No
+        // `interface` keyword needed — every handler in the imported
+        // spec is public."
+        let explicit = imported.interfaces.iter().find(|i| i.name == r.bound_name);
+        let synthesized: Option<ParsedInterface> = if explicit.is_none() {
+            synthesize_interface_from_imported(&r.bound_name, &imported)
+        } else {
+            None
+        };
+        let iface = match (explicit, &synthesized) {
+            (Some(i), _) => i,
+            (None, Some(i)) => i,
+            (None, None) => {
                 let where_clause = if r.sources.len() == 1 {
                     format!("at {}", r.sources[0].0.display())
                 } else {
                     format!("(merged from {} fragments)", r.sources.len())
                 };
-                anyhow::anyhow!(
-                    "import `{}` from `{}` — imported source {} declares no `interface {}` block",
+                anyhow::bail!(
+                    "import `{}` from `{}` — imported source {} declares no `interface {}` block and has no top-level handlers to synthesize one from. Add either an `interface {} {{ ... }}` block or at least one top-level `handler` to the imported spec.",
                     r.bound_name,
                     r.dep_key,
                     where_clause,
                     r.bound_name,
-                )
-            })?;
+                    r.bound_name,
+                );
+            }
+        };
 
         // Build the lock entry while we have everything in scope: the
         // resolved import (sources + commit), the manifest dep descriptor
@@ -1381,6 +1517,52 @@ fn resolve_and_merge_imports(
     crate::qed_lock::handle_lock(manifest_dir, &lock, lock_mode)?;
 
     Ok(())
+}
+
+/// v2.24 #13 — synthesize a `ParsedInterface` from the imported
+/// spec's top-level handlers when no explicit `interface { … }`
+/// block is declared. Closes the docs-vs-implementation gap:
+///
+/// > DSL ref: "No `interface` keyword needed — every handler in
+/// > the imported spec is public."
+///
+/// Tier-2 contract: requires / ensures come from the imported
+/// handlers' clauses, accounts from each handler's accounts block.
+/// Returns `None` when the imported spec has no top-level
+/// handlers (caller emits a clearer error).
+fn synthesize_interface_from_imported(
+    bound_name: &str,
+    imported: &ParsedSpec,
+) -> Option<ParsedInterface> {
+    if imported.handlers.is_empty() {
+        return None;
+    }
+    let handlers = imported
+        .handlers
+        .iter()
+        .map(|h| ParsedInterfaceHandler {
+            name: h.name.clone(),
+            doc: h.doc.clone(),
+            params: h.takes_params.clone(),
+            discriminant: None,
+            accounts: h.accounts.clone(),
+            requires: h.requires.clone(),
+            ensures: h.ensures.clone(),
+            // v2.24 #11 — synthesized interfaces inherit no
+            // return type today. Top-level handlers can't carry a
+            // declared return until the handler grammar grows one;
+            // for now Tier-2 callers using `let x = call …` will
+            // see the binding dropped with a lint warning.
+            return_type: None,
+        })
+        .collect();
+    Some(ParsedInterface {
+        name: bound_name.to_string(),
+        doc: None,
+        program_id: imported.program_id.clone(),
+        upstream: None,
+        handlers,
+    })
 }
 
 /// Parse the source bytes for one resolved import. Single-file deps go
@@ -2169,6 +2351,37 @@ pub fn check_completeness(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
         .map(|(n, _)| n.as_str())
         .unwrap_or("authority");
 
+    // v2.24 S5c: variant index for `Variant.field` LHS normalization.
+    // Built once and consumed by every effect-LHS lint (unused_field,
+    // write_without_read, undeclared_state_field_in_effect) so the
+    // variant prefix is stripped before comparing against bare field
+    // names. Maps variant name → fields declared in that variant's
+    // payload. Empty when no account type has variants (single-record
+    // specs are unaffected).
+    let mut variant_fields: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        std::collections::BTreeMap::new();
+    for acct in &spec.account_types {
+        for variant in &acct.variants {
+            let entry = variant_fields.entry(variant.name.clone()).or_default();
+            for (fname, _) in &variant.fields {
+                entry.insert(fname.clone());
+            }
+        }
+    }
+    // Normalize an effect LHS string by stripping a leading
+    // `Variant.` prefix when the variant is a known multi-variant ADT
+    // payload. `Active.pool` → `pool`; `accounts[i].cap` → unchanged;
+    // `pool` → unchanged. Borrows the map so the closure stays cheap.
+    let normalize_lhs = |lhs: &str| -> String {
+        if let Some(dot) = lhs.find('.') {
+            let head = &lhs[..dot];
+            if variant_fields.contains_key(head) {
+                return lhs[dot + 1..].to_string();
+            }
+        }
+        lhs.to_string()
+    };
+
     for op in &spec.handlers {
         // v2.7 G4: `auth X` and `permissionless` are mutually exclusive — one
         // declares who can call, the other declares "anyone can call." Both
@@ -2276,6 +2489,27 @@ pub fn check_completeness(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
                     continue;
                 }
 
+                // v2.24 §S2c: cumulative bound. The user wrote a guard like
+                // `requires state.x + a + b <= U64_MAX`, which logically
+                // bounds both `state.x += a` and `state.x += b` in the
+                // same block, but the strict per-pair patterns above only
+                // match the first additive term. Accept the guard when
+                // the field appears in an additive expression *and* the
+                // effect's RHS appears as a bare word elsewhere in the
+                // same guard string — captures cumulative bounds without
+                // re-parsing the guard.
+                let field_in_add = [
+                    format!("state.{} +", field),
+                    format!("s.{} +", field),
+                    format!("+ state.{}", field),
+                    format!("+ s.{}", field),
+                ]
+                .iter()
+                .any(|pat| all_guards.contains(pat.as_str()));
+                if field_in_add && contains_word(&all_guards, val) {
+                    continue;
+                }
+
                 let field_type = find_field_type(spec, op, field);
                 let type_max = match field_type.as_deref() {
                     Some("U8") => "U8_MAX (255)",
@@ -2335,10 +2569,26 @@ pub fn check_completeness(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
         if ftype == "Pubkey" {
             continue;
         }
-        let modified = spec
-            .handlers
-            .iter()
-            .any(|op| op.effects.iter().any(|(f, _, _)| f == fname));
+        // v2.24 #16: a Map / record field is "modified" not just when
+        // it appears as a whole-field LHS, but also when an effect
+        // writes through it via indexing or nested field access.
+        // `accounts[i].active := 1` writes the `accounts` map field;
+        // `pool.balance += amount` writes the `pool` record field.
+        // Pre-fix the lint only matched whole-field LHS, so any
+        // through-indexing write to a Map produced a false-positive
+        // `[P4] unused_field` (~once per Map field on percolator /
+        // Hylo specs).
+        let modified = spec.handlers.iter().any(|op| {
+            op.effects.iter().any(|(f, _, _)| {
+                let lhs = normalize_lhs(f);
+                if lhs == *fname {
+                    return true;
+                }
+                // Match `<fname>.` (record-nested) or `<fname>[` (Map-indexed)
+                // as effective writes of the named field.
+                lhs.starts_with(&format!("{}.", fname)) || lhs.starts_with(&format!("{}[", fname))
+            })
+        });
         if !modified {
             let mutating_ops: Vec<&str> = spec
                 .handlers
@@ -2703,6 +2953,32 @@ pub fn check_completeness(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
             path[..end].to_string()
         };
 
+        // v2.24 S5c: `Variant.field` LHS forms (e.g. `Active.pool := …`)
+        // bind the root to a state ADT variant name, not a field. The
+        // `variant_fields` map (built at the top of this fn) is reused
+        // so the variant index stays consistent across every effect-LHS
+        // lint.
+        let second_seg = |path: &str| -> Option<String> {
+            // Read the segment between the first and second separator.
+            // `Active.pool` → Some("pool"); `Active.x[i]` → Some("x");
+            // `Active` (no separator) → None.
+            let bytes = path.as_bytes();
+            let first = bytes.iter().position(|c| *c == b'.' || *c == b'[')?;
+            // Only `.<ident>` is the form we care about for variant lookup.
+            if bytes[first] != b'.' {
+                return None;
+            }
+            let rest = &path[first + 1..];
+            let mut end = rest.len();
+            for (i, c) in rest.char_indices() {
+                if c == '.' || c == '[' {
+                    end = i;
+                    break;
+                }
+            }
+            Some(rest[..end].to_string())
+        };
+
         // (a) LHS check
         for op in &spec.handlers {
             for (lhs, _kind, _rhs) in &op.effects {
@@ -2710,9 +2986,38 @@ pub fn check_completeness(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
                 if root.is_empty() || declared.contains(&root) {
                     continue;
                 }
+                // v2.24 §S2b: `state := <expr>` is the variant-promotion /
+                // whole-record-assignment form (e.g.
+                // `state := .Active { … }`). `state` here is a binder,
+                // not a field name — flagging it as "undeclared field"
+                // is the false positive surfaced in the v2.22 gist (#2).
+                // The RHS check below still scrutinizes any field
+                // references inside the variant payload.
+                if root == "state" {
+                    continue;
+                }
                 // Synthetic handlers (`_case_N`, `_otherwise`) inherit
                 // their parent's effects; flagging twice would be noisy.
                 if op.name.contains("_case_") || op.name.ends_with("_otherwise") {
+                    continue;
+                }
+                // v2.24 S5c: `Variant.field` LHS — the variant name as
+                // the path root is legal in a multi-variant ADT state.
+                // Re-target P7 at segments[0] (the actual field) and
+                // check it against that variant's payload.
+                if let Some(variant_payload) = variant_fields.get(&root) {
+                    if let Some(field) = second_seg(lhs) {
+                        if !variant_payload.contains(&field) && !declared.contains(&field) {
+                            push_p7(
+                                &mut warnings,
+                                &op.name,
+                                "LHS",
+                                &format!("{}.{}", root, field),
+                            );
+                        }
+                    }
+                    // Path root is a known variant — never push the
+                    // variant name itself as "undeclared field".
                     continue;
                 }
                 push_p7(&mut warnings, &op.name, "LHS", &root);
@@ -2794,6 +3099,17 @@ pub fn check_completeness(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
         // effect. The lint formerly flagged these as gaps; v2.11+ trusts
         // the spec author's intent.
         if !op.ensures.is_empty() {
+            continue;
+        }
+        // v2.24 #12 — a `call X.handler(...)` (CPI) or a declared
+        // `modifies [field, ...]` clause IS the handler's effect.
+        // The lint pre-fix didn't see these and fired
+        // `[P2] missing_effect` on every CPI-only handler (Token
+        // init / metadata create / close shapes), forcing spec
+        // authors to add fictional state writes or accept the noise.
+        // `transfers` blocks are token movements declared at spec
+        // level; same treatment.
+        if !op.calls.is_empty() || !op.transfers.is_empty() || op.modifies.is_some() {
             continue;
         }
         // Match-arm aborts: when the parser expands a handler's `match` into
@@ -2991,34 +3307,72 @@ pub fn check_completeness(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
 
     // Rule 13: write_without_read — state field written in effects but never read in guards/properties
     {
-        let mut written_fields = std::collections::HashSet::new();
+        // v2.24 S5c: normalize variant-prefixed LHS forms
+        // (`Active.pool` → `pool`) so the read-match below can find
+        // them in property bodies that reference the bare `pool`.
+        // v2.24 #16: ALSO emit leaf names for nested paths. A LHS
+        // like `accounts[i].fee_credits` indexes-then-writes `accounts`
+        // AND writes `fee_credits` — both should count as "written"
+        // so the lint can match against bare-leaf reads in
+        // properties / requires bodies.
+        let mut written_fields: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         for op in &spec.handlers {
             for (field, _, _) in &op.effects {
-                written_fields.insert(field.as_str());
+                let normalized = normalize_lhs(field);
+                written_fields.insert(normalized.clone());
+                // Also seed every dotted segment / index root so
+                // nested-path writes count for the read-side bare-
+                // leaf search. `accounts[i].fee_credits` →
+                // `accounts`, `fee_credits`. Pure ident segments only;
+                // skip the `[…]` indexing form.
+                for seg in normalized
+                    .split(['.', '[', ']'])
+                    .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_alphanumeric() || c == '_'))
+                {
+                    written_fields.insert(seg.to_string());
+                }
             }
         }
-        let mut read_fields = std::collections::HashSet::new();
+        // Gather every text that might mention a state field. Pre-
+        // v2.24 #16 the lint only consulted the legacy `guard_str`
+        // slot, which modern specs leave as `None` — every requires-
+        // only / property-only / invariant-only read was invisible
+        // to the lint, producing ~30 false-positive `write_without_read`
+        // hits on real specs (Hylo / percolator). Now we scan every
+        // requires / ensures / property body / invariant the spec
+        // declares.
+        let mut texts: Vec<&str> = Vec::new();
         for op in &spec.handlers {
             if let Some(ref guard) = op.guard_str {
-                for field in &written_fields {
-                    if guard.contains(&format!("s.{}", field))
-                        || guard.contains(&format!("state.{}", field))
-                        || contains_word(guard, field)
-                    {
-                        read_fields.insert(*field);
-                    }
-                }
+                texts.push(guard.as_str());
+            }
+            for req in &op.requires {
+                texts.push(req.lean_expr.as_str());
+                texts.push(req.rust_expr.as_str());
+            }
+            for ens in &op.ensures {
+                texts.push(ens.lean_expr.as_str());
             }
         }
         for prop in &spec.properties {
             if let Some(ref expr) = prop.expression {
-                for field in &written_fields {
-                    if expr.contains(&format!("s.{}", field))
-                        || expr.contains(&format!("state.{}", field))
-                        || contains_word(expr, field)
-                    {
-                        read_fields.insert(*field);
-                    }
+                texts.push(expr.as_str());
+            }
+        }
+        for inv in &spec.invariants {
+            if let Some(ref e) = inv.lean_expr {
+                texts.push(e.as_str());
+            }
+        }
+        let mut read_fields: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for text in &texts {
+            for field in &written_fields {
+                if text.contains(&format!("s.{}", field))
+                    || text.contains(&format!("state.{}", field))
+                    || contains_word(text, field)
+                {
+                    read_fields.insert(field.clone());
                 }
             }
         }
@@ -3032,7 +3386,7 @@ pub fn check_completeness(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
                         "state field '{}' is written in effects but never referenced in any guard or property",
                         field
                     ),
-                    subject: Some(field.to_string()),
+                    subject: Some(field.clone()),
                     fix: format!(
                         "Add '{}' to a property expression or guard, or verify that writing it without reading is intentional",
                         field
@@ -3370,6 +3724,11 @@ pub fn check_completeness(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
     // build will fail loudly. Surface that ahead of time so users see it
     // at `qedgen check` rather than at `cargo build`.
     warnings.extend(check_checked_arith_needs_math_overflow(spec));
+
+    // v2.24 §S1d — per-site `or X` overrides or `pragma checked_overflow_error
+    // = X` / `pragma checked_underflow_error = X` referencing variants that
+    // aren't declared in `type Error | …` would also fail cargo build.
+    warnings.extend(check_unknown_error_variant(spec));
 
     // v2.16: opt-in non-default arithmetic (`+=?` / `-=?` wrapping or `+=!`
     // / `-=!` saturating) is a spec-authoring concern that needs surfacing
@@ -3715,45 +4074,169 @@ fn make_old_in_single_state_warning(
 
 /// v2.8 F8: emit a `[missing_math_overflow]` warning when a spec uses
 /// checked arithmetic effects (`+=` / `-=` lower to `checked_add` /
-/// `checked_sub`, which return `<ProgramName>Error::MathOverflow` on
-/// overflow) but the spec's `type Error | …` block doesn't declare a
-/// `MathOverflow` variant. Without the declaration, `cargo build` of
-/// the generated code fails with "unknown variant MathOverflow". Surfacing
-/// this at lint time keeps the pre-flight cycle tight.
+/// `checked_sub`, which return `<ProgramName>Error::MathOverflow` /
+/// `::MathUnderflow` on overflow) but the spec's `type Error | …` block
+/// doesn't declare the variant the lowering would reference. Without the
+/// declaration, `cargo build` of the generated code fails with "unknown
+/// variant". Surfacing this at lint time keeps the pre-flight cycle tight.
+///
+/// v2.24 §S1c: extended to consider per-effect overrides (`pool += x or X`)
+/// and pragma defaults (`pragma checked_overflow_error = X`). When an
+/// override or pragma is set, this lint defers to
+/// `check_unknown_error_variant`. The back-compat fallback (spec declares
+/// `MathOverflow` but not `MathUnderflow` → `-=` raises `MathOverflow`)
+/// is honored here so existing specs continue to lint-clean.
 fn check_checked_arith_needs_math_overflow(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
-    let has_math_overflow = spec.error_codes.iter().any(|c| c == "MathOverflow");
-    if has_math_overflow {
+    let has_decl = |name: &str| spec.error_codes.iter().any(|c| c == name);
+    let has_overflow = has_decl("MathOverflow");
+    let has_underflow = has_decl("MathUnderflow");
+    let pragma_overflow = spec.pragma_value("checked_overflow_error");
+    let pragma_underflow = spec.pragma_value("checked_underflow_error");
+
+    // Collect handlers whose builtin-default lowering would reference a
+    // variant the spec didn't declare. Per-site overrides skip this lint
+    // (their variant check lives in `check_unknown_error_variant`).
+    let mut missing: std::collections::BTreeSet<&'static str> = std::collections::BTreeSet::new();
+    let mut handlers_missing: Vec<String> = Vec::new();
+
+    for h in &spec.handlers {
+        let mut handler_fires = false;
+        for (idx, (_, op_kind, _)) in h.effects.iter().enumerate() {
+            let on_error = h.effect_on_error.get(idx).and_then(|o| o.as_deref());
+            if on_error.is_some() {
+                continue; // per-site override handled elsewhere
+            }
+            match op_kind.as_str() {
+                "add" => {
+                    if pragma_overflow.is_some() {
+                        continue;
+                    }
+                    if !has_overflow {
+                        missing.insert("MathOverflow");
+                        handler_fires = true;
+                    }
+                }
+                "sub" => {
+                    if pragma_underflow.is_some() {
+                        continue;
+                    }
+                    // S1c back-compat: declared MathOverflow but not
+                    // MathUnderflow → `-=` falls back to MathOverflow. Spec
+                    // is fine; don't fire.
+                    if has_underflow {
+                        continue;
+                    }
+                    if has_overflow {
+                        continue; // back-compat path
+                    }
+                    missing.insert("MathUnderflow");
+                    handler_fires = true;
+                }
+                _ => {}
+            }
+        }
+        if handler_fires {
+            handlers_missing.push(h.name.clone());
+        }
+    }
+
+    if missing.is_empty() {
         return Vec::new();
     }
-    let handlers_with_checked: Vec<String> = spec
-        .handlers
+    let names = handlers_missing.join(", ");
+    let variants_list: Vec<String> = missing.iter().map(|s| s.to_string()).collect();
+    let variants = variants_list.join(" / ");
+    let fix_block = variants_list
         .iter()
-        .filter(|h| {
-            h.effects
-                .iter()
-                .any(|(_, op_kind, _)| op_kind == "add" || op_kind == "sub")
-        })
-        .map(|h| h.name.clone())
-        .collect();
-    if handlers_with_checked.is_empty() {
-        return Vec::new();
-    }
-    let names = handlers_with_checked.join(", ");
+        .map(|v| format!("      | {}", v))
+        .collect::<Vec<_>>()
+        .join("\n");
     vec![CompletenessWarning {
         rule: "missing_math_overflow".to_string(),
         severity: Severity::Warning,
         priority: 2,
         message: format!(
-            "handler(s) [{}] use checked-arithmetic effects (`+=` / `-=`), but `type Error` doesn't declare a `MathOverflow` variant. The generated Rust references `{}Error::MathOverflow` and won't compile without it.",
+            "handler(s) [{}] use checked-arithmetic effects (`+=` / `-=`), but `type Error` doesn't declare a `{}` variant. The generated Rust references `{}Error::{}` and won't compile without it.",
             names,
+            variants,
             crate::codegen::to_pascal_case(&spec.program_name),
+            variants,
         ),
         subject: None,
-        fix: "Add `MathOverflow` to your `type Error | …` block. Example:\n\n    type Error\n      | MathOverflow\n      | …\n\nOr opt out of checked semantics per-effect with `+=!` (saturating) or `+=?` (wrapping).".to_string(),
+        fix: format!(
+            "Add `{}` to your `type Error | …` block. Example:\n\n    type Error\n{}\n      | …\n\nOr opt out of checked semantics per-effect with `+=!` (saturating) or `+=?` (wrapping), or override the variant inline with `pool += amount else MyVariant`.",
+            variants, fix_block,
+        ),
         example: None,
         counterexample: None,
         fix_options: vec![],
     }]
+}
+
+/// v2.24 §S1d — fire `unknown_error_variant` when a per-site `or X` override
+/// or a `pragma checked_overflow_error = X` / `pragma checked_underflow_error
+/// = X` references a variant that isn't declared in `type Error | …`.
+/// Without the declaration, the generated Rust references
+/// `<ProgramName>Error::X` and won't compile.
+fn check_unknown_error_variant(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
+    let has_decl = |name: &str| spec.error_codes.iter().any(|c| c == name);
+    let mut warnings = Vec::new();
+
+    // Pragma references — fire once per pragma, not once per handler.
+    for (key, value) in &spec.pragma_assignments {
+        if (key == "checked_overflow_error" || key == "checked_underflow_error") && !has_decl(value)
+        {
+            warnings.push(CompletenessWarning {
+                rule: "unknown_error_variant".to_string(),
+                severity: Severity::Warning,
+                priority: 2,
+                message: format!(
+                    "`pragma {} = {}` references a variant absent from `type Error | …`. Generated Rust references `{}Error::{}` and won't compile.",
+                    key,
+                    value,
+                    crate::codegen::to_pascal_case(&spec.program_name),
+                    value,
+                ),
+                subject: Some(value.clone()),
+                fix: format!(
+                    "Add `{}` to your `type Error | …` block, drop the pragma, or replace it with a declared variant name.",
+                    value,
+                ),
+                example: None,
+                counterexample: None,
+                fix_options: vec![],
+            });
+        }
+    }
+
+    // Per-site `or X` references.
+    for h in &spec.handlers {
+        for on_error in h.effect_on_error.iter().flatten() {
+            if !has_decl(on_error) {
+                warnings.push(CompletenessWarning {
+                    rule: "unknown_error_variant".to_string(),
+                    severity: Severity::Warning,
+                    priority: 2,
+                    message: format!(
+                        "handler '{}' has an effect with `else {}` referencing a variant absent from `type Error | …`. Generated Rust references `{}Error::{}` and won't compile.",
+                        h.name,
+                        on_error,
+                        crate::codegen::to_pascal_case(&spec.program_name),
+                        on_error,
+                    ),
+                    subject: Some(h.name.clone()),
+                    fix: format!(
+                        "Add `{}` to your `type Error | …` block, drop the `else {}` suffix to fall back to the default, or use a declared variant.",
+                        on_error, on_error,
+                    ),
+                    example: None,
+                    counterexample: None,
+                    fix_options: vec![],
+                });
+            }
+        }
+    }
+    warnings
 }
 
 /// `[wrapping_arithmetic]` / `[saturating_arithmetic]` — handler effect uses
@@ -4363,17 +4846,16 @@ fn check_shape_only_cpi(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
                         call.target_handler, call.target_interface
                     ),
                 ),
-                (Some(_), Some(h)) if h.ensures.is_empty() => (
-                    format!(
-                        "`{}.{}` declares shape only (no `ensures`) — the call has no post-state assumptions for proofs",
-                        call.target_interface, call.target_handler
-                    ),
-                    format!(
-                        "Upgrade to Tier 1 by declaring `ensures` on `{}` inside `interface {}`, or import a qedspec for full verification.",
-                        call.target_handler, call.target_interface
-                    ),
-                ),
-                // Tier 1/2 target — nothing to lint.
+                // v2.24 #15 — pre-fix, this arm fired
+                // `shape_only_cpi` whenever a callee handler had no
+                // `ensures` clause, forcing spec authors to write
+                // `ensures true` on Token init / metadata-create /
+                // close shapes (which have no meaningful input-only
+                // post-condition). The advisory was redundant with
+                // the import-level Tier 0/1/2 signal; dropping it
+                // here removes the tautology-pressure on real specs.
+                // Tier 1 / 2 targets and shape-only Tier 0 targets
+                // all skip the lint.
                 _ => continue,
             };
 
@@ -4536,6 +5018,19 @@ fn check_map_and_subscript(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
 
     let const_names: HashSet<&str> = spec.constants.iter().map(|(n, _)| n.as_str()).collect();
     let record_names: HashSet<&str> = spec.records.iter().map(|r| r.name.as_str()).collect();
+    // v2.24 #20 — enum-typed Map bounds (`Map[AddressField] T`) where
+    // the bound names a sum type that has only unit (no-payload)
+    // variants. One slot per variant — the natural shape for
+    // per-variant PDAs (e.g. one AddressUpdateProposal per
+    // AddressField). Mixed-variant sums (some payload, some unit)
+    // are rejected by the second pass so the slot shape stays
+    // homogeneous.
+    let unit_only_sum_names: HashSet<&str> = spec
+        .sum_types
+        .iter()
+        .filter(|s| s.variants.iter().all(|v| v.fields.is_empty()))
+        .map(|s| s.name.as_str())
+        .collect();
 
     // Collect Map-typed fields across all account types, keyed by field name.
     let mut map_fields: HashMap<&str, (&str, &str, &str)> = HashMap::new(); // field → (owner, bound, inner)
@@ -4543,18 +5038,19 @@ fn check_map_and_subscript(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
     for acct in &spec.account_types {
         for (fname, ftype) in &acct.fields {
             if let FieldTypeShape::Map { bound, inner } = classify_field_type(ftype) {
-                // Rule: bound must be a declared const
-                if !const_names.contains(bound) {
+                // Rule: bound must be a declared const OR a unit-only
+                // sum type (v2.24 #20).
+                if !const_names.contains(bound) && !unit_only_sum_names.contains(bound) {
                     warnings.push(CompletenessWarning {
                         rule: "map_bound_not_const".to_string(),
                         severity: Severity::Error,
                         priority: 0,
                         message: format!(
-                            "field '{}.{}' uses Map[{}] but '{}' is not declared as `const`",
+                            "field '{}.{}' uses Map[{}] but '{}' is neither a declared `const` nor a unit-only enum type",
                             acct.name, fname, bound, bound
                         ),
                         subject: Some(fname.clone()),
-                        fix: format!("Add `const {} = <size>` at the top of the spec", bound),
+                        fix: format!("Add `const {} = <size>` or declare `type {} | Variant1 | Variant2 | …` at the top of the spec", bound, bound),
                         example: Some(format!("  const {} = 1024", bound)),
                         counterexample: None,
                         fix_options: vec![],
@@ -5429,12 +5925,14 @@ mod tests {
             aborts_total: false,
             permissionless: false,
             effects: vec![],
+            effect_on_error: vec![],
             accounts: vec![],
             transfers: vec![],
             emits: vec![],
             invariants: vec![],
             establishes: vec![],
             properties: vec![],
+            schema_includes: vec![],
             calls: vec![],
             effect_branches: None,
         }
@@ -5498,6 +5996,60 @@ mod tests {
         );
     }
 
+    /// v2.24 #12 — `call X.handler(...)` (CPI) or `transfers { … }`
+    /// or `modifies [...]` all count as effect-satisfying. Pre-fix
+    /// the lint required an `effect { … }` block specifically and
+    /// fired on CPI-only handlers (Token init / metadata-create /
+    /// close shapes) where state writes are the wrong abstraction.
+    #[test]
+    fn test_missing_effect_skips_when_handler_has_only_calls() {
+        let mut h = make_handler("init_mint");
+        h.takes_params = vec![("decimals".to_string(), "U64".to_string())];
+        h.guard_str = Some("decimals > 0".to_string());
+        h.calls = vec![ParsedCall {
+            target_interface: "Token".to_string(),
+            target_handler: "initialize_mint".to_string(),
+            args: vec![],
+            result_binding: None,
+        }];
+        let spec = ParsedSpec {
+            handlers: vec![h],
+            state_fields: vec![("balance".to_string(), "U64".to_string())],
+            lifecycle_states: vec!["Active".to_string()],
+            ..empty_spec()
+        };
+        let warnings = check_completeness(&spec);
+        assert!(
+            !warnings.iter().any(|w| w.rule == "missing_effect"),
+            "missing_effect should not fire when handler has CPI calls; got: {:?}",
+            warnings.iter().map(|w| &w.rule).collect::<Vec<_>>()
+        );
+    }
+
+    /// v2.24 #12 — `modifies [field, ...]` is the frame-condition
+    /// shape used by handlers whose effect is "writes one or more of
+    /// these fields but in a way the spec doesn't model further".
+    /// Pre-fix the lint demanded a full `effect { … }` block.
+    #[test]
+    fn test_missing_effect_skips_when_handler_has_modifies() {
+        let mut h = make_handler("opaque_update");
+        h.takes_params = vec![("payload".to_string(), "U64".to_string())];
+        h.guard_str = Some("payload > 0".to_string());
+        h.modifies = Some(vec!["balance".to_string()]);
+        let spec = ParsedSpec {
+            handlers: vec![h],
+            state_fields: vec![("balance".to_string(), "U64".to_string())],
+            lifecycle_states: vec!["Active".to_string()],
+            ..empty_spec()
+        };
+        let warnings = check_completeness(&spec);
+        assert!(
+            !warnings.iter().any(|w| w.rule == "missing_effect"),
+            "missing_effect should not fire when handler declares `modifies`; got: {:?}",
+            warnings.iter().map(|w| &w.rule).collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn test_missing_effect_skips_when_effect_exists() {
         let mut h = make_handler("deposit");
@@ -5538,12 +6090,14 @@ mod tests {
                     fields: vec![("total_deposits".to_string(), "U64".to_string())],
                     lifecycle: vec!["Active".to_string()],
                     pda_ref: None,
+                    variants: vec![],
                 },
                 ParsedAccountType {
                     name: "Loan".to_string(),
                     fields: vec![("loan_amount".to_string(), "U64".to_string())],
                     lifecycle: vec!["Empty".to_string(), "Active".to_string()],
                     pda_ref: None,
+                    variants: vec![],
                 },
             ],
             state_fields: vec![("total_deposits".to_string(), "U64".to_string())],
@@ -5839,6 +6393,7 @@ mod tests {
                 fields: vec![],
                 lifecycle: vec!["Active".to_string(), "Frozen".to_string()],
                 pda_ref: None,
+                variants: vec![],
             }],
             lifecycle_states: vec![
                 "Uninitialized".to_string(),
@@ -6437,9 +6992,16 @@ handler dec (x : U64) : State.Active -> State.Active {
     // [shape_only_cpi] lint (v2.5 slice 4)
     // ──────────────────────────────────────────────────────────────────────
 
+    /// v2.24 #15 — declared Tier-0 interfaces with no `ensures` no
+    /// longer fire `shape_only_cpi`. Pre-fix the lint forced spec
+    /// authors to write `ensures true` tautologies on Token init /
+    /// metadata-create / close handlers that have no meaningful
+    /// input-only post-condition. The Tier 0/1/2 import-level
+    /// signal already documents what kind of contract a call gets.
+    /// The lint still fires for undeclared interfaces / missing
+    /// handlers (real spec bugs).
     #[test]
-    fn shape_only_cpi_fires_on_tier0_interface() {
-        // Interface declared with no ensures — classic Tier-0. Should lint.
+    fn shape_only_cpi_silent_on_declared_tier0_interface() {
         let src = r#"spec Demo
 
 interface Token {
@@ -6460,13 +7022,11 @@ handler pay : State.A -> State.A {
         let parsed = crate::chumsky_adapter::parse_str(src).unwrap();
         let ws = check_completeness(&parsed);
         let hits: Vec<_> = ws.iter().filter(|w| w.rule == "shape_only_cpi").collect();
-        assert_eq!(
-            hits.len(),
-            1,
-            "expected one shape_only_cpi warning, got {:?}",
-            ws
+        assert!(
+            hits.is_empty(),
+            "Tier-0 interface with no `ensures` should not fire shape_only_cpi; got: {:?}",
+            hits.iter().map(|w| &w.message).collect::<Vec<_>>()
         );
-        assert!(hits[0].message.contains("shape only"));
     }
 
     #[test]
@@ -6984,6 +7544,142 @@ handler clear : State.Active -> State.Active {
         assert!(
             !warnings.iter().any(|w| w.rule == "missing_math_overflow"),
             "no checked arith → no MathOverflow obligation"
+        );
+    }
+
+    // ----- v2.24 §S1c: -= raises MathUnderflow (with back-compat) -----
+
+    #[test]
+    fn missing_math_overflow_fires_on_sub_without_underflow_or_overflow() {
+        // Pure `-=` use with neither MathOverflow nor MathUnderflow declared
+        // → fires for MathUnderflow (the v2.24 default for `-=`).
+        let spec = crate::chumsky_adapter::parse_str(
+            r#"spec Pool
+program_id "11111111111111111111111111111111"
+type State | Active of { balance : U64 }
+type Error | InvalidAmount
+
+handler withdraw (n : U64) : State.Active -> State.Active {
+  permissionless
+  effect { balance -= n }
+}
+"#,
+        )
+        .unwrap();
+        let warnings = check_completeness(&spec);
+        let hit = warnings
+            .iter()
+            .find(|w| w.rule == "missing_math_overflow")
+            .expect("expected missing_math_overflow warning for MathUnderflow");
+        assert!(
+            hit.message.contains("MathUnderflow"),
+            "v2.24: `-=` defaults to MathUnderflow; message was {:?}",
+            hit.message
+        );
+    }
+
+    #[test]
+    fn missing_math_overflow_silent_on_sub_with_only_overflow_declared() {
+        // v2.24 §S1c back-compat: declared MathOverflow but not
+        // MathUnderflow → `-=` falls back to MathOverflow. Lint stays
+        // silent; existing pre-v2.24 specs continue building.
+        let spec = crate::chumsky_adapter::parse_str(
+            r#"spec Pool
+program_id "11111111111111111111111111111111"
+type State | Active of { balance : U64 }
+type Error | MathOverflow
+
+handler withdraw (n : U64) : State.Active -> State.Active {
+  permissionless
+  effect { balance -= n }
+}
+"#,
+        )
+        .unwrap();
+        let warnings = check_completeness(&spec);
+        assert!(
+            !warnings.iter().any(|w| w.rule == "missing_math_overflow"),
+            "back-compat: only MathOverflow declared → -= falls back; no warning"
+        );
+    }
+
+    // ----- v2.24 §S1d: unknown_error_variant lint -----
+
+    #[test]
+    fn unknown_error_variant_fires_on_per_site_override_with_undeclared() {
+        let spec = crate::chumsky_adapter::parse_str(
+            r#"spec Pool
+program_id "11111111111111111111111111111111"
+type State | Active of { balance : U64 }
+type Error | MathOverflow | MathUnderflow
+
+handler deposit (n : U64) : State.Active -> State.Active {
+  permissionless
+  effect { balance += n else MintOverflow }
+}
+"#,
+        )
+        .unwrap();
+        let warnings = check_completeness(&spec);
+        let hit = warnings
+            .iter()
+            .find(|w| w.rule == "unknown_error_variant")
+            .expect("expected unknown_error_variant warning");
+        assert!(hit.message.contains("MintOverflow"));
+        assert!(hit.message.contains("deposit"));
+    }
+
+    #[test]
+    fn unknown_error_variant_fires_on_pragma_with_undeclared() {
+        let spec = crate::chumsky_adapter::parse_str(
+            r#"spec Pool
+program_id "11111111111111111111111111111111"
+type State | Active of { balance : U64 }
+type Error | MathOverflow | MathUnderflow
+
+pragma checked_overflow_error = MintOverflow
+
+handler deposit (n : U64) : State.Active -> State.Active {
+  permissionless
+  effect { balance += n }
+}
+"#,
+        )
+        .unwrap();
+        let warnings = check_completeness(&spec);
+        let hit = warnings
+            .iter()
+            .find(|w| w.rule == "unknown_error_variant")
+            .expect("expected unknown_error_variant warning for pragma");
+        assert!(hit.message.contains("checked_overflow_error"));
+        assert!(hit.message.contains("MintOverflow"));
+    }
+
+    #[test]
+    fn unknown_error_variant_silent_when_override_is_declared() {
+        let spec = crate::chumsky_adapter::parse_str(
+            r#"spec Pool
+program_id "11111111111111111111111111111111"
+type State | Active of { balance : U64 }
+type Error | MathOverflow | MintOverflow
+
+handler deposit (n : U64) : State.Active -> State.Active {
+  permissionless
+  effect { balance += n else MintOverflow }
+}
+"#,
+        )
+        .unwrap();
+        let warnings = check_completeness(&spec);
+        assert!(
+            !warnings.iter().any(|w| w.rule == "unknown_error_variant"),
+            "per-site override referencing a declared variant should not fire"
+        );
+        // The site provides an override, so missing_math_overflow defers
+        // (the `+=` doesn't fall back to the builtin default).
+        assert!(
+            !warnings.iter().any(|w| w.rule == "missing_math_overflow"),
+            "per-site override defers missing_math_overflow"
         );
     }
 
@@ -7700,6 +8396,100 @@ handler add : State.Active -> State.Active {
     }
 
     #[test]
+    fn unguarded_arithmetic_accepts_cumulative_bound_across_multiple_adds() {
+        // v2.24 §S2c: a single `requires state.x + a + b <= U64_MAX`
+        // logically bounds both `state.x += a` and `state.x += b`. Pre-v2.24
+        // the lint only matched per-pair patterns and fired on the second
+        // add. v2.24 accepts the cumulative form.
+        let spec = crate::chumsky_adapter::parse_str(
+            r#"spec Pool
+program_id "11111111111111111111111111111111"
+type State | Active of { balance : U64 }
+type Error | MathOverflow
+
+handler deposit (a : U64) (b : U64) : State.Active -> State.Active {
+  permissionless
+  requires state.balance + a + b <= U64_MAX
+  effect {
+    balance += a
+    balance += b
+  }
+}
+"#,
+        )
+        .expect("cumulative-bound spec must parse");
+        let warnings = check_completeness(&spec);
+        let arith_hits: Vec<_> = warnings
+            .iter()
+            .filter(|w| w.rule == "unguarded_arithmetic")
+            .collect();
+        assert!(
+            arith_hits.is_empty(),
+            "cumulative bound should satisfy unguarded_arithmetic for all adds; got: {arith_hits:#?}"
+        );
+    }
+
+    #[test]
+    fn u64_max_builtin_resolves_in_requires_clause() {
+        // v2.24 §S2d: `U64_MAX` (and friends) are seeded as builtin consts
+        // so users don't have to declare `const U64_MAX = …` per spec.
+        // unguarded_arithmetic's suggestion already references U64_MAX as
+        // if it were a builtin; this aligns the impl with the suggestion.
+        let spec = crate::chumsky_adapter::parse_str(
+            r#"spec Pool
+program_id "11111111111111111111111111111111"
+type State | Active of { balance : U64 }
+type Error | MathOverflow
+
+handler deposit (n : U64) : State.Active -> State.Active {
+  permissionless
+  requires state.balance + n <= U64_MAX
+  effect { balance += n }
+}
+"#,
+        )
+        .expect("U64_MAX should resolve as a builtin");
+        let warnings = check_completeness(&spec);
+        // With the U64_MAX guard, unguarded_arithmetic should be silent.
+        assert!(
+            !warnings.iter().any(|w| w.rule == "unguarded_arithmetic"),
+            "U64_MAX builtin should satisfy unguarded_arithmetic; got: {warnings:#?}"
+        );
+    }
+
+    #[test]
+    fn p7_does_not_fire_on_state_variant_promotion() {
+        // v2.24 §S2b: `state := .Variant { ... }` is the documented
+        // variant-promotion / whole-state-assignment form. Pre-v2.24,
+        // P7 stripped the LHS root and flagged `state` as an undeclared
+        // field. That was the false positive surfaced in the v2.22 gist (#2).
+        let spec = crate::chumsky_adapter::parse_str(
+            r#"spec Lifecycle
+program_id "11111111111111111111111111111111"
+type State
+  | Setup of { x : U64 }
+  | Active of { x : U64 }
+type Error | E
+
+handler activate : State.Setup -> State.Active {
+  permissionless
+  effect {
+    state := .Active { x := 0 }
+  }
+}
+"#,
+        )
+        .expect("variant-promotion spec must parse");
+        let warnings = check_completeness(&spec);
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.rule == "undeclared_state_field_in_effect"),
+            "P7 must not fire on `state := .Variant {{...}}`; got: {warnings:#?}"
+        );
+    }
+
+    #[test]
     fn p7_ignores_synthetic_match_arm_handlers() {
         // `_case_N` / `_otherwise` synthetic handlers inherit their
         // parent's effects — they don't get a second P7 hit because
@@ -7710,6 +8500,7 @@ handler add : State.Active -> State.Active {
             fields: vec![("balance".into(), "U64".into())],
             lifecycle: vec![],
             pda_ref: None,
+            variants: vec![],
         });
         spec.handlers.push(ParsedHandler {
             name: "outer_case_0".into(),
@@ -7745,12 +8536,14 @@ handler add : State.Active -> State.Active {
             aborts_total: false,
             permissionless: false,
             effects: vec![],
+            effect_on_error: vec![],
             accounts: vec![],
             transfers: vec![],
             emits: vec![],
             invariants: vec![],
             establishes: vec![],
             properties: vec![],
+            schema_includes: vec![],
             calls: vec![],
             effect_branches: None,
         }
@@ -7878,6 +8671,190 @@ property positive_balance :
                 .iter()
                 .map(|w| (&w.rule, &w.message))
                 .collect::<Vec<_>>(),
+        );
+    }
+
+    // ========================================================================
+    // v2.24 S5b — ParsedAccountType.variants populated for multi-variant ADTs
+    // ========================================================================
+
+    #[test]
+    fn multi_variant_adt_populates_account_variants() {
+        // Two-variant state ADT. Flat `fields` view stays the union (first
+        // occurrence wins). `variants` carries the per-variant shape so
+        // S5b codegen can emit `pub enum State { Setup{...}, Active{...} }`.
+        let src = r#"spec Multi
+program_id "11111111111111111111111111111111"
+
+type State
+  | Setup of { owner : Pubkey }
+  | Active of {
+      owner : Pubkey,
+      pool  : U64,
+    }
+
+property pool_nonneg :
+  state.pool >= 0
+  preserved_by all
+"#;
+        let spec = crate::chumsky_adapter::parse_str(src).expect("parse");
+        let state = spec
+            .account_types
+            .iter()
+            .find(|a| a.name == "State")
+            .expect("state account type present");
+
+        assert_eq!(
+            state.variants.len(),
+            2,
+            "two-variant ADT should produce two ParsedVariant entries"
+        );
+        assert_eq!(state.variants[0].name, "Setup");
+        assert_eq!(state.variants[1].name, "Active");
+        assert_eq!(state.variants[0].fields.len(), 1);
+        assert_eq!(state.variants[1].fields.len(), 2);
+        // Flat view stays populated as the union (back-compat).
+        assert!(state.fields.iter().any(|(n, _)| n == "owner"));
+        assert!(state.fields.iter().any(|(n, _)| n == "pool"));
+    }
+
+    #[test]
+    fn no_payload_variant_keeps_empty_field_list() {
+        // A unit-style variant (no payload) should still appear in
+        // `variants` with an empty field list so codegen can emit
+        // `pub enum State { Inactive, Active{...} }`.
+        let src = r#"spec NoPayload
+program_id "11111111111111111111111111111111"
+
+type State
+  | Inactive
+  | Active of { pool : U64 }
+
+property pool_nonneg :
+  state.pool >= 0
+  preserved_by all
+"#;
+        let spec = crate::chumsky_adapter::parse_str(src).expect("parse");
+        let state = spec
+            .account_types
+            .iter()
+            .find(|a| a.name == "State")
+            .expect("state account type present");
+        assert_eq!(state.variants.len(), 2);
+        let inactive = state
+            .variants
+            .iter()
+            .find(|v| v.name == "Inactive")
+            .expect("unit variant retained");
+        assert!(
+            inactive.fields.is_empty(),
+            "no-payload variant has zero fields"
+        );
+    }
+
+    // ========================================================================
+    // v2.24 S5c — variant-prefixed effect LHS doesn't false-positive lints
+    // ========================================================================
+
+    #[test]
+    fn variant_prefixed_lhs_passes_all_effect_lints() {
+        // `Active.pool := amount` on a multi-variant ADT state must NOT
+        // trigger any of: undeclared_state_field_in_effect (P7 LHS),
+        // write_without_read (Rule 13), unused_field (Rule 4). All three
+        // walked the LHS string assuming the path root was a field name
+        // before S5c — variant prefixes confused them.
+        let src = r#"spec MultiVar
+program_id "11111111111111111111111111111111"
+
+type State
+  | Setup of { owner : Pubkey }
+  | Active of {
+      owner : Pubkey,
+      pool  : U64,
+    }
+
+type Error
+  | MathOverflow
+
+handler activate (amount : U64) : State.Setup -> State.Active {
+  auth owner
+  requires amount > 0
+  effect {
+    Active.pool := amount
+  }
+}
+
+property pool_nonneg :
+  state.pool >= 0
+  preserved_by all
+"#;
+        let spec = crate::chumsky_adapter::parse_str(src).expect("parse");
+        let warnings = check_completeness(&spec);
+        let rules: Vec<&str> = warnings.iter().map(|w| w.rule.as_str()).collect();
+
+        assert!(
+            !rules.contains(&"undeclared_state_field_in_effect"),
+            "P7 should not fire on `Active.pool := amount` (Active is a variant, pool is its field) — got: {:?}",
+            rules
+        );
+        assert!(
+            !rules.contains(&"write_without_read"),
+            "write_without_read should match `pool` (read by property) to `Active.pool` (written) — got: {:?}",
+            rules
+        );
+        assert!(
+            !rules.contains(&"unused_field"),
+            "unused_field should see `pool` as modified via `Active.pool := amount` — got: {:?}",
+            rules
+        );
+    }
+
+    #[test]
+    fn variant_prefixed_lhs_still_catches_unknown_field() {
+        // A real bug: `Active.poool := amount` (typo). P7 should fire
+        // with subject `activate.Active.poool` — the variant prefix is
+        // legal, the field name behind it isn't declared anywhere.
+        let src = r#"spec MultiVarTypo
+program_id "11111111111111111111111111111111"
+
+type State
+  | Setup of { owner : Pubkey }
+  | Active of {
+      owner : Pubkey,
+      pool  : U64,
+    }
+
+type Error
+  | MathOverflow
+
+handler activate (amount : U64) : State.Setup -> State.Active {
+  auth owner
+  requires amount > 0
+  effect {
+    Active.poool := amount
+  }
+}
+
+property pool_nonneg :
+  state.pool >= 0
+  preserved_by all
+"#;
+        let spec = crate::chumsky_adapter::parse_str(src).expect("parse");
+        let warnings = check_completeness(&spec);
+        let p7s: Vec<&CompletenessWarning> = warnings
+            .iter()
+            .filter(|w| w.rule == "undeclared_state_field_in_effect")
+            .collect();
+        assert_eq!(
+            p7s.len(),
+            1,
+            "expected exactly one P7 hit on the misspelled `poool`, got: {:?}",
+            warnings.iter().map(|w| &w.rule).collect::<Vec<_>>()
+        );
+        assert!(
+            p7s[0].subject.as_deref().unwrap_or("").contains("poool"),
+            "P7 subject should name the misspelled field, got: {:?}",
+            p7s[0].subject
         );
     }
 

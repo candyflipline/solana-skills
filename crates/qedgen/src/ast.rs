@@ -117,6 +117,35 @@ pub enum TopItem {
     /// inference reads `ParsedSpec.pragmas` — presence of `sbpf` selects
     /// the assembly target with no explicit `target` keyword.
     Pragma(PragmaDecl),
+    /// `pragma <name> = <ident>` — top-level key=value assignment. v2.24
+    /// introduces this for `checked_overflow_error = MintOverflow` /
+    /// `checked_underflow_error = BurnUnderflow`, which override the
+    /// built-in `MathOverflow` / `MathUnderflow` defaults that
+    /// `mechanize_effect` lowers `+=` / `-=` against. Per-effect `or
+    /// <Variant>` (see `EffectStmt.on_error`) still wins over the pragma.
+    PragmaAssign {
+        name: String,
+        value: String,
+    },
+    /// `schema name { requires expr else Err … }` — v2.24 #1. Reusable
+    /// cross-cutting guard set. Handlers reference it via `uses name`
+    /// (HandlerClause::Uses) and the adapter expands every requires
+    /// in the schema into the handler's requires list.
+    Schema(SchemaDecl),
+}
+
+/// v2.24 #1 — top-level `schema` block. Body carries a list of
+/// `requires expr else Err` clauses. No state effects or ensures —
+/// schemas are *only* for cross-cutting guards.
+#[derive(Debug, Clone)]
+pub struct SchemaDecl {
+    pub name: String,
+    pub doc: Option<String>,
+    /// Each entry is one `requires <expr> [else <ErrorName>]` clause,
+    /// keeping the same `(body, on_fail)` shape that
+    /// `HandlerClause::Requires` carries so the adapter can reuse
+    /// the same lowering path.
+    pub requires: Vec<(Node<Expr>, Option<String>)>,
 }
 
 /// Platform-specific namespace. Parser accepts arbitrary `TopItem`s inside;
@@ -359,6 +388,12 @@ pub struct CallExpr {
     pub target: QualifiedPath,
     /// Keyword arguments, in source order. Positional args are not allowed.
     pub args: Vec<CallArg>,
+    /// v2.24 #11 — optional `let <name> = call …` binding. When `Some`,
+    /// the call's return value is bound to the given identifier so
+    /// downstream effects / requires can reference it. The interface
+    /// handler's return-type declaration is what gives the binding a
+    /// real semantics; without it the binding is opaque.
+    pub result_binding: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -417,6 +452,12 @@ pub struct InterfaceHandlerDecl {
     pub name: String,
     pub doc: Option<String>,
     pub params: Vec<TypedField>,
+    /// v2.24 #11 — optional `-> Type` return-type declaration. When
+    /// `Some`, callers can write `let x = call Foo.handler(...)` and
+    /// the codegen lowers to `let x = T::try_from_slice(&ret_bytes)?`
+    /// after the CPI via Solana's `get_return_data` syscall. `None`
+    /// keeps the existing terminal-statement shape.
+    pub return_type: Option<TypeRef>,
     pub clauses: Vec<Node<InterfaceHandlerClause>>,
 }
 
@@ -467,6 +508,13 @@ pub enum MatchBody {
     Effect(Vec<Node<EffectStmt>>),
     /// Empty body — case is a no-op (state unchanged, no error).
     Noop,
+    /// v2.24 #9 — `call Interface.handler(...)` — case maps to a
+    /// synthetic handler that issues this CPI (and nothing else).
+    /// Used for outcome-conditional CPI patterns where the match
+    /// arm picks between different external calls instead of
+    /// different state mutations. Optional effect block alongside
+    /// the call for cases that do both.
+    Call(CallExpr, Vec<Node<EffectStmt>>),
 }
 
 #[derive(Debug, Clone)]
@@ -492,6 +540,17 @@ pub struct EffectStmt {
     pub lhs: Path,
     pub op: EffectOp,
     pub rhs: Node<Expr>,
+    /// v2.24 §S1a — per-site error-variant override on checked `+=` / `-=`.
+    /// `pool += amount else MintOverflow` parses with `on_error =
+    /// Some("MintOverflow")`. The keyword is `else` (same as `requires X
+    /// else Err`), not `or` — `or` would collide with the boolean infix
+    /// `or` already parsed by `expr()`. None means "fall back to the
+    /// `pragma checked_overflow_error` / `pragma checked_underflow_error`
+    /// default, then the built-in `MathOverflow` / `MathUnderflow`."
+    /// Always None for saturating (`+=!`) / wrapping (`+=?`) / `Set` —
+    /// those can't fail, so the adapter drops any override even if the
+    /// parser captured one.
+    pub on_error: Option<String>,
 }
 
 /// v2.20 §S1.2 — a single statement inside `effect { … }`. Either a leaf
@@ -810,6 +869,11 @@ pub struct PropertyDecl {
 pub enum PreservedBy {
     All,
     Some(Vec<String>),
+    /// v2.24 #3 — `preserved_by all except [h1, h2, ...]` shorthand
+    /// for "every handler other than the listed ones". The adapter
+    /// expands this against the spec's full handler list, producing
+    /// a concrete `Some(Vec<String>)` for downstream consumers.
+    AllExcept(Vec<String>),
 }
 
 #[derive(Debug, Clone)]

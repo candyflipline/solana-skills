@@ -452,7 +452,7 @@ fn map_type_with_context(
             if let Some(close) = rest.find(']') {
                 let bound_src = rest[..close].trim();
                 let inner_src = rest[close + 1..].trim();
-                let n = resolve_map_bound(bound_src, &spec.constants)?;
+                let n = resolve_map_bound(bound_src, spec)?;
                 let inner_rust = map_type_with_context(inner_src, spec, context)?;
                 return Ok(format!("[{inner_rust}; {n}]"));
             }
@@ -588,20 +588,34 @@ fn primitive_map(dsl_type: &str, context: TypeMapContext) -> Option<&'static str
 }
 
 /// Resolve the bound expression inside `Map[BOUND] T`. Accepts either a
-/// numeric literal (e.g. `Map[16] U64`) or a constant declared in the spec
-/// (e.g. `Map[MAX_ACCOUNTS] U64`).
-fn resolve_map_bound(bound: &str, constants: &[(String, String)]) -> Result<String> {
+/// numeric literal (e.g. `Map[16] U64`), a constant declared in the spec
+/// (e.g. `Map[MAX_ACCOUNTS] U64`), or — v2.24 #20 — a unit-only sum type
+/// (e.g. `Map[AddressField] ProposalSlot` where every variant has no
+/// payload). The enum-bounded form lowers to a fixed-size array whose
+/// length equals the variant count; downstream readers index into it
+/// using the variant's source-declared ordinal (Owner = 0, Manager = 1,
+/// …). Mixed-variant sums (some unit, some payload) are still rejected
+/// at the lint side; the codegen never sees them.
+fn resolve_map_bound(bound: &str, spec: &ParsedSpec) -> Result<String> {
     let bound = bound.trim();
     if bound.chars().all(|c| c.is_ascii_digit()) && !bound.is_empty() {
         return Ok(bound.to_string());
     }
-    match constants.iter().find(|(n, _)| n == bound) {
-        Some((_, value)) => Ok(value.clone()),
-        None => anyhow::bail!(
-            "Map bound `{}` is not a numeric literal and not declared as a `const` in the spec",
-            bound
-        ),
+    if let Some((_, value)) = spec.constants.iter().find(|(n, _)| n == bound) {
+        return Ok(value.clone());
     }
+    // v2.24 #20 — enum-typed Map bound. Use the variant count as the
+    // array size. Unit-only check mirrors the lint at check.rs so the
+    // codegen never silently widens what the lint accepts.
+    if let Some(sum) = spec.sum_types.iter().find(|s| s.name == bound) {
+        if sum.variants.iter().all(|v| v.fields.is_empty()) {
+            return Ok(sum.variants.len().to_string());
+        }
+    }
+    anyhow::bail!(
+        "Map bound `{}` is not a numeric literal, not declared as a `const`, and not a unit-only enum type",
+        bound
+    )
 }
 
 /// Sanitize a field-path string (e.g. `accounts[i].active`) into a legal
@@ -851,6 +865,21 @@ fn generate_lib(
     Ok(())
 }
 
+/// v2.24 S5b — `true` when the spec's state is a multi-variant ADT
+/// (two or more variants in a single account type). Drives codegen
+/// to emit the wrapper-struct + inner-enum pattern instead of the
+/// flat-fields struct + parallel `Status` enum the pre-v2.24 path
+/// produced. Single-record account types, single-variant ADTs, and
+/// multi-account specs stay on the flat path.
+fn is_multi_variant_adt_state(spec: &ParsedSpec) -> bool {
+    spec.account_types.len() == 1
+        && spec
+            .account_types
+            .first()
+            .map(|a| a.variants.len() > 1)
+            .unwrap_or(false)
+}
+
 /// Generate src/state.rs
 fn generate_state(
     spec: &ParsedSpec,
@@ -957,6 +986,64 @@ fn generate_state(
                 out.push_str("}\n\n");
             }
         }
+    } else if is_multi_variant_adt_state(spec) && matches!(target, Target::Anchor) {
+        // v2.24 S5b — multi-variant ADT state lowers to a wrapper-struct
+        // + inner-enum pair. Anchor 0.32.1's `#[account]` hard-requires
+        // a struct (anchor-attribute-account-0.32.1/src/lib.rs:106), so
+        // the wrapper carries the discriminator + AccountSerialize
+        // while the inner enum carries the actual variant payloads.
+        // Borsh discriminates variants by declaration-order tag (the
+        // role the legacy `status: u8` byte used to play, now handled
+        // by the enum's own representation). See the smoke fixture at
+        // `/tmp/anchor_enum_test/` for the validated pattern, and
+        // [[reference_anchor_account_struct_only]] in user memory.
+        //
+        // Quasar's zero-copy `#[account]` is incompatible with enum
+        // payloads (alignment / `#[repr(C)]` constraints); this branch
+        // is intentionally Anchor-only. Quasar multi-variant ADT specs
+        // still go through the flat-struct branch below until that
+        // target gets its own enum emission story.
+        let state_name = format!("{}Account", to_pascal_case(&spec.program_name));
+        let inner_name = format!("{}Inner", state_name);
+        let acct = &spec.account_types[0];
+
+        out.push_str("#[account]\n");
+        out.push_str("#[derive(InitSpace)]\n");
+        out.push_str(&format!("pub struct {} {{\n", state_name));
+        out.push_str(&format!("    pub inner: {},\n", inner_name));
+        if !spec.pdas.is_empty() && !spec.state_fields.iter().any(|(n, _)| n == "bump") {
+            out.push_str("    pub bump: u8,\n");
+        }
+        out.push_str("}\n\n");
+
+        out.push_str(&format!(
+            "/// Variant-payload state for {0}. The Anchor wrapper above\n\
+             /// carries the account discriminator; this enum carries the\n\
+             /// state-machine variant + per-variant payload fields.\n",
+            state_name
+        ));
+        out.push_str(
+            "#[derive(AnchorSerialize, AnchorDeserialize, InitSpace, Clone, Debug, PartialEq)]\n",
+        );
+        out.push_str(&format!("pub enum {} {{\n", inner_name));
+        for variant in &acct.variants {
+            if variant.fields.is_empty() {
+                // Unit-style variant (no payload). `Uninitialized`,
+                // `Closed`, `HasProposal` shapes all go through here.
+                out.push_str(&format!("    {},\n", variant.name));
+            } else {
+                out.push_str(&format!("    {} {{\n", variant.name));
+                for (fname, ftype) in &variant.fields {
+                    out.push_str(&format!(
+                        "        {}: {},\n",
+                        fname,
+                        map_type_for_target(ftype, spec, target)?
+                    ));
+                }
+                out.push_str("    },\n");
+            }
+        }
+        out.push_str("}\n");
     } else {
         let state_name = format!("{}Account", to_pascal_case(&spec.program_name));
 
@@ -1288,6 +1375,46 @@ fn lifecycle_check_line(
         return String::new();
     };
 
+    // v2.24 S5c — multi-variant ADT state has no `status: u8` byte; the
+    // variant IS the discriminator. Pre-check rewrites to a
+    // `matches!(inner, Inner::<pre> { .. })` test against the wrapper's
+    // `inner` field. Post-write is a no-op — the effect lowering's
+    // match arm (or set_inner for cross-variant promotion) is what
+    // moves the variant.
+    if is_multi_variant_adt_state(spec) {
+        if write {
+            // The effect lowering handles variant transitions inline;
+            // no separate post-write needed.
+            return String::new();
+        }
+        let pre = handler.pre_status.as_deref().unwrap_or("");
+        if pre.is_empty() || matches!(pre, "Uninitialized" | "Empty") {
+            return String::new();
+        }
+        let Some(acct) = spec.account_types.first() else {
+            return String::new();
+        };
+        let Some(variant) = acct.variants.iter().find(|v| v.name == pre) else {
+            return String::new();
+        };
+        let inner_name = format!("{}AccountInner", to_pascal_case(&spec.program_name));
+        let err_enum = format!("crate::errors::{}Error", to_pascal_case(&spec.program_name));
+        let err_ctor = surface.error_expr(&err_enum, "InvalidLifecycle");
+        // Payload variants need `{ .. }`; unit variants don't.
+        let pattern = if variant.fields.is_empty() {
+            format!("{}::{}", inner_name, pre)
+        } else {
+            format!("{}::{} {{ .. }}", inner_name, pre)
+        };
+        return format!(
+            "    // lifecycle: require inner == {pre}\n    if !matches!(ctx.{acct}.inner, {pattern}) {{ return Err({err_ctor}); }}\n",
+            pre = pre,
+            acct = sa.name,
+            pattern = pattern,
+            err_ctor = err_ctor,
+        );
+    }
+
     // Resolve the Status enum name. Mirrors `generate_state`'s naming:
     //   - `is_multi` (account_types.len() > 1): emit `<ADT>Status` per
     //     lifecycle (lending: `PoolStatus`, `LoanStatus`).
@@ -1464,7 +1591,7 @@ fn try_emit_anchor_cpi(
     // Every other Anchor program gets the generic `invoke` shape
     // (v2.9 G3): sighash discriminator + Borsh-serialized args +
     // AccountMeta synthesis from the interface's accounts block.
-    emit_generic_anchor_cpi(call, handler, iface)
+    emit_generic_anchor_cpi(call, handler, iface, spec)
 }
 
 /// SPL Token dispatcher. Routes to the right `anchor_spl::token` helper
@@ -1660,6 +1787,7 @@ fn emit_generic_anchor_cpi(
     call: &crate::check::ParsedCall,
     handler: &ParsedHandler,
     iface: &crate::check::ParsedInterface,
+    spec: &ParsedSpec,
 ) -> Option<String> {
     let program_id = iface.program_id.as_deref()?;
     let iface_handler = iface
@@ -1731,8 +1859,13 @@ fn emit_generic_anchor_cpi(
     out.push_str("            ];\n\n");
 
     out.push_str("            let ix = Instruction {\n");
+    // v2.24.0 follow-up: use `Pubkey::from_str` instead of the
+    // `pubkey!` macro. The macro lives at different paths across
+    // Anchor versions (and isn't reexported under
+    // `anchor_lang::solana_program` in 0.32.x); `from_str` is
+    // stable on the `Pubkey` type itself.
     out.push_str(&format!(
-        "                program_id: anchor_lang::solana_program::pubkey!(\"{}\"),\n",
+        "                program_id: <anchor_lang::prelude::Pubkey as std::str::FromStr>::from_str(\"{}\").unwrap(),\n",
         program_id,
     ));
     out.push_str("                accounts,\n");
@@ -1752,6 +1885,43 @@ fn emit_generic_anchor_cpi(
         program_acct.name,
     ));
     out.push_str("            ])?;\n");
+
+    // v2.24 #11 — when the caller wrote `let X = call …` and the
+    // interface declares a return type, capture the callee's return
+    // data via Solana's `get_return_data` syscall + Borsh decode.
+    // The block opens with `let X = { … }` instead of bare `{ … }`,
+    // and the closing emits the binding's value as the block's
+    // result. Without a declared return type, the binding name is
+    // dropped (matched at the caller side via lint warning at
+    // adapt time — TODO v2.25.1).
+    if let (Some(bind), Some(ret_dsl_type)) = (&call.result_binding, &iface_handler.return_type) {
+        let ret_rust = match map_type(ret_dsl_type, spec) {
+            Ok(t) => t,
+            Err(_) => return None,
+        };
+        out.push_str("            use anchor_lang::AnchorDeserialize;\n");
+        out.push_str("            use anchor_lang::solana_program::program::get_return_data;\n");
+        out.push_str("            use anchor_lang::solana_program::program_error::ProgramError;\n");
+        out.push_str(
+            "            let (_, ret_bytes) = get_return_data().ok_or(ProgramError::InvalidAccountData)?;\n",
+        );
+        out.push_str(&format!(
+            "            <{ret} as AnchorDeserialize>::deserialize(&mut ret_bytes.as_slice()).map_err(|_| ProgramError::InvalidAccountData)?\n",
+            ret = ret_rust,
+        ));
+        // Close the block and use it as the RHS of the let-binding.
+        out.push_str("        };\n");
+        // Prepend the `let <bind> = ` to the front of `out` (after
+        // the leading indent), since we opened with `        {` and
+        // the binding wants `let X = {`.
+        let prefix = format!("        let {} = {{\n", bind);
+        let body_without_open = out
+            .strip_prefix("        {\n")
+            .map(String::from)
+            .unwrap_or(out.clone());
+        return Some(format!("{}{}", prefix, body_without_open));
+    }
+
     out.push_str("        }\n");
     Some(out)
 }
@@ -1855,8 +2025,16 @@ fn resolve_call_arg_for_amount(rust_expr: &str, handler: &ParsedHandler) -> Stri
 /// None when the RHS is too complex for mechanical expansion (match/arith/
 /// pre-rendered Lean form); the caller falls through to a `todo!()` so an
 /// LLM or human fills the body.
+///
+/// `on_error` is the v2.24 §S1a per-site override (`pool += amount or X`).
+/// When `Some(name)`, the generated `checked_add` / `checked_sub` uses
+/// `Name` as the error variant. When `None`, the lowering falls back to
+/// (in priority order) the `pragma checked_overflow_error =` /
+/// `pragma checked_underflow_error =` default, then the built-in
+/// `MathOverflow` / `MathUnderflow`. Always `None` for non-checked ops.
 fn mechanize_effect(
     effect: &(String, String, String),
+    on_error: Option<&str>,
     state_acct: &crate::check::ParsedHandlerAccount,
     handler: &ParsedHandler,
     spec: &ParsedSpec,
@@ -1873,6 +2051,37 @@ fn mechanize_effect(
     if !simple_rhs {
         return None;
     }
+    // v2.24 S5c — under multi-variant ADT state on the Anchor
+    // target, the flat `self.<acct>.<field>` lowering doesn't apply.
+    // The wrapper-struct + inner-enum emission from S5b means the
+    // wrapper carries only `inner` (the variant payload) and `bump`
+    // — there's no top-level `<field>` to write. Bail so the
+    // per-effect path surfaces a `// Spec effect (needs fill)` line
+    // + a trailing `todo!()` rather than a silent miscompile like
+    // `self.escrow.initializer_amount = …`.
+    //
+    // Two cases trigger:
+    //   1. Variant-prefixed LHS (`Active.balance := …`): cross-
+    //      variant emitter `emit_variant_state_handler_body` handles
+    //      same-variant + cross-variant when it can; this path is
+    //      the bail-out for cases it can't (missing post-variant
+    //      fields, payload-carrying pre, etc.).
+    //   2. Bare-field LHS (`balance := …`): a pre-v2.24 spec
+    //      hasn't been migrated to `Variant.field` syntax yet. The
+    //      `bare_field_on_multi_variant_state` lint (S5c) surfaces
+    //      this as guidance; the codegen bails so the migration
+    //      need is unmissable.
+    if is_multi_variant_adt_state(spec) && matches!(target, Target::Anchor) {
+        return None;
+    }
+    // v2.24.0 follow-up: single-variant ADT specs also accept the
+    // `Variant.field` LHS form for forward-compat. The flat-struct
+    // emission has no `Variant.` prefix in the actual struct, so
+    // strip it here. Without this, `Active.total_burned := X`
+    // would lower to `self.acct.Active.total_burned = X` which
+    // doesn't compile (Active isn't a field on the wrapper).
+    let field = strip_variant_prefix(field, spec);
+    let field = field.as_str();
 
     // Anchor / Quasar handler bodies bind state as `self.<acct>.<field>`,
     // so a bare state-field RHS (e.g. `bid_buyer := state.rfp_buyer` after
@@ -1898,11 +2107,29 @@ fn mechanize_effect(
     // which only worked when no effect actually exercised checked
     // arithmetic. Now we emit `<ProgramName>Error::MathOverflow`, which
     // matches the Anchor `#[error_code]` enum generated alongside.
-    // Specs that use `+=` / `-=` / `*=` should declare a `MathOverflow`
-    // variant in their `type Error | ...` block; the
-    // `effect_uses_checked_arith_without_math_overflow` lint surfaces
-    // missing declarations.
+    //
+    // v2.24 §S1a/b/c: variant-name resolution becomes three-tiered:
+    //   1. Per-site override:    `pool += amount or MintOverflow`
+    //   2. Pragma default:       `pragma checked_overflow_error = …`
+    //   3. Built-in default:     `MathOverflow` (for `+=`),
+    //                            `MathUnderflow` (for `-=`).
+    // S1c back-compat: specs declaring `MathOverflow` but not
+    // `MathUnderflow` keep the pre-v2.24 behavior of `-=` raising
+    // `MathOverflow`. The lint at check.rs surfaces missing declarations.
     let err_enum = format!("{}Error", to_pascal_case(&spec.program_name));
+    let has_decl = |name: &str| spec.error_codes.iter().any(|c| c == name);
+    let pragma_overflow = spec.pragma_value("checked_overflow_error");
+    let pragma_underflow = spec.pragma_value("checked_underflow_error");
+    // Built-in underflow default with back-compat: if MathOverflow is
+    // declared but MathUnderflow isn't, treat `-=` as raising MathOverflow
+    // (matches pre-v2.24 behavior). This keeps existing specs building.
+    let builtin_underflow = if has_decl("MathUnderflow") || !has_decl("MathOverflow") {
+        "MathUnderflow"
+    } else {
+        "MathOverflow"
+    };
+    let overflow_variant = on_error.or(pragma_overflow).unwrap_or("MathOverflow");
+    let underflow_variant = on_error.or(pragma_underflow).unwrap_or(builtin_underflow);
     // Quasar's `#[account]` macro auto-wraps integer state fields in their
     // Pod companions (u64 → PodU64). Plain `=` and `wrapping_*` between a
     // `u64` rhs and a `PodU64` lhs fail to type-check, so on Quasar:
@@ -1921,7 +2148,7 @@ fn mechanize_effect(
             }
         }
         "add" => format!(
-            "        self.{acct}.{field} = self.{acct}.{field}.checked_add({rhs}).ok_or({err_enum}::MathOverflow)?;\n"
+            "        self.{acct}.{field} = self.{acct}.{field}.checked_add({rhs}).ok_or({err_enum}::{overflow_variant})?;\n"
         ),
         "add_sat" => format!(
             "        self.{acct}.{field} = self.{acct}.{field}.saturating_add({rhs});\n"
@@ -1938,7 +2165,7 @@ fn mechanize_effect(
             }
         }
         "sub" => format!(
-            "        self.{acct}.{field} = self.{acct}.{field}.checked_sub({rhs}).ok_or({err_enum}::MathOverflow)?;\n"
+            "        self.{acct}.{field} = self.{acct}.{field}.checked_sub({rhs}).ok_or({err_enum}::{underflow_variant})?;\n"
         ),
         "sub_sat" => format!(
             "        self.{acct}.{field} = self.{acct}.{field}.saturating_sub({rhs});\n"
@@ -1957,6 +2184,482 @@ fn mechanize_effect(
         _ => return None,
     };
     Some(line)
+}
+
+/// v2.24 S5c — strip a leading `Variant.` prefix from an effect LHS
+/// when the root matches a known variant on the spec's single state
+/// account. `Active.pool` → `pool`; `accounts[i].cap` → unchanged;
+/// `pool` → unchanged. Pure string transform — the lint side keeps
+/// `variant_fields` indexed for validation; this just normalizes
+/// for downstream emission.
+fn strip_variant_prefix(lhs: &str, spec: &ParsedSpec) -> String {
+    if let Some(dot) = lhs.find('.') {
+        let head = &lhs[..dot];
+        let is_variant = spec
+            .account_types
+            .iter()
+            .any(|a| a.variants.iter().any(|v| v.name == head));
+        if is_variant {
+            return lhs[dot + 1..].to_string();
+        }
+    }
+    lhs.to_string()
+}
+
+/// v2.24 S5c — emit one effect line in destructured-variant context.
+/// `mechanize_effect`'s sibling for the multi-variant ADT path: the
+/// state binder is a destructured local (e.g. `pool: &mut u64` from
+/// `match &mut self.<acct>.inner { Inner::Active { pool, .. } => …`),
+/// not `self.<acct>.<field>`. Emit `*pool = …` or `pool[i] = …`
+/// instead of `self.<acct>.pool = …`. Falls back to `None` for
+/// non-scalar / non-indexed shapes the caller can route to a fresh
+/// per-effect `todo!()`.
+fn mechanize_effect_destructured(
+    effect: &(String, String, String),
+    on_error: Option<&str>,
+    handler: &ParsedHandler,
+    spec: &ParsedSpec,
+) -> Option<String> {
+    let (field_raw, op_kind, value) = effect;
+    let simple_rhs = value
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == '-');
+    if !simple_rhs {
+        return None;
+    }
+    // Strip variant prefix (`Active.pool` → `pool`) and normalize
+    // indexed-access form. The destructured binding is the bare
+    // field root — `pool[i]` keeps the indexing in place; scalar
+    // bindings carry an extra `*` deref to write through `&mut T`.
+    let field = strip_variant_prefix(field_raw, spec);
+    let field = rewrite_index_to_usize(&field);
+    let is_indexed = field.contains('[');
+    // The destructure binding shadows the field name in scope, so a
+    // bare-identifier RHS that names a sibling state field resolves
+    // directly (no `self.<acct>.` prefix). For params, the resolver
+    // already returns the bare name.
+    let rhs = crate::rust_codegen_util::resolve_value(value, handler, spec, None);
+
+    let err_enum = format!("{}Error", to_pascal_case(&spec.program_name));
+    let has_decl = |name: &str| spec.error_codes.iter().any(|c| c == name);
+    let pragma_overflow = spec.pragma_value("checked_overflow_error");
+    let pragma_underflow = spec.pragma_value("checked_underflow_error");
+    let builtin_underflow = if has_decl("MathUnderflow") || !has_decl("MathOverflow") {
+        "MathUnderflow"
+    } else {
+        "MathOverflow"
+    };
+    let overflow_variant = on_error.or(pragma_overflow).unwrap_or("MathOverflow");
+    let underflow_variant = on_error.or(pragma_underflow).unwrap_or(builtin_underflow);
+
+    // Scalars need an explicit deref to write through `&mut T`;
+    // indexed access through `&mut [T; N]` works as-is.
+    let lhs = if is_indexed {
+        field.clone()
+    } else {
+        format!("*{}", field)
+    };
+    // Method calls auto-deref `&mut T`, so the RHS-side read can
+    // stay as the bare binding name even for scalar bindings.
+    let read = strip_array_index_suffix(&field);
+
+    let line = match op_kind.as_str() {
+        "set" => format!("            {} = {};\n", lhs, rhs),
+        "add" => format!(
+            "            {} = {}.checked_add({}).ok_or({}::{})?;\n",
+            lhs, read, rhs, err_enum, overflow_variant
+        ),
+        "add_sat" => format!("            {} = {}.saturating_add({});\n", lhs, read, rhs),
+        "add_wrap" => format!("            {} = {}.wrapping_add({});\n", lhs, read, rhs),
+        "sub" => format!(
+            "            {} = {}.checked_sub({}).ok_or({}::{})?;\n",
+            lhs, read, rhs, err_enum, underflow_variant
+        ),
+        "sub_sat" => format!("            {} = {}.saturating_sub({});\n", lhs, read, rhs),
+        "sub_wrap" => format!("            {} = {}.wrapping_sub({});\n", lhs, read, rhs),
+        _ => return None,
+    };
+    Some(line)
+}
+
+/// v2.24 S5c — drop `[<idx>]` from a destructured field reference so
+/// the RHS-side read uses the bare binding name. `voted[i as usize]`
+/// → `voted`. Pure substring chop; safe for the simple shapes the
+/// destructured emitter accepts.
+fn strip_array_index_suffix(field: &str) -> String {
+    match field.find('[') {
+        Some(i) => field[..i].to_string(),
+        None => field.to_string(),
+    }
+}
+
+/// v2.24 S5c — emit the complete handler body block for a
+/// multi-variant ADT state. Wraps the per-effect lines in a
+/// destructure-and-mutate (same-variant) or destructure-and-promote
+/// (cross-variant) match block. Returns `None` when the handler
+/// shape isn't yet supported by this lowering pass — callers fall
+/// back to the per-effect loop (which emits `todo!()` for any
+/// unmechanized effect).
+///
+/// Same-variant pattern:
+///
+/// ```ignore
+/// match &mut self.<acct>.inner {
+///     <Inner>::<Variant> { f1, f2, .. } => {
+///         *f1 = …;
+///         f2[i as usize] = …;
+///     }
+///     _ => return Err(<Err>::WrongState.into()),
+/// }
+/// ```
+///
+/// Cross-variant (init / promote) is deferred — the wrapping
+/// `set_inner(Inner::Post { … })` requires picking a payload for
+/// every field of the post variant, which often needs spec data
+/// the agent fills in (CPI return values, event-binding sources).
+/// Today that lands as a `todo!()` line; v2.24.1 / v2.25 may grow
+/// a richer codegen path.
+fn emit_variant_state_handler_body(
+    handler: &ParsedHandler,
+    spec: &ParsedSpec,
+    target: Target,
+    state_acct: &crate::check::ParsedHandlerAccount,
+) -> Option<String> {
+    if !matches!(target, Target::Anchor) {
+        return None;
+    }
+    if !is_multi_variant_adt_state(spec) {
+        return None;
+    }
+    let pre = handler.pre_status.as_deref()?;
+    let post = handler.post_status.as_deref()?;
+    // WrongState is the error variant returned on a variant
+    // mismatch. Demand it's declared so codegen doesn't emit a
+    // dangling reference to an undeclared error variant.
+    let has_wrong_state = spec.error_codes.iter().any(|c| c == "WrongState");
+    if !has_wrong_state {
+        return None;
+    }
+
+    let acct = spec.account_types.first()?;
+    let post_variant = acct.variants.iter().find(|v| v.name == post)?;
+    let inner_name = format!("{}AccountInner", to_pascal_case(&spec.program_name));
+    let err_enum = format!("{}Error", to_pascal_case(&spec.program_name));
+    let acct_binder = &state_acct.name;
+
+    // Cross-variant promotion (init / promote handlers,
+    // `pre != post`) routes through a separate emitter: destructure
+    // the pre (if it carries payload) + assemble the post-variant
+    // payload + assign `self.<acct>.inner = <Inner>::<Post>{ … }`.
+    // Same-variant continues with the in-place match destructure
+    // below.
+    if pre != post {
+        return emit_cross_variant_promotion(
+            handler,
+            spec,
+            acct_binder,
+            pre,
+            post_variant,
+            &inner_name,
+            &err_enum,
+        );
+    }
+
+    // Collect the unique set of bare field names referenced on the
+    // LHS of any effect (after stripping `<Variant>.` prefix and
+    // any `[…]` indexing). These go into the match destructure
+    // pattern so the inner block can rebind them.
+    let mut mutated_fields: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (lhs, _, _) in &handler.effects {
+        let stripped = strip_variant_prefix(lhs, spec);
+        let bare = strip_array_index_suffix(&stripped);
+        // Only fields that actually live on the post variant get
+        // destructured. References that don't match are a spec
+        // bug — fall back so the per-effect path emits a clear
+        // `todo!()` with the offending line surfaced verbatim.
+        if !post_variant.fields.iter().any(|(n, _)| n == &bare) {
+            return None;
+        }
+        mutated_fields.insert(bare);
+    }
+    if mutated_fields.is_empty() {
+        // Pure read-only handler (no effects on state). Emit a
+        // skip-style match so the runtime still rejects the wrong
+        // variant — the guard layer doesn't catch variant drift on
+        // its own.
+        let mut out = String::new();
+        out.push_str(&format!("        match self.{}.inner {{\n", acct_binder));
+        out.push_str(&format!(
+            "            {}::{} {{ .. }} => {{}}\n",
+            inner_name, post
+        ));
+        out.push_str(&format!(
+            "            _ => return Err({}::WrongState.into()),\n",
+            err_enum
+        ));
+        out.push_str("        }\n");
+        return Some(out);
+    }
+
+    let destructure = mutated_fields
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "        match &mut self.{}.inner {{\n",
+        acct_binder
+    ));
+    out.push_str(&format!(
+        "            {}::{} {{ {}, .. }} => {{\n",
+        inner_name, post, destructure
+    ));
+    for (idx, effect) in handler.effects.iter().enumerate() {
+        let on_error = handler.effect_on_error.get(idx).and_then(|o| o.as_deref());
+        let line = mechanize_effect_destructured(effect, on_error, handler, spec)?;
+        out.push_str(&line);
+    }
+    out.push_str("            }\n");
+    out.push_str(&format!(
+        "            _ => return Err({}::WrongState.into()),\n",
+        err_enum
+    ));
+    out.push_str("        }\n");
+    Some(out)
+}
+
+/// v2.24 S5c — render an effect RHS for the cross-variant promotion
+/// emitter. Pre-variant fields aren't in scope here (no destructure
+/// has happened yet), so the legal RHS shapes are restricted:
+///
+///   - bare param (handler `takes_params`) → bare identifier
+///   - bare const (spec `constants`) → bare identifier (Rust resolves)
+///   - integer literal → bare integer
+///   - `<account>.pubkey` where `<account>` is bound on the handler
+///     and is a signer / writable account → `self.<account>.key()`
+///
+/// Anything else returns `None`, which bails the whole cross-variant
+/// emitter back to the per-effect `todo!()` path so the agent fills
+/// the gap manually instead of getting a silent miscompile.
+fn resolve_cross_variant_rhs(
+    raw: &str,
+    handler: &ParsedHandler,
+    spec: &ParsedSpec,
+) -> Option<String> {
+    if raw.is_empty() {
+        return None;
+    }
+    // Integer literal — render_effect emits `Expr::Int(v)` as its
+    // decimal form.
+    if raw.chars().all(|c| c.is_ascii_digit() || c == '-') {
+        return Some(raw.to_string());
+    }
+    // Bare param or const — no dot, no bracket, matches a known name.
+    if !raw.contains('.') && !raw.contains('[') {
+        if handler.takes_params.iter().any(|(n, _)| n == raw) {
+            return Some(raw.to_string());
+        }
+        if spec.constants.iter().any(|(n, _)| n == raw) {
+            return Some(raw.to_string());
+        }
+        // Unknown bare ident — could be a param shadowed by a state
+        // field of the same name; that's a spec smell. Bail loud
+        // (via `None`) rather than guess.
+        return None;
+    }
+    // `<account>.pubkey` shape — map to the Anchor key() accessor on
+    // the handler's account binding.
+    if let Some(account_name) = raw.strip_suffix(".pubkey") {
+        if handler.accounts.iter().any(|a| a.name == account_name) {
+            return Some(format!("self.{}.key()", account_name));
+        }
+    }
+    None
+}
+
+/// v2.24 S5c — emit cross-variant promotion (init / promote) for a
+/// multi-variant ADT state. Assembles every post-variant field
+/// from the handler's effect lines and assigns the new variant via
+/// `self.<acct>.inner = <Inner>::<Post> { … };`.
+///
+/// Bail-out conditions (each falls back to the per-effect
+/// `todo!()` path):
+///   - Pre is a payload-carrying variant (the destructure would
+///     need to capture pre fields that may flow into post; for
+///     v2.24 we keep cross-variant scoped to unit-style pre).
+///   - Any post-variant field has no matching effect line (we don't
+///     guess defaults for unspecified fields).
+///   - Any effect RHS can't be resolved by `resolve_cross_variant_rhs`
+///     (complex shapes — match / record / arith — fall through).
+fn emit_cross_variant_promotion(
+    handler: &ParsedHandler,
+    spec: &ParsedSpec,
+    acct_binder: &str,
+    pre: &str,
+    post_variant: &crate::check::ParsedVariant,
+    inner_name: &str,
+    err_enum: &str,
+) -> Option<String> {
+    // v2.24.0 follow-up: lift the unit-pre-only restriction. Three
+    // cross-variant promotion patterns are now valid:
+    //   1. unit pre → payload post  (init: Uninitialized → Active)
+    //   2. payload pre → unit post  (terminate: Open → Closed; the cancel case)
+    //   3. unit pre → unit post     (rare; harmless: just set the variant)
+    // Payload-pre → payload-post is still rejected — it would need
+    // a destructure-then-rebuild pass to capture pre's fields, and
+    // the current RHS resolver doesn't see the pre as a binding.
+    let pre_variant = spec
+        .account_types
+        .first()?
+        .variants
+        .iter()
+        .find(|v| v.name == pre)?;
+    if !pre_variant.fields.is_empty() && !post_variant.fields.is_empty() {
+        return None;
+    }
+
+    // Build a {field → RHS-rust} map from the handler's effects.
+    // For cross-variant we only accept the `:= <rhs>` form (effect
+    // op kind "set"); checked-arith ops don't make sense in a
+    // promotion (no pre value to read).
+    let mut field_rhs: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    for (lhs, op_kind, rhs) in &handler.effects {
+        if op_kind != "set" {
+            return None;
+        }
+        let stripped = strip_variant_prefix(lhs, spec);
+        let bare = strip_array_index_suffix(&stripped);
+        // Field must live on the post variant.
+        if !post_variant.fields.iter().any(|(n, _)| n == &bare) {
+            return None;
+        }
+        let resolved = resolve_cross_variant_rhs(rhs, handler, spec)?;
+        field_rhs.insert(bare, resolved);
+    }
+
+    // Every post-variant field must have an RHS. We don't fill
+    // defaults — silent defaults hide bugs (a zeroed pubkey is a
+    // famously bad bug). For unit-style post variants, this loop
+    // iterates zero times — the assignment lands as a bare
+    // variant constructor with no braces.
+    for (fname, _) in &post_variant.fields {
+        if !field_rhs.contains_key(fname) {
+            return None;
+        }
+    }
+
+    // Assemble the assignment. Pre-check: ensure the wrapper is in
+    // the pre variant. Init handlers (`Uninitialized`/`Empty`) skip
+    // this since the `#[account(init, …)]` constraint zeroes the
+    // account before our code runs — there's no prior payload to
+    // mismatch on. Other pres still get the gate. Payload pres
+    // use `Inner::Pre { .. }` to match without binding fields.
+    let is_init_pre = matches!(pre, "Uninitialized" | "Empty");
+    let mut out = String::new();
+    if !is_init_pre {
+        let pre_pattern = if pre_variant.fields.is_empty() {
+            format!("{}::{}", inner_name, pre)
+        } else {
+            format!("{}::{} {{ .. }}", inner_name, pre)
+        };
+        out.push_str(&format!(
+            "        if !matches!(self.{}.inner, {}) {{ return Err({}::WrongState.into()); }}\n",
+            acct_binder, pre_pattern, err_enum
+        ));
+    }
+    // Unit-style post: emit `... = Inner::Closed;` without the
+    // empty `{}` braces. Payload post: emit the brace-wrapped
+    // field-by-field initializer in declared order.
+    if post_variant.fields.is_empty() {
+        out.push_str(&format!(
+            "        self.{}.inner = {}::{};\n",
+            acct_binder, inner_name, post_variant.name
+        ));
+    } else {
+        out.push_str(&format!(
+            "        self.{}.inner = {}::{} {{\n",
+            acct_binder, inner_name, post_variant.name
+        ));
+        // Emit fields in the variant's declared order so the
+        // assembled initializer reads the way a user would write
+        // it. The map is sorted by name for lookup; iterating the
+        // variant's `fields` here preserves source-declared order.
+        for (fname, _) in &post_variant.fields {
+            let rhs = &field_rhs[fname];
+            out.push_str(&format!("            {}: {},\n", fname, rhs));
+        }
+        out.push_str("        };\n");
+    }
+    Some(out)
+}
+
+/// v2.24 S5c — emit a destructure-then-compare auth guard for a
+/// handler whose `auth X` field lives in a variant payload. Returns
+/// the empty string when the conditions don't apply (single-variant
+/// state, no `auth X`, X is on the wrapper not in a variant payload,
+/// no matching signer account, or `Unauthorized` not declared in
+/// `type Error`). The guard fires after the lifecycle pre-check, so
+/// the destructure is guaranteed to bind.
+fn emit_variant_auth_guard(handler: &ParsedHandler, spec: &ParsedSpec) -> String {
+    let Some(ref who) = handler.who else {
+        return String::new();
+    };
+    if !crate::check::is_multi_variant_adt_with_field_in_variant(spec, who) {
+        return String::new();
+    }
+    let Some(ref pre) = handler.pre_status else {
+        return String::new();
+    };
+    if matches!(pre.as_str(), "Uninitialized" | "Empty") {
+        return String::new();
+    }
+    let Some(acct) = spec.account_types.first() else {
+        return String::new();
+    };
+    let Some(variant) = acct.variants.iter().find(|v| v.name == *pre) else {
+        return String::new();
+    };
+    if !variant.fields.iter().any(|(n, _)| n == who) {
+        return String::new();
+    }
+    // Need a signer account in the handler with the same name as
+    // the auth field, so the auth comparison can resolve
+    // `ctx.<signer>.key()` without renaming dance.
+    let Some(signer_acct) = handler
+        .accounts
+        .iter()
+        .find(|a| a.is_signer && a.name == *who)
+    else {
+        return String::new();
+    };
+    if !spec.error_codes.iter().any(|c| c == "Unauthorized") {
+        return String::new();
+    }
+    let Some(state_acct) = find_state_account(handler) else {
+        return String::new();
+    };
+
+    let inner_name = format!("{}AccountInner", to_pascal_case(&spec.program_name));
+    let err_enum = format!("{}Error", to_pascal_case(&spec.program_name));
+    // Pin the auth-field destructure binding to a stable local name
+    // (`auth_field`) to avoid shadowing param names that might match
+    // the field's name in user code. The rest of the variant payload
+    // gets ignored via `..`.
+    format!(
+        "    // auth: variant payload {pre}.{who} == ctx.{signer}.key()\n\
+         \x20   let {inner}::{pre} {{ {who}: auth_field, .. }} = &ctx.{acct}.inner\n\
+         \x20   else {{ return Err({err}::InvalidLifecycle.into()); }};\n\
+         \x20   if auth_field != &ctx.{signer}.key() {{ return Err({err}::Unauthorized.into()); }}\n",
+        inner = inner_name,
+        pre = pre,
+        who = who,
+        signer = signer_acct.name,
+        acct = state_acct.name,
+        err = err_enum,
+    )
 }
 
 /// Render the `#[derive(Accounts)] pub struct X<'info>? { fields }`
@@ -2076,13 +2779,41 @@ fn render_handler_scaffold(
     // `<Pascal>Error::MathOverflow`. Bring the error enum into scope so
     // the rendered scaffold body compiles. Saturating / wrapping
     // (`+=!` / `+=?`) don't reference the enum.
-    let body_uses_error_enum = !spec.error_codes.is_empty()
+    //
+    // v2.24.0 follow-up: variant-state cross-variant promotion also
+    // emits `MiniEscrowError::WrongState` (the pre-variant gate)
+    // even when the handler has no checked-arith effects. Bring the
+    // enum in whenever the spec is multi-variant ADT on Anchor and
+    // the handler has a non-init pre — the same condition under
+    // which `emit_cross_variant_promotion` emits the `matches!`
+    // check that references the error variant.
+    let uses_wrong_state_check = is_multi_variant_adt_state(spec)
+        && matches!(target, Target::Anchor)
         && handler
-            .effects
-            .iter()
-            .any(|(_, op_kind, _)| op_kind == "add" || op_kind == "sub");
+            .pre_status
+            .as_deref()
+            .is_some_and(|p| !matches!(p, "Uninitialized" | "Empty"));
+    let body_uses_error_enum = !spec.error_codes.is_empty()
+        && (uses_wrong_state_check
+            || handler
+                .effects
+                .iter()
+                .any(|(_, op_kind, _)| op_kind == "add" || op_kind == "sub"));
     if body_uses_error_enum {
         out.push_str("use crate::errors::*;\n");
+    }
+    // v2.24 S5c — variant-state lowering references `<Name>AccountInner`
+    // directly inside the handler body (`match &mut self.<acct>.inner {
+    // <Name>AccountInner::<post> { … } => … }`). Without an explicit
+    // `use`, Rust's name resolution can't find the inner enum from
+    // inside the per-handler module — `state::*` is already imported
+    // when `render_struct` is true, but Anchor's handler scaffold
+    // (the `!render_struct` branch) skips that import to keep the
+    // common case lint-clean. Bring the inner enum in by name when
+    // the spec actually uses variant-state lowering.
+    if is_multi_variant_adt_state(spec) {
+        let inner_name = format!("{}AccountInner", to_pascal_case(&spec.program_name));
+        out.push_str(&format!("use crate::state::{};\n", inner_name));
     }
     if !render_struct {
         // Anchor: bring the Accounts struct (defined in lib.rs) into
@@ -2196,23 +2927,83 @@ fn render_handler_scaffold(
         out.push_str(&format!("        let {} = {};\n", binding_name, rust_expr));
     }
 
+    // v2.24 #11 — `let X = call …` bindings must be in scope when
+    // subsequent effects / requires reference them. Emit bound calls
+    // BEFORE the effect block. Unbound calls keep firing at the
+    // tail (after effects) per the pre-v2.24 convention. Track
+    // emitted-here calls so the tail emission skips them.
+    let mut emitted_call_indices = std::collections::HashSet::new();
+    let mut any_unmechanized_call_pre = false;
+    for (idx, c) in handler.calls.iter().enumerate() {
+        if c.result_binding.is_none() {
+            continue;
+        }
+        match try_emit_anchor_cpi(c, handler, spec) {
+            Some(rendered) => {
+                out.push_str(&format!(
+                    "        // Spec call: {}.{} (binding: {})\n",
+                    c.target_interface,
+                    c.target_handler,
+                    c.result_binding.as_deref().unwrap_or("_")
+                ));
+                out.push_str(&rendered);
+                emitted_call_indices.insert(idx);
+            }
+            None => {
+                let args = c
+                    .args
+                    .iter()
+                    .map(|a| format!("{}={}", a.name, a.rust_expr))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                out.push_str(&format!(
+                    "        // Spec call: {}.{}({}) (binding: {}) — needs fill\n",
+                    c.target_interface,
+                    c.target_handler,
+                    args,
+                    c.result_binding.as_deref().unwrap_or("_")
+                ));
+                any_unmechanized_call_pre = true;
+                emitted_call_indices.insert(idx);
+            }
+        }
+    }
+
     // Mechanical-effect expansion (v2.4-M3). For each spec effect we try to
     // emit a real Rust statement; anything non-mechanical stays as a comment
     // and forces a trailing `todo!()` so the user / an LLM (M4) fills it in.
     let state_acct = find_state_account(handler);
     let mut any_unmechanized = false;
-    for effect in &handler.effects {
-        let mechanized =
-            state_acct.and_then(|sa| mechanize_effect(effect, sa, handler, spec, target));
-        match mechanized {
-            Some(line) => out.push_str(&line),
-            None => {
-                let (field, op_kind, value) = effect;
-                out.push_str(&format!(
-                    "        // Spec effect (needs fill): {} {} {}\n",
-                    field, op_kind, value
-                ));
-                any_unmechanized = true;
+    // v2.24 S5c — multi-variant ADT specs need a different lowering
+    // shape: the wrapper-struct + inner-enum emission from S5b means
+    // `self.<acct>.<field>` no longer resolves; effects must run
+    // inside a `match &mut self.<acct>.inner { Inner::<post> { … }
+    // => …, _ => Err(WrongState) }` block. Try the variant-aware
+    // emitter first; on `None`, fall through to the per-effect
+    // path (which will emit `// Spec effect (needs fill)` + the
+    // trailing `todo!()` for cross-variant / non-mechanical shapes).
+    let variant_body =
+        state_acct.and_then(|sa| emit_variant_state_handler_body(handler, spec, target, sa));
+    if let Some(body) = variant_body {
+        out.push_str(&body);
+    } else {
+        for (idx, effect) in handler.effects.iter().enumerate() {
+            // v2.24 §S1a — per-site error-variant override, indexed parallel
+            // to `effects`. Missing entry = `None` (silent fallback to pragma
+            // / built-in default inside mechanize_effect).
+            let on_error = handler.effect_on_error.get(idx).and_then(|o| o.as_deref());
+            let mechanized = state_acct
+                .and_then(|sa| mechanize_effect(effect, on_error, sa, handler, spec, target));
+            match mechanized {
+                Some(line) => out.push_str(&line),
+                None => {
+                    let (field, op_kind, value) = effect;
+                    out.push_str(&format!(
+                        "        // Spec effect (needs fill): {} {} {}\n",
+                        field, op_kind, value
+                    ));
+                    any_unmechanized = true;
+                }
             }
         }
     }
@@ -2245,7 +3036,14 @@ fn render_handler_scaffold(
     // site remained unmechanized so the tail `todo!()` only fires for
     // those.
     let mut any_unmechanized_call = false;
-    for c in &handler.calls {
+    for (idx, c) in handler.calls.iter().enumerate() {
+        // v2.24 #11 — bound calls (result_binding = Some(_)) were
+        // already emitted before the effect block so the binding
+        // would be in scope for subsequent effects / requires.
+        // Skip them here so we don't double-emit.
+        if emitted_call_indices.contains(&idx) {
+            continue;
+        }
         match try_emit_anchor_cpi(c, handler, spec) {
             Some(rendered) => {
                 out.push_str(&format!(
@@ -2270,7 +3068,11 @@ fn render_handler_scaffold(
         }
     }
 
-    let needs_fill = any_unmechanized || has_events || has_transfers || any_unmechanized_call;
+    let needs_fill = any_unmechanized
+        || has_events
+        || has_transfers
+        || any_unmechanized_call
+        || any_unmechanized_call_pre;
     if needs_fill {
         out.push_str("        todo!(\"fill non-mechanical effects, events, transfers, calls\")\n");
     } else {
@@ -2492,6 +3294,27 @@ fn generate_guards(
         let lifecycle_post_write = lifecycle_check_line(handler, spec, true, &surface);
         if !lifecycle_pre_check.is_empty() {
             out.push_str(&lifecycle_pre_check);
+        }
+
+        // v2.24 S5c — auth guard for fields that live in a variant
+        // payload. R25's `auth X → has_one = X` suppresses the
+        // Anchor `has_one` attribute under multi-variant ADT
+        // because the macro can't reach `wrapper.inner.<variant>.X`
+        // (see `is_multi_variant_adt_with_field_in_variant` in
+        // check.rs). Replace it with an explicit destructure-then-
+        // compare guard so the auth check still fires at runtime.
+        // Requires:
+        //   - multi-variant ADT spec
+        //   - handler declares `auth X` where X is a variant-payload
+        //     field on the pre-variant
+        //   - handler binds a signer account named `X`
+        //   - the spec declares `Unauthorized` in `type Error`
+        // Missing any condition: silently skip — the auth gap shows
+        // up as a `qedgen check` warning (`no_access_control` / R25
+        // friend) rather than a compile error.
+        let auth_guard = emit_variant_auth_guard(handler, spec);
+        if !auth_guard.is_empty() {
+            out.push_str(&auth_guard);
         }
 
         let err_enum_name_r28 = format!("{}Error", to_pascal_case(&spec.program_name));
@@ -3403,6 +4226,507 @@ handler cancel : State.Open -> State.Closed {
         assert!(!guards.contains("to_account_view"));
     }
 
+    /// v2.24 S5b — multi-variant ADT state lowers to the
+    /// `#[account] pub struct Wrapper { pub inner: WrapperInner }` +
+    /// `pub enum WrapperInner { … }` pattern. Smoke fixture at
+    /// `/tmp/anchor_enum_test/` validated against Anchor 0.32.1
+    /// (see [[reference_anchor_account_struct_only]]). This test
+    /// pins the codegen output shape so a future regression that
+    /// flips back to flat-struct + `status: u8` fails fast.
+    #[test]
+    fn multi_variant_adt_emits_wrapper_struct_plus_inner_enum() {
+        let src = r#"spec Escrow
+
+type State
+  | Uninitialized
+  | Open of {
+      initializer        : Pubkey,
+      taker              : Pubkey,
+      initializer_amount : U64,
+      taker_amount       : U64,
+    }
+  | Closed
+
+type Error
+  | InvalidAmount
+
+handler initialize (amount : U64) : State.Uninitialized -> State.Open {
+  auth initializer
+  accounts {
+    initializer : signer, writable
+  }
+  requires amount > 0 else InvalidAmount
+  effect {
+    Open.initializer := initializer.pubkey
+  }
+}
+"#;
+        let spec = crate::chumsky_adapter::parse_str(src).unwrap();
+        let fp = crate::fingerprint::compute_fingerprint(&spec);
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path().join("programs");
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        generate_state(&spec, &fp, &out_dir, Target::Anchor).unwrap();
+        let state = std::fs::read_to_string(out_dir.join("src/state.rs")).unwrap();
+
+        // Wrapper struct carries `#[account]` + `InitSpace` and owns
+        // the discriminator. The smoke fixture proved this is the
+        // only pattern Anchor 0.32.1's struct-only `#[account]`
+        // macro accepts.
+        assert!(
+            state.contains("#[account]\n#[derive(InitSpace)]\npub struct EscrowAccount"),
+            "missing wrapper struct shape; got:\n{state}"
+        );
+        assert!(
+            state.contains("pub inner: EscrowAccountInner"),
+            "wrapper struct should hold the inner enum as `pub inner: …`; got:\n{state}"
+        );
+
+        // Inner enum carries the actual variants. No-payload variants
+        // stay unit-style; payload variants get struct-style fields.
+        assert!(
+            state.contains(
+                "#[derive(AnchorSerialize, AnchorDeserialize, InitSpace, Clone, Debug, PartialEq)]"
+            ),
+            "inner enum should carry Borsh + Clone + Debug + PartialEq derives; got:\n{state}"
+        );
+        assert!(
+            state.contains("pub enum EscrowAccountInner"),
+            "missing inner enum; got:\n{state}"
+        );
+        assert!(
+            state.contains("Uninitialized,"),
+            "unit-style variant missing; got:\n{state}"
+        );
+        assert!(
+            state.contains("Closed,"),
+            "second unit-style variant missing; got:\n{state}"
+        );
+        assert!(
+            state.contains("Open {")
+                && state.contains("initializer: Pubkey,")
+                && state.contains("initializer_amount: u64,"),
+            "payload variant missing fields; got:\n{state}"
+        );
+
+        // The legacy flat-fields shape must NOT appear: no
+        // `status: u8` discriminator field on the wrapper, no
+        // parallel `pub enum Status` enum, and no top-level
+        // `pub initializer:` on the wrapper struct.
+        assert!(
+            !state.contains("pub status: u8"),
+            "legacy `status: u8` discriminator should not appear for multi-variant ADT; got:\n{state}"
+        );
+        assert!(
+            !state.contains("pub enum Status {"),
+            "legacy `Status` enum should not appear for multi-variant ADT; got:\n{state}"
+        );
+        assert!(
+            !state.contains("pub initializer: Pubkey,\n    pub taker: Pubkey,"),
+            "wrapper should not carry flattened fields directly; got:\n{state}"
+        );
+    }
+
+    /// v2.24 S5c — same-variant handler bodies lower to a
+    /// `match &mut self.<acct>.inner { Inner::<post> { … } => { … },
+    ///  _ => Err(WrongState.into()) }` block when the spec is a
+    /// multi-variant ADT. Locks the new emission shape so a future
+    /// regression that emits the legacy `self.<acct>.<field> = …`
+    /// (which no longer compiles against the S5b wrapper+enum) fails
+    /// fast.
+    #[test]
+    fn variant_state_lowers_same_variant_handler_to_match_block() {
+        let src = r#"spec Vault
+
+type State
+  | Uninitialized
+  | Active of {
+      owner   : Pubkey,
+      balance : U64,
+    }
+
+type Error
+  | MathOverflow
+  | WrongState
+
+handler deposit (amount : U64) : State.Active -> State.Active {
+  auth owner
+  accounts {
+    vault : writable
+    owner : signer
+  }
+  requires amount > 0 else MathOverflow
+  effect {
+    Active.balance += amount
+  }
+}
+"#;
+        let spec = crate::chumsky_adapter::parse_str(src).unwrap();
+        let fp = crate::fingerprint::compute_fingerprint(&spec);
+        let dir = tempfile::tempdir().unwrap();
+        let spec_path = dir.path().join("vault.qedspec");
+        let out_dir = dir.path().join("programs");
+        std::fs::write(&spec_path, src).unwrap();
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        generate_lib(&spec, &fp, &out_dir, Target::Anchor).unwrap();
+        generate_instructions(&spec, &fp, &spec_path, &out_dir, Target::Anchor).unwrap();
+
+        let deposit = std::fs::read_to_string(out_dir.join("src/instructions/deposit.rs")).unwrap();
+
+        // Match-wrapped body lands.
+        assert!(
+            deposit.contains("match &mut self.vault.inner"),
+            "expected variant match destructure; got:\n{deposit}"
+        );
+        assert!(
+            deposit.contains("VaultAccountInner::Active { balance, .. } =>"),
+            "expected destructure pattern naming only the mutated field; got:\n{deposit}"
+        );
+
+        // Effect line uses the destructured binding (no `self.vault.balance`).
+        assert!(
+            deposit.contains(
+                "*balance = balance.checked_add(amount).ok_or(VaultError::MathOverflow)?;"
+            ),
+            "expected destructured checked_add line; got:\n{deposit}"
+        );
+
+        // Wrong-variant fallthrough.
+        assert!(
+            deposit.contains("_ => return Err(VaultError::WrongState.into()),"),
+            "expected WrongState fallthrough arm; got:\n{deposit}"
+        );
+
+        // Legacy `self.vault.balance` shape must NOT appear.
+        assert!(
+            !deposit.contains("self.vault.balance"),
+            "legacy flat-field handler body should not appear under variant-state lowering; got:\n{deposit}"
+        );
+    }
+
+    /// v2.24 S5c — guards module emits a `matches!(inner, Inner::<pre>
+    /// { .. })` lifecycle check instead of the legacy
+    /// `ctx.<acct>.status != Status::<pre> as u8` byte compare when the
+    /// state is a multi-variant ADT. Wrapper has no `status` field
+    /// under the new emission, so the byte compare would no longer
+    /// compile. Also locks the `has_one` suppression for fields that
+    /// live in variant payloads — without it the wrapper-side
+    /// `has_one = X` macro tries to read `wrapper.X` and fails with
+    /// "no field X on Account<…, Wrapper>". Both gaps were caught by
+    /// the end-to-end `cargo check` smoke on the Vault fixture.
+    #[test]
+    fn variant_state_guards_use_matches_and_skip_has_one() {
+        let src = r#"spec Vault
+
+type State
+  | Uninitialized
+  | Active of {
+      owner   : Pubkey,
+      balance : U64,
+    }
+
+type Error
+  | MathOverflow
+  | WrongState
+  | InvalidLifecycle
+  | Unauthorized
+
+handler deposit (amount : U64) : State.Active -> State.Active {
+  auth owner
+  accounts {
+    vault : writable
+    owner : signer
+  }
+  requires amount > 0 else MathOverflow
+  effect {
+    Active.balance += amount
+  }
+}
+"#;
+        let spec = crate::chumsky_adapter::parse_str(src).unwrap();
+        let fp = crate::fingerprint::compute_fingerprint(&spec);
+        let dir = tempfile::tempdir().unwrap();
+        let spec_path = dir.path().join("vault.qedspec");
+        let out_dir = dir.path().join("programs");
+        std::fs::write(&spec_path, src).unwrap();
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        generate_lib(&spec, &fp, &out_dir, Target::Anchor).unwrap();
+        generate_guards(&spec, &fp, &out_dir, Target::Anchor).unwrap();
+
+        let guards = std::fs::read_to_string(out_dir.join("src/guards.rs")).unwrap();
+        assert!(
+            guards.contains("if !matches!(ctx.vault.inner, VaultAccountInner::Active { .. })"),
+            "expected `matches!` lifecycle check; got:\n{guards}"
+        );
+        assert!(
+            !guards.contains("Status::Active as u8"),
+            "legacy status byte compare must not appear under variant-state lowering; got:\n{guards}"
+        );
+
+        let lib = std::fs::read_to_string(out_dir.join("src/lib.rs")).unwrap();
+        assert!(
+            !lib.contains("has_one = owner"),
+            "has_one suppression failed — wrapper-side `has_one = owner` should not appear because owner lives in variant payload; got:\n{lib}"
+        );
+    }
+
+    /// v2.24 S5c-auth — when `has_one` is suppressed under multi-variant
+    /// ADT (the auth field lives in a variant payload, see
+    /// 01dc057), guards.rs picks up a destructure-then-compare
+    /// auth check so the security gap is closed at runtime.
+    /// Without this the wrapper-side `has_one = owner` is silently
+    /// dropped and any signer can call the handler.
+    #[test]
+    fn variant_state_guards_emit_auth_check_when_has_one_suppressed() {
+        let src = r#"spec Vault
+
+type State
+  | Uninitialized
+  | Active of {
+      owner   : Pubkey,
+      balance : U64,
+    }
+
+type Error
+  | MathOverflow
+  | WrongState
+  | InvalidLifecycle
+  | Unauthorized
+
+handler deposit (amount : U64) : State.Active -> State.Active {
+  auth owner
+  accounts {
+    vault : writable
+    owner : signer
+  }
+  requires amount > 0 else MathOverflow
+  effect {
+    Active.balance += amount
+  }
+}
+"#;
+        let spec = crate::chumsky_adapter::parse_str(src).unwrap();
+        let fp = crate::fingerprint::compute_fingerprint(&spec);
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path().join("programs");
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        generate_lib(&spec, &fp, &out_dir, Target::Anchor).unwrap();
+        generate_guards(&spec, &fp, &out_dir, Target::Anchor).unwrap();
+
+        let guards = std::fs::read_to_string(out_dir.join("src/guards.rs")).unwrap();
+
+        // Destructure-then-compare guard fires.
+        assert!(
+            guards.contains(
+                "let VaultAccountInner::Active { owner: auth_field, .. } = &ctx.vault.inner"
+            ),
+            "expected destructure binding of variant-payload auth field; got:\n{guards}"
+        );
+        assert!(
+            guards.contains("if auth_field != &ctx.owner.key()"),
+            "expected key comparison against signer account; got:\n{guards}"
+        );
+        assert!(
+            guards.contains("return Err(VaultError::Unauthorized.into())"),
+            "expected Unauthorized error on auth mismatch; got:\n{guards}"
+        );
+    }
+
+    /// v2.24 S5c-auth — when `Unauthorized` isn't declared in
+    /// `type Error`, the auth guard suppresses itself rather than
+    /// emitting a dangling reference. The `has_one` is already
+    /// suppressed too (separate gate), so the spec needs a manual
+    /// auth check elsewhere — which the lint side surfaces via
+    /// `no_access_control` / R25-friend warnings. Locks the
+    /// silent-skip behavior.
+    #[test]
+    fn variant_state_auth_guard_skips_when_unauthorized_undeclared() {
+        let src = r#"spec Vault
+
+type State
+  | Uninitialized
+  | Active of {
+      owner   : Pubkey,
+      balance : U64,
+    }
+
+type Error
+  | MathOverflow
+  | WrongState
+  | InvalidLifecycle
+
+handler deposit (amount : U64) : State.Active -> State.Active {
+  auth owner
+  accounts {
+    vault : writable
+    owner : signer
+  }
+  requires amount > 0 else MathOverflow
+  effect {
+    Active.balance += amount
+  }
+}
+"#;
+        let spec = crate::chumsky_adapter::parse_str(src).unwrap();
+        let fp = crate::fingerprint::compute_fingerprint(&spec);
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path().join("programs");
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        generate_lib(&spec, &fp, &out_dir, Target::Anchor).unwrap();
+        generate_guards(&spec, &fp, &out_dir, Target::Anchor).unwrap();
+
+        let guards = std::fs::read_to_string(out_dir.join("src/guards.rs")).unwrap();
+        assert!(
+            !guards.contains("Unauthorized"),
+            "auth guard should not emit reference to undeclared Unauthorized variant; got:\n{guards}"
+        );
+        assert!(
+            !guards.contains("owner: auth_field"),
+            "auth destructure should not appear when Unauthorized is undeclared; got:\n{guards}"
+        );
+    }
+
+    /// v2.24 S5c — cross-variant (init / promote) handlers now lower
+    /// to an explicit `self.<acct>.inner = <Inner>::<Post> { … };`
+    /// assignment. Pre-variant must be unit-style (no payload); every
+    /// post-variant field must have a matching `Active.field := <rhs>`
+    /// effect. Bail-outs (payload-carrying pre, missing fields,
+    /// complex RHS) fall through to the per-effect `todo!()` path —
+    /// a separate test covers those.
+    #[test]
+    fn variant_state_lowers_cross_variant_init_to_set_inner() {
+        let src = r#"spec Vault
+
+type State
+  | Uninitialized
+  | Active of {
+      owner   : Pubkey,
+      balance : U64,
+    }
+
+type Error
+  | MathOverflow
+  | WrongState
+  | InvalidLifecycle
+  | Unauthorized
+
+handler create (initial : U64) : State.Uninitialized -> State.Active {
+  auth owner
+  accounts {
+    vault : writable
+    owner : signer
+  }
+  requires initial > 0 else MathOverflow
+  effect {
+    Active.balance := initial
+    Active.owner := owner.pubkey
+  }
+}
+"#;
+        let spec = crate::chumsky_adapter::parse_str(src).unwrap();
+        let fp = crate::fingerprint::compute_fingerprint(&spec);
+        let dir = tempfile::tempdir().unwrap();
+        let spec_path = dir.path().join("vault.qedspec");
+        let out_dir = dir.path().join("programs");
+        std::fs::write(&spec_path, src).unwrap();
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        generate_lib(&spec, &fp, &out_dir, Target::Anchor).unwrap();
+        generate_instructions(&spec, &fp, &spec_path, &out_dir, Target::Anchor).unwrap();
+
+        let create = std::fs::read_to_string(out_dir.join("src/instructions/create.rs")).unwrap();
+
+        // Assignment shape lands. Note: declared field order matters
+        // — `owner` first, then `balance` — to match the variant
+        // declaration in the spec.
+        assert!(
+            create.contains("self.vault.inner = VaultAccountInner::Active {"),
+            "expected variant assignment; got:\n{create}"
+        );
+        assert!(
+            create.contains("owner: self.owner.key(),"),
+            "expected `.pubkey` RHS to lower to `self.<acct>.key()`; got:\n{create}"
+        );
+        assert!(
+            create.contains("balance: initial,"),
+            "expected param RHS to lower as bare ident; got:\n{create}"
+        );
+
+        // No leftover `todo!()` — fully mechanized.
+        assert!(
+            !create.contains("todo!("),
+            "cross-variant init should be fully mechanized, no todo!(); got:\n{create}"
+        );
+
+        // Init handlers (`Uninitialized` pre) elide the
+        // `matches!(.., Pre)` pre-check since `#[account(init, …)]`
+        // zeroes the account before the body runs.
+        assert!(
+            !create.contains("if !matches!(self.vault.inner, VaultAccountInner::Uninitialized"),
+            "init handler should skip the pre-variant check; got:\n{create}"
+        );
+    }
+
+    /// v2.24 S5c — cross-variant emitter bails (returns `None`) when
+    /// any post-variant field has no corresponding effect line. Silent
+    /// defaults would hide bugs (e.g. a zeroed Pubkey owner). The
+    /// fallback per-effect path then surfaces a clear `todo!()`.
+    #[test]
+    fn variant_state_bails_on_cross_variant_missing_field() {
+        let src = r#"spec Vault
+
+type State
+  | Uninitialized
+  | Active of {
+      owner   : Pubkey,
+      balance : U64,
+    }
+
+type Error
+  | MathOverflow
+  | WrongState
+
+handler create (initial : U64) : State.Uninitialized -> State.Active {
+  auth owner
+  accounts {
+    vault : writable
+    owner : signer
+  }
+  requires initial > 0 else MathOverflow
+  effect {
+    Active.balance := initial
+  }
+}
+"#;
+        let spec = crate::chumsky_adapter::parse_str(src).unwrap();
+        let fp = crate::fingerprint::compute_fingerprint(&spec);
+        let dir = tempfile::tempdir().unwrap();
+        let spec_path = dir.path().join("vault.qedspec");
+        let out_dir = dir.path().join("programs");
+        std::fs::write(&spec_path, src).unwrap();
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        generate_lib(&spec, &fp, &out_dir, Target::Anchor).unwrap();
+        generate_instructions(&spec, &fp, &spec_path, &out_dir, Target::Anchor).unwrap();
+
+        let create = std::fs::read_to_string(out_dir.join("src/instructions/create.rs")).unwrap();
+
+        // Missing `owner` field → cross-variant emitter bails.
+        assert!(
+            !create.contains("self.vault.inner = VaultAccountInner::Active {"),
+            "cross-variant emitter should bail on missing post-variant field; got:\n{create}"
+        );
+        assert!(
+            create.contains("todo!("),
+            "fallback should surface a todo!() for the user to fill; got:\n{create}"
+        );
+    }
+
     /// Quasar twin of the Anchor scaffold-imports test. Workstreams A + B
     /// (target-aware type mappers + `FrameworkSurface` boundary) and F
     /// (conditional imports + warning gating) reshaped both targets'
@@ -3809,6 +5133,73 @@ handler send : State.Active -> State.Active {
         assert!(rendered.contains("AnchorSerialize::serialize"));
     }
 
+    /// v2.24 #11 — `let X = call Foo.handler(...)` lowers to a Rust
+    /// let-binding capturing the callee's return value via Solana's
+    /// `get_return_data` syscall, when the interface declares a
+    /// return type (`-> U64` etc.).
+    #[test]
+    fn cpi_emits_let_binding_when_interface_declares_return_type() {
+        let spec = crate::chumsky_adapter::parse_str(
+            r#"spec Caller
+program_id "11111111111111111111111111111111"
+
+interface Pool {
+  program_id "22222222222222222222222222222222"
+  handler absorb_loss (loss : U64) -> U64 {
+    accounts { vault : writable }
+  }
+}
+
+type State | Active of { total_burned : U64 }
+type Error | MathOverflow | E
+
+handler liquidate (loss : U64) : State.Active -> State.Active {
+  permissionless
+  accounts {
+    vault         : writable
+    pool_program  : program
+  }
+  let burned = call Pool.absorb_loss(vault = vault, loss = loss)
+}
+"#,
+        )
+        .unwrap();
+        let handler = spec
+            .handlers
+            .iter()
+            .find(|h| h.name == "liquidate")
+            .unwrap();
+        let call = handler.calls.first().expect("call site");
+        assert_eq!(
+            call.result_binding.as_deref(),
+            Some("burned"),
+            "result_binding should land in ParsedCall"
+        );
+        let rendered = try_emit_anchor_cpi(call, handler, &spec)
+            .expect("must emit a generic CPI with let-binding capture");
+        // Block opens as a `let burned = { … }` expression.
+        assert!(
+            rendered.starts_with("        let burned = {\n"),
+            "expected let-binding open; got prefix:\n{}",
+            &rendered[..200.min(rendered.len())]
+        );
+        // The CPI invoke happens inside.
+        assert!(rendered.contains("invoke(&ix"));
+        // get_return_data captures the callee's return.
+        assert!(rendered.contains("get_return_data"));
+        // The return type maps to u64; deserialize is typed.
+        assert!(
+            rendered.contains("<u64 as AnchorDeserialize>"),
+            "expected typed deserialize for U64 return; got:\n{rendered}"
+        );
+        // Block closes with `};` (let-binding terminator).
+        assert!(
+            rendered.ends_with("        };\n"),
+            "expected let-binding close; got suffix:\n{}",
+            &rendered[rendered.len().saturating_sub(200)..]
+        );
+    }
+
     // ----- v2.8 F8: Error-sum threading via mechanize_effect -----
 
     #[test]
@@ -3832,7 +5223,7 @@ handler bump (n : U64) : State.Active -> State.Active {
         let handler = spec.handlers.iter().find(|h| h.name == "bump").unwrap();
         let state_acct = find_state_account(handler).expect("state account");
         let effect = handler.effects.first().unwrap();
-        let rendered = mechanize_effect(effect, state_acct, handler, &spec, Target::Anchor)
+        let rendered = mechanize_effect(effect, None, state_acct, handler, &spec, Target::Anchor)
             .expect("mechanized");
         // Pre-F8 this said `ErrorCode::MathOverflow` (a non-existent enum).
         // F8: it now says `<ProgramName>Error::MathOverflow`, matching the
@@ -3844,6 +5235,123 @@ handler bump (n : U64) : State.Active -> State.Active {
         assert!(
             !rendered.contains("ErrorCode::MathOverflow"),
             "should not reference the legacy non-existent ErrorCode enum; got:\n{rendered}"
+        );
+    }
+
+    // ----- v2.24 §S1a/b/c: per-site override + pragma + underflow default -----
+
+    fn mechanize_first_effect(src: &str, handler_name: &str) -> String {
+        let spec = crate::chumsky_adapter::parse_str(src).unwrap();
+        let handler = spec
+            .handlers
+            .iter()
+            .find(|h| h.name == handler_name)
+            .expect("handler not found");
+        let state_acct = find_state_account(handler).expect("state account");
+        let effect = handler.effects.first().expect("at least one effect");
+        let on_error = handler.effect_on_error.first().and_then(|o| o.as_deref());
+        mechanize_effect(effect, on_error, state_acct, handler, &spec, Target::Anchor)
+            .expect("mechanized")
+    }
+
+    #[test]
+    fn per_site_else_overrides_default_variant_for_checked_add() {
+        let rendered = mechanize_first_effect(
+            r#"spec Mint
+program_id "11111111111111111111111111111111"
+type State | Active of { pool : U64 }
+type Error | MathOverflow | MintOverflow
+
+handler deposit (n : U64) : State.Active -> State.Active {
+  permissionless
+  accounts { state : writable }
+  effect { pool += n else MintOverflow }
+}
+"#,
+            "deposit",
+        );
+        assert!(
+            rendered.contains("MintError::MintOverflow"),
+            "v2.24 §S1a: `else MintOverflow` should lower to MintError::MintOverflow; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("MintError::MathOverflow"),
+            "should not use the default; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn pragma_overrides_default_variant_when_no_per_site_override() {
+        let rendered = mechanize_first_effect(
+            r#"spec Mint
+program_id "11111111111111111111111111111111"
+type State | Active of { pool : U64 }
+type Error | MathOverflow | MintOverflow
+
+pragma checked_overflow_error = MintOverflow
+
+handler deposit (n : U64) : State.Active -> State.Active {
+  permissionless
+  accounts { state : writable }
+  effect { pool += n }
+}
+"#,
+            "deposit",
+        );
+        assert!(
+            rendered.contains("MintError::MintOverflow"),
+            "v2.24 §S1b: pragma checked_overflow_error should override the default; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn checked_sub_defaults_to_math_underflow_when_declared() {
+        let rendered = mechanize_first_effect(
+            r#"spec Pool
+program_id "11111111111111111111111111111111"
+type State | Active of { balance : U64 }
+type Error | MathOverflow | MathUnderflow
+
+handler withdraw (n : U64) : State.Active -> State.Active {
+  permissionless
+  accounts { state : writable }
+  effect { balance -= n }
+}
+"#,
+            "withdraw",
+        );
+        assert!(
+            rendered.contains("PoolError::MathUnderflow"),
+            "v2.24 §S1c: -= should default to MathUnderflow when declared; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn checked_sub_falls_back_to_math_overflow_for_legacy_specs() {
+        // S1c back-compat: only MathOverflow declared, no MathUnderflow.
+        // `-=` keeps raising MathOverflow (pre-v2.24 behavior) so existing
+        // specs continue to build without spec edits.
+        let rendered = mechanize_first_effect(
+            r#"spec Pool
+program_id "11111111111111111111111111111111"
+type State | Active of { balance : U64 }
+type Error | MathOverflow
+
+handler withdraw (n : U64) : State.Active -> State.Active {
+  permissionless
+  accounts { state : writable }
+  effect { balance -= n }
+}
+"#,
+            "withdraw",
+        );
+        assert!(
+            rendered.contains("PoolError::MathOverflow"),
+            "v2.24 §S1c back-compat: legacy spec falls back to MathOverflow; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("MathUnderflow"),
+            "back-compat path should not reference MathUnderflow; got:\n{rendered}"
         );
     }
 

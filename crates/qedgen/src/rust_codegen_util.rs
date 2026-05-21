@@ -339,6 +339,15 @@ pub fn resolve_value(
         value.to_string()
     } else if let Some((_, const_val)) = spec.constants.iter().find(|(n, _)| n == value) {
         const_val.clone()
+    } else if op
+        .calls
+        .iter()
+        .any(|c| c.result_binding.as_deref() == Some(value))
+    {
+        // v2.24 #11 — `let <name> = call …` binding is in scope for
+        // subsequent effects / requires. Render as the bare ident
+        // so the generated Rust references the let-bound local.
+        value.to_string()
     } else if let Some(binder) = state_binder {
         if is_state_field(value, spec) {
             format!("{}{}", binder, value)
@@ -396,6 +405,21 @@ pub fn mutable_fields(fields: &[(String, String)]) -> Vec<&(String, String)> {
 /// (callers default to "not Pubkey" — emit normally) so unknown fields
 /// surface as compile errors at the right line, not as silent skips.
 pub fn field_type_is_pubkey(field: &str, op: &ParsedHandler, spec: &ParsedSpec) -> bool {
+    // v2.24 S5d — variant-prefixed paths (`Active.owner`) resolve
+    // against the variant's payload, not the wrapper. Look up the
+    // type there first; fall through to the flat schema otherwise.
+    if let Some(dot) = field.find('.') {
+        let head = &field[..dot];
+        let rest = &field[dot + 1..];
+        let nested_base = effect_target_base(rest);
+        for at in &spec.account_types {
+            if let Some(variant) = at.variants.iter().find(|v| v.name == head) {
+                if let Some((_, t)) = variant.fields.iter().find(|(n, _)| n == nested_base) {
+                    return t == "Pubkey";
+                }
+            }
+        }
+    }
     let base = effect_target_base(field);
     if let Some(ref acct_name) = op.on_account {
         if let Some(acct) = spec.account_types.iter().find(|a| a.name == *acct_name) {
@@ -420,6 +444,28 @@ pub fn effect_target_base(path: &str) -> &str {
     &path[..end]
 }
 
+/// v2.24 S5d — strip a leading `<Variant>.` prefix from an effect path
+/// when the root names a multi-variant ADT variant on the spec's state.
+/// Returns the path unchanged otherwise. Used by proptest / Kani /
+/// integration_test harnesses whose flat-`State` model carries fields
+/// in their union form (not under variant constructors), so
+/// `Active.balance := …` must lower to `s.balance = …`. Owned-string
+/// return so callers can pass the result through `&str`-only APIs
+/// without lifetime juggling.
+pub fn strip_variant_prefix_for_flat_state(path: &str, spec: &ParsedSpec) -> String {
+    if let Some(dot) = path.find('.') {
+        let head = &path[..dot];
+        let is_variant = spec
+            .account_types
+            .iter()
+            .any(|a| a.variants.iter().any(|v| v.name == head));
+        if is_variant {
+            return path[dot + 1..].to_string();
+        }
+    }
+    path.to_string()
+}
+
 /// Render a single `(field, op_kind, value)` triple into Rust at the given
 /// indent. Shared between unconditional effect lowering and v2.20's
 /// match-arm lowering. The helper writes the trailing newline; the caller
@@ -435,6 +481,16 @@ pub fn emit_one_effect(
     value: &str,
     indent: &str,
 ) {
+    // v2.24 S5d — proptest / Kani / integration_test all run against a
+    // flat `State` struct (the spec's union-of-variant-fields view). A
+    // `Variant.field := …` effect from a multi-variant ADT spec must
+    // strip the variant prefix here so the body emits `s.field = …`
+    // instead of `s.Variant.field = …` (which doesn't compile). The
+    // proptest model tracks the variant via `s.status: u8`, set by
+    // `emit_transition_fn`'s post-status write — no enum needed in
+    // this harness layer.
+    let field_owned = strip_variant_prefix_for_flat_state(field, spec);
+    let field = field_owned.as_str();
     // proptest / kani body binds state as `s` — pass that binder so a
     // bare state-field RHS (e.g. `bid_buyer := state.rfp_buyer` after
     // upstream strips `state.`) renders as `s.rfp_buyer`. (PR #45 fix #2,
@@ -538,9 +594,45 @@ pub fn check_effect_targets(spec: &ParsedSpec) -> anyhow::Result<()> {
         }
     }
 
+    // v2.24 S5c — variant-prefixed effect targets (`Active.balance`) are
+    // legal under the wrapper-struct + inner-enum codegen. The base
+    // matches a variant name on a multi-variant ADT account; the second
+    // segment is the actual field. Build a variant-fields index so the
+    // check can re-target at the field beneath the variant prefix
+    // instead of false-positive-bailing on the variant name.
+    let mut variant_fields: std::collections::HashMap<&str, HashSet<&str>> =
+        std::collections::HashMap::new();
+    for acct in &spec.account_types {
+        for variant in &acct.variants {
+            let entry = variant_fields.entry(variant.name.as_str()).or_default();
+            for (n, _) in &variant.fields {
+                entry.insert(n.as_str());
+            }
+        }
+    }
+
     for handler in &spec.handlers {
         for (field, _kind, _value) in &handler.effects {
             let base = effect_target_base(field);
+            // Variant-prefixed: the root is a variant name, so check
+            // the field beneath it against that variant's payload.
+            if let Some(variant_payload) = variant_fields.get(base) {
+                let after = field.trim_start_matches(base).trim_start_matches('.');
+                let nested_base = effect_target_base(after);
+                if !nested_base.is_empty()
+                    && !variant_payload.contains(nested_base)
+                    && !declared.contains(nested_base)
+                {
+                    anyhow::bail!(
+                        "handler `{}` writes effect target `{}` but `{}` is not declared in variant `{}`'s payload — add it to the variant or rename the effect",
+                        handler.name,
+                        field,
+                        nested_base,
+                        base,
+                    );
+                }
+                continue;
+            }
             if !declared.contains(base) {
                 anyhow::bail!(
                     "handler `{}` writes effect target `{}` but `{}` is not declared in any state, account, record, or sum-variant payload — add it to the state declaration or remove the effect",

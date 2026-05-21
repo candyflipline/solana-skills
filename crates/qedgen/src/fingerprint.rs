@@ -56,6 +56,26 @@ pub fn compute_fingerprint(spec: &ParsedSpec) -> SpecFingerprint {
         for pda in &spec.pdas {
             c.push_str(&format!("pda={}|{}\n", pda.name, pda.seeds.join(",")));
         }
+        // v2.24 S5i — hash the per-variant payload structure of any
+        // multi-variant ADT account type. Pre-v2.24 the fingerprint
+        // only saw the flat `state_fields` union, so a spec that now
+        // triggers the wrapper-struct + inner-enum emission (S5b)
+        // wouldn't show a fingerprint change between v2.23 and v2.24
+        // output. Hashing the variants here gives users a visible
+        // signal that the on-disk state.rs needs regenerating after
+        // upgrading.
+        for acct in &spec.account_types {
+            if acct.variants.len() <= 1 {
+                continue;
+            }
+            c.push_str(&format!("variant_state_acct={}\n", acct.name));
+            for variant in &acct.variants {
+                c.push_str(&format!("  variant={}\n", variant.name));
+                for (fname, ftype) in &variant.fields {
+                    c.push_str(&format!("    {}:{}\n", fname, ftype));
+                }
+            }
+        }
         hashes.insert("src/state.rs".to_string(), section_hash(&c));
     }
 
@@ -313,6 +333,65 @@ property bounded :
         let fp1 = compute_fingerprint(&spec1);
         let fp2 = compute_fingerprint(&spec2);
         assert_eq!(fp1.file_hashes, fp2.file_hashes);
+    }
+
+    /// v2.24 S5i — adding (or restructuring) a variant on a
+    /// multi-variant ADT must bump the `src/state.rs` fingerprint so
+    /// the on-disk emission gets regenerated. Pre-S5i the fingerprint
+    /// only hashed the flat `state_fields` union, so two specs that
+    /// agreed on the union but disagreed on the per-variant layout
+    /// produced identical hashes. With S5b's wrapper-struct +
+    /// inner-enum emission that's a real divergence at codegen time.
+    #[test]
+    fn test_fingerprint_state_changes_on_variant_restructure() {
+        let spec_one_variant = r#"
+spec Vault
+type State
+  | Active of { owner : Pubkey, balance : U64, }
+"#;
+        let spec_two_variants = r#"
+spec Vault
+type State
+  | Uninitialized
+  | Active of { owner : Pubkey, balance : U64, }
+"#;
+        let fp_one =
+            compute_fingerprint(&crate::chumsky_adapter::parse_str(spec_one_variant).unwrap());
+        let fp_two =
+            compute_fingerprint(&crate::chumsky_adapter::parse_str(spec_two_variants).unwrap());
+        assert_ne!(
+            fp_one.file_hashes.get("src/state.rs"),
+            fp_two.file_hashes.get("src/state.rs"),
+            "adding a variant must invalidate the state.rs fingerprint"
+        );
+    }
+
+    /// v2.24 S5i — moving a field between variants (without changing
+    /// the flat union) must still bump the state.rs fingerprint.
+    /// Pre-S5i `balance` lived in `state_fields` either way, so the
+    /// flat hash didn't see the move; the wrapper+enum emission would
+    /// silently flip variant payloads.
+    #[test]
+    fn test_fingerprint_state_changes_on_variant_field_move() {
+        let spec_a = r#"
+spec Vault
+type State
+  | Uninitialized
+  | Active of { owner : Pubkey, balance : U64, }
+"#;
+        let spec_b = r#"
+spec Vault
+type State
+  | Uninitialized of { balance : U64, }
+  | Active of { owner : Pubkey, }
+"#;
+        let fp_a = compute_fingerprint(&crate::chumsky_adapter::parse_str(spec_a).unwrap());
+        let fp_b = compute_fingerprint(&crate::chumsky_adapter::parse_str(spec_b).unwrap());
+        assert_ne!(
+            fp_a.file_hashes.get("src/state.rs"),
+            fp_b.file_hashes.get("src/state.rs"),
+            "moving a field between variants must invalidate the state.rs fingerprint"
+        );
     }
 
     #[test]

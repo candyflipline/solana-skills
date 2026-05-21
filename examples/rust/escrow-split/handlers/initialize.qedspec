@@ -17,8 +17,8 @@ handler initialize (deposit_amount : U64) (receive_amount : U64) : State.Uniniti
   requires deposit_amount > 0 and receive_amount > 0 else InvalidAmount
 
   effect {
-    initializer_amount := deposit_amount
-    taker_amount := receive_amount
+    Open.initializer_amount := deposit_amount
+    Open.taker_amount := receive_amount
   }
 
   call Token.transfer(
