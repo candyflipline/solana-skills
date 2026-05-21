@@ -3099,6 +3099,9 @@ fn adapt_handler(h: &a::HandlerDecl, consts: ConstTable, env: &TypeEnv) -> Parse
                     target_interface: iface,
                     target_handler: handler_name,
                     args,
+                    // v2.24 #11 — propagate optional `let <name> =`
+                    // binding through to downstream backends.
+                    result_binding: c.result_binding.clone(),
                 });
             }
         }
@@ -3223,6 +3226,68 @@ mod tests {
 
     const PERCOLATOR_SPEC: &str =
         include_str!("../../../examples/rust/percolator/percolator.qedspec");
+
+    /// v2.24 #11 — `let X = call Foo.handler(...)` parses and the
+    /// adapter records the binding name on `ParsedCall.result_binding`.
+    /// Pre-fix `call` was strictly terminal; capturing a callee return
+    /// value (e.g. `absorb_loss` returning the actually-burned amount)
+    /// required out-of-band threading via params.
+    #[test]
+    fn call_with_let_binding_records_result_name() {
+        let src = r#"spec CallLet
+program_id "11111111111111111111111111111111"
+
+interface Pool {
+  program_id "11111111111111111111111111111111"
+  handler absorb_loss (amount : U64) {
+    accounts {
+      vault : writable
+    }
+  }
+}
+
+type State
+  | Active of { total_loss : U64 }
+
+type Error
+  | MathOverflow
+
+handler liquidate (loss : U64) : State.Active -> State.Active {
+  permissionless
+  let burned = call Pool.absorb_loss(amount = loss)
+  effect { Active.total_loss += loss }
+}
+
+handler unbound_call : State.Active -> State.Active {
+  permissionless
+  call Pool.absorb_loss(amount = 1)
+  effect { Active.total_loss += 1 }
+}
+"#;
+        let spec = parse_str(src).expect("parse");
+        let liquidate = spec
+            .handlers
+            .iter()
+            .find(|h| h.name == "liquidate")
+            .expect("liquidate handler");
+        let unbound = spec
+            .handlers
+            .iter()
+            .find(|h| h.name == "unbound_call")
+            .expect("unbound_call handler");
+        assert_eq!(liquidate.calls.len(), 1);
+        assert_eq!(
+            liquidate.calls[0].result_binding.as_deref(),
+            Some("burned"),
+            "result_binding should carry the `let` name; got: {:?}",
+            liquidate.calls[0].result_binding
+        );
+        assert_eq!(unbound.calls.len(), 1);
+        assert_eq!(
+            unbound.calls[0].result_binding, None,
+            "bare `call …` keeps result_binding None"
+        );
+    }
 
     /// v2.24 #1 — top-level `schema name { requires … }` blocks parse,
     /// and a handler's `include <schema>` clause expands every requires

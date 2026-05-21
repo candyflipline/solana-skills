@@ -614,6 +614,14 @@ pub struct ParsedCall {
     pub target_interface: String,
     pub target_handler: String,
     pub args: Vec<ParsedCallArg>,
+    /// v2.24 #11 — set when the call appeared as
+    /// `let <name> = call …`. Downstream backends bind the
+    /// callee's return value to this identifier so subsequent
+    /// effects / requires can reference it. Tier-1/2 interfaces
+    /// that declare a handler return type fully drive the
+    /// resulting Rust / Lean shape; Tier-0 interfaces fall back
+    /// to an opaque placeholder.
+    pub result_binding: Option<String>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -684,6 +692,7 @@ impl ParsedHandler {
                         rust_expr_pod: t.authority.clone().unwrap_or_default(),
                     },
                 ],
+                result_binding: None,
             })
             .collect();
         out.extend(self.calls.iter().cloned());
@@ -5984,6 +5993,7 @@ mod tests {
             target_interface: "Token".to_string(),
             target_handler: "initialize_mint".to_string(),
             args: vec![],
+            result_binding: None,
         }];
         let spec = ParsedSpec {
             handlers: vec![h],

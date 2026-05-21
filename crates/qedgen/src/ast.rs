@@ -385,6 +385,12 @@ pub struct CallExpr {
     pub target: QualifiedPath,
     /// Keyword arguments, in source order. Positional args are not allowed.
     pub args: Vec<CallArg>,
+    /// v2.24 #11 — optional `let <name> = call …` binding. When `Some`,
+    /// the call's return value is bound to the given identifier so
+    /// downstream effects / requires can reference it. The interface
+    /// handler's return-type declaration is what gives the binding a
+    /// real semantics; without it the binding is opaque.
+    pub result_binding: Option<String>,
 }
 
 #[derive(Debug, Clone)]

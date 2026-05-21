@@ -1244,14 +1244,54 @@ fn handler_clause<'a>() -> impl Parser<'a, &'a str, HandlerClause, Err<'a>> + Cl
         .then_ignore(just(']'))
         .map(HandlerClause::Modifies);
 
+    // v2.24 #11 — `let <ident> = call Foo.handler(...)` binds the
+    // call's return value, OR `let <ident> = <expr>` is the existing
+    // handler-level let. The two forms diverge after the `=`; the
+    // call form is tried first so the parser doesn't commit to an
+    // expression and then choke on `call`. Local enum (anonymous via
+    // the closure capture) carries the disambiguated RHS form.
+    enum LetRhs {
+        Expr(Node<Expr>),
+        Call(QualifiedPath, Vec<CallArg>),
+    }
     let let_c = just("let")
         .then_ignore(wsc())
         .ignore_then(non_keyword_ident())
         .then_ignore(wsc())
         .then_ignore(just('='))
         .then_ignore(wsc())
-        .then(expr())
-        .map(|(name, value)| HandlerClause::Let { name, value });
+        .then(choice((
+            just("call")
+                .then_ignore(wsc())
+                .ignore_then(qualified_path())
+                .then_ignore(wsc())
+                .then_ignore(just('('))
+                .then_ignore(wsc())
+                .then(
+                    non_keyword_ident()
+                        .then_ignore(wsc())
+                        .then_ignore(just('='))
+                        .then_ignore(wsc())
+                        .then(expr())
+                        .map(|(name, value)| CallArg { name, value })
+                        .then_ignore(wsc())
+                        .separated_by(just(',').then_ignore(wsc()))
+                        .allow_trailing()
+                        .collect::<Vec<CallArg>>(),
+                )
+                .then_ignore(wsc())
+                .then_ignore(just(')'))
+                .map(|(target, args)| LetRhs::Call(target, args)),
+            expr().map(LetRhs::Expr),
+        )))
+        .map(|(name, rhs)| match rhs {
+            LetRhs::Expr(value) => HandlerClause::Let { name, value },
+            LetRhs::Call(target, args) => HandlerClause::Call(CallExpr {
+                target,
+                args,
+                result_binding: Some(name),
+            }),
+        });
 
     // v2.20 §S1.2 — `effect { … }` admits leaf stmts and `match` blocks.
     let effect = just("effect")
@@ -1438,22 +1478,49 @@ fn handler_clause<'a>() -> impl Parser<'a, &'a str, HandlerClause, Err<'a>> + Cl
         .then(expr())
         .map(|(name, value)| CallArg { name, value });
 
-    let call_c = just("call")
+    // v2.24 #11 — optional `let <ident> = ` prefix binds the call's
+    // return value. Without the prefix the call remains a terminal
+    // statement (existing shape). Interface handlers can declare a
+    // return type; without it the binding is opaque and downstream
+    // backends emit a placeholder until full lowering lands.
+    let call_let_prefix = kw("let")
+        .ignore_then(non_keyword_ident())
+        .then_ignore(wsc())
+        .then_ignore(just('='))
+        .then_ignore(wsc());
+    let call_args = call_kw_arg
+        .then_ignore(wsc())
+        .separated_by(just(',').then_ignore(wsc()))
+        .allow_trailing()
+        .collect::<Vec<CallArg>>();
+    let call_body = just("call")
         .then_ignore(wsc())
         .ignore_then(qualified_path())
         .then_ignore(wsc())
         .then_ignore(just('('))
         .then_ignore(wsc())
-        .then(
-            call_kw_arg
-                .then_ignore(wsc())
-                .separated_by(just(',').then_ignore(wsc()))
-                .allow_trailing()
-                .collect::<Vec<CallArg>>(),
-        )
+        .then(call_args.clone())
         .then_ignore(wsc())
-        .then_ignore(just(')'))
-        .map(|(target, args)| HandlerClause::Call(CallExpr { target, args }));
+        .then_ignore(just(')'));
+    let call_c = choice((
+        // Try the bound form first so the bare `call …` doesn't shadow it.
+        call_let_prefix
+            .then(call_body.clone())
+            .map(|(binding, (target, args))| {
+                HandlerClause::Call(CallExpr {
+                    target,
+                    args,
+                    result_binding: Some(binding),
+                })
+            }),
+        call_body.map(|(target, args)| {
+            HandlerClause::Call(CallExpr {
+                target,
+                args,
+                result_binding: None,
+            })
+        }),
+    ));
 
     // `choice()` has an arity limit; split into groups.
     let grp_a = choice((auth, accounts, requires, ensures, modifies, let_c, effect));
