@@ -1954,6 +1954,28 @@ fn mechanize_effect(
     if !simple_rhs {
         return None;
     }
+    // v2.24 S5c — if the LHS root matches a multi-variant ADT
+    // variant name (e.g. `Active.balance`), the flat
+    // `self.<acct>.<field>` lowering doesn't apply. The wrapper +
+    // inner-enum shape from S5b requires `match &mut self.<acct>.inner
+    // { Inner::Active { balance, .. } => *balance = … }` instead.
+    // The variant-state lowering at `emit_variant_state_handler_body`
+    // handles same-variant; cross-variant (init/promote) currently
+    // bails out — which is where this guard comes in. Returning
+    // `None` here surfaces the effect as a `// Spec effect (needs
+    // fill)` comment + a trailing `todo!()` so the user notices
+    // they need to fill the promotion, instead of getting a silent
+    // miscompile like `self.vault.Active.balance = initial;`.
+    if field.contains('.') {
+        let head = field.split('.').next().unwrap_or("");
+        let is_variant = spec
+            .account_types
+            .iter()
+            .any(|a| a.variants.iter().any(|v| v.name == head));
+        if is_variant {
+            return None;
+        }
+    }
 
     // Anchor / Quasar handler bodies bind state as `self.<acct>.<field>`,
     // so a bare state-field RHS (e.g. `bid_buyer := state.rfp_buyer` after
@@ -2060,6 +2082,262 @@ fn mechanize_effect(
         _ => return None,
     };
     Some(line)
+}
+
+/// v2.24 S5c — strip a leading `Variant.` prefix from an effect LHS
+/// when the root matches a known variant on the spec's single state
+/// account. `Active.pool` → `pool`; `accounts[i].cap` → unchanged;
+/// `pool` → unchanged. Pure string transform — the lint side keeps
+/// `variant_fields` indexed for validation; this just normalizes
+/// for downstream emission.
+fn strip_variant_prefix(lhs: &str, spec: &ParsedSpec) -> String {
+    if let Some(dot) = lhs.find('.') {
+        let head = &lhs[..dot];
+        let is_variant = spec
+            .account_types
+            .iter()
+            .any(|a| a.variants.iter().any(|v| v.name == head));
+        if is_variant {
+            return lhs[dot + 1..].to_string();
+        }
+    }
+    lhs.to_string()
+}
+
+/// v2.24 S5c — emit one effect line in destructured-variant context.
+/// `mechanize_effect`'s sibling for the multi-variant ADT path: the
+/// state binder is a destructured local (e.g. `pool: &mut u64` from
+/// `match &mut self.<acct>.inner { Inner::Active { pool, .. } => …`),
+/// not `self.<acct>.<field>`. Emit `*pool = …` or `pool[i] = …`
+/// instead of `self.<acct>.pool = …`. Falls back to `None` for
+/// non-scalar / non-indexed shapes the caller can route to a fresh
+/// per-effect `todo!()`.
+fn mechanize_effect_destructured(
+    effect: &(String, String, String),
+    on_error: Option<&str>,
+    handler: &ParsedHandler,
+    spec: &ParsedSpec,
+) -> Option<String> {
+    let (field_raw, op_kind, value) = effect;
+    let simple_rhs = value
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == '-');
+    if !simple_rhs {
+        return None;
+    }
+    // Strip variant prefix (`Active.pool` → `pool`) and normalize
+    // indexed-access form. The destructured binding is the bare
+    // field root — `pool[i]` keeps the indexing in place; scalar
+    // bindings carry an extra `*` deref to write through `&mut T`.
+    let field = strip_variant_prefix(field_raw, spec);
+    let field = rewrite_index_to_usize(&field);
+    let is_indexed = field.contains('[');
+    // The destructure binding shadows the field name in scope, so a
+    // bare-identifier RHS that names a sibling state field resolves
+    // directly (no `self.<acct>.` prefix). For params, the resolver
+    // already returns the bare name.
+    let rhs = crate::rust_codegen_util::resolve_value(value, handler, spec, None);
+
+    let err_enum = format!("{}Error", to_pascal_case(&spec.program_name));
+    let has_decl = |name: &str| spec.error_codes.iter().any(|c| c == name);
+    let pragma_overflow = spec.pragma_value("checked_overflow_error");
+    let pragma_underflow = spec.pragma_value("checked_underflow_error");
+    let builtin_underflow = if has_decl("MathUnderflow") || !has_decl("MathOverflow") {
+        "MathUnderflow"
+    } else {
+        "MathOverflow"
+    };
+    let overflow_variant = on_error.or(pragma_overflow).unwrap_or("MathOverflow");
+    let underflow_variant = on_error.or(pragma_underflow).unwrap_or(builtin_underflow);
+
+    // Scalars need an explicit deref to write through `&mut T`;
+    // indexed access through `&mut [T; N]` works as-is.
+    let lhs = if is_indexed {
+        field.clone()
+    } else {
+        format!("*{}", field)
+    };
+    // Method calls auto-deref `&mut T`, so the RHS-side read can
+    // stay as the bare binding name even for scalar bindings.
+    let read = strip_array_index_suffix(&field);
+
+    let line = match op_kind.as_str() {
+        "set" => format!("            {} = {};\n", lhs, rhs),
+        "add" => format!(
+            "            {} = {}.checked_add({}).ok_or({}::{})?;\n",
+            lhs, read, rhs, err_enum, overflow_variant
+        ),
+        "add_sat" => format!(
+            "            {} = {}.saturating_add({});\n",
+            lhs, read, rhs
+        ),
+        "add_wrap" => format!(
+            "            {} = {}.wrapping_add({});\n",
+            lhs, read, rhs
+        ),
+        "sub" => format!(
+            "            {} = {}.checked_sub({}).ok_or({}::{})?;\n",
+            lhs, read, rhs, err_enum, underflow_variant
+        ),
+        "sub_sat" => format!(
+            "            {} = {}.saturating_sub({});\n",
+            lhs, read, rhs
+        ),
+        "sub_wrap" => format!(
+            "            {} = {}.wrapping_sub({});\n",
+            lhs, read, rhs
+        ),
+        _ => return None,
+    };
+    Some(line)
+}
+
+/// v2.24 S5c — drop `[<idx>]` from a destructured field reference so
+/// the RHS-side read uses the bare binding name. `voted[i as usize]`
+/// → `voted`. Pure substring chop; safe for the simple shapes the
+/// destructured emitter accepts.
+fn strip_array_index_suffix(field: &str) -> String {
+    match field.find('[') {
+        Some(i) => field[..i].to_string(),
+        None => field.to_string(),
+    }
+}
+
+/// v2.24 S5c — emit the complete handler body block for a
+/// multi-variant ADT state. Wraps the per-effect lines in a
+/// destructure-and-mutate (same-variant) or destructure-and-promote
+/// (cross-variant) match block. Returns `None` when the handler
+/// shape isn't yet supported by this lowering pass — callers fall
+/// back to the per-effect loop (which emits `todo!()` for any
+/// unmechanized effect).
+///
+/// Same-variant pattern:
+///
+/// ```ignore
+/// match &mut self.<acct>.inner {
+///     <Inner>::<Variant> { f1, f2, .. } => {
+///         *f1 = …;
+///         f2[i as usize] = …;
+///     }
+///     _ => return Err(<Err>::WrongState.into()),
+/// }
+/// ```
+///
+/// Cross-variant (init / promote) is deferred — the wrapping
+/// `set_inner(Inner::Post { … })` requires picking a payload for
+/// every field of the post variant, which often needs spec data
+/// the agent fills in (CPI return values, event-binding sources).
+/// Today that lands as a `todo!()` line; v2.24.1 / v2.25 may grow
+/// a richer codegen path.
+fn emit_variant_state_handler_body(
+    handler: &ParsedHandler,
+    spec: &ParsedSpec,
+    target: Target,
+    state_acct: &crate::check::ParsedHandlerAccount,
+) -> Option<String> {
+    if !matches!(target, Target::Anchor) {
+        return None;
+    }
+    if !is_multi_variant_adt_state(spec) {
+        return None;
+    }
+    let pre = handler.pre_status.as_deref()?;
+    let post = handler.post_status.as_deref()?;
+    // Cross-variant promotion is more involved (need to assemble
+    // every field of the post variant, often from CPI / event /
+    // param sources). Same-variant lowering is the common case
+    // and lands first; cross-variant returns `None` so the caller
+    // falls through to the per-effect `todo!()` path.
+    if pre != post {
+        return None;
+    }
+    // WrongState is the error variant returned on a variant
+    // mismatch. Demand it's declared so codegen doesn't emit a
+    // dangling reference to an undeclared error variant.
+    let has_wrong_state = spec.error_codes.iter().any(|c| c == "WrongState");
+    if !has_wrong_state {
+        return None;
+    }
+
+    let acct = spec.account_types.first()?;
+    let post_variant = acct.variants.iter().find(|v| v.name == post)?;
+    let inner_name = format!(
+        "{}AccountInner",
+        to_pascal_case(&spec.program_name)
+    );
+    let err_enum = format!("{}Error", to_pascal_case(&spec.program_name));
+    let acct_binder = &state_acct.name;
+
+    // Collect the unique set of bare field names referenced on the
+    // LHS of any effect (after stripping `<Variant>.` prefix and
+    // any `[…]` indexing). These go into the match destructure
+    // pattern so the inner block can rebind them.
+    let mut mutated_fields: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    for (lhs, _, _) in &handler.effects {
+        let stripped = strip_variant_prefix(lhs, spec);
+        let bare = strip_array_index_suffix(&stripped);
+        // Only fields that actually live on the post variant get
+        // destructured. References that don't match are a spec
+        // bug — fall back so the per-effect path emits a clear
+        // `todo!()` with the offending line surfaced verbatim.
+        if !post_variant.fields.iter().any(|(n, _)| n == &bare) {
+            return None;
+        }
+        mutated_fields.insert(bare);
+    }
+    if mutated_fields.is_empty() {
+        // Pure read-only handler (no effects on state). Emit a
+        // skip-style match so the runtime still rejects the wrong
+        // variant — the guard layer doesn't catch variant drift on
+        // its own.
+        let mut out = String::new();
+        out.push_str(&format!(
+            "        match self.{}.inner {{\n",
+            acct_binder
+        ));
+        out.push_str(&format!(
+            "            {}::{} {{ .. }} => {{}}\n",
+            inner_name, post
+        ));
+        out.push_str(&format!(
+            "            _ => return Err({}::WrongState.into()),\n",
+            err_enum
+        ));
+        out.push_str("        }\n");
+        return Some(out);
+    }
+
+    let destructure = mutated_fields
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "        match &mut self.{}.inner {{\n",
+        acct_binder
+    ));
+    out.push_str(&format!(
+        "            {}::{} {{ {}, .. }} => {{\n",
+        inner_name, post, destructure
+    ));
+    for (idx, effect) in handler.effects.iter().enumerate() {
+        let on_error = handler
+            .effect_on_error
+            .get(idx)
+            .and_then(|o| o.as_deref());
+        let line = mechanize_effect_destructured(effect, on_error, handler, spec)?;
+        out.push_str(&line);
+    }
+    out.push_str("            }\n");
+    out.push_str(&format!(
+        "            _ => return Err({}::WrongState.into()),\n",
+        err_enum
+    ));
+    out.push_str("        }\n");
+    Some(out)
 }
 
 /// Render the `#[derive(Accounts)] pub struct X<'info>? { fields }`
@@ -2304,25 +2582,39 @@ fn render_handler_scaffold(
     // and forces a trailing `todo!()` so the user / an LLM (M4) fills it in.
     let state_acct = find_state_account(handler);
     let mut any_unmechanized = false;
-    for (idx, effect) in handler.effects.iter().enumerate() {
-        // v2.24 §S1a — per-site error-variant override, indexed parallel
-        // to `effects`. Missing entry = `None` (silent fallback to pragma
-        // / built-in default inside mechanize_effect).
-        let on_error = handler
-            .effect_on_error
-            .get(idx)
-            .and_then(|o| o.as_deref());
-        let mechanized = state_acct
-            .and_then(|sa| mechanize_effect(effect, on_error, sa, handler, spec, target));
-        match mechanized {
-            Some(line) => out.push_str(&line),
-            None => {
-                let (field, op_kind, value) = effect;
-                out.push_str(&format!(
-                    "        // Spec effect (needs fill): {} {} {}\n",
-                    field, op_kind, value
-                ));
-                any_unmechanized = true;
+    // v2.24 S5c — multi-variant ADT specs need a different lowering
+    // shape: the wrapper-struct + inner-enum emission from S5b means
+    // `self.<acct>.<field>` no longer resolves; effects must run
+    // inside a `match &mut self.<acct>.inner { Inner::<post> { … }
+    // => …, _ => Err(WrongState) }` block. Try the variant-aware
+    // emitter first; on `None`, fall through to the per-effect
+    // path (which will emit `// Spec effect (needs fill)` + the
+    // trailing `todo!()` for cross-variant / non-mechanical shapes).
+    let variant_body = state_acct
+        .and_then(|sa| emit_variant_state_handler_body(handler, spec, target, sa));
+    if let Some(body) = variant_body {
+        out.push_str(&body);
+    } else {
+        for (idx, effect) in handler.effects.iter().enumerate() {
+            // v2.24 §S1a — per-site error-variant override, indexed parallel
+            // to `effects`. Missing entry = `None` (silent fallback to pragma
+            // / built-in default inside mechanize_effect).
+            let on_error = handler
+                .effect_on_error
+                .get(idx)
+                .and_then(|o| o.as_deref());
+            let mechanized = state_acct
+                .and_then(|sa| mechanize_effect(effect, on_error, sa, handler, spec, target));
+            match mechanized {
+                Some(line) => out.push_str(&line),
+                None => {
+                    let (field, op_kind, value) = effect;
+                    out.push_str(&format!(
+                        "        // Spec effect (needs fill): {} {} {}\n",
+                        field, op_kind, value
+                    ));
+                    any_unmechanized = true;
+                }
             }
         }
     }
@@ -3610,6 +3902,145 @@ handler initialize (amount : U64) : State.Uninitialized -> State.Open {
         assert!(
             !state.contains("pub initializer: Pubkey,\n    pub taker: Pubkey,"),
             "wrapper should not carry flattened fields directly; got:\n{state}"
+        );
+    }
+
+    /// v2.24 S5c — same-variant handler bodies lower to a
+    /// `match &mut self.<acct>.inner { Inner::<post> { … } => { … },
+    ///  _ => Err(WrongState.into()) }` block when the spec is a
+    /// multi-variant ADT. Locks the new emission shape so a future
+    /// regression that emits the legacy `self.<acct>.<field> = …`
+    /// (which no longer compiles against the S5b wrapper+enum) fails
+    /// fast.
+    #[test]
+    fn variant_state_lowers_same_variant_handler_to_match_block() {
+        let src = r#"spec Vault
+
+type State
+  | Uninitialized
+  | Active of {
+      owner   : Pubkey,
+      balance : U64,
+    }
+
+type Error
+  | MathOverflow
+  | WrongState
+
+handler deposit (amount : U64) : State.Active -> State.Active {
+  auth owner
+  accounts {
+    vault : writable
+    owner : signer
+  }
+  requires amount > 0 else MathOverflow
+  effect {
+    Active.balance += amount
+  }
+}
+"#;
+        let spec = crate::chumsky_adapter::parse_str(src).unwrap();
+        let fp = crate::fingerprint::compute_fingerprint(&spec);
+        let dir = tempfile::tempdir().unwrap();
+        let spec_path = dir.path().join("vault.qedspec");
+        let out_dir = dir.path().join("programs");
+        std::fs::write(&spec_path, src).unwrap();
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        generate_lib(&spec, &fp, &out_dir, Target::Anchor).unwrap();
+        generate_instructions(&spec, &fp, &spec_path, &out_dir, Target::Anchor).unwrap();
+
+        let deposit =
+            std::fs::read_to_string(out_dir.join("src/instructions/deposit.rs")).unwrap();
+
+        // Match-wrapped body lands.
+        assert!(
+            deposit.contains("match &mut self.vault.inner"),
+            "expected variant match destructure; got:\n{deposit}"
+        );
+        assert!(
+            deposit.contains("VaultAccountInner::Active { balance, .. } =>"),
+            "expected destructure pattern naming only the mutated field; got:\n{deposit}"
+        );
+
+        // Effect line uses the destructured binding (no `self.vault.balance`).
+        assert!(
+            deposit.contains(
+                "*balance = balance.checked_add(amount).ok_or(VaultError::MathOverflow)?;"
+            ),
+            "expected destructured checked_add line; got:\n{deposit}"
+        );
+
+        // Wrong-variant fallthrough.
+        assert!(
+            deposit.contains("_ => return Err(VaultError::WrongState.into()),"),
+            "expected WrongState fallthrough arm; got:\n{deposit}"
+        );
+
+        // Legacy `self.vault.balance` shape must NOT appear.
+        assert!(
+            !deposit.contains("self.vault.balance"),
+            "legacy flat-field handler body should not appear under variant-state lowering; got:\n{deposit}"
+        );
+    }
+
+    /// v2.24 S5c — cross-variant (init / promote) handlers are not
+    /// yet covered by the variant-state lowering; today they fall
+    /// back to the per-effect path, which surfaces the unmechanized
+    /// effects as `// Spec effect (needs fill)` comments + a trailing
+    /// `todo!()`. Locks the bail-out shape so a future regression
+    /// that *silently* miscompiles cross-variant handlers fails fast
+    /// (loud todo > silent miscompile).
+    #[test]
+    fn variant_state_bails_out_on_cross_variant_handler() {
+        let src = r#"spec Vault
+
+type State
+  | Uninitialized
+  | Active of {
+      owner   : Pubkey,
+      balance : U64,
+    }
+
+type Error
+  | MathOverflow
+  | WrongState
+
+handler create (initial : U64) : State.Uninitialized -> State.Active {
+  auth owner
+  accounts {
+    vault : writable
+    owner : signer
+  }
+  requires initial > 0 else MathOverflow
+  effect {
+    Active.balance := initial
+  }
+}
+"#;
+        let spec = crate::chumsky_adapter::parse_str(src).unwrap();
+        let fp = crate::fingerprint::compute_fingerprint(&spec);
+        let dir = tempfile::tempdir().unwrap();
+        let spec_path = dir.path().join("vault.qedspec");
+        let out_dir = dir.path().join("programs");
+        std::fs::write(&spec_path, src).unwrap();
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        generate_lib(&spec, &fp, &out_dir, Target::Anchor).unwrap();
+        generate_instructions(&spec, &fp, &spec_path, &out_dir, Target::Anchor).unwrap();
+
+        let create =
+            std::fs::read_to_string(out_dir.join("src/instructions/create.rs")).unwrap();
+
+        // Cross-variant — no match block.
+        assert!(
+            !create.contains("match &mut self.vault.inner"),
+            "cross-variant lowering not yet supported; should fall back to per-effect path; got:\n{create}"
+        );
+        // Trailing todo!() so the user knows what's left.
+        assert!(
+            create.contains("todo!("),
+            "cross-variant fallback should emit a trailing todo!(); got:\n{create}"
         );
     }
 

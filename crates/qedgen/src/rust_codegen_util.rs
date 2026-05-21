@@ -538,9 +538,45 @@ pub fn check_effect_targets(spec: &ParsedSpec) -> anyhow::Result<()> {
         }
     }
 
+    // v2.24 S5c — variant-prefixed effect targets (`Active.balance`) are
+    // legal under the wrapper-struct + inner-enum codegen. The base
+    // matches a variant name on a multi-variant ADT account; the second
+    // segment is the actual field. Build a variant-fields index so the
+    // check can re-target at the field beneath the variant prefix
+    // instead of false-positive-bailing on the variant name.
+    let mut variant_fields: std::collections::HashMap<&str, HashSet<&str>> =
+        std::collections::HashMap::new();
+    for acct in &spec.account_types {
+        for variant in &acct.variants {
+            let entry = variant_fields.entry(variant.name.as_str()).or_default();
+            for (n, _) in &variant.fields {
+                entry.insert(n.as_str());
+            }
+        }
+    }
+
     for handler in &spec.handlers {
         for (field, _kind, _value) in &handler.effects {
             let base = effect_target_base(field);
+            // Variant-prefixed: the root is a variant name, so check
+            // the field beneath it against that variant's payload.
+            if let Some(variant_payload) = variant_fields.get(base) {
+                let after = field.trim_start_matches(base).trim_start_matches('.');
+                let nested_base = effect_target_base(after);
+                if !nested_base.is_empty()
+                    && !variant_payload.contains(nested_base)
+                    && !declared.contains(nested_base)
+                {
+                    anyhow::bail!(
+                        "handler `{}` writes effect target `{}` but `{}` is not declared in variant `{}`'s payload — add it to the variant or rename the effect",
+                        handler.name,
+                        field,
+                        nested_base,
+                        base,
+                    );
+                }
+                continue;
+            }
             if !declared.contains(base) {
                 anyhow::bail!(
                     "handler `{}` writes effect target `{}` but `{}` is not declared in any state, account, record, or sum-variant payload — add it to the state declaration or remove the effect",
