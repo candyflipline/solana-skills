@@ -851,6 +851,21 @@ fn generate_lib(
     Ok(())
 }
 
+/// v2.24 S5b — `true` when the spec's state is a multi-variant ADT
+/// (two or more variants in a single account type). Drives codegen
+/// to emit the wrapper-struct + inner-enum pattern instead of the
+/// flat-fields struct + parallel `Status` enum the pre-v2.24 path
+/// produced. Single-record account types, single-variant ADTs, and
+/// multi-account specs stay on the flat path.
+fn is_multi_variant_adt_state(spec: &ParsedSpec) -> bool {
+    spec.account_types.len() == 1
+        && spec
+            .account_types
+            .first()
+            .map(|a| a.variants.len() > 1)
+            .unwrap_or(false)
+}
+
 /// Generate src/state.rs
 fn generate_state(
     spec: &ParsedSpec,
@@ -957,6 +972,64 @@ fn generate_state(
                 out.push_str("}\n\n");
             }
         }
+    } else if is_multi_variant_adt_state(spec) && matches!(target, Target::Anchor) {
+        // v2.24 S5b — multi-variant ADT state lowers to a wrapper-struct
+        // + inner-enum pair. Anchor 0.32.1's `#[account]` hard-requires
+        // a struct (anchor-attribute-account-0.32.1/src/lib.rs:106), so
+        // the wrapper carries the discriminator + AccountSerialize
+        // while the inner enum carries the actual variant payloads.
+        // Borsh discriminates variants by declaration-order tag (the
+        // role the legacy `status: u8` byte used to play, now handled
+        // by the enum's own representation). See the smoke fixture at
+        // `/tmp/anchor_enum_test/` for the validated pattern, and
+        // [[reference_anchor_account_struct_only]] in user memory.
+        //
+        // Quasar's zero-copy `#[account]` is incompatible with enum
+        // payloads (alignment / `#[repr(C)]` constraints); this branch
+        // is intentionally Anchor-only. Quasar multi-variant ADT specs
+        // still go through the flat-struct branch below until that
+        // target gets its own enum emission story.
+        let state_name = format!("{}Account", to_pascal_case(&spec.program_name));
+        let inner_name = format!("{}Inner", state_name);
+        let acct = &spec.account_types[0];
+
+        out.push_str("#[account]\n");
+        out.push_str("#[derive(InitSpace)]\n");
+        out.push_str(&format!("pub struct {} {{\n", state_name));
+        out.push_str(&format!("    pub inner: {},\n", inner_name));
+        if !spec.pdas.is_empty() && !spec.state_fields.iter().any(|(n, _)| n == "bump") {
+            out.push_str("    pub bump: u8,\n");
+        }
+        out.push_str("}\n\n");
+
+        out.push_str(&format!(
+            "/// Variant-payload state for {0}. The Anchor wrapper above\n\
+             /// carries the account discriminator; this enum carries the\n\
+             /// state-machine variant + per-variant payload fields.\n",
+            state_name
+        ));
+        out.push_str(
+            "#[derive(AnchorSerialize, AnchorDeserialize, InitSpace, Clone, Debug, PartialEq)]\n",
+        );
+        out.push_str(&format!("pub enum {} {{\n", inner_name));
+        for variant in &acct.variants {
+            if variant.fields.is_empty() {
+                // Unit-style variant (no payload). `Uninitialized`,
+                // `Closed`, `HasProposal` shapes all go through here.
+                out.push_str(&format!("    {},\n", variant.name));
+            } else {
+                out.push_str(&format!("    {} {{\n", variant.name));
+                for (fname, ftype) in &variant.fields {
+                    out.push_str(&format!(
+                        "        {}: {},\n",
+                        fname,
+                        map_type_for_target(ftype, spec, target)?
+                    ));
+                }
+                out.push_str("    },\n");
+            }
+        }
+        out.push_str("}\n");
     } else {
         let state_name = format!("{}Account", to_pascal_case(&spec.program_name));
 
@@ -3438,6 +3511,106 @@ handler cancel : State.Open -> State.Closed {
         assert!(guards.contains("EscrowError::Unauthorized.into()"));
         assert!(guards.contains("EscrowError::InvalidLifecycle.into()"));
         assert!(!guards.contains("to_account_view"));
+    }
+
+    /// v2.24 S5b — multi-variant ADT state lowers to the
+    /// `#[account] pub struct Wrapper { pub inner: WrapperInner }` +
+    /// `pub enum WrapperInner { … }` pattern. Smoke fixture at
+    /// `/tmp/anchor_enum_test/` validated against Anchor 0.32.1
+    /// (see [[reference_anchor_account_struct_only]]). This test
+    /// pins the codegen output shape so a future regression that
+    /// flips back to flat-struct + `status: u8` fails fast.
+    #[test]
+    fn multi_variant_adt_emits_wrapper_struct_plus_inner_enum() {
+        let src = r#"spec Escrow
+
+type State
+  | Uninitialized
+  | Open of {
+      initializer        : Pubkey,
+      taker              : Pubkey,
+      initializer_amount : U64,
+      taker_amount       : U64,
+    }
+  | Closed
+
+type Error
+  | InvalidAmount
+
+handler initialize (amount : U64) : State.Uninitialized -> State.Open {
+  auth initializer
+  accounts {
+    initializer : signer, writable
+  }
+  requires amount > 0 else InvalidAmount
+  effect {
+    Open.initializer := initializer.pubkey
+  }
+}
+"#;
+        let spec = crate::chumsky_adapter::parse_str(src).unwrap();
+        let fp = crate::fingerprint::compute_fingerprint(&spec);
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path().join("programs");
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        generate_state(&spec, &fp, &out_dir, Target::Anchor).unwrap();
+        let state = std::fs::read_to_string(out_dir.join("src/state.rs")).unwrap();
+
+        // Wrapper struct carries `#[account]` + `InitSpace` and owns
+        // the discriminator. The smoke fixture proved this is the
+        // only pattern Anchor 0.32.1's struct-only `#[account]`
+        // macro accepts.
+        assert!(
+            state.contains("#[account]\n#[derive(InitSpace)]\npub struct EscrowAccount"),
+            "missing wrapper struct shape; got:\n{state}"
+        );
+        assert!(
+            state.contains("pub inner: EscrowAccountInner"),
+            "wrapper struct should hold the inner enum as `pub inner: …`; got:\n{state}"
+        );
+
+        // Inner enum carries the actual variants. No-payload variants
+        // stay unit-style; payload variants get struct-style fields.
+        assert!(
+            state.contains("#[derive(AnchorSerialize, AnchorDeserialize, InitSpace, Clone, Debug, PartialEq)]"),
+            "inner enum should carry Borsh + Clone + Debug + PartialEq derives; got:\n{state}"
+        );
+        assert!(
+            state.contains("pub enum EscrowAccountInner"),
+            "missing inner enum; got:\n{state}"
+        );
+        assert!(
+            state.contains("Uninitialized,"),
+            "unit-style variant missing; got:\n{state}"
+        );
+        assert!(
+            state.contains("Closed,"),
+            "second unit-style variant missing; got:\n{state}"
+        );
+        assert!(
+            state.contains("Open {")
+                && state.contains("initializer: Pubkey,")
+                && state.contains("initializer_amount: u64,"),
+            "payload variant missing fields; got:\n{state}"
+        );
+
+        // The legacy flat-fields shape must NOT appear: no
+        // `status: u8` discriminator field on the wrapper, no
+        // parallel `pub enum Status` enum, and no top-level
+        // `pub initializer:` on the wrapper struct.
+        assert!(
+            !state.contains("pub status: u8"),
+            "legacy `status: u8` discriminator should not appear for multi-variant ADT; got:\n{state}"
+        );
+        assert!(
+            !state.contains("pub enum Status {"),
+            "legacy `Status` enum should not appear for multi-variant ADT; got:\n{state}"
+        );
+        assert!(
+            !state.contains("pub initializer: Pubkey,\n    pub taker: Pubkey,"),
+            "wrapper should not carry flattened fields directly; got:\n{state}"
+        );
     }
 
     /// Quasar twin of the Anchor scaffold-imports test. Workstreams A + B
