@@ -1381,7 +1381,16 @@ fn lifecycle_check_line(
     // `inner` field. Post-write is a no-op — the effect lowering's
     // match arm (or set_inner for cross-variant promotion) is what
     // moves the variant.
-    if is_multi_variant_adt_state(spec) {
+    //
+    // v2.24.0 follow-up: gate on Anchor target. Quasar emits the
+    // legacy flat-struct `pub struct X { … status: u8, … }` shape
+    // even for multi-variant ADT specs (the wrapper-struct + inner-
+    // enum rewrite is Anchor-only — Quasar's zero-copy `#[account]`
+    // is incompatible with enum payloads). Emitting the `matches!
+    // (ctx.X.inner, …)` check on Quasar produces uncompilable code:
+    // there's no `inner` field on the Quasar wrapper. Quasar specs
+    // keep the legacy `status` byte check below.
+    if is_multi_variant_adt_state(spec) && matches!(surface.target, Target::Anchor) {
         if write {
             // The effect lowering handles variant transitions inline;
             // no separate post-write needed.
@@ -2603,7 +2612,18 @@ fn emit_cross_variant_promotion(
 /// no matching signer account, or `Unauthorized` not declared in
 /// `type Error`). The guard fires after the lifecycle pre-check, so
 /// the destructure is guaranteed to bind.
-fn emit_variant_auth_guard(handler: &ParsedHandler, spec: &ParsedSpec) -> String {
+fn emit_variant_auth_guard(handler: &ParsedHandler, spec: &ParsedSpec, target: Target) -> String {
+    // v2.24.0 follow-up: gate on Anchor target. Quasar keeps the
+    // flat-struct shape even for multi-variant ADT specs, so
+    // emitting a `let <Inner>::<Pre> { auth: auth_field, .. } = …`
+    // destructure references a type that doesn't exist on Quasar.
+    // The `has_one = X` suppression in check.rs::account_attr is
+    // also target-gated below — Quasar specs keep firing `has_one`
+    // (the flat-struct field IS accessible) and don't need the
+    // replacement destructure-check guard.
+    if !matches!(target, Target::Anchor) {
+        return String::new();
+    }
     let Some(ref who) = handler.who else {
         return String::new();
     };
@@ -2811,7 +2831,12 @@ fn render_handler_scaffold(
     // (the `!render_struct` branch) skips that import to keep the
     // common case lint-clean. Bring the inner enum in by name when
     // the spec actually uses variant-state lowering.
-    if is_multi_variant_adt_state(spec) {
+    // v2.24.0 follow-up: only emit the inner-enum import when the
+    // wrapper-struct + inner-enum emission actually fires (Anchor
+    // target). Quasar specs stay on the flat-struct path; no
+    // `<Name>AccountInner` type exists, so importing it would
+    // fail to resolve.
+    if is_multi_variant_adt_state(spec) && matches!(target, Target::Anchor) {
         let inner_name = format!("{}AccountInner", to_pascal_case(&spec.program_name));
         out.push_str(&format!("use crate::state::{};\n", inner_name));
     }
@@ -3312,7 +3337,7 @@ fn generate_guards(
         // Missing any condition: silently skip — the auth gap shows
         // up as a `qedgen check` warning (`no_access_control` / R25
         // friend) rather than a compile error.
-        let auth_guard = emit_variant_auth_guard(handler, spec);
+        let auth_guard = emit_variant_auth_guard(handler, spec, target);
         if !auth_guard.is_empty() {
             out.push_str(&auth_guard);
         }
