@@ -536,6 +536,12 @@ fn expr_to_lean(e: &Expr, ctx: Ctx, consts: ConstTable, env: &TypeEnv) -> String
             if func == "now" && args.is_empty() {
                 return "now".to_string();
             }
+            // v2.24 #19: `current_epoch()` resolves the same way —
+            // axiomatized at `QEDGen.Solana.Valid.current_epoch : Nat`,
+            // not a per-spec uninterpreted helper.
+            if func == "current_epoch" && args.is_empty() {
+                return "current_epoch".to_string();
+            }
             // Lean function application: `f a b c` (space-separated, parenthesized
             // args). Leaves `func` as the raw name — downstream users declare
             // these as uninterpreted helpers (axioms or defs) in a support module.
@@ -1021,6 +1027,12 @@ fn expr_to_rust(e: &Expr, ctx: Ctx, consts: ConstTable, opts: RustOpts<'_, '_>) 
             if func == "now" && args.is_empty() {
                 return "(solana_program::clock::Clock::get().unwrap().unix_timestamp as u64)"
                     .to_string();
+            }
+            // v2.24 #19: `current_epoch()` reads `.epoch` (already u64)
+            // off the same Clock sysvar. No cast needed — `epoch` is
+            // u64 in solana_program::clock::Clock.
+            if func == "current_epoch" && args.is_empty() {
+                return "solana_program::clock::Clock::get().unwrap().epoch".to_string();
             }
             let args_str: Vec<String> = args
                 .iter()
@@ -1752,6 +1764,11 @@ fn walk_apps(
             // walk_apps emits `axiom now : Bool` which collides with the
             // support-library declaration at elaboration.
             if func == "now" && args.is_empty() {
+                return;
+            }
+            // v2.24 #19: `current_epoch()` resolves via the support
+            // library, same shape as `now`.
+            if func == "current_epoch" && args.is_empty() {
                 return;
             }
             let key = (func.clone(), args.len());
@@ -3697,6 +3714,41 @@ handler refresh : State.Active -> State.Active {
         assert!(
             req.rust_expr.contains("Clock::get"),
             "rust expr should mention Clock::get; got: {}",
+            req.rust_expr
+        );
+    }
+
+    /// v2.24 #19 — `current_epoch()` parses as a zero-arg builtin
+    /// and lowers to `Clock::get().unwrap().epoch` in Rust and to
+    /// the bare ident `current_epoch` in Lean (axiomatized in the
+    /// support library at QEDGen.Solana.Valid).
+    #[test]
+    fn current_epoch_builtin_parses_in_requires() {
+        let src = r#"spec EpochReq
+type State | Active of { last_epoch : U64 }
+type Error | StaleEpoch
+handler refresh : State.Active -> State.Active {
+  permissionless
+  requires state.last_epoch < current_epoch() else StaleEpoch
+  effect { last_epoch := current_epoch() }
+}
+"#;
+        let spec = parse_str(src).expect("parse");
+        let h = spec.handlers.iter().find(|h| h.name == "refresh").unwrap();
+        let req = h.requires.first().expect("requires clause");
+        assert!(
+            req.lean_expr.contains("current_epoch"),
+            "lean expr should reference current_epoch; got: {}",
+            req.lean_expr
+        );
+        assert!(
+            req.rust_expr.contains("Clock::get"),
+            "rust expr should mention Clock::get; got: {}",
+            req.rust_expr
+        );
+        assert!(
+            req.rust_expr.contains(".epoch"),
+            "rust expr should read .epoch (not .unix_timestamp); got: {}",
             req.rust_expr
         );
     }

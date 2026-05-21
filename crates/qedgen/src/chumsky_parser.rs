@@ -477,6 +477,35 @@ fn expr<'a>() -> impl Parser<'a, &'a str, Node<Expr>, Err<'a>> + Clone {
                 )
             });
 
+        // v2.24 #19: `current_epoch()` — zero-arg builtin returning a
+        // fresh symbolic `u64` epoch. Lowers per-backend identically
+        // to `now()` except the Rust form reads `Clock::get().unwrap().epoch`
+        // instead of `unix_timestamp`. Lean axiomatizes
+        // `QEDGen.Solana.Valid.current_epoch : Nat`. Solana protocols
+        // use epoch for stake / vote / commission scheduling — having
+        // to thread `current_epoch : U64` as a handler param to every
+        // epoch-gated check was the v2.22 friction the gist called out.
+        let current_epoch_atom = just("current_epoch")
+            .then(
+                any::<&'a str, Err<'a>>()
+                    .filter(|c: &char| c.is_ascii_alphanumeric() || *c == '_')
+                    .rewind()
+                    .not(),
+            )
+            .then_ignore(wsc())
+            .ignore_then(just('('))
+            .then_ignore(wsc())
+            .then_ignore(just(')'))
+            .map_with(|_, e| {
+                Node::new(
+                    Expr::App {
+                        func: "current_epoch".to_string(),
+                        args: vec![],
+                    },
+                    e.span().into_range(),
+                )
+            });
+
         // Generic function application: `f(arg1, arg2, ...)`.
         // Must precede path_expr in the atom choice (both start with ident);
         // `.and_is(just('(').rewind())` ensures we only commit to `app` when
@@ -659,7 +688,7 @@ fn expr<'a>() -> impl Parser<'a, &'a str, Node<Expr>, Err<'a>> + Clone {
         // `.boxed()` tames the type complexity that otherwise trips Apple's
         // linker on overlong symbol names.
         let group_a = choice((int, bool_lit, old, let_in, if_then_else, sum, quant)).boxed();
-        let group_b = choice((now_atom, mul_div_floor_atom, mul_div_ceil_atom, match_expr)).boxed();
+        let group_b = choice((now_atom, current_epoch_atom, mul_div_floor_atom, mul_div_ceil_atom, match_expr)).boxed();
         // `record_update` must precede `ctor` (leading `.` distinguishes
         // them, but this ordering is clearer). `app_expr` must precede
         // `path_expr` (both start with ident; app commits only when `(`
