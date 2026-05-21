@@ -124,6 +124,25 @@ pub enum TopItem {
     /// `mechanize_effect` lowers `+=` / `-=` against. Per-effect `or
     /// <Variant>` (see `EffectStmt.on_error`) still wins over the pragma.
     PragmaAssign { name: String, value: String },
+    /// `schema name { requires expr else Err … }` — v2.24 #1. Reusable
+    /// cross-cutting guard set. Handlers reference it via `uses name`
+    /// (HandlerClause::Uses) and the adapter expands every requires
+    /// in the schema into the handler's requires list.
+    Schema(SchemaDecl),
+}
+
+/// v2.24 #1 — top-level `schema` block. Body carries a list of
+/// `requires expr else Err` clauses. No state effects or ensures —
+/// schemas are *only* for cross-cutting guards.
+#[derive(Debug, Clone)]
+pub struct SchemaDecl {
+    pub name: String,
+    pub doc: Option<String>,
+    /// Each entry is one `requires <expr> [else <ErrorName>]` clause,
+    /// keeping the same `(body, on_fail)` shape that
+    /// `HandlerClause::Requires` carries so the adapter can reuse
+    /// the same lowering path.
+    pub requires: Vec<(Node<Expr>, Option<String>)>,
 }
 
 /// Platform-specific namespace. Parser accepts arbitrary `TopItem`s inside;

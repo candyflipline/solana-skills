@@ -6685,6 +6685,7 @@ handler noop : State -> State {
             invariants: vec![],
             establishes: vec![],
             properties: vec![],
+            schema_includes: vec![],
             calls: vec![],
             effect_branches: None,
         };

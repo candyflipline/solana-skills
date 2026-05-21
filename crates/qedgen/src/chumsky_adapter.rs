@@ -2564,6 +2564,39 @@ pub fn adapt(spec: &a::Spec) -> ParsedSpec {
                 out.pragma_assignments
                     .push((name.clone(), value.clone()));
             }
+            TopItem::Schema(s) => {
+                // v2.24 #1 — collect schema blocks so handlers can
+                // expand them via `include <name>`. Adapt each
+                // requires expression eagerly using the shared
+                // `expr_to_lean` / `expr_to_rust` so the schema's
+                // guards land in the same shape as inline requires.
+                let requires = s
+                    .requires
+                    .iter()
+                    .map(|(guard, on_fail)| ParsedRequires {
+                        lean_expr: expr_to_lean(&guard.node, Ctx::Guard, consts, &env),
+                        rust_expr: expr_to_rust(
+                            &guard.node,
+                            Ctx::Guard,
+                            consts,
+                            opts_native(&env),
+                        ),
+                        rust_expr_pod: expr_to_rust(
+                            &guard.node,
+                            Ctx::Guard,
+                            consts,
+                            opts_pod(&env),
+                        ),
+                        error_name: on_fail.clone(),
+                        ast_body: Some(guard.clone()),
+                    })
+                    .collect();
+                out.schemas.push(crate::check::ParsedSchema {
+                    name: s.name.clone(),
+                    doc: s.doc.clone(),
+                    requires,
+                });
+            }
             TopItem::Pragma(p) => {
                 // Record the pragma name for target inference. Any given
                 // pragma may appear at most once per spec; duplicates are
@@ -2657,6 +2690,26 @@ pub fn adapt(spec: &a::Spec) -> ParsedSpec {
     // populated — the collector needs the full state_fields + records
     // + sum_types picture to infer argument types.
     out.uninterpreted_helpers = collect_uninterpreted_helpers(spec, &out);
+
+    // v2.24 #1 — expand `include <schema>` clauses on handlers. Done
+    // here as a post-pass so the schema lookup sees every declared
+    // schema regardless of source order, and so synthetic match-arm
+    // handlers (which inherit `schema_includes` from their parent
+    // via `expand_handler`) get the same expansion.
+    let schemas = out.schemas.clone();
+    for handler in &mut out.handlers {
+        if handler.schema_includes.is_empty() {
+            continue;
+        }
+        for include in &handler.schema_includes {
+            if let Some(schema) = schemas.iter().find(|s| s.name == *include) {
+                for r in &schema.requires {
+                    handler.requires.push(r.clone());
+                }
+            }
+        }
+    }
+
     out
 }
 
@@ -2809,6 +2862,7 @@ fn adapt_handler(h: &a::HandlerDecl, consts: ConstTable, env: &TypeEnv) -> Parse
         emits: Vec::new(),
         invariants: Vec::new(),
         establishes: Vec::new(),
+        schema_includes: Vec::new(),
         properties: Vec::new(),
         calls: Vec::new(),
         effect_branches: None,
@@ -2994,8 +3048,16 @@ fn adapt_handler(h: &a::HandlerDecl, consts: ConstTable, env: &TypeEnv) -> Parse
             a::HandlerClause::Permissionless => handler.permissionless = true,
             a::HandlerClause::Invariant(name) => handler.invariants.push(name.clone()),
             a::HandlerClause::Establishes(name) => handler.establishes.push(name.clone()),
-            a::HandlerClause::Include(_) => {
-                // Schema includes: forward-compat; ignored in phase 1.
+            a::HandlerClause::Include(schema_name) => {
+                // v2.24 #1 — record the schema reference here; the
+                // actual expansion (append schema.requires onto
+                // handler.requires) happens in a post-pass at the
+                // bottom of `adapt()` once every schema is known
+                // and every base handler is built. Storing the
+                // include-list on the handler lets the expansion
+                // survive the synthetic-match-arm expansion step
+                // (each arm sees the same parent's includes).
+                handler.schema_includes.push(schema_name.clone());
             }
             a::HandlerClause::Match(_) => {
                 // Branches are expanded into synthetic handlers by
@@ -3161,6 +3223,74 @@ mod tests {
 
     const PERCOLATOR_SPEC: &str =
         include_str!("../../../examples/rust/percolator/percolator.qedspec");
+
+    /// v2.24 #1 — top-level `schema name { requires … }` blocks parse,
+    /// and a handler's `include <schema>` clause expands every requires
+    /// from the schema into the handler's requires list at adapt time.
+    /// Closes the gist friction: pre-fix, the schema block parse-errored
+    /// and authors had to inline every cross-cutting guard.
+    #[test]
+    fn schema_include_expands_into_handler_requires() {
+        let src = r#"spec SchemaDemo
+program_id "11111111111111111111111111111111"
+
+type State
+  | Active of { balance : U64, paused : U8 }
+
+type Error
+  | Paused
+  | MathOverflow
+
+schema gated_by_pause {
+  requires state.paused == 0 else Paused
+}
+
+handler deposit (amount : U64) : State.Active -> State.Active {
+  permissionless
+  include gated_by_pause
+  requires amount > 0 else MathOverflow
+  effect { Active.balance += amount }
+}
+
+handler withdraw (amount : U64) : State.Active -> State.Active {
+  permissionless
+  include gated_by_pause
+  requires amount > 0 else MathOverflow
+  effect { Active.balance -= amount }
+}
+"#;
+        let spec = parse_str(src).expect("parse");
+        // Both handlers got the schema's `requires state.paused == 0`
+        // appended to their existing `amount > 0` clause.
+        for handler_name in ["deposit", "withdraw"] {
+            let h = spec
+                .handlers
+                .iter()
+                .find(|h| h.name == handler_name)
+                .unwrap_or_else(|| panic!("missing handler {handler_name}"));
+            assert!(
+                h.requires.iter().any(|r| r.lean_expr.contains("paused")),
+                "handler {handler_name} should pick up `paused` requires from gated_by_pause; got: {:?}",
+                h.requires.iter().map(|r| &r.lean_expr).collect::<Vec<_>>()
+            );
+            assert!(
+                h.requires.iter().any(|r| r.error_name.as_deref() == Some("Paused")),
+                "handler {handler_name} should pick up the schema's Paused error; got: {:?}",
+                h.requires.iter().map(|r| &r.error_name).collect::<Vec<_>>()
+            );
+            assert!(
+                h.schema_includes.contains(&"gated_by_pause".to_string()),
+                "handler {handler_name} should remember its includes list"
+            );
+        }
+        // Schema is also surfaced on spec.schemas for downstream
+        // consumers (lint / docs / future tooling).
+        assert!(
+            spec.schemas.iter().any(|s| s.name == "gated_by_pause"),
+            "spec.schemas should list gated_by_pause; got: {:?}",
+            spec.schemas.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
 
     /// v2.24 #3 — `preserved_by all except [h1, h2]` expands to the
     /// full handler list minus the excluded names. Common pattern for

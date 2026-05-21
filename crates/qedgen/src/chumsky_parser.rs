@@ -116,6 +116,8 @@ const KEYWORDS: &[&str] = &[
     "in",
     // v2.7 G4: handler-level opt-out of the no_access_control lint.
     "permissionless",
+    // v2.24 #1: top-level reusable guard block.
+    "schema",
     // v2.17 follow-up: handler-side clause asserting the named invariant
     // holds at POST-state without assuming it pre-state.
     "establishes",
@@ -1622,6 +1624,42 @@ fn liveness_decl<'a>() -> impl Parser<'a, &'a str, TopItem, Err<'a>> + Clone {
 }
 
 // invariant name : expr  OR  invariant name "description"
+/// v2.24 #1 — top-level `schema name { requires expr else Err … }`.
+/// Reusable cross-cutting guard set. Pre-fix the parser rejected the
+/// whole construct, forcing spec authors to inline the same
+/// `requires not state.protocol_paused else ProtocolPaused` into
+/// every gated handler. Handlers reference a schema via the existing
+/// `include <name>` clause (no new keyword); the adapter expands
+/// every requires in the schema into the handler's requires list.
+fn schema_decl<'a>() -> impl Parser<'a, &'a str, TopItem, Err<'a>> + Clone {
+    let req = just("requires")
+        .then_ignore(wsc())
+        .ignore_then(expr())
+        .then_ignore(wsc())
+        .then(
+            just("else")
+                .then_ignore(wsc())
+                .ignore_then(non_keyword_ident())
+                .or_not(),
+        );
+    doc_comments()
+        .then_ignore(kw("schema"))
+        .then(non_keyword_ident())
+        .then_ignore(wsc())
+        .then_ignore(just('{'))
+        .then_ignore(wsc())
+        .then(req.then_ignore(wsc()).repeated().collect::<Vec<_>>())
+        .then_ignore(wsc())
+        .then_ignore(just('}'))
+        .map(|((doc, name), requires)| {
+            TopItem::Schema(SchemaDecl {
+                name,
+                doc,
+                requires,
+            })
+        })
+}
+
 fn invariant_decl<'a>() -> impl Parser<'a, &'a str, TopItem, Err<'a>> + Clone {
     kw("invariant")
         .ignore_then(non_keyword_ident())
@@ -2480,6 +2518,7 @@ fn top_item<'a>() -> impl Parser<'a, &'a str, Node<TopItem>, Err<'a>> + Clone {
         cover_decl(),
         liveness_decl(),
         invariant_decl(),
+        schema_decl(),
     ));
     let group_b = choice((
         pda_decl(),
@@ -2998,6 +3037,7 @@ property conservation :
                 TopItem::Pragma(_) => "pragma",
                 TopItem::PragmaAssign { .. } => "pragma_assign",
                 TopItem::Import { .. } => "import",
+                TopItem::Schema(_) => "schema",
             })
             .fold(
                 std::collections::BTreeMap::<&str, usize>::new(),

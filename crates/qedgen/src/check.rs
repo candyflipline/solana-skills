@@ -551,6 +551,12 @@ pub struct ParsedHandler {
     /// these like `invariants` for the post-assertion but skips the
     /// `kani::assume` / `prop_assume!` pre-state guard.
     pub establishes: Vec<String>,
+    /// v2.24 #1 — names of `include <schema>` clauses on this handler.
+    /// The adapter's post-pass walks this list and appends each
+    /// referenced schema's `requires` onto `self.requires`. Stored
+    /// (not just expanded inline) so synthetic match-arm handlers
+    /// inherit the same expansion without duplicating the lookup.
+    pub schema_includes: Vec<String>,
     /// Per-handler properties (from inline property/invariant clauses).
     pub properties: Vec<String>,
     /// `call Interface.handler(name = expr, ...)` sites — CPI invocations
@@ -1073,6 +1079,15 @@ pub struct ParsedSpec {
     /// `EffectStmt.on_error` still wins over the pragma.
     pub pragma_assignments: Vec<(String, String)>,
 
+    /// v2.24 #1 — top-level `schema name { requires expr else Err … }`
+    /// blocks. Each schema bundles a reusable set of guards. Handlers
+    /// reference them via `include <schema_name>` clauses, which the
+    /// adapter expands into the handler's `requires` list at parse
+    /// time so downstream lints / codegen see the union as if the
+    /// handler had inlined the guards itself.
+    #[allow(dead_code)]
+    pub schemas: Vec<ParsedSchema>,
+
     /// Uninterpreted helper functions referenced by name in
     /// `requires` / `ensures` / effect-RHS / property bodies but not
     /// declared structurally in the spec. For each, we capture an
@@ -1176,6 +1191,20 @@ pub struct ParsedInterfaceHandler {
     pub accounts: Vec<ParsedHandlerAccount>,
     pub requires: Vec<ParsedRequires>,
     pub ensures: Vec<ParsedEnsures>,
+}
+
+/// v2.24 #1 — parsed `schema` block. A named bundle of `requires`
+/// clauses that handlers reference via `include <name>` to share
+/// cross-cutting guards (e.g. pause gating, time-window checks).
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct ParsedSchema {
+    pub name: String,
+    pub doc: Option<String>,
+    /// The schema's body — one entry per `requires expr else Err`
+    /// clause. Identical shape to `ParsedHandler.requires` so the
+    /// adapter can just clone-and-append.
+    pub requires: Vec<ParsedRequires>,
 }
 
 /// Check spec coverage: which properties have proofs, which have sorry, which are missing.
@@ -5877,6 +5906,7 @@ mod tests {
             invariants: vec![],
             establishes: vec![],
             properties: vec![],
+            schema_includes: vec![],
             calls: vec![],
             effect_branches: None,
         }
@@ -8488,6 +8518,7 @@ handler activate : State.Setup -> State.Active {
             invariants: vec![],
             establishes: vec![],
             properties: vec![],
+            schema_includes: vec![],
             calls: vec![],
             effect_branches: None,
         }

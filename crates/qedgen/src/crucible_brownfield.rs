@@ -110,6 +110,7 @@ fn empty_handler(name: String) -> ParsedHandler {
         emits: vec![],
         invariants: vec![],
         establishes: vec![],
+        schema_includes: vec![],
         properties: vec![],
         calls: vec![],
         effect_branches: None,

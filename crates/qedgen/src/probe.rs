@@ -1691,6 +1691,7 @@ mod tests {
             invariants: vec![],
             establishes: vec![],
             properties: vec![],
+            schema_includes: vec![],
             calls: vec![],
             effect_branches: None,
         }
