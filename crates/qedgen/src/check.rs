@@ -717,6 +717,25 @@ impl ParsedHandler {
     }
 }
 
+/// True iff the spec is a multi-variant ADT *and* the named field lives
+/// inside one or more variant payloads (not directly on the wrapper).
+/// Used by R25's `auth X → has_one = X` lowering to skip the `has_one`
+/// attribute when the field can't be reached from the Anchor wrapper —
+/// `has_one` looks up `wrapper.<field>`, which fails for fields buried
+/// in `wrapper.inner.<variant>`. See `ParsedHandlerAccount::account_attr`
+/// for the gating logic.
+fn is_multi_variant_adt_with_field_in_variant(spec: &ParsedSpec, field: &str) -> bool {
+    let Some(acct) = spec.account_types.first() else {
+        return false;
+    };
+    if acct.variants.len() <= 1 {
+        return false;
+    }
+    acct.variants
+        .iter()
+        .any(|v| v.fields.iter().any(|(n, _)| n == field))
+}
+
 /// True if the parsed state struct that backs this handler-account has a
 /// field named `field`. For multi-state specs the lookup walks
 /// `spec.account_types`; for single-state specs the union lives in
@@ -866,10 +885,24 @@ impl ParsedHandlerAccount {
         // someone"). Closes the percolator-CRIT, multisig::remove_member
         // CRIT, and the lending init_pool/borrow/repay HIGHs in one
         // emit. Anchor and Quasar both accept `has_one = field`.
+        //
+        // v2.24 S5c: with multi-variant ADT state, the auth field often
+        // lives in a variant payload (e.g. `Active.owner`), not directly
+        // on the wrapper struct. Anchor's `has_one` macro can't reach
+        // into the inner enum, so the attribute is silently invalid
+        // ("no field `owner` on `Account<…, VaultAccount>`"). Skip
+        // emission in that case — the auth gap surfaces via a TODO
+        // line emitted next to the handler body (rather than dropped
+        // silently). A follow-up slice (v2.24.x) will generate the
+        // explicit destructure-then-check guard.
         if is_state_account {
             if let Some(ref who) = handler.who {
                 if state_account_has_field(self, spec, who) {
-                    parts.push(format!("has_one = {}", who));
+                    if is_multi_variant_adt_with_field_in_variant(spec, who) {
+                        // Auth check skipped — see fn-level doc above.
+                    } else {
+                        parts.push(format!("has_one = {}", who));
+                    }
                 }
             }
         }

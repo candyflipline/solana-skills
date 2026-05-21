@@ -1361,6 +1361,46 @@ fn lifecycle_check_line(
         return String::new();
     };
 
+    // v2.24 S5c — multi-variant ADT state has no `status: u8` byte; the
+    // variant IS the discriminator. Pre-check rewrites to a
+    // `matches!(inner, Inner::<pre> { .. })` test against the wrapper's
+    // `inner` field. Post-write is a no-op — the effect lowering's
+    // match arm (or set_inner for cross-variant promotion) is what
+    // moves the variant.
+    if is_multi_variant_adt_state(spec) {
+        if write {
+            // The effect lowering handles variant transitions inline;
+            // no separate post-write needed.
+            return String::new();
+        }
+        let pre = handler.pre_status.as_deref().unwrap_or("");
+        if pre.is_empty() || matches!(pre, "Uninitialized" | "Empty") {
+            return String::new();
+        }
+        let Some(acct) = spec.account_types.first() else {
+            return String::new();
+        };
+        let Some(variant) = acct.variants.iter().find(|v| v.name == pre) else {
+            return String::new();
+        };
+        let inner_name = format!("{}AccountInner", to_pascal_case(&spec.program_name));
+        let err_enum = format!("crate::errors::{}Error", to_pascal_case(&spec.program_name));
+        let err_ctor = surface.error_expr(&err_enum, "InvalidLifecycle");
+        // Payload variants need `{ .. }`; unit variants don't.
+        let pattern = if variant.fields.is_empty() {
+            format!("{}::{}", inner_name, pre)
+        } else {
+            format!("{}::{} {{ .. }}", inner_name, pre)
+        };
+        return format!(
+            "    // lifecycle: require inner == {pre}\n    if !matches!(ctx.{acct}.inner, {pattern}) {{ return Err({err_ctor}); }}\n",
+            pre = pre,
+            acct = sa.name,
+            pattern = pattern,
+            err_ctor = err_ctor,
+        );
+    }
+
     // Resolve the Status enum name. Mirrors `generate_state`'s naming:
     //   - `is_multi` (account_types.len() > 1): emit `<ADT>Status` per
     //     lifecycle (lending: `PoolStatus`, `LoanStatus`).
@@ -2464,6 +2504,19 @@ fn render_handler_scaffold(
             .any(|(_, op_kind, _)| op_kind == "add" || op_kind == "sub");
     if body_uses_error_enum {
         out.push_str("use crate::errors::*;\n");
+    }
+    // v2.24 S5c — variant-state lowering references `<Name>AccountInner`
+    // directly inside the handler body (`match &mut self.<acct>.inner {
+    // <Name>AccountInner::<post> { … } => … }`). Without an explicit
+    // `use`, Rust's name resolution can't find the inner enum from
+    // inside the per-handler module — `state::*` is already imported
+    // when `render_struct` is true, but Anchor's handler scaffold
+    // (the `!render_struct` branch) skips that import to keep the
+    // common case lint-clean. Bring the inner enum in by name when
+    // the spec actually uses variant-state lowering.
+    if is_multi_variant_adt_state(spec) {
+        let inner_name = format!("{}AccountInner", to_pascal_case(&spec.program_name));
+        out.push_str(&format!("use crate::state::{};\n", inner_name));
     }
     if !render_struct {
         // Anchor: bring the Accounts struct (defined in lib.rs) into
@@ -3981,6 +4034,75 @@ handler deposit (amount : U64) : State.Active -> State.Active {
         assert!(
             !deposit.contains("self.vault.balance"),
             "legacy flat-field handler body should not appear under variant-state lowering; got:\n{deposit}"
+        );
+    }
+
+    /// v2.24 S5c — guards module emits a `matches!(inner, Inner::<pre>
+    /// { .. })` lifecycle check instead of the legacy
+    /// `ctx.<acct>.status != Status::<pre> as u8` byte compare when the
+    /// state is a multi-variant ADT. Wrapper has no `status` field
+    /// under the new emission, so the byte compare would no longer
+    /// compile. Also locks the `has_one` suppression for fields that
+    /// live in variant payloads — without it the wrapper-side
+    /// `has_one = X` macro tries to read `wrapper.X` and fails with
+    /// "no field X on Account<…, Wrapper>". Both gaps were caught by
+    /// the end-to-end `cargo check` smoke on the Vault fixture.
+    #[test]
+    fn variant_state_guards_use_matches_and_skip_has_one() {
+        let src = r#"spec Vault
+
+type State
+  | Uninitialized
+  | Active of {
+      owner   : Pubkey,
+      balance : U64,
+    }
+
+type Error
+  | MathOverflow
+  | WrongState
+  | InvalidLifecycle
+  | Unauthorized
+
+handler deposit (amount : U64) : State.Active -> State.Active {
+  auth owner
+  accounts {
+    vault : writable
+    owner : signer
+  }
+  requires amount > 0 else MathOverflow
+  effect {
+    Active.balance += amount
+  }
+}
+"#;
+        let spec = crate::chumsky_adapter::parse_str(src).unwrap();
+        let fp = crate::fingerprint::compute_fingerprint(&spec);
+        let dir = tempfile::tempdir().unwrap();
+        let spec_path = dir.path().join("vault.qedspec");
+        let out_dir = dir.path().join("programs");
+        std::fs::write(&spec_path, src).unwrap();
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        generate_lib(&spec, &fp, &out_dir, Target::Anchor).unwrap();
+        generate_guards(&spec, &fp, &out_dir, Target::Anchor).unwrap();
+
+        let guards = std::fs::read_to_string(out_dir.join("src/guards.rs")).unwrap();
+        assert!(
+            guards.contains(
+                "if !matches!(ctx.vault.inner, VaultAccountInner::Active { .. })"
+            ),
+            "expected `matches!` lifecycle check; got:\n{guards}"
+        );
+        assert!(
+            !guards.contains("Status::Active as u8"),
+            "legacy status byte compare must not appear under variant-state lowering; got:\n{guards}"
+        );
+
+        let lib = std::fs::read_to_string(out_dir.join("src/lib.rs")).unwrap();
+        assert!(
+            !lib.contains("has_one = owner"),
+            "has_one suppression failed — wrapper-side `has_one = owner` should not appear because owner lives in variant payload; got:\n{lib}"
         );
     }
 
