@@ -4753,17 +4753,16 @@ fn check_shape_only_cpi(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
                         call.target_handler, call.target_interface
                     ),
                 ),
-                (Some(_), Some(h)) if h.ensures.is_empty() => (
-                    format!(
-                        "`{}.{}` declares shape only (no `ensures`) — the call has no post-state assumptions for proofs",
-                        call.target_interface, call.target_handler
-                    ),
-                    format!(
-                        "Upgrade to Tier 1 by declaring `ensures` on `{}` inside `interface {}`, or import a qedspec for full verification.",
-                        call.target_handler, call.target_interface
-                    ),
-                ),
-                // Tier 1/2 target — nothing to lint.
+                // v2.24 #15 — pre-fix, this arm fired
+                // `shape_only_cpi` whenever a callee handler had no
+                // `ensures` clause, forcing spec authors to write
+                // `ensures true` on Token init / metadata-create /
+                // close shapes (which have no meaningful input-only
+                // post-condition). The advisory was redundant with
+                // the import-level Tier 0/1/2 signal; dropping it
+                // here removes the tautology-pressure on real specs.
+                // Tier 1 / 2 targets and shape-only Tier 0 targets
+                // all skip the lint.
                 _ => continue,
             };
 
@@ -6884,9 +6883,16 @@ handler dec (x : U64) : State.Active -> State.Active {
     // [shape_only_cpi] lint (v2.5 slice 4)
     // ──────────────────────────────────────────────────────────────────────
 
+    /// v2.24 #15 — declared Tier-0 interfaces with no `ensures` no
+    /// longer fire `shape_only_cpi`. Pre-fix the lint forced spec
+    /// authors to write `ensures true` tautologies on Token init /
+    /// metadata-create / close handlers that have no meaningful
+    /// input-only post-condition. The Tier 0/1/2 import-level
+    /// signal already documents what kind of contract a call gets.
+    /// The lint still fires for undeclared interfaces / missing
+    /// handlers (real spec bugs).
     #[test]
-    fn shape_only_cpi_fires_on_tier0_interface() {
-        // Interface declared with no ensures — classic Tier-0. Should lint.
+    fn shape_only_cpi_silent_on_declared_tier0_interface() {
         let src = r#"spec Demo
 
 interface Token {
@@ -6907,13 +6913,11 @@ handler pay : State.A -> State.A {
         let parsed = crate::chumsky_adapter::parse_str(src).unwrap();
         let ws = check_completeness(&parsed);
         let hits: Vec<_> = ws.iter().filter(|w| w.rule == "shape_only_cpi").collect();
-        assert_eq!(
-            hits.len(),
-            1,
-            "expected one shape_only_cpi warning, got {:?}",
-            ws
+        assert!(
+            hits.is_empty(),
+            "Tier-0 interface with no `ensures` should not fire shape_only_cpi; got: {:?}",
+            hits.iter().map(|w| &w.message).collect::<Vec<_>>()
         );
-        assert!(hits[0].message.contains("shape only"));
     }
 
     #[test]
