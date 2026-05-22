@@ -1257,6 +1257,14 @@ pub struct ParsedInterfaceHandler {
     /// terminal and any caller-side `let` binding is dropped with a
     /// warning.
     pub return_type: Option<String>,
+    /// v2.26 Track K — when the interface handler declares
+    /// `-> <ident> : <Type>`, the identifier names the return value
+    /// inside the callee's `ensures`. The CPI substitution helper
+    /// rewrites that identifier to the caller's `let X = …` binder
+    /// at each call site. `None` (plain `-> Type` or no return) means
+    /// the substitution falls back to the literal `"result"` for
+    /// back-compat with the v2.24 #11 convention.
+    pub result_binder: Option<String>,
 }
 
 /// v2.24 #1 — parsed `schema` block. A named bundle of `requires`
@@ -1482,16 +1490,25 @@ fn resolve_and_merge_imports(
         return Ok(());
     }
 
-    // Locate qed.toml. Required when imports are present.
+    // Locate qed.toml. Required when imports are present, EXCEPT when
+    // every import resolves to a bundled-stdlib builtin (`from "spl"`,
+    // `from "system"`). The resolver short-circuits those before
+    // consulting the manifest, so an empty manifest is fine.
     let manifest = match crate::qed_manifest::load_from_dir(manifest_dir)? {
         Some(m) => m,
-        None => anyhow::bail!(
-            "spec has {} `import` statement(s) but no `qed.toml` next to it (expected at {})",
-            parsed.imports.len(),
-            manifest_dir
-                .join(crate::qed_manifest::MANIFEST_FILENAME)
-                .display(),
-        ),
+        None => {
+            if crate::import_resolver::all_imports_are_builtins(&parsed.imports) {
+                crate::qed_manifest::Manifest::default()
+            } else {
+                anyhow::bail!(
+                    "spec has {} `import` statement(s) but no `qed.toml` next to it (expected at {})",
+                    parsed.imports.len(),
+                    manifest_dir
+                        .join(crate::qed_manifest::MANIFEST_FILENAME)
+                        .display(),
+                )
+            }
+        }
     };
 
     let resolved = crate::import_resolver::resolve_imports_with_opts(
@@ -1547,11 +1564,16 @@ fn resolve_and_merge_imports(
         // resolved import (sources + commit), the manifest dep descriptor
         // (source kind + ref), and the imported interface (carries
         // program_id and the optional upstream block).
-        let dep = manifest
-            .dependencies
-            .get(&r.dep_key)
-            .expect("resolver only returns deps that are in the manifest");
-        let lock_entry = crate::qed_lock::entry_for_resolved(&r, dep, iface);
+        //
+        // Bundled-stdlib builtins (v2.26 Track F) don't appear in
+        // `manifest.dependencies`; their lock entry uses a synthetic
+        // `builtin:<key>` source identifier so reproducibility is still
+        // recorded but no manifest entry is consulted.
+        let lock_entry = if let Some(dep) = manifest.dependencies.get(&r.dep_key) {
+            crate::qed_lock::entry_for_resolved(&r, dep, iface)
+        } else {
+            crate::qed_lock::entry_for_builtin(&r, iface)
+        };
         lock.dependencies.push(lock_entry);
 
         // F5 fold-in: apply the optional `as <alias>` rename when merging
@@ -1604,6 +1626,11 @@ fn synthesize_interface_from_imported(
             // for now Tier-2 callers using `let x = call …` will
             // see the binding dropped with a lint warning.
             return_type: None,
+            // v2.26 Track K — same story: the synthesizer can't
+            // recover a named binder until top-level handlers carry
+            // one. Defaults to `None` ⇒ literal `"result"` in the
+            // substitution.
+            result_binder: None,
         })
         .collect();
     Some(ParsedInterface {
@@ -3764,6 +3791,11 @@ pub fn check_completeness(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
     // program is verified." See docs/design/spec-composition.md §2.
     warnings.extend(check_shape_only_cpi(spec));
 
+    // v2.26 Track F: complement to shape_only_cpi — flags declared handlers
+    // with no `ensures` clauses, since the caller's Lean theorem still has
+    // to carry `by sorry` in that case.
+    warnings.extend(check_cpi_no_callee_ensures(spec));
+
     // PDA seed collision: two PDA declarations with identical seed tuples resolve
     // to the same on-chain address — a common source of account confusion bugs.
     warnings.extend(check_pda_collisions(spec));
@@ -3829,6 +3861,21 @@ pub fn check_completeness(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
     // nothing to verify against. Either spec'd intent is missing or
     // the modifies clause is wrong. Fire P0.
     warnings.extend(check_unconstrained_modifies(spec));
+
+    // v2.26 fold-in: ref_impl bodies with potentially-overflowing
+    // arithmetic over bounded-numeric params surface a P2 informational
+    // lint. The Lean side proves on unbounded `Nat`; Rust runs on
+    // bounded `u64`/`i64` where the same expression can wrap or panic.
+    // Bounded-arith verification lives in Kani; the same predicate
+    // drives the impl-targeted Kani auto-trigger.
+    warnings.extend(check_ref_impl_unbounded_arith(spec));
+
+    // v2.26 Track J: when a handler makes ≥2 CPI calls whose substituted
+    // ensures reference the SAME caller-state field, both `kani::assume`
+    // lines fire at the same splice point against one (pre, post)
+    // snapshot pair, which can over-constrain. Lint surfaces the
+    // structural gap; per-call snapshot frames is v3.0-class.
+    warnings.extend(check_multi_cpi_same_field(spec));
 
     // Sort by priority (ascending), then by rule name for stability
     warnings.sort_by(|a, b| a.priority.cmp(&b.priority).then(a.rule.cmp(&b.rule)));
@@ -4173,6 +4220,80 @@ fn check_error_declared_as_record(spec: &ParsedSpec) -> Vec<CompletenessWarning>
 /// Two ways out: add an `ensures` clause that constrains the
 /// post-value (the canonical "Kani checks impl" pattern), or remove
 /// the field from `modifies` (it wasn't really being modified).
+/// v2.26 fold-in — predicate shared with `kani_impl::spec_triggers_impl_harness`.
+/// True iff a ref_impl carries arithmetic that could overflow when lowered to
+/// bounded Rust types, even though the Lean lowering on `Nat`/`Int` cannot.
+/// Used both as a lint trigger and as an auto-trigger for the impl-targeted
+/// Kani harness so spec authors don't ship a ref_impl-bearing spec without
+/// the bit-width-bounded verification surface running.
+pub fn ref_impl_has_overflow_risk(r: &ParsedRefImpl) -> bool {
+    let has_numeric_io = std::iter::once(&r.return_type)
+        .chain(r.params.iter().map(|(_, t)| t))
+        .any(|t| {
+            matches!(
+                t.trim(),
+                "U8" | "U16" | "U32" | "U64" | "U128" | "I8" | "I16" | "I32" | "I64" | "I128"
+            )
+        });
+    if !has_numeric_io {
+        return false;
+    }
+    // Pure-expression bodies — `*` is always multiplication, `<<` is always
+    // left-shift, `+`/`-` are always add/sub (no pointer arithmetic, no
+    // unary `-` ambiguity in our DSL emission). A simple substring check
+    // is sufficient and the lint's false-positive cost is "user is told
+    // to run Kani" — tolerable.
+    let body = &r.rust_body;
+    body.contains('*') || body.contains("<<") || body.contains('+') || body.contains('-')
+}
+
+fn check_ref_impl_unbounded_arith(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
+    let mut warnings = Vec::new();
+    for r in &spec.ref_impls {
+        if !ref_impl_has_overflow_risk(r) {
+            continue;
+        }
+        let mut ops: Vec<&str> = Vec::new();
+        if r.rust_body.contains('*') {
+            ops.push("*");
+        }
+        if r.rust_body.contains("<<") {
+            ops.push("<<");
+        }
+        if r.rust_body.contains('+') {
+            ops.push("+");
+        }
+        if r.rust_body.contains('-') {
+            ops.push("-");
+        }
+        warnings.push(CompletenessWarning {
+            rule: "ref_impl_unbounded_arith".to_string(),
+            severity: Severity::Info,
+            priority: 2,
+            message: format!(
+                "ref_impl '{}' uses {} over bounded-numeric params/return. \
+                 Lean lowers this to `Nat`/`Int` (unbounded — no overflow), \
+                 but the generated Rust runs on `u64`/`i64`/etc. where the \
+                 same expression can wrap (release) or panic (debug). \
+                 Bounded-arithmetic verification lives in Kani.",
+                r.name,
+                ops.join("/"),
+            ),
+            subject: Some(r.name.clone()),
+            fix: "Run `qedgen verify --kani` against the generated impl-targeted \
+                Kani harness — auto-emitted starting v2.26 whenever a ref_impl \
+                trips this lint. The harness drives every numeric param with \
+                `kani::any()` and produces a concrete counterexample at the \
+                bit-width boundary."
+                .to_string(),
+            example: None,
+            counterexample: None,
+            fix_options: vec![],
+        });
+    }
+    warnings
+}
+
 fn check_unconstrained_modifies(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
     let mut warnings = Vec::new();
     for h in &spec.handlers {
@@ -4234,6 +4355,140 @@ fn check_unconstrained_modifies(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
                     "  ensures {}_grew : state.{} >= old(state.{})",
                     field, field, field
                 )),
+                counterexample: None,
+                fix_options: vec![],
+            });
+        }
+    }
+    warnings
+}
+
+/// v2.26 Track J — extract the set of `pre.<field>` / `post.<field>` field
+/// references from a `rust_expr_binary`-rendered expression.
+///
+/// The chumsky_adapter's binary-mode renderer is the only source of these
+/// tokens: `state.x` → `post.x`, `old(state.x)` → `pre.x`. No other DSL
+/// construct produces a bare `pre.` / `post.` prefix in the binary form, so
+/// a static regex over the textual rendering is sufficient and stable.
+///
+/// "Same field" for the multi-CPI lint normalizes `pre.X` and `post.X` both
+/// to `X` — the Kani impl harness reads both from the same snapshot pair
+/// (`pre_X` / `post_X`), so an over-constraint via `pre.X` in one assume
+/// and via `post.X` in another binds the same locals.
+pub fn extract_pre_post_field_refs(expr: &str) -> std::collections::BTreeSet<String> {
+    static RE: LazyLock<Regex> = LazyLock::new(|| {
+        // Word-boundary at the start ensures `xpre.foo` doesn't match.
+        Regex::new(r"\b(?:pre|post)\.([A-Za-z_][A-Za-z0-9_]*)").expect("static regex")
+    });
+    let mut fields = std::collections::BTreeSet::new();
+    for cap in RE.captures_iter(expr) {
+        fields.insert(cap[1].to_string());
+    }
+    fields
+}
+
+/// v2.26 Track J — per-handler predicate consumed by both `check.rs` (lint
+/// emission) and `kani_impl.rs` (breadcrumb comment above the assume block).
+///
+/// Walks `handler.calls` and, for each unordered pair `(call_i, call_j)`
+/// with `i < j` whose callees both resolve in `spec.interfaces`, runs the
+/// same substitution `kani_impl.rs::emit_cpi_ensures_as_assume` runs and
+/// reports any `pre.X` / `post.X` field reference that appears in both
+/// callees' substituted ensures. Tier-0 callees (empty ensures) contribute
+/// no field refs → silent.
+///
+/// Returns `(call_i_label, call_j_label, shared_field)` triples, one per
+/// shared field per pair. The label format `Iface.handler` mirrors the
+/// CPI-block comment in the generated harness.
+pub fn multi_cpi_shared_fields(
+    spec: &ParsedSpec,
+    handler: &ParsedHandler,
+) -> Vec<(String, String, String)> {
+    // Resolve every call's substituted-ensures field set up front. Tier-0
+    // / unresolved callees get an empty set and effectively drop out of the
+    // pairwise compare.
+    let resolved: Vec<(String, std::collections::BTreeSet<String>)> = handler
+        .calls
+        .iter()
+        .map(|call| {
+            let label = format!("{}.{}", call.target_interface, call.target_handler);
+            let Some(iface) = spec
+                .interfaces
+                .iter()
+                .find(|i| i.name == call.target_interface)
+            else {
+                return (label, std::collections::BTreeSet::new());
+            };
+            let Some(callee) = iface
+                .handlers
+                .iter()
+                .find(|h| h.name == call.target_handler)
+            else {
+                return (label, std::collections::BTreeSet::new());
+            };
+            let mut fields = std::collections::BTreeSet::new();
+            for ens in &callee.ensures {
+                let substituted = crate::cpi_substitute::substitute_callee_ensures_rust_binary(
+                    &ens.rust_expr_binary,
+                    call,
+                    &callee.params,
+                    callee.result_binder.as_deref(),
+                );
+                fields.extend(extract_pre_post_field_refs(&substituted));
+            }
+            (label, fields)
+        })
+        .collect();
+
+    let mut findings = Vec::new();
+    for i in 0..resolved.len() {
+        if resolved[i].1.is_empty() {
+            continue;
+        }
+        for j in (i + 1)..resolved.len() {
+            if resolved[j].1.is_empty() {
+                continue;
+            }
+            // Set intersection ordered by BTreeSet iteration (stable
+            // alphabetical for deterministic lint output).
+            for field in resolved[i].1.intersection(&resolved[j].1) {
+                findings.push((resolved[i].0.clone(), resolved[j].0.clone(), field.clone()));
+            }
+        }
+    }
+    findings
+}
+
+/// v2.26 Track J — P2 informational lint surfacing the multi-CPI ordering
+/// gap. Fires when `multi_cpi_shared_fields` returns at least one entry
+/// for any handler. One warning per shared field per call pair (matches
+/// the predicate's granularity).
+fn check_multi_cpi_same_field(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
+    let mut warnings = Vec::new();
+    for handler in &spec.handlers {
+        let findings = multi_cpi_shared_fields(spec, handler);
+        for (call_i_label, call_j_label, field) in findings {
+            warnings.push(CompletenessWarning {
+                rule: "multi_cpi_same_field".to_string(),
+                severity: Severity::Info,
+                priority: 2,
+                message: format!(
+                    "handler '{}' makes multiple CPI calls ({} and {}) whose \
+                     substituted ensures both reference '{}'. Kani's impl-targeted \
+                     harness has only one (pre_{}, post_{}) snapshot pair captured \
+                     at handler boundary; both assumes will fire at the same splice \
+                     point, which can over-constrain.",
+                    handler.name, call_i_label, call_j_label, field, field, field
+                ),
+                subject: Some(handler.name.clone()),
+                fix: "Until per-call snapshot frames land (v3.0), either: (1) \
+                      merge the CPI calls into a single helper handler whose \
+                      ensures captures the combined effect; (2) tighten each \
+                      callee's ensures so they reference disjoint fields; or \
+                      (3) split the multi-CPI handler into separate handlers \
+                      (one per CPI) so each gets its own (pre, post) snapshot."
+                    .to_string(),
+                example: None,
                 counterexample: None,
                 fix_options: vec![],
             });
@@ -5011,6 +5266,65 @@ fn check_unconditional_value_transfer(spec: &ParsedSpec) -> Vec<CompletenessWarn
     warnings
 }
 
+/// v2.26 Track F lint: `cpi_no_callee_ensures` flags a `call
+/// Interface.handler(...)` site whose interface handler has no
+/// `ensures` clauses. The caller's Lean proof carries a `by sorry` at
+/// the call site (Tier-0 axiomatization) because there's no
+/// post-condition to discharge. Adding an `ensures` clause — even a
+/// trivial one — gives the caller a binding hypothesis after the call.
+///
+/// Distinct from `shape_only_cpi` (v2.24 #15, which flags missing
+/// interface / handler declarations) — this one fires on declared
+/// handlers that simply have no post-condition shape.
+fn check_cpi_no_callee_ensures(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
+    let mut warnings = Vec::new();
+    for handler in &spec.handlers {
+        for call in &handler.calls {
+            let Some(iface) = spec
+                .interfaces
+                .iter()
+                .find(|i| i.name == call.target_interface)
+            else {
+                continue; // shape_only_cpi handles undeclared interfaces.
+            };
+            let Some(ih) = iface
+                .handlers
+                .iter()
+                .find(|h| h.name == call.target_handler)
+            else {
+                continue; // shape_only_cpi handles undeclared handlers.
+            };
+            if !ih.ensures.is_empty() {
+                continue;
+            }
+            warnings.push(CompletenessWarning {
+                rule: "cpi_no_callee_ensures".to_string(),
+                severity: Severity::Info,
+                priority: 1,
+                message: format!(
+                    "handler '{}' calls `{}.{}` — callee has no `ensures` clauses; \
+                     caller's Lean theorem carries `by sorry` (Tier-0 axiomatization)",
+                    handler.name, call.target_interface, call.target_handler,
+                ),
+                subject: Some(handler.name.clone()),
+                fix: format!(
+                    "Add at least one `ensures <expr>` inside `interface {} {{ handler {} {{ ... }} }}`, \
+                     or commit to an `upstream {{ binary_hash = ... }}` pin on the interface so the \
+                     caller can discharge via the bundled axiom module.",
+                    call.target_interface, call.target_handler,
+                ),
+                example: Some(format!(
+                    "  interface {} {{\n    handler {} (...) {{\n      ensures /* observable post-condition */\n    }}\n  }}",
+                    call.target_interface, call.target_handler,
+                )),
+                counterexample: None,
+                fix_options: vec![],
+            });
+        }
+    }
+    warnings
+}
+
 fn check_shape_only_cpi(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
     let mut warnings = Vec::new();
 
@@ -5526,6 +5840,11 @@ pub fn check_code_drift(
     }
     if !spec.error_codes.is_empty() {
         codegen_owned_files.push("src/errors.rs".to_string());
+    }
+    // v2.26 Slice 3: ref_impls.rs is codegen-owned whenever the spec
+    // declares any `ref_impl` — the file holds one `pub fn` per impl.
+    if !spec.ref_impls.is_empty() {
+        codegen_owned_files.push("src/ref_impls.rs".to_string());
     }
 
     // Per-handler files at `src/instructions/<handler>.rs` are user-owned
@@ -6233,6 +6552,155 @@ handler deposit (amount : U64) {
             warnings.is_empty(),
             "lint must stay silent when ensures references the field, got: {:?}",
             warnings.iter().map(|w| &w.rule).collect::<Vec<_>>()
+        );
+    }
+
+    // ========================================================================
+    // v2.26 Track J — multi_cpi_same_field lint
+    // ========================================================================
+
+    /// Two CPI calls whose substituted ensures both reference the same
+    /// caller-state field (`post.vault_balance`) → lint fires P2 Info.
+    /// Mirrors the bear-hug scenario where two `Token.transfer` calls
+    /// drain the same vault. Without per-call snapshot frames (v3.0),
+    /// the Kani harness can over-constrain.
+    #[test]
+    fn multi_cpi_same_field_fires_on_two_token_transfers_from_same_vault() {
+        let src = r#"spec MultiCpi
+program_id "11111111111111111111111111111111"
+
+interface Token {
+  program_id "11111111111111111111111111111111"
+  handler transfer (amount : U64) {
+    accounts {
+      from      : writable
+      to        : writable
+      authority : signer
+    }
+    requires amount > 0
+    ensures state.vault_balance == old(state.vault_balance) - amount
+  }
+}
+
+state { vault_balance : U64 }
+
+handler split (a : U64) (b : U64) {
+  permissionless
+  requires a > 0 else InvalidAmount
+  requires b > 0 else InvalidAmount
+  call Token.transfer(from = 0, to = 1, amount = a, authority = 0)
+  call Token.transfer(from = 0, to = 2, amount = b, authority = 0)
+  effect { vault_balance -= a }
+  ensures state.vault_balance == old(state.vault_balance) - a - b
+}"#;
+        let spec = crate::chumsky_adapter::parse_str(src).expect("spec parses");
+        let warnings = check_multi_cpi_same_field(&spec);
+        let hit = warnings
+            .iter()
+            .find(|w| w.rule == "multi_cpi_same_field")
+            .unwrap_or_else(|| {
+                panic!(
+                    "multi_cpi_same_field must fire; got: {:?}",
+                    warnings.iter().map(|w| &w.rule).collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(hit.severity, Severity::Info);
+        assert_eq!(hit.priority, 2);
+        assert!(
+            hit.message.contains("'vault_balance'"),
+            "message must name the shared field; got: {}",
+            hit.message
+        );
+        assert!(
+            hit.message.contains("Token.transfer"),
+            "message must name the call pair; got: {}",
+            hit.message
+        );
+        assert_eq!(hit.subject.as_deref(), Some("split"));
+    }
+
+    /// Two CPI calls whose substituted ensures reference disjoint
+    /// caller-state fields → lint stays silent. No (pre, post) snapshot
+    /// pair is shared, so the over-constraint risk doesn't apply.
+    #[test]
+    fn multi_cpi_same_field_silent_on_disjoint_fields() {
+        let src = r#"spec MultiCpiDisjoint
+program_id "11111111111111111111111111111111"
+
+interface VaultA {
+  program_id "11111111111111111111111111111111"
+  handler debit (amount : U64) {
+    accounts { vault : writable }
+    requires amount > 0
+    ensures state.vault_a_balance == old(state.vault_a_balance) - amount
+  }
+}
+
+interface VaultB {
+  program_id "11111111111111111111111111111111"
+  handler debit (amount : U64) {
+    accounts { vault : writable }
+    requires amount > 0
+    ensures state.vault_b_balance == old(state.vault_b_balance) - amount
+  }
+}
+
+state { vault_a_balance : U64, vault_b_balance : U64 }
+
+handler tap_both (a : U64) (b : U64) {
+  permissionless
+  requires a > 0 else InvalidAmount
+  requires b > 0 else InvalidAmount
+  call VaultA.debit(amount = a)
+  call VaultB.debit(amount = b)
+  effect { vault_a_balance -= a }
+  effect { vault_b_balance -= b }
+  ensures state.vault_a_balance == old(state.vault_a_balance) - a
+  ensures state.vault_b_balance == old(state.vault_b_balance) - b
+}"#;
+        let spec = crate::chumsky_adapter::parse_str(src).expect("spec parses");
+        let warnings = check_multi_cpi_same_field(&spec);
+        assert!(
+            warnings.is_empty(),
+            "disjoint-field CPI ensures must not fire multi_cpi_same_field; got: {:?}",
+            warnings.iter().map(|w| &w.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// Tier-0 callees (no `ensures` declared) → no substituted field
+    /// references → lint stays silent regardless of CPI multiplicity.
+    /// Catches the spec-shape where the user hasn't yet declared the
+    /// callee's contract; the `cpi_no_callee_ensures` lint surfaces
+    /// that gap separately.
+    #[test]
+    fn multi_cpi_same_field_silent_on_tier0_callees() {
+        let src = r#"spec MultiCpiTier0
+program_id "11111111111111111111111111111111"
+
+interface Logger {
+  program_id "11111111111111111111111111111111"
+  handler log (msg : U64) {
+    accounts { sink : writable }
+  }
+}
+
+state { counter : U64 }
+
+handler tick_twice (a : U64) (b : U64) {
+  permissionless
+  requires a > 0 else InvalidAmount
+  requires b > 0 else InvalidAmount
+  call Logger.log(msg = a)
+  call Logger.log(msg = b)
+  effect { counter += a }
+  ensures state.counter == old(state.counter) + a
+}"#;
+        let spec = crate::chumsky_adapter::parse_str(src).expect("spec parses");
+        let warnings = check_multi_cpi_same_field(&spec);
+        assert!(
+            warnings.is_empty(),
+            "tier-0 callees produce no field refs → lint must stay silent; got: {:?}",
+            warnings.iter().map(|w| &w.message).collect::<Vec<_>>()
         );
     }
 
@@ -9480,6 +9948,96 @@ property balance_monotonic :
             warnings
                 .iter()
                 .map(|w| (&w.rule, &w.message))
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    /// v2.26 fold-in — ref_impl with multiplication over U64 params trips
+    /// the lint. Lean lowers to `Nat` (no overflow); Rust runs `u64 *
+    /// u64` which can wrap or panic.
+    #[test]
+    fn ref_impl_with_multiplication_over_u64_fires_unbounded_arith_lint() {
+        let src = r#"spec Pool
+type Error | InvalidAmount
+type State = { x : U64 }
+
+ref_impl scaled (a : U64) (b : U64) : U64 = a * b
+
+handler set (amt : U64) {
+  requires amt > 0 else InvalidAmount
+  effect { x := amt }
+}
+"#;
+        let spec = crate::chumsky_adapter::parse_str(src).expect("parse");
+        let warnings = check_ref_impl_unbounded_arith(&spec);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.rule == "ref_impl_unbounded_arith"
+                    && w.subject.as_deref() == Some("scaled")),
+            "expected ref_impl_unbounded_arith on `scaled`; got: {:?}",
+            warnings
+                .iter()
+                .map(|w| (&w.rule, &w.subject))
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    /// Pure-division ref_impl doesn't trip the lint — `/` cannot produce
+    /// values exceeding the inputs in unsigned arithmetic.
+    #[test]
+    fn ref_impl_with_division_only_does_not_fire_unbounded_arith_lint() {
+        let src = r#"spec Pool
+type Error | InvalidAmount
+type State = { x : U64 }
+
+ref_impl half (a : U64) : U64 = a / 2
+
+handler set (amt : U64) {
+  requires amt > 0 else InvalidAmount
+  effect { x := amt }
+}
+"#;
+        let spec = crate::chumsky_adapter::parse_str(src).expect("parse");
+        let warnings = check_ref_impl_unbounded_arith(&spec);
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.rule == "ref_impl_unbounded_arith"),
+            "lint should not fire on division-only ref_impl; got: {:?}",
+            warnings
+                .iter()
+                .map(|w| (&w.rule, &w.subject))
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    /// Ref impls without bounded-numeric params (e.g., Pubkey predicates)
+    /// don't trip the lint even when they do arithmetic on other inputs.
+    /// Lean and Rust agree on Bool / Pubkey semantics, so no gap.
+    #[test]
+    fn ref_impl_with_no_numeric_params_does_not_fire_unbounded_arith_lint() {
+        let src = r#"spec Pool
+type Error | InvalidAmount
+type State = { admin : Pubkey }
+
+ref_impl is_admin (who : Pubkey) (admin : Pubkey) : Bool = who == admin
+
+handler set (amt : U64) {
+  requires amt > 0 else InvalidAmount
+  effect {}
+}
+"#;
+        let spec = crate::chumsky_adapter::parse_str(src).expect("parse");
+        let warnings = check_ref_impl_unbounded_arith(&spec);
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.rule == "ref_impl_unbounded_arith"),
+            "lint should not fire when ref_impl has no bounded-numeric IO; got: {:?}",
+            warnings
+                .iter()
+                .map(|w| (&w.rule, &w.subject))
                 .collect::<Vec<_>>(),
         );
     }

@@ -15,6 +15,7 @@ mod chumsky_parser;
 mod cluster;
 mod codegen;
 mod consolidate;
+mod cpi_substitute;
 mod crucible_brownfield;
 mod crucible_gen;
 mod crucible_probe;
@@ -31,6 +32,7 @@ mod init;
 mod integration_test;
 mod interface_gen;
 mod kani;
+mod kani_impl;
 mod lean_gen;
 mod lifecycle_probe;
 mod miri_verify;
@@ -536,6 +538,14 @@ enum Commands {
         #[arg(long)]
         frozen: bool,
 
+        /// v2.26 Slice 4c — escalate `--check-upstream`-style pin
+        /// mismatches surfaced by `--frozen` to CRIT severity, so a
+        /// stale `upstream { binary_hash }` pin fails the check instead
+        /// of just warning. Use in release-blocking CI; default `--frozen`
+        /// stays warning-only (P2) for everyday local runs.
+        #[arg(long, requires = "frozen")]
+        strict: bool,
+
         /// Force-refresh the github source cache for every imported dep.
         /// Wipes `~/.qedgen/cache/github/<org>/<repo>/<kind>/<ref>/` and
         /// re-clones. Use after a force-pushed tag or when the
@@ -634,6 +644,17 @@ enum Commands {
         /// pinned hash / no program_id) still skip cleanly. CI gate friendly.
         #[arg(long)]
         offline: bool,
+
+        /// v2.26 Slice 4c — suppress the upstream binary-hash check
+        /// even when the lock declares pinned hashes. Mismatches demote
+        /// to `Info` and the verify run stays green. Intended for
+        /// offline development; **do not** use in CI — a real stale pin
+        /// is silently masked. Pairs with the auto-on behavior of
+        /// `--check-upstream`: when any `upstream { binary_hash }` is
+        /// pinned, verify runs the check by default unless this flag is
+        /// set.
+        #[arg(long)]
+        upstream_stale_ok: bool,
 
         /// Run probe reproducers under `<project>/target/qedgen-repros/`
         /// (PLAN-v2.16 D4). Each repro is a Mollusk-driven Rust test
@@ -791,6 +812,24 @@ enum Commands {
         /// that layout silently broke `qedgen verify`.)
         #[arg(long, default_value = "./programs/tests/kani.rs")]
         kani_output: PathBuf,
+
+        /// Generate impl-targeted Kani harnesses (v2.26): call the user's
+        /// real Anchor handler against a symbolic `Accounts` context and
+        /// assert the spec's `ensures` clauses. Pairs with `--kani` (which
+        /// produces the spec-model harnesses). Even without this flag,
+        /// emission is auto-triggered when any handler has `modifies`
+        /// listing fields absent from its `effect` block (the v2.25 LP-
+        /// shape signal indicating the impl is expected to fill those
+        /// fields). Anchor target only in v2.26.
+        #[arg(long)]
+        kani_impl: bool,
+
+        /// Output path for impl-targeted Kani harnesses (default:
+        /// `./programs/tests/kani_impl.rs`). Separate file from the
+        /// spec-model `kani.rs` so `cargo kani --harness` can target
+        /// either set without ambiguity.
+        #[arg(long, default_value = "./programs/tests/kani_impl.rs")]
+        kani_impl_output: PathBuf,
 
         /// Generate unit tests (plain Rust, cargo test)
         #[arg(long)]
@@ -2235,6 +2274,7 @@ async fn dispatch(cmd: Commands) -> Result<()> {
             asm,
             json,
             frozen,
+            strict,
             no_cache,
             regen_drift,
             examples_root,
@@ -2297,6 +2337,50 @@ async fn dispatch(cmd: Commands) -> Result<()> {
             };
 
             let mut has_issues = false;
+
+            // v2.26 Slice 4c — `check --frozen` runs the upstream
+            // binary-hash diff opportunistically. Mismatches surface as
+            // P2 warnings (`has_issues` stays false; exit zero) so a
+            // routine CI run that misses a redeploy still draws
+            // attention without blocking. `--strict` escalates mismatch
+            // to CRIT and gates exit, matching the verify behavior.
+            //
+            // Fetch errors (missing `solana` CLI, no network) never
+            // gate either mode — they always surface as P2 so a sandbox
+            // without the Solana toolchain doesn't false-positive CI.
+            if frozen {
+                let spec_dir = spec.parent().unwrap_or_else(|| Path::new("."));
+                let pinned = qed_lock::read(spec_dir)
+                    .ok()
+                    .flatten()
+                    .as_ref()
+                    .map(upstream_check::lock_has_pinned_hash)
+                    .unwrap_or(false);
+                if pinned {
+                    match upstream_check::check_lock(spec_dir, None, false) {
+                        Ok(results) => {
+                            let gate = if strict {
+                                upstream_check::Gate::CheckFrozenStrict
+                            } else {
+                                upstream_check::Gate::CheckFrozen
+                            };
+                            let routed = upstream_check::route_findings(results, gate);
+                            let blocking = upstream_check::print_routed_report(&routed);
+                            if blocking {
+                                has_issues = true;
+                            }
+                        }
+                        Err(e) => {
+                            // Couldn't open the lock to dispatch — surface
+                            // a P2-equivalent note but never gate exit
+                            // (parity with the verify path's Error
+                            // routing). `--strict` users see the message;
+                            // they decide whether to investigate.
+                            eprintln!("note: --frozen upstream check skipped: {}", e);
+                        }
+                    }
+                }
+            }
 
             // sBPF verification (--asm)
             if let Some(ref asm_path) = asm {
@@ -2546,6 +2630,7 @@ async fn dispatch(cmd: Commands) -> Result<()> {
             check_upstream,
             rpc_url,
             offline,
+            upstream_stale_ok,
             probe_repros,
             crucible,
             crucible_harness_dir,
@@ -2561,22 +2646,58 @@ async fn dispatch(cmd: Commands) -> Result<()> {
             let cwd = std::env::current_dir()?;
             let spec = init::resolve_spec_path(spec.as_deref(), &cwd)?;
 
-            // v2.8 G5: --check-upstream is a separate verification stage
-            // from the proptest/kani/lean backends — it diffs each
+            // v2.8 G5 / v2.26 Slice 4c: --check-upstream diffs each
             // imported library's pinned binary hash against the on-chain
             // `.so` via `solana program dump`. Runs independently so
             // users can `--check-upstream` without re-running the harnesses.
             // F6 fold-in: --offline refuses any network fetch.
-            if check_upstream {
-                let spec_dir = spec.parent().unwrap_or_else(|| Path::new("."));
+            //
+            // v2.26 Slice 4c — auto-on when `qed.lock` declares any
+            // pinned `upstream_binary_hash`. Explicit `--check-upstream`
+            // still works (and is the right flag in scripts / CI), but
+            // skipping it no longer silently bypasses the gate. Pair
+            // with `--upstream-stale-ok` to suppress the check for
+            // offline dev runs.
+            let spec_dir = spec.parent().unwrap_or_else(|| Path::new("."));
+            let run_upstream = if upstream_stale_ok {
+                // Honor the suppression flag even when --check-upstream
+                // is explicit — `upstream-stale-ok` is the local-dev
+                // escape hatch, not a "render warnings anyway" knob.
+                false
+            } else if check_upstream {
+                true
+            } else {
+                // Auto-on detection: only when a qed.lock exists and
+                // at least one entry has a populated binary_hash pin.
+                qed_lock::read(spec_dir)
+                    .ok()
+                    .flatten()
+                    .as_ref()
+                    .map(upstream_check::lock_has_pinned_hash)
+                    .unwrap_or(false)
+            };
+            if run_upstream {
                 let results = upstream_check::check_lock(spec_dir, rpc_url.as_deref(), offline)?;
-                let any_failure = upstream_check::print_report(&results);
-                if any_failure {
+                let gate = upstream_check::Gate::Verify;
+                let routed = upstream_check::route_findings(results, gate);
+                let blocking = upstream_check::print_routed_report(&routed);
+                if blocking {
                     std::process::exit(1);
                 }
                 // When --check-upstream is the only verb, exit cleanly
                 // without firing the backend runners. Combine with
                 // --proptest etc. to do both in one invocation.
+                let any_backend_flag = proptest || kani || lean || miri || probe_repros;
+                if check_upstream && !any_backend_flag {
+                    return Ok(());
+                }
+            } else if check_upstream && upstream_stale_ok {
+                // The combination is explicitly allowed — emit a single
+                // breadcrumb so the operator knows the gate was honored
+                // but the suppression flag won.
+                eprintln!(
+                    "note: --upstream-stale-ok suppressed --check-upstream (offline-dev mode)"
+                );
                 let any_backend_flag = proptest || kani || lean || miri || probe_repros;
                 if !any_backend_flag {
                     return Ok(());
@@ -2777,6 +2898,8 @@ async fn dispatch(cmd: Commands) -> Result<()> {
             output_dir,
             kani,
             kani_output,
+            kani_impl,
+            kani_impl_output,
             test,
             test_output,
             proptest,
@@ -2810,7 +2933,8 @@ async fn dispatch(cmd: Commands) -> Result<()> {
             // alone (no backend flags) and Pinocchio is the chosen
             // target — that's the unambiguous "I want a Pinocchio
             // Rust program" case the scaffold can't satisfy.
-            let any_backend = kani || proptest || lean || test || integration || ci || crucible;
+            let any_backend =
+                kani || kani_impl || proptest || lean || test || integration || ci || crucible;
             let pinocchio_no_scaffold = matches!(target, Target::Pinocchio);
             if pinocchio_no_scaffold && !any_backend && !all {
                 anyhow::bail!(
@@ -2841,6 +2965,31 @@ async fn dispatch(cmd: Commands) -> Result<()> {
                 }
                 kani::generate(&spec, &kani_output)?;
             }
+
+            // v2.26 Batch 2 Track H — impl-targeted Kani harness. Emits
+            // when:
+            //   1. `--kani-impl` was passed explicitly, OR
+            //   2. `--all` was passed AND at least one handler auto-triggers
+            //      (modifies ⊋ effect.lhs — the LP-shape signal), OR
+            //   3. `--kani` was passed AND at least one handler auto-triggers
+            //      (so users on `--kani` get the impl-side coverage when
+            //      their spec declares modifies-driven fill sites).
+            //
+            // `kani_impl::spec_triggers_impl_harness` is the auto-trigger
+            // predicate. Per-handler heuristic lives in one place
+            // (mirrors `codegen.rs` Phase A's modifies-vs-effect diff).
+            let auto_impl_trigger = {
+                let parsed = check::parse_spec_file(&spec)?;
+                kani_impl::spec_triggers_impl_harness(&parsed)
+            };
+            let want_kani_impl = kani_impl || ((kani || all) && auto_impl_trigger);
+            if want_kani_impl {
+                if let Err(e) = deps::require_kani() {
+                    eprintln!("warning: {e}");
+                }
+                kani_impl::generate(&spec, &kani_impl_output, /*explicit_flag=*/ kani_impl)?;
+            }
+
             if test || all {
                 unit_test::generate(&spec, &test_output)?;
             }

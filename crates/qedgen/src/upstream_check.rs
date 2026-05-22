@@ -16,6 +16,33 @@
 //!   spec, or library entry that hasn't been pinned yet) or is missing
 //!   a `program_id` to fetch by.
 //! - **Error**: the `solana` CLI failed (network, auth, missing CLI).
+//!
+//! v2.26 Slice 4c — severity routing. A mismatched pin is no longer a
+//! plain stderr warning; it surfaces as a structured [`Finding`] with a
+//! severity that depends on the [`Gate`] the call was made from:
+//!
+//! - `qedgen verify --check-upstream` → mismatch = `Crit`, exits non-zero
+//! - `qedgen check --frozen` → mismatch = `P2`, exits zero (warning)
+//! - `qedgen check --frozen --strict` → mismatch = `Crit`, exits non-zero
+//! - `qedgen verify --check-upstream --upstream-stale-ok` → mismatch
+//!   demoted to `Info` (suppressed); exits zero. Intended for offline dev.
+//!
+//! Network/CLI errors stay non-blocking under every gate — they surface
+//! as `P2` so a missing `solana` CLI never silently passes nor falsely
+//! gates CI. Only `Mismatch` is severity-routed.
+//!
+//! ### Test seam — `QEDGEN_UPSTREAM_FAKE_BYTES`
+//!
+//! v2.26 Track M — `SolanaCliFetcher::fetch` honors the
+//! `QEDGEN_UPSTREAM_FAKE_BYTES` env var: when set, the value's UTF-8 bytes
+//! are returned in place of the `solana program dump` payload (no shell
+//! out). Lets the end-to-end CLI test exercise the full
+//! `verify --check-upstream` dispatch path — including the
+//! `std::process::exit` codes that the routing layer can't observe — on
+//! hosts without the Solana CLI. Production callers never set this env
+//! var, so behavior outside tests is unchanged. The value goes through
+//! `format_hash` like any other byte payload, so tests compute their
+//! pinned hash from the same `format_hash` they're asserting against.
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
@@ -23,6 +50,12 @@ use std::path::Path;
 use std::process::Command;
 
 use crate::qed_lock::{self, LockEntry, LockFile};
+
+/// Env var that overrides `solana program dump` in the production
+/// `SolanaCliFetcher`. Used only by `tests/upstream_check_e2e.rs` and the
+/// in-process E2E test below. See the module docs for details.
+#[allow(dead_code)]
+pub const FAKE_BYTES_ENV: &str = "QEDGEN_UPSTREAM_FAKE_BYTES";
 
 /// Result of checking one dependency.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,6 +84,145 @@ pub enum DepCheckOutcome {
 pub struct DepCheckResult {
     pub name: String,
     pub outcome: DepCheckOutcome,
+}
+
+// ----------------------------------------------------------------------------
+// v2.26 Slice 4c — severity routing
+// ----------------------------------------------------------------------------
+
+/// Verification gate the upstream check is running under. Determines how
+/// `Mismatch` outcomes map onto [`FindingSeverity`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum Gate {
+    /// `qedgen verify --check-upstream` — mismatch = Crit, fails.
+    Verify,
+    /// `qedgen verify --check-upstream --upstream-stale-ok` — mismatch
+    /// demoted to Info; exits zero. Offline-dev only.
+    VerifyStaleOk,
+    /// `qedgen check --frozen` — mismatch = P2 (warning), exits zero.
+    CheckFrozen,
+    /// `qedgen check --frozen --strict` — mismatch = Crit, fails.
+    CheckFrozenStrict,
+}
+
+/// Severity assigned to a single [`Finding`] after [`Gate`]-aware routing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum FindingSeverity {
+    /// Verification-gating. Caller exits non-zero.
+    Crit,
+    /// P2 warning. Surfaces in the report but the caller exits zero.
+    P2,
+    /// Informational; suppressed by `--upstream-stale-ok` or a clean run.
+    Info,
+}
+
+/// Structured finding the verify / check command rolls up. One per
+/// dependency that had a `Mismatch` or `Error` outcome; clean matches
+/// and unpinned skips are summarized separately.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct Finding {
+    pub name: String,
+    pub severity: FindingSeverity,
+    pub message: String,
+}
+
+/// Result of routing a slate of [`DepCheckResult`]s through a [`Gate`].
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct RoutedReport {
+    /// One [`Finding`] per Mismatch / Error outcome, with severity routed.
+    pub findings: Vec<Finding>,
+    /// The original outcomes, preserved so the caller can render skips /
+    /// matches alongside the routed findings.
+    pub raw: Vec<DepCheckResult>,
+}
+
+impl RoutedReport {
+    /// True if any finding is severity-CRIT — the caller exits non-zero.
+    #[allow(dead_code)]
+    pub fn any_blocking(&self) -> bool {
+        self.findings
+            .iter()
+            .any(|f| matches!(f.severity, FindingSeverity::Crit))
+    }
+
+    /// True if any finding is at least P2 — the caller renders the
+    /// "warnings present" tail line but does not exit non-zero.
+    #[allow(dead_code)]
+    pub fn any_warning(&self) -> bool {
+        self.findings
+            .iter()
+            .any(|f| matches!(f.severity, FindingSeverity::P2))
+    }
+}
+
+/// Pure routing step. Takes the per-dep outcomes and the [`Gate`] and
+/// produces a [`RoutedReport`]. No I/O — the network call already
+/// happened in `check_lock_with_fetcher`. Unit-tested below.
+#[allow(dead_code)]
+pub fn route_findings(results: Vec<DepCheckResult>, gate: Gate) -> RoutedReport {
+    let mut findings = Vec::new();
+    for r in &results {
+        match &r.outcome {
+            DepCheckOutcome::Mismatch {
+                program_id,
+                pinned,
+                on_chain,
+            } => {
+                let severity = match gate {
+                    Gate::Verify | Gate::CheckFrozenStrict => FindingSeverity::Crit,
+                    Gate::CheckFrozen => FindingSeverity::P2,
+                    Gate::VerifyStaleOk => FindingSeverity::Info,
+                };
+                findings.push(Finding {
+                    name: r.name.clone(),
+                    severity,
+                    message: format!(
+                        "binary_hash pin for {} ({}) is stale — pinned {}, on-chain {}",
+                        r.name, program_id, pinned, on_chain
+                    ),
+                });
+            }
+            DepCheckOutcome::Error { message } => {
+                // Network / CLI errors are never CRIT; we don't want a
+                // missing `solana` CLI to gate CI silently. P2 under
+                // every gate; demoted to Info under VerifyStaleOk so
+                // offline dev runs stay green.
+                let severity = match gate {
+                    Gate::VerifyStaleOk => FindingSeverity::Info,
+                    _ => FindingSeverity::P2,
+                };
+                findings.push(Finding {
+                    name: r.name.clone(),
+                    severity,
+                    message: format!("upstream fetch failed: {}", message),
+                });
+            }
+            DepCheckOutcome::Match { .. } | DepCheckOutcome::Skipped { .. } => {
+                // No finding — caller renders these in the summary tail.
+            }
+        }
+    }
+    RoutedReport {
+        findings,
+        raw: results,
+    }
+}
+
+/// True if `lock` has at least one entry with a populated
+/// `upstream_binary_hash`. `qedgen verify` uses this to auto-enable
+/// `--check-upstream` when any pin is present (v2.26 Slice 4c).
+#[allow(dead_code)]
+pub fn lock_has_pinned_hash(lock: &LockFile) -> bool {
+    lock.dependencies.iter().any(|e| {
+        e.upstream_binary_hash
+            .as_deref()
+            .map(|h| !h.is_empty())
+            .unwrap_or(false)
+    })
 }
 
 /// Read `qed.lock` from `spec_dir` and check every dependency that
@@ -120,6 +292,18 @@ struct SolanaCliFetcher<'a> {
 
 impl<'a> BinaryFetcher for SolanaCliFetcher<'a> {
     fn fetch(&mut self, program_id: &str) -> Result<Vec<u8>> {
+        // v2.26 Track M — the env-var seam lets the E2E test inject a
+        // canned payload without shelling out to `solana`. Honored before
+        // the temp-file / Command setup so the test path doesn't depend
+        // on the Solana CLI being on $PATH. Empty string is treated as
+        // "unset" (defensive: `std::env::set_var("X", "")` should not
+        // silently mute the production fetcher in test runners).
+        if let Ok(payload) = std::env::var(FAKE_BYTES_ENV) {
+            if !payload.is_empty() {
+                let _ = program_id; // intentionally unused under the seam
+                return Ok(payload.into_bytes());
+            }
+        }
         let tmp = tempfile::Builder::new()
             .prefix("qedgen-program-")
             .suffix(".so")
@@ -264,6 +448,42 @@ pub fn print_report(results: &[DepCheckResult]) -> bool {
     any_failure
 }
 
+/// v2.26 Slice 4c — render a [`RoutedReport`] with severity-tagged
+/// findings. Matches stay informational, mismatches / errors carry the
+/// gate-derived severity. Returns true if the caller should exit non-zero
+/// (any CRIT finding); otherwise the caller surfaces warnings without
+/// gating exit.
+#[allow(dead_code)]
+pub fn print_routed_report(report: &RoutedReport) -> bool {
+    // First render the original per-dep outcomes so the operator sees the
+    // skip / match context, then the severity-tagged findings tail.
+    for r in &report.raw {
+        match &r.outcome {
+            DepCheckOutcome::Match { program_id, hash } => {
+                eprintln!("  ✓ {} ({}): {}", r.name, program_id, hash);
+            }
+            DepCheckOutcome::Mismatch { program_id, .. } => {
+                eprintln!("  ✗ {} ({}): MISMATCH", r.name, program_id);
+            }
+            DepCheckOutcome::Skipped { reason } => {
+                eprintln!("  · {}: skipped — {}", r.name, reason);
+            }
+            DepCheckOutcome::Error { message } => {
+                eprintln!("  ! {}: error — {}", r.name, message);
+            }
+        }
+    }
+    for f in &report.findings {
+        let tag = match f.severity {
+            FindingSeverity::Crit => "CRIT",
+            FindingSeverity::P2 => "P2  ",
+            FindingSeverity::Info => "INFO",
+        };
+        eprintln!("  [{tag}] {}: {}", f.name, f.message);
+    }
+    report.any_blocking()
+}
+
 // ----------------------------------------------------------------------------
 // Tests
 // ----------------------------------------------------------------------------
@@ -311,6 +531,45 @@ mod tests {
             program_id: None,
             upstream_binary_hash: hash.map(str::to_string),
             upstream_version: None,
+        }
+    }
+
+    fn mismatch_result() -> DepCheckResult {
+        DepCheckResult {
+            name: "spl_token".to_string(),
+            outcome: DepCheckOutcome::Mismatch {
+                program_id: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string(),
+                pinned: "sha256:aaaa".to_string(),
+                on_chain: "sha256:bbbb".to_string(),
+            },
+        }
+    }
+
+    fn error_result() -> DepCheckResult {
+        DepCheckResult {
+            name: "missing".to_string(),
+            outcome: DepCheckOutcome::Error {
+                message: "solana CLI not in PATH".to_string(),
+            },
+        }
+    }
+
+    fn match_result() -> DepCheckResult {
+        DepCheckResult {
+            name: "fine".to_string(),
+            outcome: DepCheckOutcome::Match {
+                program_id: "Tokenkeg".to_string(),
+                hash: "sha256:aaaa".to_string(),
+            },
+        }
+    }
+
+    fn skipped_result() -> DepCheckResult {
+        DepCheckResult {
+            name: "no_pin".to_string(),
+            outcome: DepCheckOutcome::Skipped {
+                reason: "no upstream_binary_hash pinned".to_string(),
+            },
         }
     }
 
@@ -478,5 +737,282 @@ mod tests {
             },
         ];
         assert!(!print_report(&results));
+    }
+
+    // ----------------------------------------------------------------------
+    // v2.26 Slice 4c — severity-routing unit tests
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn lock_has_pinned_hash_detects_populated_entries() {
+        let empty = LockFile {
+            version: LOCK_VERSION,
+            dependencies: vec![entry_with_hash("plain", None)],
+        };
+        assert!(!lock_has_pinned_hash(&empty));
+
+        let with_pin = LockFile {
+            version: LOCK_VERSION,
+            dependencies: vec![
+                entry_with_hash("plain", None),
+                entry_with_hash("pinned", Some("sha256:abc")),
+            ],
+        };
+        assert!(lock_has_pinned_hash(&with_pin));
+
+        // Empty-string hash counts as not-pinned (defensive against
+        // serde defaulting to "").
+        let with_empty = LockFile {
+            version: LOCK_VERSION,
+            dependencies: vec![entry_with_hash("empty", Some(""))],
+        };
+        assert!(!lock_has_pinned_hash(&with_empty));
+    }
+
+    #[test]
+    fn verify_gate_routes_mismatch_to_crit_and_blocks() {
+        let routed = route_findings(vec![mismatch_result()], Gate::Verify);
+        assert_eq!(routed.findings.len(), 1);
+        assert_eq!(routed.findings[0].severity, FindingSeverity::Crit);
+        assert!(routed.any_blocking(), "verify mismatch must gate exit");
+        assert!(routed.findings[0].message.contains("stale"));
+    }
+
+    #[test]
+    fn check_frozen_gate_routes_mismatch_to_p2_and_does_not_block() {
+        let routed = route_findings(vec![mismatch_result()], Gate::CheckFrozen);
+        assert_eq!(routed.findings.len(), 1);
+        assert_eq!(routed.findings[0].severity, FindingSeverity::P2);
+        assert!(
+            !routed.any_blocking(),
+            "check --frozen mismatch must not exit non-zero"
+        );
+        assert!(
+            routed.any_warning(),
+            "check --frozen mismatch surfaces as warning"
+        );
+    }
+
+    #[test]
+    fn check_frozen_strict_routes_mismatch_to_crit_and_blocks() {
+        let routed = route_findings(vec![mismatch_result()], Gate::CheckFrozenStrict);
+        assert_eq!(routed.findings.len(), 1);
+        assert_eq!(routed.findings[0].severity, FindingSeverity::Crit);
+        assert!(routed.any_blocking(), "--strict must escalate to CRIT");
+    }
+
+    #[test]
+    fn verify_stale_ok_demotes_mismatch_to_info_and_does_not_block() {
+        let routed = route_findings(vec![mismatch_result()], Gate::VerifyStaleOk);
+        assert_eq!(routed.findings.len(), 1);
+        assert_eq!(routed.findings[0].severity, FindingSeverity::Info);
+        assert!(!routed.any_blocking());
+        assert!(
+            !routed.any_warning(),
+            "--upstream-stale-ok suppresses warnings too — exit fully clean"
+        );
+    }
+
+    #[test]
+    fn fetch_errors_stay_p2_under_verify_and_check() {
+        // A missing solana CLI never gates CI silently — it surfaces as
+        // P2 under both verify (where it would otherwise be tempting to
+        // CRIT it) and check --frozen.
+        for gate in [Gate::Verify, Gate::CheckFrozen, Gate::CheckFrozenStrict] {
+            let routed = route_findings(vec![error_result()], gate);
+            assert_eq!(routed.findings.len(), 1);
+            assert_eq!(
+                routed.findings[0].severity,
+                FindingSeverity::P2,
+                "fetch errors must be P2 under {gate:?}"
+            );
+            assert!(
+                !routed.any_blocking(),
+                "fetch errors must not gate exit under {gate:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fetch_errors_demoted_to_info_under_stale_ok() {
+        let routed = route_findings(vec![error_result()], Gate::VerifyStaleOk);
+        assert_eq!(routed.findings[0].severity, FindingSeverity::Info);
+    }
+
+    #[test]
+    fn matches_and_skips_produce_no_findings() {
+        let routed = route_findings(vec![match_result(), skipped_result()], Gate::Verify);
+        assert!(routed.findings.is_empty());
+        assert!(!routed.any_blocking());
+    }
+
+    #[test]
+    fn print_routed_report_returns_blocking_for_crit_only() {
+        let routed = route_findings(vec![mismatch_result()], Gate::Verify);
+        assert!(routed.any_blocking());
+
+        let routed_p2 = route_findings(vec![mismatch_result()], Gate::CheckFrozen);
+        assert!(!routed_p2.any_blocking());
+    }
+
+    // ----------------------------------------------------------------------
+    // v2.26 Track M — end-to-end test through `check_lock` + the env-var
+    // seam. Drives the full lock-read → fetch → hash → route → render
+    // pipeline that the CLI dispatch path uses, without shelling out to
+    // `solana program dump`. Complements the pure routing unit tests
+    // above (which feed synthetic `DepCheckResult`s) and the CLI-level
+    // exit-code test in `tests/upstream_check_e2e.rs`.
+    // ----------------------------------------------------------------------
+
+    /// Serialize tests that touch `QEDGEN_UPSTREAM_FAKE_BYTES`. `cargo
+    /// test` runs cases in parallel by default; env-var mutation is
+    /// process-global, so without this mutex one test could observe
+    /// another's fake payload (or set/unset race).
+    fn env_lock() -> &'static std::sync::Mutex<()> {
+        static M: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        M.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    /// RAII guard: install `QEDGEN_UPSTREAM_FAKE_BYTES=payload` for the
+    /// duration of the test, unset on drop. Acquires `env_lock` so
+    /// parallel test cases don't trample each other.
+    struct FakeBytesGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+    impl FakeBytesGuard {
+        fn set(payload: &str) -> Self {
+            let lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+            std::env::set_var(FAKE_BYTES_ENV, payload);
+            Self { _lock: lock }
+        }
+    }
+    impl Drop for FakeBytesGuard {
+        fn drop(&mut self) {
+            std::env::remove_var(FAKE_BYTES_ENV);
+        }
+    }
+
+    /// Write a minimal `qed.lock` with one pinned dep into `dir` and
+    /// return the program_id used. The pinned hash is `format_hash` of
+    /// the supplied `pinned_payload`; the caller controls whether the
+    /// fetcher's response (via the env var) matches or differs.
+    fn write_lock_with_pin(dir: &Path, pinned_payload: &[u8]) -> String {
+        let program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string();
+        let pinned_hash = format_hash(pinned_payload);
+        let lock = LockFile {
+            version: LOCK_VERSION,
+            dependencies: vec![LockEntry {
+                name: "spl".to_string(),
+                source: "builtin:spl".to_string(),
+                spec_hash: "sha256:0".to_string(),
+                git_ref: None,
+                resolved_commit: None,
+                path: None,
+                program_id: Some(program_id.clone()),
+                upstream_binary_hash: Some(pinned_hash),
+                upstream_version: Some("4.0.3".to_string()),
+            }],
+        };
+        crate::qed_lock::write(dir, &lock).expect("write qed.lock");
+        program_id
+    }
+
+    /// Mismatch under `Gate::Verify` produces a CRIT finding that gates
+    /// exit (`any_blocking()` is true). The pinned payload differs from
+    /// the env-var-injected on-chain payload, so the fetcher reports a
+    /// hash that doesn't match the lock.
+    #[test]
+    fn e2e_verify_mismatch_is_crit_and_blocks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _pid = write_lock_with_pin(dir.path(), b"pinned-bytes-v1");
+        let _g = FakeBytesGuard::set("on-chain-bytes-v2");
+
+        let results = check_lock(dir.path(), None, false).expect("check_lock");
+        let routed = route_findings(results, Gate::Verify);
+        assert_eq!(routed.findings.len(), 1, "one finding for one dep");
+        assert_eq!(
+            routed.findings[0].severity,
+            FindingSeverity::Crit,
+            "verify mismatch must be CRIT"
+        );
+        assert!(routed.any_blocking(), "CRIT must gate exit");
+    }
+
+    /// Same mismatch under `Gate::CheckFrozen` lowers severity to P2 —
+    /// surfaces in the report but does not gate exit. This is the
+    /// non-strict `check --frozen` behavior.
+    #[test]
+    fn e2e_check_frozen_mismatch_is_p2_and_does_not_block() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _pid = write_lock_with_pin(dir.path(), b"pinned-bytes-v1");
+        let _g = FakeBytesGuard::set("on-chain-bytes-v2");
+
+        let results = check_lock(dir.path(), None, false).expect("check_lock");
+        let routed = route_findings(results, Gate::CheckFrozen);
+        assert_eq!(routed.findings.len(), 1);
+        assert_eq!(routed.findings[0].severity, FindingSeverity::P2);
+        assert!(!routed.any_blocking(), "check --frozen must not block");
+        assert!(routed.any_warning(), "P2 must surface as warning");
+    }
+
+    /// `check --frozen --strict` escalates the same mismatch back to CRIT.
+    #[test]
+    fn e2e_check_frozen_strict_escalates_to_crit_and_blocks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _pid = write_lock_with_pin(dir.path(), b"pinned-bytes-v1");
+        let _g = FakeBytesGuard::set("on-chain-bytes-v2");
+
+        let results = check_lock(dir.path(), None, false).expect("check_lock");
+        let routed = route_findings(results, Gate::CheckFrozenStrict);
+        assert_eq!(routed.findings.len(), 1);
+        assert_eq!(routed.findings[0].severity, FindingSeverity::Crit);
+        assert!(routed.any_blocking(), "--strict must gate exit");
+    }
+
+    /// `--upstream-stale-ok` demotes the mismatch finding to Info; the
+    /// report still records it but neither blocks nor counts as a
+    /// warning. Offline-dev escape hatch.
+    #[test]
+    fn e2e_verify_stale_ok_demotes_to_info() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _pid = write_lock_with_pin(dir.path(), b"pinned-bytes-v1");
+        let _g = FakeBytesGuard::set("on-chain-bytes-v2");
+
+        let results = check_lock(dir.path(), None, false).expect("check_lock");
+        let routed = route_findings(results, Gate::VerifyStaleOk);
+        assert_eq!(routed.findings.len(), 1);
+        assert_eq!(routed.findings[0].severity, FindingSeverity::Info);
+        assert!(!routed.any_blocking());
+        assert!(!routed.any_warning(), "stale-ok suppresses warnings too");
+    }
+
+    /// When the on-chain bytes hash to the pinned value, no finding is
+    /// produced under any gate and the run exits clean. Sanity-check
+    /// that the env var doesn't manufacture findings out of thin air.
+    #[test]
+    fn e2e_match_under_any_gate_produces_no_finding() {
+        let bytes = b"matching-bytes";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _pid = write_lock_with_pin(dir.path(), bytes);
+        let _g = FakeBytesGuard::set(std::str::from_utf8(bytes).unwrap());
+
+        let results = check_lock(dir.path(), None, false).expect("check_lock");
+        assert!(
+            matches!(results[0].outcome, DepCheckOutcome::Match { .. }),
+            "fetcher payload hashes to pinned value → Match",
+        );
+        for gate in [
+            Gate::Verify,
+            Gate::CheckFrozen,
+            Gate::CheckFrozenStrict,
+            Gate::VerifyStaleOk,
+        ] {
+            let routed = route_findings(results.clone(), gate);
+            assert!(
+                routed.findings.is_empty(),
+                "matching pin must produce no finding under {gate:?}",
+            );
+            assert!(!routed.any_blocking());
+        }
     }
 }
