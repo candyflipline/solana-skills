@@ -50,7 +50,11 @@ total=0
 
 for cmd in $commands; do
     total=$((total + 1))
-    if ! echo "$readme_content" | grep -qi "$cmd"; then
+    # Use a here-string instead of `echo | grep` — under `set -o pipefail`,
+    # `grep -q` closes the pipe early on first match, which makes `echo` exit
+    # non-zero with "Broken pipe" and fails the whole pipeline despite the
+    # match succeeding. CI runners hit this intermittently on large READMEs.
+    if ! grep -qi "$cmd" <<<"$readme_content"; then
         missing="$missing $cmd"
     fi
 done
