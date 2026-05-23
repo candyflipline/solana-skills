@@ -70,6 +70,18 @@ pub enum DepCheckOutcome {
         pinned: String,
         on_chain: String,
     },
+    /// v2.27 Track D1 — proof_hash drift between the on-disk lock and the
+    /// content of the provider's proof package on disk. No network fetch:
+    /// the "on-chain" side is `qed_lock::compute_proof_hash` walking the
+    /// provider's `.qed/proofs/` directory. Routed through the same
+    /// [`Gate`]-aware severity layer as [`DepCheckOutcome::Mismatch`] so
+    /// `check --frozen` warns (P2) while `--strict` and `verify` block
+    /// (CRIT). Surfaces when a provider's proof package was edited
+    /// without re-running `qedgen check` to refresh the lockfile.
+    ProofHashMismatch {
+        pinned: String,
+        computed: String,
+    },
     Skipped {
         reason: String,
     },
@@ -183,6 +195,26 @@ pub fn route_findings(results: Vec<DepCheckResult>, gate: Gate) -> RoutedReport 
                     message: format!(
                         "binary_hash pin for {} ({}) is stale — pinned {}, on-chain {}",
                         r.name, program_id, pinned, on_chain
+                    ),
+                });
+            }
+            DepCheckOutcome::ProofHashMismatch { pinned, computed } => {
+                // Track D1 — same severity routing as binary_hash
+                // Mismatch. Drift between the on-disk lock and the
+                // provider's proof package content is the legible signal
+                // that a Stance-2 callee's proofs changed without the
+                // consumer rerunning `qedgen check`.
+                let severity = match gate {
+                    Gate::Verify | Gate::CheckFrozenStrict => FindingSeverity::Crit,
+                    Gate::CheckFrozen => FindingSeverity::P2,
+                    Gate::VerifyStaleOk => FindingSeverity::Info,
+                };
+                findings.push(Finding {
+                    name: r.name.clone(),
+                    severity,
+                    message: format!(
+                        "proof_hash for {} is stale — pinned {}, computed {}",
+                        r.name, pinned, computed
                     ),
                 });
             }
@@ -359,6 +391,23 @@ fn check_one(entry: &LockEntry, fetcher: &mut dyn BinaryFetcher) -> DepCheckOutc
         }
     };
 
+    // v2.27 Track C3 — `sha256:00…00` is the recognized sentinel for
+    // "no payload to pin against". Native programs like the System
+    // Program live inside the validator binary itself and aren't
+    // returned by `solana program dump` — there's nothing to fetch and
+    // nothing to hash. Treating the sentinel as a real pin would
+    // produce a confusing Error ("11111111111111111111111111111111 is
+    // not an SBF program") instead of a clean skip. Bundled-stdlib
+    // interfaces that ship with the sentinel are intentionally Stance-1
+    // tautology axioms with no on-chain counterpart; the trust anchor
+    // is the runtime, not a content hash.
+    if is_sentinel_hash(pinned) {
+        return DepCheckOutcome::Skipped {
+            reason: "binary_hash sentinel (sha256:00…00) — native program or unverified pin"
+                .to_string(),
+        };
+    }
+
     // program_id flows from the imported interface's
     // `program_id "..."` declaration into qed.lock at resolution time
     // (v2.8 fold-in F1). Only `None` when the imported interface itself
@@ -412,6 +461,29 @@ fn format_hash(bytes: &[u8]) -> String {
     format!("sha256:{:x}", hasher.finalize())
 }
 
+/// v2.27 Track C3 — recognize the "no payload to pin" sentinel.
+/// Accepts `sha256:` prefix, any case, and either 64 zero characters
+/// (the standard form qedgen emits) or fewer (a degenerate shorthand a
+/// user might hand-write). Defensive: stricter matching would let the
+/// production fetcher attempt `solana program dump` on entries the
+/// author marked as native, producing confusing "not an SBF program"
+/// errors instead of a clean skip.
+///
+/// v2.27 Track D2 fold-in: also called by
+/// `check::collect_require_verified_findings` to exempt sentinel-pinned
+/// native programs (System) from `--require-verified` — their `ensures`
+/// clauses are validated by the validator runtime itself, not by a
+/// Lake-buildable proof package. Made `pub(crate)` so the lint reuses the
+/// same definition the runtime fetcher trusts.
+#[allow(dead_code)]
+pub(crate) fn is_sentinel_hash(pinned: &str) -> bool {
+    let body = pinned
+        .strip_prefix("sha256:")
+        .or_else(|| pinned.strip_prefix("SHA256:"))
+        .unwrap_or(pinned);
+    !body.is_empty() && body.chars().all(|c| c == '0')
+}
+
 // ----------------------------------------------------------------------------
 // Reporting
 // ----------------------------------------------------------------------------
@@ -435,6 +507,12 @@ pub fn print_report(results: &[DepCheckResult]) -> bool {
                 eprintln!("  ✗ {} ({}): MISMATCH", r.name, program_id);
                 eprintln!("      pinned:   {}", pinned);
                 eprintln!("      on-chain: {}", on_chain);
+            }
+            DepCheckOutcome::ProofHashMismatch { pinned, computed } => {
+                any_failure = true;
+                eprintln!("  ✗ {}: PROOF_HASH MISMATCH", r.name);
+                eprintln!("      pinned:   {}", pinned);
+                eprintln!("      computed: {}", computed);
             }
             DepCheckOutcome::Skipped { reason } => {
                 eprintln!("  · {}: skipped — {}", r.name, reason);
@@ -464,6 +542,9 @@ pub fn print_routed_report(report: &RoutedReport) -> bool {
             }
             DepCheckOutcome::Mismatch { program_id, .. } => {
                 eprintln!("  ✗ {} ({}): MISMATCH", r.name, program_id);
+            }
+            DepCheckOutcome::ProofHashMismatch { .. } => {
+                eprintln!("  ✗ {}: PROOF_HASH MISMATCH", r.name);
             }
             DepCheckOutcome::Skipped { reason } => {
                 eprintln!("  · {}: skipped — {}", r.name, reason);
@@ -531,6 +612,8 @@ mod tests {
             program_id: None,
             upstream_binary_hash: hash.map(str::to_string),
             upstream_version: None,
+            verified: false,
+            proof_hash: None,
         }
     }
 
@@ -541,6 +624,16 @@ mod tests {
                 program_id: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string(),
                 pinned: "sha256:aaaa".to_string(),
                 on_chain: "sha256:bbbb".to_string(),
+            },
+        }
+    }
+
+    fn proof_hash_mismatch_result() -> DepCheckResult {
+        DepCheckResult {
+            name: "tokenlib".to_string(),
+            outcome: DepCheckOutcome::ProofHashMismatch {
+                pinned: "sha256:proof_old".to_string(),
+                computed: "sha256:proof_new".to_string(),
             },
         }
     }
@@ -589,6 +682,59 @@ mod tests {
             other => panic!("expected Skipped, got {:?}", other),
         }
     }
+
+    // ----- v2.27 Track C3: sentinel-hash skip -----
+
+    #[test]
+    fn skips_entries_with_zero_sentinel_hash() {
+        // Native programs (e.g. the System Program) have no on-chain
+        // SBF payload to fetch. The sentinel `sha256:00…00` marks that
+        // case; check_one returns Skipped with a sentinel-explaining
+        // reason instead of trying to fetch and erroring.
+        let zero = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        let mut e = entry_with_hash("system", Some(zero));
+        e.program_id = Some("11111111111111111111111111111111".to_string());
+        let lock = LockFile {
+            version: LOCK_VERSION,
+            dependencies: vec![e],
+        };
+        // Fetcher is never called for sentinel entries; assert that by
+        // leaving it empty — a fetch attempt would error and propagate
+        // through as DepCheckOutcome::Error.
+        let mut fetcher = FakeFetcher::new();
+        let results = check_lock_with_fetcher(&lock, &mut fetcher);
+        match &results[0].outcome {
+            DepCheckOutcome::Skipped { reason } => {
+                assert!(
+                    reason.contains("sentinel"),
+                    "should explain the sentinel skip; got: {reason}"
+                );
+            }
+            other => panic!("expected Skipped (sentinel hash), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn sentinel_detection_accepts_prefix_and_short_form() {
+        // Defensive matching: both `sha256:` and `SHA256:` prefixes,
+        // and shorthand of fewer than 64 zeros, still classify as
+        // sentinel. Stricter matching risks running the real fetcher
+        // on intentionally-unpinned entries.
+        assert!(is_sentinel_hash(
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        ));
+        assert!(is_sentinel_hash("SHA256:0000"));
+        assert!(is_sentinel_hash("0000000000000000"));
+        assert!(!is_sentinel_hash(
+            "sha256:8190d3f7ceb6cb7a7a8d8924bff89f9f611e15ce1f806f2b6237f3311a98f697"
+        ));
+        // Empty body shouldn't be classified as sentinel — that case
+        // is the "no hash pinned" branch.
+        assert!(!is_sentinel_hash("sha256:"));
+        assert!(!is_sentinel_hash(""));
+    }
+
+    // ----- end Track C3 -----
 
     #[test]
     fn skips_when_imported_interface_omits_program_id() {
@@ -846,6 +992,49 @@ mod tests {
         assert!(!routed.any_blocking());
     }
 
+    // ----------------------------------------------------------------------
+    // v2.27 Track D1 — proof_hash drift severity routing. Same shape as
+    // the binary_hash Mismatch routing: P2 under `check --frozen`, CRIT
+    // under `verify` and `--frozen --strict`, Info under
+    // `--upstream-stale-ok`.
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn proof_hash_drift_routes_crit_under_verify() {
+        let routed = route_findings(vec![proof_hash_mismatch_result()], Gate::Verify);
+        assert_eq!(routed.findings.len(), 1);
+        assert_eq!(routed.findings[0].severity, FindingSeverity::Crit);
+        assert!(
+            routed.findings[0].message.contains("proof_hash"),
+            "message must name the drifted field; got: {}",
+            routed.findings[0].message,
+        );
+        assert!(routed.any_blocking());
+    }
+
+    #[test]
+    fn proof_hash_drift_routes_p2_under_check_frozen() {
+        let routed = route_findings(vec![proof_hash_mismatch_result()], Gate::CheckFrozen);
+        assert_eq!(routed.findings[0].severity, FindingSeverity::P2);
+        assert!(!routed.any_blocking(), "default --frozen must not block");
+        assert!(routed.any_warning());
+    }
+
+    #[test]
+    fn proof_hash_drift_routes_crit_under_strict_frozen() {
+        let routed = route_findings(vec![proof_hash_mismatch_result()], Gate::CheckFrozenStrict);
+        assert_eq!(routed.findings[0].severity, FindingSeverity::Crit);
+        assert!(routed.any_blocking(), "--strict must escalate to CRIT");
+    }
+
+    #[test]
+    fn proof_hash_drift_demotes_to_info_under_stale_ok() {
+        let routed = route_findings(vec![proof_hash_mismatch_result()], Gate::VerifyStaleOk);
+        assert_eq!(routed.findings[0].severity, FindingSeverity::Info);
+        assert!(!routed.any_blocking());
+        assert!(!routed.any_warning());
+    }
+
     #[test]
     fn print_routed_report_returns_blocking_for_crit_only() {
         let routed = route_findings(vec![mismatch_result()], Gate::Verify);
@@ -911,6 +1100,8 @@ mod tests {
                 program_id: Some(program_id.clone()),
                 upstream_binary_hash: Some(pinned_hash),
                 upstream_version: Some("4.0.3".to_string()),
+                verified: false,
+                proof_hash: None,
             }],
         };
         crate::qed_lock::write(dir, &lock).expect("write qed.lock");
