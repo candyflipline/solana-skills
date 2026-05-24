@@ -1133,6 +1133,141 @@ handler exchange : State.Open -> State.Closed {
 `ensures` — the visible gap between "my Rust compiles" and "my program is
 verified."
 
+## Cross-program patterns
+
+Two distinct "another program" stories share the `import` keyword:
+
+1. **Importing a callee interface** for CPI ensures. The imported source
+   declares an `interface <Name> { ... }` block; the consumer's `call
+   Target.handler(...)` substitutes the callee's `ensures` at the call
+   site. The bundled SPL Token / System Program / Metaplex stubs ship this
+   way. See [`references/qedspec-imports.md`](./qedspec-imports.md) for the
+   full manifest / lock / `--frozen` surface.
+2. **Importing another program's data shape** for cross-program account
+   reads (v2.29). The imported source is a full qedspec carrying `type`
+   declarations; the consumer binds a foreign account via `acct : type
+   Foreign.State` and reads fields directly. No CPI is involved — just the
+   shared data shape. Covered below.
+
+### Importing another program's spec
+
+When a handler reads from an account owned by another program (a config
+PDA, a registry, a state structure shared between programs in a suite),
+import that program's qedspec by `dep_key` and bind the account to one
+of its imported `type` declarations.
+
+```fsharp
+spec MyConsumer
+
+import Foreign from "foreign_program"        // dep_key in qed.toml
+
+handler do_thing : State.Active -> State.Active {
+  accounts {
+    signer       : signer
+    foreign_acct : type Foreign.State        // <- imported account type
+    state        : writable
+  }
+  requires foreign_acct.admin == signer.pubkey else Unauthorized
+  effect { last_admin_seen := foreign_acct.admin }
+}
+```
+
+The `from` string is the same `dep_key` shape `qed.toml` uses to resolve
+CPI imports — the resolver picks the data-shape path automatically when
+the imported source declares `type` blocks but no `interface` block /
+handlers. See `qedspec-imports.md` for the path / github / version-pin
+surface; everything below is consumer-side only.
+
+#### Resolver surface (Slice F)
+
+After `qedgen check` resolves an `import` whose source declares `type`
+blocks, the parsed spec gains an `imported_namespaces[Foreign]` entry
+that records the dep_key, the imported account types, and any plain
+record types they reference. `qed.lock` then carries an
+`imported_account_type_names` field (comma-joined, sorted) for every
+import so a renamed or removed foreign type surfaces under `qedgen check
+--frozen` with the same kind of before/after line as a changed
+`spec_hash`.
+
+#### Account binding: `acct : type Foreign.State`
+
+In handler `accounts { ... }` blocks, an account attribute of the form
+`type <Namespace>.<TypeName>` binds the account to an imported account
+type. The dotted form is parsed as a single `AccountAttr::Type`; the
+adapter splits on `.` and records `imported_namespace = Some("Foreign")`
+on the parsed handler-account. A `validate_imported_account_refs` pass
+(after import resolution) bails with a known-namespaces / known-types
+hint if either side is unknown.
+
+Bare-type bindings (`type token`, `type State`) keep their pre-v2.29
+single-ident semantics — no dotted form, no namespace lookup.
+
+#### Field reads in `requires` / `ensures`
+
+Once an account binds to an imported type, references like
+`foreign_acct.admin` and `foreign_acct.counter` in `requires` / `ensures`
+lower against the local mirror codegen emits at `src/imported/<ns>.rs`
+(Slice H — see below). The bind-state pass routes the field through:
+
+- **Flat-struct mirrors** → `ctx.foreign_acct.admin` (Anchor
+  `Account<'info, T>` auto-derefs the `T` body).
+- **Multi-variant ADT mirrors** → `(*ctx.foreign_acct.inner.admin())`
+  (routes through the v2.29 Slice B accessor that returns `&Pubkey`).
+
+The user writes `foreign_acct.admin` in both cases; the lowering picks
+the right shape from the imported type's declaration.
+
+#### Local mirror (Slice H)
+
+`qedgen codegen --target anchor` materializes every imported account
+type as a local Rust module at `src/imported/<ns>.rs`, plus a
+`src/imported/mod.rs` re-exporter. `lib.rs` gains `pub mod imported;`
+whenever any imported namespace is non-empty. Two shapes are mirrored:
+
+- **Single-variant account types** → plain `#[account] pub struct
+  <Name> { ... }` with the same Anchor derive set the local state
+  uses (plus the lifecycle `status: u8` + `enum <Name>Status` when
+  the imported type declares lifecycle states).
+- **Multi-variant ADT account types** → wrapper struct + inner enum +
+  the v2.29 Slice B accessor methods. Field reads via
+  `imported_acct.inner.<field>()` resolve through the same shape
+  used for locally-declared multi-variant state.
+
+Plain record types referenced by the imported account types are emitted
+in the same file so the mirror is self-contained — no cross-file `use
+crate::imported::<other>::*;` chasing. The mirror is fully owned by
+codegen; do not hand-edit `src/imported/`.
+
+#### Backcompat — bundled CPI stubs
+
+The bundled SPL Token / System Program / Metaplex stubs declare *no*
+`type` blocks — they're interface-only, used solely for CPI ensures.
+`import Token from "spl"` continues to route through the existing CPI
+import path; the data-shape resolver path stays empty (no
+`imported_namespaces` entry, no `src/imported/Token.rs` mirror). Mixing
+the two is fine in the same spec: import some namespaces for CPI
+ensures and others for data shape; resolution dispatches per-import on
+what the imported source actually declares.
+
+#### Limitations in v2.29
+
+- **Anchor target only.** Imported-namespace account types lower to
+  `Account<'info, crate::imported::<ns>::<T>>` on Anchor. The Quasar
+  target falls back to the pre-v2.29 path (`UncheckedAccount`); the
+  Pinocchio runtime work is deferred behind the v2.24 Pinocchio
+  backends (an `ImportedOwnerCheck` audit site + bytemuck
+  deserialization stub are reserved for that follow-up).
+- **Lean ∀-quantification of imported fields is not yet wired.** The
+  consumer's handler theorem statement does not quantify over the
+  imported account's fields in v2.29 — proofs that reference
+  `foreign_acct.admin` from Lean show as an undefined identifier
+  until v2.29.1 closes the wiring (same scope as the Slice A
+  `abstract <name>` binder Lean gap).
+- **Kani / proptest symbolic init for imported fields is opt-in.**
+  The current paths don't emit `kani::any()` for imported account
+  fields automatically; only reachable when a property explicitly
+  quantifies over an imported field. Documented gap for v2.29.1+.
+
 ## sBPF-specific constructs (inside `pragma sbpf { ... }`)
 
 Everything in this section lives inside `pragma sbpf { ... }`. The pragma
