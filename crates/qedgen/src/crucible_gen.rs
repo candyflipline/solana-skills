@@ -1303,6 +1303,7 @@ handler bump (delta : U64) : State.Active -> State.Active {
             schema_includes: vec![],
             calls: vec![],
             effect_branches: None,
+            abstract_binders: vec![],
         }
     }
 

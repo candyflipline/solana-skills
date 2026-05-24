@@ -3220,6 +3220,50 @@ async fn dispatch(cmd: Commands) -> Result<()> {
                 eprintln!("Generated CI workflow: {}", ci_output.display());
             }
 
+            // v2.29 Slice E (#16) — surface stale `#[qed(verified)]`
+            // stamps immediately after regen so users get the re-stamp
+            // command before the proc-macro's `compile_error!` fires
+            // on the next `cargo build`. Scans the Rust scaffold output
+            // dir for stamped functions whose `hash`, `spec_hash`, or
+            // `accounts_hash` no longer matches; emits a `cargo:warning=`-
+            // style line per affected file plus a one-line hint with the
+            // exact `qedgen check --drift … --update-hashes` invocation.
+            //
+            // Skipped for pure-Pinocchio specs (no Rust scaffold; no
+            // user-owned `#[qed(verified)]` stamps to drift). Also
+            // skipped on output_dir miss, since the drift scan only
+            // makes sense when the scaffold tree was actually emitted.
+            if !pinocchio_no_scaffold && output_dir.exists() {
+                match drift::check_stamped_drift(&output_dir) {
+                    Ok(stamped) if !stamped.is_empty() => {
+                        eprintln!(
+                            "cargo:warning={} verified handler(s) have stale stamps after regen:",
+                            stamped.len()
+                        );
+                        for entry in &stamped {
+                            eprintln!(
+                                "cargo:warning=  {}::{}",
+                                entry.file.display(),
+                                entry.fn_name
+                            );
+                        }
+                        // Build a representative re-stamp command. All
+                        // stamped fns share the same `--drift` root
+                        // (programs/<name>/src), so one invocation
+                        // refreshes the whole tree.
+                        eprintln!(
+                            "cargo:warning=hint: run `qedgen check --drift {} --update-hashes` \
+                             to re-stamp",
+                            output_dir.display()
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        eprintln!("warning: stamped-drift scan failed: {}", e);
+                    }
+                }
+            }
+
             if fill {
                 eprintln!("warning: `qedgen codegen --fill` is deprecated.");
                 eprintln!("         The agent can fill `todo!()` sites directly via Read / Edit.");

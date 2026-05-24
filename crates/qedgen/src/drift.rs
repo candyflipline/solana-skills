@@ -484,6 +484,105 @@ pub fn check(input: &Path) -> Result<Vec<VerifiedEntry>> {
     Ok(all_entries)
 }
 
+/// A `#[qed(verified, ...)]` stamp whose `hash`, `spec_hash`, or
+/// `accounts_hash` no longer matches what `qedgen check --drift X
+/// --update-hashes` would compute. Surfaced by `check_stamped_drift` so
+/// `qedgen codegen` can warn users immediately after regenerating
+/// artifacts, rather than waiting for the next `cargo build` to fire
+/// `compile_error!` from the proc-macro side.
+#[derive(Debug)]
+pub struct StampedDriftEntry {
+    pub file: PathBuf,
+    pub fn_name: String,
+}
+
+/// Walk `input` for `#[qed(verified, ...)]`-stamped functions whose
+/// `hash`, `spec_hash`, or `accounts_hash` is stale relative to the
+/// current spec / accounts / function body. Returns one entry per stale
+/// stamp; an empty Vec means every stamp is current.
+///
+/// This is the read-only complement to `update`: same staleness logic,
+/// no in-place rewrites. `qedgen codegen` calls this after regenerating
+/// artifacts so users see actionable next-step guidance instead of
+/// waiting for the proc-macro's `compile_error!` on the next build.
+pub fn check_stamped_drift(input: &Path) -> Result<Vec<StampedDriftEntry>> {
+    let files = collect_rs_files(input)?;
+    let mut entries = Vec::new();
+
+    for file in &files {
+        let source = match std::fs::read_to_string(file) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let syntax = match syn::parse_file(&source) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        let mut scanned = Vec::new();
+        collect_from_items(&syntax.items, &mut scanned);
+        let attrs = collect_verified_attrs(&syntax.items);
+        if scanned.is_empty() {
+            continue;
+        }
+
+        for ((fn_name, _expected_body, func), attr) in scanned.iter().zip(attrs.iter()) {
+            let mut stale = false;
+
+            // Body hash leg
+            let actual_body = content_hash(func);
+            if let Some(expected) = &attr.hash {
+                if expected != &actual_body {
+                    stale = true;
+                }
+            }
+
+            // spec_hash leg
+            if let (Some(spec_path), Some(handler_name), Some(expected_spec)) =
+                (&attr.spec, &attr.handler, &attr.spec_hash)
+            {
+                if let Some(resolved) = find_relative_file(file, spec_path) {
+                    if let Ok(spec_src) = std::fs::read_to_string(&resolved) {
+                        if let Some(actual_spec) =
+                            spec_hash::spec_hash_for_handler(&spec_src, handler_name)
+                        {
+                            if &actual_spec != expected_spec {
+                                stale = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // accounts_hash leg
+            if let (Some(struct_name), Some(accounts_file), Some(expected_acct)) =
+                (&attr.accounts, &attr.accounts_file, &attr.accounts_hash)
+            {
+                if let Some(resolved) = find_relative_file(file, accounts_file) {
+                    if let Ok(acct_src) = std::fs::read_to_string(&resolved) {
+                        if let Some(actual_acct) =
+                            spec_hash::accounts_struct_hash(&acct_src, struct_name)
+                        {
+                            if &actual_acct != expected_acct {
+                                stale = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if stale {
+                entries.push(StampedDriftEntry {
+                    file: file.clone(),
+                    fn_name: fn_name.clone(),
+                });
+            }
+        }
+    }
+
+    Ok(entries)
+}
+
 /// Print a human-readable drift report.
 pub fn print_report(entries: &[VerifiedEntry]) {
     if entries.is_empty() {
@@ -1076,5 +1175,65 @@ mod tests {
                  content_hash docstring for the alignment requirement."
             );
         }
+    }
+
+    #[test]
+    fn check_stamped_drift_flags_stale_spec_hash() {
+        // v2.29 Slice E (#16) regression test: `check_stamped_drift`
+        // surfaces a stamped function whose `spec_hash` no longer
+        // matches the live spec, so `qedgen codegen` can warn the
+        // user before the proc-macro's `compile_error!` fires.
+        let dir = tempfile::tempdir().unwrap();
+
+        // Write a spec, compute its real `spec_hash` for handler `foo`,
+        // then write a sibling .rs file stamped with a deliberately
+        // stale `spec_hash` value. Body hash matches; only the
+        // `spec_hash` leg is stale.
+        let spec_src = r#"program foo
+
+handler foo (n : U64) : Active -> Active {
+  effect { n := n + 1 }
+}
+"#;
+        let spec_path = dir.path().join("foo.qedspec");
+        std::fs::write(&spec_path, spec_src).unwrap();
+        let real_spec_hash = spec_hash::spec_hash_for_handler(spec_src, "foo").unwrap();
+
+        // Compute the body hash so only `spec_hash` is stale.
+        let body_only = r#"
+            pub fn foo(n: u64) -> u64 { n + 1 }
+        "#;
+        let f0 = write_temp_rs(body_only);
+        let body_hash = match &scan_file(f0.path()).unwrap()[0].status {
+            DriftStatus::NoHash { computed } => computed.clone(),
+            _ => panic!("expected NoHash"),
+        };
+
+        let rs_path = dir.path().join("foo.rs");
+        let stamped = format!(
+            r#"
+            #[qed(verified, spec = "foo.qedspec", handler = "foo", hash = "{}", spec_hash = "{}")]
+            pub fn foo(n: u64) -> u64 {{ n + 1 }}
+            "#,
+            body_hash, "deadbeef_stale_hash"
+        );
+        std::fs::write(&rs_path, stamped).unwrap();
+        // Sanity: live spec_hash is non-empty and not equal to the stale value.
+        assert!(!real_spec_hash.is_empty());
+        assert_ne!(real_spec_hash, "deadbeef_stale_hash");
+
+        let stale = check_stamped_drift(dir.path()).unwrap();
+        assert_eq!(stale.len(), 1, "expected 1 stale stamp, got {:?}", stale);
+        assert_eq!(stale[0].fn_name, "foo");
+    }
+
+    #[test]
+    fn check_stamped_drift_silent_when_in_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        // No stamped .rs files at all — should return an empty Vec, not
+        // an error.
+        std::fs::write(dir.path().join("plain.rs"), "fn plain() {}").unwrap();
+        let stale = check_stamped_drift(dir.path()).unwrap();
+        assert!(stale.is_empty());
     }
 }

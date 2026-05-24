@@ -2561,14 +2561,17 @@ fn emit_variant_state_handler_body(
 }
 
 /// v2.24 S5c — render an effect RHS for the cross-variant promotion
-/// emitter. Pre-variant fields aren't in scope here (no destructure
-/// has happened yet), so the legal RHS shapes are restricted:
+/// emitter. The legal RHS shapes are restricted to ones the emitter
+/// can lower deterministically:
 ///
 ///   - bare param (handler `takes_params`) → bare identifier
 ///   - bare const (spec `constants`) → bare identifier (Rust resolves)
 ///   - integer literal → bare integer
 ///   - `<account>.pubkey` where `<account>` is bound on the handler
 ///     and is a signer / writable account → `self.<account>.key()`
+///   - bare pre-variant field name (v2.29 Slice C, payload→payload):
+///     the destructured local shadowing `<field>` is in scope inside
+///     the emitter's preamble → bare identifier
 ///
 /// Anything else returns `None`, which bails the whole cross-variant
 /// emitter back to the per-effect `todo!()` path so the agent fills
@@ -2577,6 +2580,7 @@ fn resolve_cross_variant_rhs(
     raw: &str,
     handler: &ParsedHandler,
     spec: &ParsedSpec,
+    pre_fields: &[String],
 ) -> Option<String> {
     if raw.is_empty() {
         return None;
@@ -2592,6 +2596,15 @@ fn resolve_cross_variant_rhs(
             return Some(raw.to_string());
         }
         if spec.constants.iter().any(|(n, _)| n == raw) {
+            return Some(raw.to_string());
+        }
+        // v2.29 Slice C — pre-variant field captured by the
+        // destructure preamble. The emitter binds `<field>` as a
+        // local before the assignment, so a bare reference resolves
+        // directly. render_effect strips `state.` for bare paths
+        // (chumsky_adapter.rs::render_effect line 1356), so the raw
+        // form here is the bare field name.
+        if pre_fields.iter().any(|n| n == raw) {
             return Some(raw.to_string());
         }
         // Unknown bare ident — could be a param shadowed by a state
@@ -2632,23 +2645,20 @@ fn emit_cross_variant_promotion(
     inner_name: &str,
     err_enum: &str,
 ) -> Option<String> {
-    // v2.24.0 follow-up: lift the unit-pre-only restriction. Three
-    // cross-variant promotion patterns are now valid:
-    //   1. unit pre → payload post  (init: Uninitialized → Active)
-    //   2. payload pre → unit post  (terminate: Open → Closed; the cancel case)
-    //   3. unit pre → unit post     (rare; harmless: just set the variant)
-    // Payload-pre → payload-post is still rejected — it would need
-    // a destructure-then-rebuild pass to capture pre's fields, and
-    // the current RHS resolver doesn't see the pre as a binding.
+    // v2.24.0: three baseline cross-variant promotion patterns are
+    // valid (unit→payload init, payload→unit terminate, unit→unit).
+    // v2.29 Slice C lifts the last restriction — payload→payload now
+    // emits a destructure preamble that captures pre fields as
+    // locals, then assembles the post variant referencing those
+    // locals where the spec carries `state.<pre_field>` reads.
     let pre_variant = spec
         .account_types
         .first()?
         .variants
         .iter()
         .find(|v| v.name == pre)?;
-    if !pre_variant.fields.is_empty() && !post_variant.fields.is_empty() {
-        return None;
-    }
+
+    let pre_field_names: Vec<String> = pre_variant.fields.iter().map(|(n, _)| n.clone()).collect();
 
     // Build a {field → RHS-rust} map from the handler's effects.
     // For cross-variant we only accept the `:= <rhs>` form (effect
@@ -2666,7 +2676,7 @@ fn emit_cross_variant_promotion(
         if !post_variant.fields.iter().any(|(n, _)| n == &bare) {
             return None;
         }
-        let resolved = resolve_cross_variant_rhs(rhs, handler, spec)?;
+        let resolved = resolve_cross_variant_rhs(rhs, handler, spec, &pre_field_names)?;
         field_rhs.insert(bare, resolved);
     }
 
@@ -2681,25 +2691,79 @@ fn emit_cross_variant_promotion(
         }
     }
 
-    // Assemble the assignment. Pre-check: ensure the wrapper is in
-    // the pre variant. Init handlers (`Uninitialized`/`Empty`) skip
-    // this since the `#[account(init, …)]` constraint zeroes the
-    // account before our code runs — there's no prior payload to
-    // mismatch on. Other pres still get the gate. Payload pres
-    // use `Inner::Pre { .. }` to match without binding fields.
+    // v2.29 Slice C — collect the pre-variant fields referenced by
+    // any post-variant RHS. Only these need to be bound by the
+    // destructure preamble; binding the rest would produce
+    // `unused variable` warnings.
+    let referenced_pre_fields: Vec<String> = pre_field_names
+        .iter()
+        .filter(|f| field_rhs.values().any(|rhs| rhs == *f))
+        .cloned()
+        .collect();
+
     let is_init_pre = matches!(pre, "Uninitialized" | "Empty");
     let mut out = String::new();
-    if !is_init_pre {
-        let pre_pattern = if pre_variant.fields.is_empty() {
-            format!("{}::{}", inner_name, pre)
+
+    if pre_variant.fields.is_empty() {
+        // Unit pre — emit the bare matches! gate (unchanged from v2.24).
+        // Init handlers skip the gate: `#[account(init, …)]` zeroes
+        // the account, so there's no prior payload to mismatch on.
+        if !is_init_pre {
+            out.push_str(&format!(
+                "        if !matches!(self.{}.inner, {}::{}) {{ return Err({}::WrongState.into()); }}\n",
+                acct_binder, inner_name, pre, err_enum
+            ));
+        }
+    } else if referenced_pre_fields.is_empty() {
+        // Payload pre, no fields read by post — variant check only.
+        // (Same shape as v2.24 payload-pre + unit-post; covers the
+        // rare payload-pre + payload-post where post is fully
+        // populated from params / consts / literals.)
+        if !is_init_pre {
+            out.push_str(&format!(
+                "        if !matches!(self.{}.inner, {}::{} {{ .. }}) {{ return Err({}::WrongState.into()); }}\n",
+                acct_binder, inner_name, pre, err_enum
+            ));
+        }
+    } else {
+        // Payload pre + at least one field is read by post — emit a
+        // `match` that doubles as the variant-gate and the field
+        // capture step. Bind only referenced fields via the
+        // destructure pattern; ignore the rest with `..` so Rust
+        // doesn't warn on unused bindings. The inner enum derives
+        // Clone (codegen.rs:1053), so calling `.clone()` per field
+        // works uniformly for both Copy and non-Copy field types
+        // (e.g. `Map[N] Pubkey`).
+        let bind_pat = referenced_pre_fields.join(", ");
+        let local_pat = if referenced_pre_fields.len() == 1 {
+            referenced_pre_fields[0].clone()
         } else {
-            format!("{}::{} {{ .. }}", inner_name, pre)
+            format!("({})", bind_pat)
+        };
+        let tuple_expr = if referenced_pre_fields.len() == 1 {
+            format!("{}.clone()", referenced_pre_fields[0])
+        } else {
+            let parts: Vec<String> = referenced_pre_fields
+                .iter()
+                .map(|n| format!("{}.clone()", n))
+                .collect();
+            format!("({})", parts.join(", "))
         };
         out.push_str(&format!(
-            "        if !matches!(self.{}.inner, {}) {{ return Err({}::WrongState.into()); }}\n",
-            acct_binder, pre_pattern, err_enum
+            "        let {} = match &self.{}.inner {{\n",
+            local_pat, acct_binder
         ));
+        out.push_str(&format!(
+            "            {}::{} {{ {}, .. }} => {},\n",
+            inner_name, pre, bind_pat, tuple_expr
+        ));
+        out.push_str(&format!(
+            "            _ => return Err({}::WrongState.into()),\n",
+            err_enum
+        ));
+        out.push_str("        };\n");
     }
+
     // Unit-style post: emit `... = Inner::Closed;` without the
     // empty `{}` braces. Payload post: emit the brace-wrapped
     // field-by-field initializer in declared order.
@@ -3063,6 +3127,33 @@ fn render_handler_scaffold(
     ));
     if handler.has_bumps() {
         out.push_str("        let _ = bumps;\n");
+    }
+
+    // v2.29 Slice A (#8) — `abstract <name> : <Type>` clauses become
+    // user-fillable `todo!()` bindings in the Rust scaffold. The
+    // structured prompt strings list the active `requires` clauses
+    // so the agent / human knows what the concrete value must
+    // satisfy. Emitted BEFORE let_bindings so any spec-level `let`
+    // that references the binder resolves.
+    for (binder_name, binder_ty_str) in &handler.abstract_binders {
+        let ty = map_type_for_target(binder_ty_str, spec, target)?;
+        let requires_summary: Vec<String> = handler
+            .requires
+            .iter()
+            .map(|r| r.rust_expr.clone())
+            .collect();
+        let constraint_hint = if requires_summary.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " Constraints from `requires`: {}.",
+                requires_summary.join(" && ")
+            )
+        };
+        out.push_str(&format!(
+            "        let {}: {} = todo!(\"v2.29 abstract binder `{}` — fill with the concrete library / math value.{}\");\n",
+            binder_name, ty, binder_name, constraint_hint
+        ));
     }
 
     // Spec-level `let` bindings (e.g. `let total_fee = amount * 125 / 10000`)
@@ -6161,5 +6252,78 @@ anchor-lang = "0.32"
         assert!(merged.contains("[package]"));
         assert!(merged.contains("[dependencies]"));
         assert!(merged.contains("[workspace]"));
+    }
+
+    /// v2.29 Slice C — payload-pre + payload-post cross-variant
+    /// promotion emits a destructure preamble that captures the
+    /// referenced pre fields as local bindings, followed by the
+    /// post-variant assignment that reads those bindings.
+    #[test]
+    fn cross_variant_promotion_payload_to_payload_emits_destructure() {
+        let src = r#"spec Promote
+program_id "11111111111111111111111111111111"
+
+type State
+  | Open of { x : U64, y : U64 }
+  | Closed of { y : U64 }
+
+type Error
+  | WrongState
+
+handler close : State.Open -> State.Closed {
+  accounts {
+    authority : signer
+    state_acct : writable
+  }
+  effect {
+    state := .Closed { y := state.x }
+  }
+}
+"#;
+        let spec = crate::chumsky_adapter::parse_str(src).expect("parse");
+        let handler = spec
+            .handlers
+            .iter()
+            .find(|h| h.name == "close")
+            .expect("close handler");
+        let acct = spec.account_types.first().expect("state account type");
+        let post_variant = acct
+            .variants
+            .iter()
+            .find(|v| v.name == "Closed")
+            .expect("Closed variant");
+        let body = emit_cross_variant_promotion(
+            handler,
+            &spec,
+            "state_acct",
+            "Open",
+            post_variant,
+            "PromoteAccountInner",
+            "PromoteError",
+        )
+        .expect("payload->payload promotion should lower in v2.29");
+        // The destructure should bind `x` (referenced by `y := state.x`),
+        // ignore `y` (post writes it from `x`, doesn't read pre's y),
+        // and capture via `.clone()` so non-Copy variant fields work.
+        assert!(
+            body.contains("let x = match &self.state_acct.inner"),
+            "expected destructure preamble binding `x`; got:\n{body}"
+        );
+        assert!(
+            body.contains("PromoteAccountInner::Open { x, .. } => x.clone()"),
+            "expected single-binding match arm with .clone(); got:\n{body}"
+        );
+        assert!(
+            body.contains("return Err(PromoteError::WrongState.into())"),
+            "expected WrongState guard on the no-match arm; got:\n{body}"
+        );
+        assert!(
+            body.contains("self.state_acct.inner = PromoteAccountInner::Closed {"),
+            "expected the post-variant assignment; got:\n{body}"
+        );
+        assert!(
+            body.contains("y: x,"),
+            "expected `y: x,` referencing the destructured local; got:\n{body}"
+        );
     }
 }

@@ -290,6 +290,17 @@ Both forms generate Rust-side BMC + proptest harnesses when the body has a `rust
 
 Pick `property` when the handler list is short and the property name reads naturally as the claim ("conservation"). Pick `invariant` when the predicate is reused as a *thing* across many handlers, especially when some establish it and others preserve it.
 
+## Cross-program patterns
+
+When a handler's signing authority lives on an account owned by **another** program (a config PDA, an admin-key registry, a vault belonging to a stdlib like SPL), the `auth` clause won't help — it only matches state fields on the local program. Use `<account>.pubkey` to read the signing identity directly from the account context:
+
+- **Persist it on init**: `effect { admin := admin_account.pubkey }`. Later handlers gate via `requires state.admin == signer.pubkey else Unauthorized`.
+- **Or check it inline** when you don't need to store it: `requires foreign_config.admin == signer.pubkey else Unauthorized`. No phantom state field needed.
+
+Full grammar + lowering details: see `references/qedspec-dsl.md#accountpubkey-accessor` and the "Cross-program authority" callout under `### Handler clauses`.
+
+Cross-program *spec* composition (importing another program's qedspec or interface stub for CPI ensures) lives in `references/qedspec-imports.md` — that's about the call contract, not field reads.
+
 ## References
 
 Load references on demand. Do not bulk-load all files.

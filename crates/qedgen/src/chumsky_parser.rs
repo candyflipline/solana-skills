@@ -346,6 +346,33 @@ fn expr<'a>() -> impl Parser<'a, &'a str, Node<Expr>, Err<'a>> + Clone {
     recursive(|expr| {
         let int = integer().map_with(|v, e| Node::new(Expr::Int(v), e.span().into_range()));
 
+        // v2.29 Slice A (#2) — unary minus on integer literals.
+        // Lowers to `Arith { Sub, Int(0), Int(v) }` so no AST change
+        // is needed: downstream renderers and lints already handle
+        // `0 - 6` as a subtraction expression, which evaluates to
+        // `-6` in signed contexts (Lean Int, Rust signed integers).
+        // For unsigned contexts the user is doing something wrong
+        // (negative value in an unsigned field) and existing arith
+        // lints will catch it.
+        //
+        // Limited to immediate integer literals (`-6`, not `-x` or
+        // `-(a + b)`) to keep the prefix-vs-infix `-` disambiguation
+        // trivial: this atom only fires at atom-start position, so
+        // binary subtraction (`a - 6`) is unaffected — `a` is
+        // parsed as an atom, then `-` is consumed by `add_op`, then
+        // the second atom parses `6` (no leading `-`).
+        let neg_int = just('-').ignore_then(integer()).map_with(|v, e| {
+            let span = e.span().into_range();
+            Node::new(
+                Expr::Arith {
+                    op: ArithOp::Sub,
+                    lhs: Box::new(Node::new(Expr::Int(0), span.clone())),
+                    rhs: Box::new(Node::new(Expr::Int(v), span.clone())),
+                },
+                span,
+            )
+        });
+
         let bool_lit = choice((kw("true").to(true), kw("false").to(false)))
             .map_with(|b, e| Node::new(Expr::Bool(b), e.span().into_range()));
 
@@ -719,7 +746,21 @@ fn expr<'a>() -> impl Parser<'a, &'a str, Node<Expr>, Err<'a>> + Clone {
         // atom — must stay under chumsky's `choice` arity limit; split.
         // `.boxed()` tames the type complexity that otherwise trips Apple's
         // linker on overlong symbol names.
-        let group_a = choice((int, bool_lit, old, let_in, if_then_else, sum, quant)).boxed();
+        // `neg_int` precedes `int` so the leading `-` doesn't fail
+        // the digit-first `integer()` filter. Order within the
+        // `choice` doesn't affect performance — both branches commit
+        // on their first character.
+        let group_a = choice((
+            neg_int,
+            int,
+            bool_lit,
+            old,
+            let_in,
+            if_then_else,
+            sum,
+            quant,
+        ))
+        .boxed();
         let group_b = choice((
             now_atom,
             current_epoch_atom,
@@ -913,12 +954,30 @@ fn expr<'a>() -> impl Parser<'a, &'a str, Node<Expr>, Err<'a>> + Clone {
 // ----------------------------------------------------------------------------
 
 fn const_decl<'a>() -> impl Parser<'a, &'a str, TopItem, Err<'a>> + Clone {
+    // v2.29 Slice A (#3) — accept an optional leading `-` so spec
+    // authors can write `const N6 = -6` directly instead of forcing
+    // the `0 - 6` workaround. The full const-expression grammar
+    // (arithmetic + paren + const refs + shifts) is deferred — this
+    // pass only widens the immediate-literal case. The friction-report
+    // primary use case (fixed-point exponent constants) only needs
+    // the negative literal.
     kw("const")
         .ignore_then(non_keyword_ident())
         .then_ignore(wsc())
         .then_ignore(just('='))
         .then_ignore(wsc())
-        .then(integer())
+        .then(
+            just('-')
+                .or_not()
+                .then(integer())
+                .try_map(|(sign, v), span| {
+                    if v > i128::MAX as u128 {
+                        return Err(Rich::custom(span, "const value overflows i128"));
+                    }
+                    let as_i = v as i128;
+                    Ok(if sign.is_some() { -as_i } else { as_i })
+                }),
+        )
         .map(|(name, value)| TopItem::Const { name, value })
 }
 
@@ -1651,10 +1710,24 @@ fn handler_clause<'a>() -> impl Parser<'a, &'a str, HandlerClause, Err<'a>> + Cl
         }),
     ));
 
+    // v2.29 Slice A (#8) — `abstract <name> : <Type>` declares an
+    // existentially-quantified value the handler can refer to in
+    // `requires` / `effect` / `ensures` clauses. Lowers per-backend
+    // (Kani `kani::any()` + `kani::assume`, proptest `prop_assume!`,
+    // Lean `∃ name : Type,`, Rust `let name: T = todo!(...)`).
+    let abstract_c = just("abstract")
+        .then_ignore(wsc())
+        .ignore_then(non_keyword_ident())
+        .then_ignore(wsc())
+        .then_ignore(just(':'))
+        .then_ignore(wsc())
+        .then(type_ref())
+        .map(|(name, ty)| HandlerClause::Abstract { name, ty });
+
     // `choice()` has an arity limit; split into groups.
     let grp_a = choice((auth, accounts, requires, ensures, modifies, let_c, effect));
     let grp_b = choice((transfers, takes, emits, aborts_total, invariant, include));
-    let grp_c = choice((match_c, call_c, permissionless, establishes));
+    let grp_c = choice((match_c, call_c, permissionless, establishes, abstract_c));
     choice((grp_a, grp_b, grp_c))
 }
 
@@ -2389,7 +2462,21 @@ fn instruction_item<'a>() -> impl Parser<'a, &'a str, InstructionItem, Err<'a>> 
         .then_ignore(wsc())
         .then_ignore(just('='))
         .then_ignore(wsc())
-        .then(integer())
+        .then(
+            // v2.29 Slice A (#3) — mirror the top-level const_decl
+            // widening to accept an optional `-` so per-instruction
+            // const declarations also support negative literals.
+            just('-')
+                .or_not()
+                .then(integer())
+                .try_map(|(sign, v), span| {
+                    if v > i128::MAX as u128 {
+                        return Err(Rich::custom(span, "const value overflows i128"));
+                    }
+                    let as_i = v as i128;
+                    Ok(if sign.is_some() { -as_i } else { as_i })
+                }),
+        )
         .map(|(name, value)| InstructionItem::Const { name, value });
     let errors_c = just("errors")
         .then(

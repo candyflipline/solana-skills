@@ -225,12 +225,20 @@ program_id "11111111111111111111111111111111"
 
 ### `const`
 
-Named integer constants. Underscores allowed for readability.
+Named integer constants. Underscores allowed for readability. Negative
+literals are accepted (v2.29) — useful for fixed-point exponents and
+other signed integer values.
 
 ```fsharp
 const MAX_MEMBERS = 32
 const MAX_VAULT_TVL = 10_000_000_000_000_000
+const FP_EXPONENT = -6              // v2.29: signed literal in const_decl
 ```
+
+Expressions in `const` bodies (arithmetic, paren, references to other
+declared consts) are not yet supported — `const N6 = 0 - 6` is rejected
+by the parser. Use the negative-literal form `const N6 = -6` instead.
+Full const-expression evaluation is v2.30+.
 
 ## Type system
 
@@ -456,6 +464,16 @@ handler transfer_sol { ... }
 
 ### Handler clauses
 
+> **Cross-program authority** — when the signing identity isn't stored in this
+> program's state (e.g. the admin lives on a PDA owned by another program),
+> use [`<account>.pubkey`](#accountpubkey-accessor) to read it from the
+> account directly. Either capture it into state on init
+> (`admin := admin.pubkey`) and compare against it later
+> (`requires state.admin == admin.pubkey`), or — if you don't need to persist
+> it — gate the handler with `requires admin.pubkey == signer.pubkey` and skip
+> the storage step. The `auth` clause only matches state-resident fields, so
+> the `.pubkey` accessor is the right tool here.
+
 | Clause | Purpose | Example |
 |---|---|---|
 | `auth` | Access control (signer must match field) | `auth authority` |
@@ -474,6 +492,42 @@ handler transfer_sol { ... }
 | `establishes name` | Establish a global invariant at post-state without assuming it pre-state. Use for init / one-shot handlers. | `establishes root_set` |
 | `permissionless` | Opt out of the `no_access_control` lint (v2.7) | see below |
 | `takes { ... }` | Parameters (sugar, prefer signature) | `takes amount : U64` |
+| `abstract` (v2.29) | Existentially-quantified value the handler refers to in `requires` / `effect` / `ensures` without expressing how it was computed. | `abstract d : U64` |
+
+#### `abstract <name> : <Type>` (v2.29)
+
+When a handler's spec depends on a value that comes from a library call or
+external math the DSL can't model directly (e.g. a price oracle, a curve
+solver, a precomputed Merkle proof element), declare it as `abstract`. The
+binder is in scope inside `requires` / `effect` / `ensures` clauses and the
+`requires` set constrains the symbolic value at verification time.
+
+```fsharp
+handler user_deposit (amount_stablecoin : U64) : State.Active -> State.Active {
+  abstract d : U64                  // shares of LP token to mint
+  requires d > 0
+  requires d <= amount_stablecoin
+
+  effect { lp_supply += d }
+  ensures state.lp_supply == old(state.lp_supply) + d
+}
+```
+
+Per-backend lowering:
+- **Kani** — `let d: u64 = kani::any();` followed by the `requires`-derived
+  `kani::assume(...)` so the verifier explores values that satisfy the
+  constraint set.
+- **proptest** — `d in <boundary strategy>` is added to the proptest test
+  parameter list; the same `requires`-derived `prop_assume!` filters.
+- **Rust scaffold** — `let d: T = todo!("v2.29 abstract binder ...")`. The
+  agent fills the body with the concrete library / math call that
+  produces `d`; the `requires` constraints are surfaced in the
+  todo!() prompt so the implementation knows the contract.
+- **Lean** — Lean lowering is v2.29.1+; the transition function will
+  treat the binder as a let-bound undefined value until the
+  existential-wrapping codegen lands. Authors using abstract binders
+  with the Lean backend should expect a missing-identifier error
+  until that wiring is in.
 
 ### `accounts` block
 

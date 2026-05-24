@@ -579,6 +579,19 @@ pub struct ParsedHandler {
     /// `effect { … }`. The flat `effects` field still holds the union of
     /// every arm's effects (for back-compat); this carries arm grouping.
     pub effect_branches: Option<ParsedEffectBranches>,
+    /// v2.29 Slice A (#8) — `abstract <name> : <Type>` handler clauses.
+    /// Each entry is `(name, dsl_type_string)`; the DSL-type is
+    /// preserved verbatim so per-backend lowering can resolve to its
+    /// own concrete type (`map_type_for_target` on Rust, plain DSL
+    /// name on Lean / Kani / proptest). Lowered separately by each
+    /// backend: Kani emits `let <name>: T = kani::any();` +
+    /// `kani::assume(<requires-conjunction>);`, proptest emits the
+    /// same via `any::<T>().new_tree(...)` + `prop_assume!`, Lean
+    /// wraps the handler theorem statement in `∃ <name> : T,`, and
+    /// the Rust handler scaffold emits `let <name>: T = todo!(...);`
+    /// so the agent fills the body with whichever concrete library
+    /// math produced the value.
+    pub abstract_binders: Vec<(String, String)>,
 }
 
 /// v2.20 §S1.2 — IR form of a top-level `match` block inside `effect { … }`.
@@ -3417,11 +3430,34 @@ pub fn check_completeness(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
     }
 
     // Rule 10: handler has token program in accounts but no transfers
+    //
+    // v2.29 Slice D (#9) — suppress on lifecycle-init handlers that
+    // create a token account. Anchor's `#[account(init,
+    // associated_token::mint = X, associated_token::authority = Y)]` (or
+    // `init, token::authority = Y, token::mint = X`) handles the
+    // SPL Token CPI implicitly via the init macro — no explicit
+    // `transfers` or `call Token.*` is needed. The DSL-level signal is
+    // `pre_status in {Uninitialized, Empty}` combined with at least one
+    // writable token-type account, which is exactly the shape codegen
+    // lowers to Anchor's `init` constraint set (see
+    // `quasar_account_attr` in this file). Without this suppression
+    // every Anchor `initialize` handler that sets up a vault/TA fires
+    // a spurious lint.
     for handler in &spec.handlers {
         if !handler.has_token_program() {
             continue;
         }
         if !handler.has_calls() {
+            let is_lifecycle_init = matches!(
+                handler.pre_status.as_deref(),
+                Some("Uninitialized") | Some("Empty")
+            );
+            let has_writable_token_account = handler.accounts.iter().any(|a| {
+                a.is_writable && a.account_type.as_deref() == Some("token") && !a.is_program
+            });
+            if is_lifecycle_init && has_writable_token_account {
+                continue;
+            }
             let writable_tokens: Vec<&str> = handler
                 .accounts
                 .iter()
@@ -6755,6 +6791,7 @@ mod tests {
             schema_includes: vec![],
             calls: vec![],
             effect_branches: None,
+            abstract_binders: vec![],
         }
     }
 
@@ -7397,6 +7434,122 @@ handler init { effect { balance := 0 } }
                 .iter()
                 .any(|w| w.rule == "missing_cpi_for_token_context"),
             "expected missing_cpi_for_token_context, got: {:?}",
+            warnings.iter().map(|w| &w.rule).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_missing_cpi_for_token_context_suppressed_on_lifecycle_init() {
+        // v2.29 Slice D (#9): an `initialize` handler that creates a
+        // writable token account via Anchor's `#[account(init, ...)]`
+        // doesn't need an explicit `transfers` or `call Token.*` block —
+        // the init macro handles the SPL CPI implicitly. The lint must
+        // recognize this shape and stay silent.
+        let mut h = make_handler("initialize");
+        h.pre_status = Some("Uninitialized".to_string());
+        h.post_status = Some("Active".to_string());
+        h.accounts = vec![
+            ParsedHandlerAccount {
+                name: "authority".to_string(),
+                is_signer: true,
+                is_writable: false,
+                is_program: false,
+                pda_seeds: None,
+                account_type: None,
+                authority: None,
+                default_pubkey: None,
+            },
+            ParsedHandlerAccount {
+                name: "vault".to_string(),
+                is_signer: false,
+                is_writable: true,
+                is_program: false,
+                pda_seeds: Some(vec!["vault".to_string(), "authority".to_string()]),
+                account_type: Some("token".to_string()),
+                authority: Some("vault_pda".to_string()),
+                default_pubkey: None,
+            },
+            ParsedHandlerAccount {
+                name: "token_program".to_string(),
+                is_signer: false,
+                is_writable: false,
+                is_program: true,
+                pda_seeds: None,
+                account_type: Some("token".to_string()),
+                authority: None,
+                default_pubkey: None,
+            },
+        ];
+        let spec = ParsedSpec {
+            handlers: vec![h],
+            lifecycle_states: vec!["Uninitialized".to_string(), "Active".to_string()],
+            ..empty_spec()
+        };
+        let warnings = check_completeness(&spec);
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.rule == "missing_cpi_for_token_context"),
+            "lifecycle-init handler creating a token account should NOT fire \
+             missing_cpi_for_token_context; got: {:?}",
+            warnings.iter().map(|w| &w.rule).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_missing_cpi_for_token_context_still_fires_on_non_init() {
+        // Complement to the suppression: a handler in a non-init
+        // lifecycle (e.g. Active → Active) with token_program and a
+        // writable token account but no transfers SHOULD still fire —
+        // Anchor's init macro doesn't apply, so the missing CPI is a
+        // real spec gap.
+        let mut h = make_handler("transfer");
+        h.pre_status = Some("Active".to_string());
+        h.post_status = Some("Active".to_string());
+        h.accounts = vec![
+            ParsedHandlerAccount {
+                name: "authority".to_string(),
+                is_signer: true,
+                is_writable: false,
+                is_program: false,
+                pda_seeds: None,
+                account_type: None,
+                authority: None,
+                default_pubkey: None,
+            },
+            ParsedHandlerAccount {
+                name: "source".to_string(),
+                is_signer: false,
+                is_writable: true,
+                is_program: false,
+                pda_seeds: None,
+                account_type: Some("token".to_string()),
+                authority: None,
+                default_pubkey: None,
+            },
+            ParsedHandlerAccount {
+                name: "token_program".to_string(),
+                is_signer: false,
+                is_writable: false,
+                is_program: true,
+                pda_seeds: None,
+                account_type: Some("token".to_string()),
+                authority: None,
+                default_pubkey: None,
+            },
+        ];
+        let spec = ParsedSpec {
+            handlers: vec![h],
+            lifecycle_states: vec!["Active".to_string()],
+            ..empty_spec()
+        };
+        let warnings = check_completeness(&spec);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.rule == "missing_cpi_for_token_context"),
+            "non-init handler with token_program and no transfers SHOULD \
+             still fire; got: {:?}",
             warnings.iter().map(|w| &w.rule).collect::<Vec<_>>()
         );
     }
@@ -9824,6 +9977,7 @@ handler activate : State.Setup -> State.Active {
             schema_includes: vec![],
             calls: vec![],
             effect_branches: None,
+            abstract_binders: vec![],
         }
     }
 

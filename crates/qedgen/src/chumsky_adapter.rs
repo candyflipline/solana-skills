@@ -1423,6 +1423,120 @@ fn string_to_typeref_best_effort(s: &str) -> a::TypeRef {
     a::TypeRef::Named(s.trim().to_string())
 }
 
+/// Render an effect RHS expression to the same string form `render_effect`
+/// uses. Factored out so the v2.29 Slice C variant-promotion desugaring
+/// can emit per-field synthetic effects without duplicating the
+/// rendering logic. Mirrors `render_effect`'s value branch exactly.
+fn render_effect_rhs_value(rhs: &Expr, params: &[(String, String)], consts: ConstTable) -> String {
+    match rhs {
+        Expr::Int(v) => v.to_string(),
+        Expr::Path(p) => {
+            let is_param = p.segments.is_empty() && params.iter().any(|(n, _)| n == &p.root);
+            if is_param {
+                p.root.clone()
+            } else if p.root == "state" {
+                let mut s = String::new();
+                for seg in &p.segments {
+                    match seg {
+                        a::PathSeg::Field(f) => {
+                            if !s.is_empty() {
+                                s.push('.');
+                            }
+                            s.push_str(f);
+                        }
+                        a::PathSeg::Index(i) => {
+                            s.push('[');
+                            s.push_str(i);
+                            s.push(']');
+                        }
+                    }
+                }
+                s
+            } else {
+                let mut s = p.root.clone();
+                for seg in &p.segments {
+                    match seg {
+                        a::PathSeg::Field(f) => {
+                            s.push('.');
+                            s.push_str(f);
+                        }
+                        a::PathSeg::Index(i) => {
+                            s.push('[');
+                            s.push_str(i);
+                            s.push(']');
+                        }
+                    }
+                }
+                s
+            }
+        }
+        other => {
+            let env = TypeEnv::default().with_params(&[]);
+            let _ = params;
+            expr_to_lean(other, Ctx::Guard, consts, &env)
+        }
+    }
+}
+
+/// v2.29 Slice C — desugar the `state := .Variant { f := e, ... }`
+/// whole-state-assignment shape into per-field effects with
+/// variant-prefixed LHS (e.g. `Variant.f`). The cross-variant
+/// promotion path in `codegen.rs::emit_cross_variant_promotion`
+/// already understands variant-prefixed LHS; the desugaring routes
+/// the new top-level shape through that existing emitter without
+/// needing a parallel codegen pathway.
+///
+/// Returns the expanded effect list for the `state := .Variant`
+/// shape; for every other shape, returns a single-element Vec
+/// holding the unmodified `render_effect` output (so call sites
+/// can iterate uniformly).
+///
+/// Unit-variant promotion (`state := .Closed` — no payload) drops
+/// to an empty Vec: the wrapper assignment in
+/// `emit_cross_variant_promotion` handles the variant transition
+/// from `handler.post_status`, so the per-field effect list is
+/// expected to be empty for unit-post handlers.
+fn render_effect_or_expand_variant_promotion(
+    stmt: &a::EffectStmt,
+    params: &[(String, String)],
+    consts: ConstTable,
+) -> Vec<((String, String, String), Option<String>)> {
+    if matches!(stmt.op, a::EffectOp::Set)
+        && stmt.lhs.root == "state"
+        && stmt.lhs.segments.is_empty()
+    {
+        if let Expr::Ctor { variant, payload } = &stmt.rhs.node {
+            match payload {
+                None => {
+                    // Unit variant — drop. Wrapper handles transition.
+                    return Vec::new();
+                }
+                Some(p) => {
+                    if let Expr::RecordLit(fields) = &p.node {
+                        // Payload variant + record literal — expand
+                        // per field with variant-prefixed LHS.
+                        return fields
+                            .iter()
+                            .map(|(fname, fvalue)| {
+                                let lhs_str = format!("{}.{}", variant, fname);
+                                let value_str =
+                                    render_effect_rhs_value(&fvalue.node, params, consts);
+                                ((lhs_str, "set".to_string(), value_str), None)
+                            })
+                            .collect();
+                    }
+                    // Non-record-literal payload (e.g.
+                    // `state := .Active some_bound_record`) — fall
+                    // through to single render_effect. Codegen will
+                    // bail (currently unsupported); agent fills the
+                    // todo!() body.
+                }
+            }
+        }
+    }
+    vec![render_effect(stmt, params, consts)]
+}
+
 // ============================================================================
 // sBPF instruction adapter
 // ============================================================================
@@ -2074,7 +2188,7 @@ fn check_no_recursive_ref_impls(spec: &a::Spec) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn collect_numeric_consts(spec: &a::Spec) -> std::collections::HashMap<String, u128> {
+fn collect_numeric_consts(spec: &a::Spec) -> std::collections::HashMap<String, i128> {
     let mut out = std::collections::HashMap::new();
     for Node { node, .. } in &spec.items {
         match node {
@@ -2127,7 +2241,7 @@ fn typecheck_handler(
     h: &a::HandlerDecl,
     field_types: &std::collections::HashMap<String, String>,
     param_types: &std::collections::HashMap<String, String>,
-    const_literals: &std::collections::HashMap<String, u128>,
+    const_literals: &std::collections::HashMap<String, i128>,
 ) -> anyhow::Result<()> {
     for Node { node, .. } in &h.clauses {
         match node {
@@ -2196,7 +2310,7 @@ fn check_effect_typed(
     stmt: &a::EffectStmt,
     field_types: &std::collections::HashMap<String, String>,
     param_types: &std::collections::HashMap<String, String>,
-    const_literals: &std::collections::HashMap<String, u128>,
+    const_literals: &std::collections::HashMap<String, i128>,
 ) -> anyhow::Result<()> {
     let lhs_type = match resolve_path_type(&stmt.lhs, field_types, param_types) {
         Some(t) => t,
@@ -2223,7 +2337,7 @@ fn check_cmp_types(
     expr: &Expr,
     field_types: &std::collections::HashMap<String, String>,
     param_types: &std::collections::HashMap<String, String>,
-    const_literals: &std::collections::HashMap<String, u128>,
+    const_literals: &std::collections::HashMap<String, i128>,
 ) -> anyhow::Result<()> {
     match expr {
         Expr::Cmp { lhs, rhs, .. } => {
@@ -2289,10 +2403,10 @@ fn check_cmp_pair(
     rhs: &Expr,
     field_types: &std::collections::HashMap<String, String>,
     param_types: &std::collections::HashMap<String, String>,
-    const_literals: &std::collections::HashMap<String, u128>,
+    const_literals: &std::collections::HashMap<String, i128>,
 ) -> anyhow::Result<()> {
     // Try both orientations (LHS Pubkey / RHS Int and vice versa).
-    let pubkey_vs_int = |p: &Expr, i: &Expr| -> Option<(String, u128)> {
+    let pubkey_vs_int = |p: &Expr, i: &Expr| -> Option<(String, i128)> {
         let path = match p {
             Expr::Path(path) => path,
             _ => return None,
@@ -2322,12 +2436,25 @@ fn check_cmp_pair(
 
 fn numeric_literal_value(
     expr: &Expr,
-    const_literals: &std::collections::HashMap<String, u128>,
-) -> Option<u128> {
+    const_literals: &std::collections::HashMap<String, i128>,
+) -> Option<i128> {
     match expr {
-        Expr::Int(v) => Some(*v),
+        // v2.29 Slice A: integer literals stay non-negative at the
+        // AST (`Expr::Int(u128)`); negative literals desugar to
+        // `Arith { Sub, Int(0), Int(v) }` so they're recognized here
+        // via the explicit Sub branch below.
+        Expr::Int(v) => i128::try_from(*v).ok(),
         Expr::Path(p) if p.segments.is_empty() => const_literals.get(&p.root).copied(),
         Expr::Paren(inner) | Expr::Old(inner) => numeric_literal_value(&inner.node, const_literals),
+        Expr::Arith {
+            op: a::ArithOp::Sub,
+            lhs,
+            rhs,
+        } => {
+            let l = numeric_literal_value(&lhs.node, const_literals)?;
+            let r = numeric_literal_value(&rhs.node, const_literals)?;
+            l.checked_sub(r)
+        }
         _ => None,
     }
 }
@@ -3146,9 +3273,12 @@ fn expand_handler(
             }
             a::MatchBody::Effect(stmts) => {
                 for Node { node: stmt, .. } in stmts {
-                    let (triple, on_error) = render_effect(stmt, &base.takes_params, consts);
-                    synth.effects.push(triple);
-                    synth.effect_on_error.push(on_error);
+                    for (triple, on_error) in
+                        render_effect_or_expand_variant_promotion(stmt, &base.takes_params, consts)
+                    {
+                        synth.effects.push(triple);
+                        synth.effect_on_error.push(on_error);
+                    }
                 }
             }
             // v2.24 #9 — synth handler issues the CPI plus any
@@ -3197,9 +3327,12 @@ fn expand_handler(
                     state_binders: lower_state_binders(&call.state_binders),
                 });
                 for Node { node: stmt, .. } in effects {
-                    let (triple, on_error) = render_effect(stmt, &base.takes_params, consts);
-                    synth.effects.push(triple);
-                    synth.effect_on_error.push(on_error);
+                    for (triple, on_error) in
+                        render_effect_or_expand_variant_promotion(stmt, &base.takes_params, consts)
+                    {
+                        synth.effects.push(triple);
+                        synth.effect_on_error.push(on_error);
+                    }
                 }
             }
             a::MatchBody::Noop => {}
@@ -3319,6 +3452,7 @@ fn adapt_handler(h: &a::HandlerDecl, consts: ConstTable, env: &TypeEnv) -> Parse
         properties: Vec::new(),
         calls: Vec::new(),
         effect_branches: None,
+        abstract_binders: Vec::new(),
     };
 
     for Node { node: clause, .. } in &h.clauses {
@@ -3398,9 +3532,12 @@ fn adapt_handler(h: &a::HandlerDecl, consts: ConstTable, env: &TypeEnv) -> Parse
                 for Node { node: block, .. } in blocks {
                     match block {
                         a::EffectBlock::Stmt(stmt) => {
-                            let (triple, on_error) = render_effect(stmt, &params, consts);
-                            handler.effects.push(triple);
-                            handler.effect_on_error.push(on_error);
+                            for (triple, on_error) in
+                                render_effect_or_expand_variant_promotion(stmt, &params, consts)
+                            {
+                                handler.effects.push(triple);
+                                handler.effect_on_error.push(on_error);
+                            }
                         }
                         a::EffectBlock::Match { scrutinee, arms } => {
                             let mut parsed_arms: Vec<crate::check::ParsedEffectArm> = Vec::new();
@@ -3411,14 +3548,19 @@ fn adapt_handler(h: &a::HandlerDecl, consts: ConstTable, env: &TypeEnv) -> Parse
                                     let mut leaves = Vec::new();
                                     nested.node.collect_leaves(&mut leaves);
                                     for stmt in leaves {
-                                        let (triple, on_error) =
-                                            render_effect(stmt, &params, consts);
-                                        // Mirror into union so flat readers
-                                        // see this potential write.
-                                        handler.effects.push(triple.clone());
-                                        handler.effect_on_error.push(on_error.clone());
-                                        arm_effects.push(triple);
-                                        arm_on_error.push(on_error);
+                                        for (triple, on_error) in
+                                            render_effect_or_expand_variant_promotion(
+                                                stmt, &params, consts,
+                                            )
+                                        {
+                                            // Mirror into union so flat
+                                            // readers see this potential
+                                            // write.
+                                            handler.effects.push(triple.clone());
+                                            handler.effect_on_error.push(on_error.clone());
+                                            arm_effects.push(triple);
+                                            arm_on_error.push(on_error);
+                                        }
                                     }
                                 }
                                 let (pattern_rust, pattern_lean, is_wildcard) = match &arm.pattern {
@@ -3509,6 +3651,16 @@ fn adapt_handler(h: &a::HandlerDecl, consts: ConstTable, env: &TypeEnv) -> Parse
             a::HandlerClause::Permissionless => handler.permissionless = true,
             a::HandlerClause::Invariant(name) => handler.invariants.push(name.clone()),
             a::HandlerClause::Establishes(name) => handler.establishes.push(name.clone()),
+            a::HandlerClause::Abstract { name, ty } => {
+                // v2.29 Slice A (#8) — store the binder as (name,
+                // DSL-type-string). Per-backend lowering maps the
+                // DSL type to its own concrete representation
+                // (Rust via `map_type_for_target`, Lean via the
+                // Lean type vocabulary, etc.).
+                handler
+                    .abstract_binders
+                    .push((name.clone(), type_ref_to_string(ty)));
+            }
             a::HandlerClause::Include(schema_name) => {
                 // v2.24 #1 — record the schema reference here; the
                 // actual expansion (append schema.requires onto
@@ -3760,6 +3912,186 @@ type Error
             af.variants.iter().all(|v| v.fields.is_empty()),
             "AddressField should be unit-only"
         );
+    }
+
+    /// v2.29 Slice C — `state := .Variant { f := e, ... }` whole-state
+    /// assignment desugars into per-field effects with
+    /// variant-prefixed LHS so the existing
+    /// `emit_cross_variant_promotion` codepath in codegen.rs can
+    /// consume them without a parallel pathway.
+    #[test]
+    fn state_variant_promotion_expands_to_per_field_effects() {
+        let src = r#"spec Lifecycle
+program_id "11111111111111111111111111111111"
+
+type State
+  | Uninitialized
+  | Setup of { admin : Pubkey, balance : U64, }
+
+type Error
+  | WrongState
+
+handler initialize : State.Uninitialized -> State.Setup {
+  accounts {
+    admin : signer
+  }
+  effect {
+    state := .Setup { admin := admin.pubkey, balance := 0 }
+  }
+}
+"#;
+        let spec = parse_str(src).expect("parse");
+        let handler = spec
+            .handlers
+            .iter()
+            .find(|h| h.name == "initialize")
+            .expect("initialize handler");
+        // The single `state := .Setup { ... }` effect should have
+        // expanded into two per-field effects with variant-prefixed
+        // LHS, not a single bare-state effect.
+        let lhs_strs: Vec<&String> = handler.effects.iter().map(|(lhs, _, _)| lhs).collect();
+        assert!(
+            lhs_strs.iter().any(|s| s.as_str() == "Setup.admin"),
+            "expected Setup.admin in effect LHS list; got: {:?}",
+            lhs_strs
+        );
+        assert!(
+            lhs_strs.iter().any(|s| s.as_str() == "Setup.balance"),
+            "expected Setup.balance in effect LHS list; got: {:?}",
+            lhs_strs
+        );
+        assert!(
+            !lhs_strs.iter().any(|s| s.as_str() == "state"),
+            "bare-state LHS should have been desugared away; got: {:?}",
+            lhs_strs
+        );
+    }
+
+    /// v2.29 Slice A (#8) — `abstract <name> : <Type>` handler
+    /// clauses parse into `ParsedHandler::abstract_binders`. Each
+    /// entry carries the binder name and the verbatim DSL type
+    /// string; per-backend lowering resolves to its own concrete
+    /// type via `map_type_for_target` / Lean type mapping.
+    #[test]
+    fn abstract_binder_clause_parses_into_handler() {
+        let src = r#"spec Earn
+program_id "11111111111111111111111111111111"
+
+type State
+  | Active of { lp_supply : U64 }
+
+type Error
+  | InvalidAmount
+
+handler user_deposit (amount_stablecoin : U64) : State.Active -> State.Active {
+  accounts { user : signer }
+  abstract d : U64
+  requires d > 0 else InvalidAmount
+  requires d <= amount_stablecoin else InvalidAmount
+  effect { lp_supply += d }
+}
+"#;
+        let spec = parse_str(src).expect("parse");
+        let handler = spec
+            .handlers
+            .iter()
+            .find(|h| h.name == "user_deposit")
+            .expect("user_deposit handler");
+        assert_eq!(handler.abstract_binders.len(), 1);
+        assert_eq!(handler.abstract_binders[0].0, "d");
+        assert_eq!(handler.abstract_binders[0].1, "U64");
+    }
+
+    /// v2.29 Slice A (#2) — negative integer literals desugar to
+    /// `Arith { Sub, Int(0), Int(v) }` at parse time, so they reach
+    /// the AST as a single sub-expression rather than failing the
+    /// integer-first atom parser.
+    #[test]
+    fn negative_integer_literal_parses_as_sub_of_zero() {
+        let src = r#"spec Exp
+program_id "11111111111111111111111111111111"
+
+type State
+  | Active of { exp : U64 }
+
+type Error
+  | Bad
+
+handler set_exp : State.Active -> State.Active {
+  accounts { authority : signer }
+  requires state.exp == -4 else Bad
+  effect { exp := 0 }
+}
+"#;
+        // The successful parse is the assertion — pre-v2.29 the
+        // `-4` would fail because the expression-level integer atom
+        // didn't accept a leading `-`.
+        let _spec = parse_str(src).expect("negative literal must parse");
+    }
+
+    /// v2.29 Slice A (#3) — `const NAME = -VALUE` parses with the
+    /// const value stored as a signed `i128`. The PRD's friction
+    /// case (`const N6 = -6` for a fixed-point exponent) drops the
+    /// `0 - 6` workaround.
+    #[test]
+    fn const_decl_accepts_negative_literal() {
+        let src = r#"spec ExpConst
+program_id "11111111111111111111111111111111"
+
+const N6 = -6
+
+type State
+  | Active of { exp : U64 }
+
+type Error
+  | Bad
+"#;
+        let spec = parse_str(src).expect("parse");
+        let n6 = spec
+            .constants
+            .iter()
+            .find(|(n, _)| n == "N6")
+            .expect("N6 const must exist");
+        assert_eq!(n6.1, "-6");
+    }
+
+    /// v2.29 Slice C — unit-variant promotion (`state := .Closed`)
+    /// drops to zero effects; the wrapper assignment in
+    /// `emit_cross_variant_promotion` handles the transition from
+    /// `handler.post_status` directly.
+    #[test]
+    fn state_unit_variant_promotion_emits_no_effects() {
+        let src = r#"spec Lifecycle
+program_id "11111111111111111111111111111111"
+
+type State
+  | Open of { x : U64 }
+  | Closed
+
+type Error
+  | WrongState
+
+handler close : State.Open -> State.Closed {
+  accounts {
+    authority : signer
+  }
+  effect {
+    state := .Closed
+  }
+}
+"#;
+        let spec = parse_str(src).expect("parse");
+        let handler = spec
+            .handlers
+            .iter()
+            .find(|h| h.name == "close")
+            .expect("close handler");
+        assert!(
+            handler.effects.is_empty(),
+            "unit-variant promotion should desugar to zero effects; got: {:?}",
+            handler.effects
+        );
+        assert_eq!(handler.post_status.as_deref(), Some("Closed"));
     }
 
     /// v2.24 #9 — `call Interface.handler(...)` is now legal inside

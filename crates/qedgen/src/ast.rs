@@ -59,9 +59,17 @@ pub struct Spec {
 
 #[derive(Debug, Clone)]
 pub enum TopItem {
+    /// `const NAME = VALUE` — top-level integer constant.
+    /// v2.29 Slice A (#3): widened to `i128` so `const N6 = -6` parses
+    /// into a single negative-valued constant rather than forcing
+    /// authors to inline `0 - 6` workarounds throughout the spec.
+    /// Const consumers in `chumsky_adapter` and the codegen backends
+    /// format via `value.to_string()`, which handles the negative
+    /// sign correctly; `infer_const_type` in `rust_codegen_util` picks
+    /// a signed Rust type for negative values.
     Const {
         name: String,
-        value: u128,
+        value: i128,
     },
     /// `type T = { f : Type, ... }` — plain record.
     Record(RecordDecl),
@@ -201,7 +209,14 @@ pub enum InstructionItem {
     /// `entry N` — byte offset of instruction entry point in the program.
     Entry(u64),
     /// `const NAME = VALUE` — instruction-local constant.
-    Const { name: String, value: u128 },
+    /// v2.29 Slice A (#3): widened to `i128` so `const N6 = -6` parses
+    /// into a single negative-valued constant rather than forcing
+    /// authors to inline `0 - 6` workarounds throughout the spec.
+    /// Const consumers in `chumsky_adapter` and the codegen backends
+    /// format via `value.to_string()`, which handles the negative
+    /// sign correctly; `infer_const_type` in `rust_codegen_util` picks
+    /// a signed Rust type for negative values.
+    Const { name: String, value: i128 },
     /// `errors [...]` inside an instruction — per-instruction error list.
     Errors(Vec<ErrorEntry>),
     /// `input_layout { ... }` — layout of input buffer.
@@ -380,6 +395,20 @@ pub enum HandlerClause {
     Match(MatchClause),
     Emits(String),
     AbortsTotal,
+    /// v2.29 Slice A (#8) — `abstract <name> : <Type>` binds an
+    /// existentially-quantified value the handler can refer to in
+    /// its `requires` / `effect` / `ensures` clauses without the
+    /// DSL needing to express how the value was computed. Lowers to
+    /// `kani::any()` + `kani::assume(<requires>)` in Kani harnesses,
+    /// a proptest `Arbitrary` source + `prop_assume!` in proptest
+    /// harnesses, an existential quantifier in Lean theorem
+    /// statements, and a `let <name>: T = todo!(...)` in the Rust
+    /// handler scaffold (agent fills the body once it picks the
+    /// concrete library / math).
+    Abstract {
+        name: String,
+        ty: TypeRef,
+    },
     Invariant(String),
     /// `establishes Name` — this handler establishes the named invariant
     /// at post-state. Unlike `invariant Name` (which means "preserves"),

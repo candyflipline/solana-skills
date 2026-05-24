@@ -179,6 +179,10 @@ pub fn emit_add_strict_bounds(
 /// Infer a Rust integer type from a constant's value magnitude.
 pub fn infer_const_type(value: &str) -> &'static str {
     let clean_val = value.replace('_', "");
+    // v2.29 Slice A (#3): try unsigned first so positive literals
+    // keep their pre-v2.29 type (u8 / u16 / …). Fall through to
+    // signed only when the leading `-` rules out the unsigned path,
+    // matching the smallest signed type that fits.
     if let Ok(v) = clean_val.parse::<u128>() {
         if v <= u8::MAX as u128 {
             "u8"
@@ -190,6 +194,18 @@ pub fn infer_const_type(value: &str) -> &'static str {
             "u64"
         } else {
             "u128"
+        }
+    } else if let Ok(v) = clean_val.parse::<i128>() {
+        if v >= i8::MIN as i128 && v <= i8::MAX as i128 {
+            "i8"
+        } else if v >= i16::MIN as i128 && v <= i16::MAX as i128 {
+            "i16"
+        } else if v >= i32::MIN as i128 && v <= i32::MAX as i128 {
+            "i32"
+        } else if v >= i64::MIN as i128 && v <= i64::MAX as i128 {
+            "i64"
+        } else {
+            "i128"
         }
     } else {
         "u64"
@@ -634,6 +650,20 @@ pub fn check_effect_targets(spec: &ParsedSpec) -> anyhow::Result<()> {
                 continue;
             }
             if !declared.contains(base) {
+                // v2.29 Slice C — `state := .Variant { … }` whole-state
+                // assignment desugars to per-field variant-prefixed
+                // effects at the adapter (chumsky_adapter.rs::
+                // render_effect_or_expand_variant_promotion), but
+                // non-RecordLit RHS shapes (e.g. `state := .Active some_var`)
+                // and unit-variant shapes that survive into codegen
+                // still surface a single bare-state effect tuple here.
+                // Accept `state` as a base whenever the spec has any
+                // multi-variant ADT account type — the cross-variant
+                // promotion path either handles it (RecordLit) or
+                // bails to a `todo!()` (other shapes) downstream.
+                if base == "state" && spec.account_types.iter().any(|a| !a.variants.is_empty()) {
+                    continue;
+                }
                 anyhow::bail!(
                     "handler `{}` writes effect target `{}` but `{}` is not declared in any state, account, record, or sum-variant payload — add it to the state declaration or remove the effect",
                     handler.name,
@@ -700,6 +730,30 @@ fn mentions_handler_account_pubkey(
 // ============================================================================
 
 /// Emit constant declarations from spec constants.
+/// v2.29 Slice A (#8) — emit `let <name>: <T> = <source>;` lines for
+/// each `abstract <name> : <T>` clause on a handler, mapping the
+/// DSL type through the caller-supplied resolver. `indent` lets
+/// callers match their surrounding block (4 / 8 / 12 spaces);
+/// `source` is the per-backend symbolic-input expression
+/// (`kani::any()` for Kani, `todo!("...")` for Rust scaffolds, etc.).
+///
+/// Call this after the equivalent takes_params emission so the
+/// abstract binders are in scope when the following
+/// `kani::assume(<requires>)` / `prop_assume!(...)` reads them.
+pub fn emit_abstract_binders(
+    out: &mut String,
+    handler: &crate::check::ParsedHandler,
+    indent: &str,
+    source: &str,
+    map_ty: impl Fn(&str) -> anyhow::Result<String>,
+) -> anyhow::Result<()> {
+    for (name, ty_str) in &handler.abstract_binders {
+        let ty = map_ty(ty_str)?;
+        out.push_str(&format!("{}let {}: {} = {};\n", indent, name, ty, source));
+    }
+    Ok(())
+}
+
 pub fn emit_constants(out: &mut String, constants: &[(String, String)]) {
     for (name, value) in constants {
         let upper = name.to_uppercase();

@@ -1256,6 +1256,14 @@ fn emit_guard_tests(
             let boundary = boundary_strategy_for_type(ptype);
             param_parts.push(format!("{} in {}", pname, boundary));
         }
+        // v2.29 Slice A (#8) — abstract binders: same strategy
+        // shape as takes_params. The `requires` clauses (which can
+        // reference the binder) are negated in the prop_assume below
+        // so the harness explores values that would reject.
+        for (binder_name, binder_ty) in &op.abstract_binders {
+            let boundary = boundary_strategy_for_type(binder_ty);
+            param_parts.push(format!("{} in {}", binder_name, boundary));
+        }
 
         out.push_str(&format!(
             "    fn {}_rejects_invalid({}) {{\n",

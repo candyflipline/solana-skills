@@ -534,6 +534,16 @@ fn emit_kani_account_section(
                     map_type(ptype, spec)?
                 ));
             }
+            // v2.29 Slice A (#8) — abstract binders.
+            rust_codegen_util::emit_abstract_binders(out, op, "    ", "kani::any()", |t| {
+                map_type(t, spec)
+            })?;
+            // v2.29 Slice A (#8) — abstract binders. Same kani::any()
+            // shape as params; the requires-derived assume below
+            // constrains the symbolic value.
+            rust_codegen_util::emit_abstract_binders(out, op, "    ", "kani::any()", |t| {
+                map_type(t, spec)
+            })?;
 
             // Assume at least one guard component is violated. For a
             // conjunction `g1 && g2 && ... && gN` the negation is
@@ -593,6 +603,14 @@ fn emit_kani_account_section(
                         map_type(ptype, spec)?
                     ));
                 }
+                // v2.29 Slice A (#8) — abstract binders.
+                rust_codegen_util::emit_abstract_binders(out, op, "    ", "kani::any()", |t| {
+                    map_type(t, spec)
+                })?;
+                // v2.29 Slice A (#8) — abstract binders.
+                rust_codegen_util::emit_abstract_binders(out, op, "    ", "kani::any()", |t| {
+                    map_type(t, spec)
+                })?;
 
                 // Assume abort condition
                 out.push_str(&format!("    kani::assume({});\n", abort.rust_expr));
@@ -789,6 +807,10 @@ fn emit_kani_account_section(
                         map_type(ptype, spec)?
                     ));
                 }
+                // v2.29 Slice A (#8) — abstract binders.
+                rust_codegen_util::emit_abstract_binders(out, op, "    ", "kani::any()", |t| {
+                    map_type(t, spec)
+                })?;
 
                 // For operations that increment a field (add effect), assume
                 // the field is strictly less than its bound to prevent overflow.
@@ -906,6 +928,10 @@ fn emit_kani_account_section(
                         map_type(ptype, spec)?
                     ));
                 }
+                // v2.29 Slice A (#8) — abstract binders.
+                rust_codegen_util::emit_abstract_binders(out, op, "    ", "kani::any()", |t| {
+                    map_type(t, spec)
+                })?;
 
                 // Assume the handler's `requires` guards hold pre-state.
                 // Otherwise the transition would reject the input and the
@@ -1069,6 +1095,10 @@ fn emit_kani_account_section(
                         map_type(ptype, spec)?
                     ));
                 }
+                // v2.29 Slice A (#8) — abstract binders.
+                rust_codegen_util::emit_abstract_binders(out, op, "    ", "kani::any()", |t| {
+                    map_type(t, spec)
+                })?;
 
                 let args: String = op
                     .takes_params
@@ -1171,6 +1201,10 @@ fn emit_kani_account_section(
                         map_type(ptype, spec)?
                     ));
                 }
+                // v2.29 Slice A (#8) — abstract binders.
+                rust_codegen_util::emit_abstract_binders(out, op, "    ", "kani::any()", |t| {
+                    map_type(t, spec)
+                })?;
 
                 // Bounds assumptions for arithmetic safety
                 if !is_init {
@@ -1320,6 +1354,10 @@ fn emit_kani_account_section(
                     map_type(ptype, spec)?
                 ));
             }
+            // v2.29 Slice A (#8) — abstract binders.
+            rust_codegen_util::emit_abstract_binders(out, op, "    ", "kani::any()", |t| {
+                map_type(t, spec)
+            })?;
 
             // Call transition — Kani's built-in overflow detection fires on +=
             let args: String = op

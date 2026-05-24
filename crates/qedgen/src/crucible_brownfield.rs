@@ -114,6 +114,7 @@ fn empty_handler(name: String) -> ParsedHandler {
         properties: vec![],
         calls: vec![],
         effect_branches: None,
+        abstract_binders: vec![],
     }
 }
 
