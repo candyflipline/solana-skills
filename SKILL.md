@@ -292,16 +292,85 @@ Pick `property` when the handler list is short and the property name reads natur
 
 ## Cross-program patterns
 
-When a handler's signing authority lives on an account owned by **another** program (a config PDA, an admin-key registry, a vault belonging to a stdlib like SPL), the `auth` clause won't help — it only matches state fields on the local program. Use `<account>.pubkey` to read the signing identity directly from the account context:
+When a handler's signing authority lives on an account owned by **another** program (a config PDA, an admin-key registry, a vault belonging to a stdlib like SPL), three lowering paths work depending on what you need:
 
-- **Persist it on init**: `effect { admin := admin_account.pubkey }`. Later handlers gate via `requires state.admin == signer.pubkey else Unauthorized`.
-- **Or check it inline** when you don't need to store it: `requires foreign_config.admin == signer.pubkey else Unauthorized`. No phantom state field needed.
+**1. Dotted `auth <acct>.<field>` (v2.29.1+, preferred for cross-program auth).** The cleanest sugar when the signing identity is read directly off an imported account:
+
+```fsharp
+handler emergency_close : State.Active -> State.Active {
+  auth admin_config.admin           // ← reads from imported AdminConfig.State
+  accounts {
+    admin         : signer
+    admin_config  : type AdminConfig.State
+    ...
+  }
+  ...
+}
+```
+
+The adapter desugars this to `requires admin_config.admin == admin.pubkey else Unauthorized` against the handler's lone signer. Handlers with 0 or >1 signers can't use the sugar — write the explicit `requires` form instead (see option 3). Bundled regression: `examples/rust/cross-program-vault/`.
+
+**2. Persist on init, gate on later handlers.** When the signing identity should be captured into local state at create time:
+
+```fsharp
+effect { admin := admin_account.pubkey }                          // on init
+requires state.admin == signer.pubkey else Unauthorized           // on later handlers
+```
+
+**3. Inline `requires` field comparison.** The general form. Works for any field-read shape including multi-signer handlers where dotted `auth` can't pick a signer:
+
+```fsharp
+requires foreign_config.admin == chosen_signer.pubkey else Unauthorized
+```
 
 Full grammar + lowering details: see `references/qedspec-dsl.md#accountpubkey-accessor` and the "Cross-program authority" callout under `### Handler clauses`.
 
 Cross-program *spec* composition (importing another program's qedspec or interface stub for CPI ensures) lives in `references/qedspec-imports.md` — that's about the call contract, not field reads.
 
 When you need the **data shape** of another program's account (not its CPI surface), v2.29's `import Foreign from "dep_key"` against a foreign qedspec that declares `type` blocks materializes those types as a local Rust mirror at `src/imported/<ns>.rs`, lets the handler bind accounts via `acct : type Foreign.State`, and resolves field reads (`foreign_acct.admin`) through the mirror. See [`references/qedspec-dsl.md#importing-another-programs-spec`](./references/qedspec-dsl.md#importing-another-programs-spec) for the full walkthrough (Anchor target only in v2.29; Lean ∀-quantification of imported fields deferred to v2.29.1).
+
+## When the spec hits a wall: fail fast, file an issue
+
+**Hard rule for spec-authoring agents:** if `qedgen check` or `qedgen codegen` emits an error or lint you don't have a documented path past, **stop and file an issue at <https://github.com/qedgen/solana-skills/issues>**. Do *not* invent workarounds — phantom state fields to satisfy `auth`, manual `transfers` blocks to silence `missing_cpi_for_token_context`, hand-edited generated files, parser-tricking renames, etc. Those workarounds:
+
+- Erode the spec's correctness story (the spec stops describing what the program actually does).
+- Hide the real bug from the next user, who will reinvent the same workaround.
+- Outlive the upstream fix — the workaround is in the spec forever, even after the underlying limitation lands a proper fix.
+
+The fail-fast script:
+
+1. **Surface the error verbatim.** The lint name (`unsupported_quantifier_shape`, `no_access_control`, `missing_cpi_for_token_context`, etc.) and the spec fragment that tripped it.
+2. **Check `docs/limitations.md`** — many shapes already have documented status (deferred, workaround, won't-fix). If your shape is listed, follow the documented path.
+3. **If the shape isn't documented OR the documented workaround is itself a phantom-state / manual-rewrite anti-pattern**, file an issue:
+   ```bash
+   gh issue create \
+     --title "qedgen: <one-line summary of the wall>" \
+     --body "$(cat <<EOF
+   ## Spec fragment
+
+   \`\`\`fsharp
+   <minimal reproducer — 10-20 lines>
+   \`\`\`
+
+   ## What I tried to do
+
+   <one paragraph: the program shape, why the spec needs this construct>
+
+   ## What qedgen says
+
+   \`\`\`
+   <verbatim error / lint output>
+   \`\`\`
+
+   ## Workarounds rejected
+
+   <list any workarounds you considered + why each lies about the spec>
+   EOF
+   )"
+   ```
+4. **Then pause and tell the user.** Don't auto-apply a workaround "for now." Auto-workarounds in a spec are how `phantom_admin: Pubkey` ends up in production state forever (the friction-report's #6 was exactly this shape).
+
+The exception: if the user explicitly tells you to ship a workaround (with phrasing like "just inline it for now" / "phantom field is fine" / "we'll fix it later"), apply the workaround AND leave a `// FIXME(qedgen-issue: <url>):` comment pointing at the issue. The marker makes the regression auditable later.
 
 ## References
 

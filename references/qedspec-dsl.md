@@ -466,17 +466,32 @@ handler transfer_sol { ... }
 
 > **Cross-program authority** — when the signing identity isn't stored in this
 > program's state (e.g. the admin lives on a PDA owned by another program),
-> use [`<account>.pubkey`](#accountpubkey-accessor) to read it from the
-> account directly. Either capture it into state on init
-> (`admin := admin.pubkey`) and compare against it later
-> (`requires state.admin == admin.pubkey`), or — if you don't need to persist
-> it — gate the handler with `requires admin.pubkey == signer.pubkey` and skip
-> the storage step. The `auth` clause only matches state-resident fields, so
-> the `.pubkey` accessor is the right tool here.
+> three lowering paths work:
+>
+> 1. **`auth <acct>.<field>` (v2.29.1+, preferred for cross-program auth).**
+>    Dotted form reads the auth identity directly off a handler-bound
+>    account — including an imported program's account (`auth
+>    admin_config.admin`). The adapter desugars to
+>    `requires <acct>.<field> == <signer>.pubkey else Unauthorized`
+>    against the handler's lone signer. Skipped when the handler has 0 or
+>    2+ signers (use option 3 then).
+>
+> 2. **Persist on init via [`<account>.pubkey`](#accountpubkey-accessor).**
+>    Capture the signer into local state (`effect { admin := admin.pubkey }`)
+>    on the init handler, then gate later handlers with `requires state.admin
+>    == admin.pubkey`. Adds a persistent state field.
+>
+> 3. **Inline `requires` field comparison.** The general form. Works for any
+>    field-read shape including multi-signer handlers:
+>    `requires foreign_config.admin == chosen_signer.pubkey else Unauthorized`.
+>
+> Bare `auth <name>` (no dot) still does the original state-field lookup —
+> lowers to Anchor `has_one = <name>` for flat state, or to the variant-
+> destructure auth guard for multi-variant ADT.
 
 | Clause | Purpose | Example |
 |---|---|---|
-| `auth` | Access control (signer must match field) | `auth authority` |
+| `auth` | Access control (signer must match field). Dotted form (v2.29.1+) reads from an imported account: `auth admin_config.admin`. | `auth authority`, `auth admin_config.admin` |
 | `accounts { ... }` | Account descriptors | see below |
 | `requires expr else Error` | Guard with error code | `requires amount > 0 else InvalidAmount` |
 | `requires expr` | Guard without error code | `requires state.member_count > state.threshold` |

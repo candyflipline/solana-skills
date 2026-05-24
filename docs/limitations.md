@@ -158,3 +158,10 @@ When `qedgen check` emits a P5 lint pointing at one of the categories
 above and you've hit a *new* shape that should be supported, open an
 issue at <https://github.com/qedgen/solana-skills/issues> with the
 fragment that doesn't lower.
+
+**Agents authoring `.qedspec`s: fail fast.** SKILL.md's "When the
+spec hits a wall" section is the binding contract — if you hit a lint
+/ codegen error not covered by the documented workarounds above, file
+the issue and pause. Do not invent phantom state fields, hand-edit
+generated files, or otherwise lie about the spec to silence the lint.
+The workaround lives in the spec forever; the bug doesn't.
