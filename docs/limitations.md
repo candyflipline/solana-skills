@@ -161,7 +161,16 @@ fragment that doesn't lower.
 
 **Agents authoring `.qedspec`s: fail fast.** SKILL.md's "When the
 spec hits a wall" section is the binding contract — if you hit a lint
-/ codegen error not covered by the documented workarounds above, file
-the issue and pause. Do not invent phantom state fields, hand-edit
-generated files, or otherwise lie about the spec to silence the lint.
-The workaround lives in the spec forever; the bug doesn't.
+/ codegen error (or a generated-output compile / kani / lake failure)
+not covered by the documented workarounds above, sanitize a generic
+reproducer, ask the user before filing, then file the issue and
+pause. Do not invent phantom state fields, hand-edit generated files,
+or otherwise lie about the spec to silence the lint. The workaround
+lives in the spec forever; the bug doesn't.
+
+**Sanitization is mandatory.** GitHub issues are public. Strip real
+pubkeys, named accounts / fields / handlers that hint at protocol
+identity, deal-specific constants, internal paths, and product-name
+comments before sharing. The issue only needs the generic shape that
+trips qedgen — not the user's business logic. See SKILL.md step 3
+for the full scrub checklist.
