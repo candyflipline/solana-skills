@@ -3141,7 +3141,66 @@ pub fn adapt(spec: &a::Spec) -> ParsedSpec {
         }
     }
 
+    // v2.29.1 — desugar dotted-auth (`auth admin_config.admin_key`).
+    // The parser stored it as `handler.who = Some("admin_config.admin_key")`;
+    // here we split on `.`, identify the signer account, and
+    // synthesize a `requires <acct>.<field> == <signer>.pubkey else
+    // Unauthorized` clause. `handler.who` is rewritten to the signer
+    // account name so downstream "handler has auth" lints still
+    // fire. Bare `auth <name>` (no dot) is left untouched — that
+    // path lowers to Anchor `has_one = X` for state-resident fields.
+    desugar_dotted_auth(&mut out);
+
     out
+}
+
+/// v2.29.1 — post-pass that turns `auth <acct>.<field>` into a
+/// `requires <acct>.<field> == <signer>.pubkey else Unauthorized`
+/// synthesized clause plus a `who = <signer>` rewrite. See the
+/// caller in `adapt()` for the integration point.
+fn desugar_dotted_auth(spec: &mut ParsedSpec) {
+    for handler in &mut spec.handlers {
+        let Some(actor) = handler.who.clone() else {
+            continue;
+        };
+        let Some((acct_name, field)) = actor.split_once('.') else {
+            continue;
+        };
+        // Identify the signer (single signer in accounts block).
+        // Multiple signers → bail without desugaring; the user should
+        // explicitly write the requires clause.
+        let signers: Vec<&str> = handler
+            .accounts
+            .iter()
+            .filter(|a| a.is_signer)
+            .map(|a| a.name.as_str())
+            .collect();
+        if signers.len() != 1 {
+            continue;
+        }
+        let signer = signers[0].to_string();
+        // Synthesize the requires clause. Lean form uses `=` (the
+        // adapter's Lean output convention); Rust form uses `==` per
+        // `expr_to_rust(Ctx::Guard)`. Both forms read the imported
+        // account through the handler-account binding name, which
+        // `bind_state` in guards.rs rewrites to `ctx.<acct>.<field>`
+        // (flat-struct path) or `(*ctx.<acct>.inner.<field>())`
+        // (multi-variant ADT) at codegen time.
+        let lean_expr = format!("{}.{} = {}.pubkey", acct_name, field, signer);
+        let rust_expr = format!("{}.{} == {}.pubkey", acct_name, field, signer);
+        let synthesized = crate::check::ParsedRequires {
+            lean_expr,
+            rust_expr: rust_expr.clone(),
+            rust_expr_pod: rust_expr,
+            error_name: Some("Unauthorized".to_string()),
+            ast_body: None,
+        };
+        handler.requires.insert(0, synthesized);
+        // Rewrite `who` to the signer so downstream consumers see a
+        // simple-ident auth (no_access_control lint, lifecycle gates,
+        // etc.).
+        handler.who = Some(signer);
+    }
 }
 
 /// Expand a handler declaration into one or more `ParsedHandler`s.

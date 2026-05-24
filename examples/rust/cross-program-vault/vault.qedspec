@@ -76,9 +76,13 @@ handler deposit (amount : U64) : State.Active -> State.Active {
 
 // Admin-only emergency close: drains the vault. Auth gate reads
 // `admin_config.admin` (cross-program state, friction items #4/#5/#6)
-// and the CPI amount reads `state.total_deposits` (v2.29 CPI arg
+// via v2.29.1's dotted `auth <acct>.<field>` sugar. The adapter
+// desugars this into a `requires admin_config.admin == admin.pubkey
+// else Unauthorized` clause against the handler's lone signer.
+// The CPI amount reads `state.total_deposits` (v2.29 CPI arg
 // lowering for multi-variant ADT).
 handler emergency_close : State.Active -> State.Active {
+  auth admin_config.admin
   accounts {
     admin         : signer
     vault         : writable
@@ -87,7 +91,6 @@ handler emergency_close : State.Active -> State.Active {
     token_program : program, type token
     admin_config  : type AdminConfig.State
   }
-  requires admin_config.admin == admin.pubkey else Unauthorized
   call Token.transfer(
     from      = vault_ta,
     to        = sink_ta,

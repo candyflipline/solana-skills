@@ -12,7 +12,7 @@ use crate::state::VaultAccountInner;
 use crate::EmergencyClose;
 
 impl<'info> EmergencyClose<'info> {
-    #[qed(verified, spec = "../vault.qedspec", handler = "emergency_close", hash = "430a111b688406bc", spec_hash = "8d391a8d253b9bcc")]
+    #[qed(verified, spec = "../vault.qedspec", handler = "emergency_close", hash = "430a111b688406bc", spec_hash = "fbd50c2e7640978c")]
     #[inline(always)]
     pub fn handler(&mut self) -> Result<()> {
         guards::emergency_close(self)?;

@@ -1327,10 +1327,24 @@ fn effect_block<'a>() -> impl Parser<'a, &'a str, EffectBlock, Err<'a>> + Clone 
 }
 
 fn handler_clause<'a>() -> impl Parser<'a, &'a str, HandlerClause, Err<'a>> + Clone {
+    // v2.29.1 — accept dotted form `auth <acct>.<field>` so the
+    // signing identity can live on an imported program's account
+    // (the cross-program-vault shape). The adapter splits on `.`
+    // and, when the dotted form is present, synthesizes a
+    // `requires <acct>.<field> == <signer>.pubkey else Unauthorized`
+    // clause against the handler's lone signer. Bare `auth <name>`
+    // keeps the pre-v2.29.1 state-field lookup behavior.
     let auth = just("auth")
         .then_ignore(wsc())
         .ignore_then(non_keyword_ident())
-        .map(HandlerClause::Auth);
+        .then(just('.').ignore_then(non_keyword_ident()).or_not())
+        .map(|(head, tail)| {
+            let actor = match tail {
+                Some(t) => format!("{}.{}", head, t),
+                None => head,
+            };
+            HandlerClause::Auth(actor)
+        });
 
     let accounts = just("accounts")
         .then_ignore(wsc())
