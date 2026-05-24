@@ -117,6 +117,17 @@ pub struct LockEntry {
     /// root). `None` when `verified` is false.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub proof_hash: Option<String>,
+
+    // ---- v2.29 Slice F — full-spec import bookkeeping. ----
+    /// Comma-separated list of account-type names captured from the
+    /// imported source (e.g. `"State,UserVault"`). Empty when the
+    /// dep ships only an interface stub with no `type` declarations
+    /// (bundled SPL Token / System Program / Metaplex). The
+    /// `--frozen` check uses this to detect a renamed / removed
+    /// imported type at resolve time, before the consumer's codegen
+    /// has a chance to fail mysteriously on a missing mirror.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub imported_account_type_names: String,
 }
 
 /// Helper for `skip_serializing_if` on `bool` fields that default to
@@ -234,6 +245,7 @@ pub fn entry_for_resolved(
     resolved: &crate::import_resolver::ResolvedImport,
     dep: &crate::qed_manifest::Dependency,
     iface: &crate::check::ParsedInterface,
+    imported_account_type_names: &str,
 ) -> LockEntry {
     use crate::qed_manifest::Dependency;
     let spec_hash = compute_spec_hash(&resolved.sources);
@@ -274,6 +286,7 @@ pub fn entry_for_resolved(
         upstream_version,
         verified: resolved.has_proofs,
         proof_hash,
+        imported_account_type_names: imported_account_type_names.to_string(),
     }
 }
 
@@ -285,6 +298,7 @@ pub fn entry_for_resolved(
 pub fn entry_for_builtin(
     resolved: &crate::import_resolver::ResolvedImport,
     iface: &crate::check::ParsedInterface,
+    imported_account_type_names: &str,
 ) -> LockEntry {
     let spec_hash = compute_spec_hash(&resolved.sources);
     let (upstream_binary_hash, upstream_version) = match &iface.upstream {
@@ -308,6 +322,7 @@ pub fn entry_for_builtin(
         upstream_version,
         verified: resolved.has_proofs,
         proof_hash,
+        imported_account_type_names: imported_account_type_names.to_string(),
     }
 }
 
@@ -519,6 +534,18 @@ fn describe_lock_diff(existing: Option<&LockFile>, computed: &LockFile) -> Strin
                         existing_entry.verified, computed_entry.verified,
                     ));
                 }
+                // v2.29 Slice F — surface imported type-set drift so
+                // users see exactly which type was added / removed /
+                // renamed without grepping the imported source.
+                if existing_entry.imported_account_type_names
+                    != computed_entry.imported_account_type_names
+                {
+                    out.push_str(&format!(
+                        "      imported_account_type_names: {:?} → {:?}\n",
+                        existing_entry.imported_account_type_names,
+                        computed_entry.imported_account_type_names,
+                    ));
+                }
             }
             None => {
                 out.push_str(&format!(
@@ -602,6 +629,7 @@ mod tests {
             upstream_version: None,
             verified: false,
             proof_hash: None,
+            imported_account_type_names: String::new(),
         }
     }
 
@@ -634,6 +662,7 @@ mod tests {
                 upstream_version: Some("spl-token@4.0.3".to_string()),
                 verified: true,
                 proof_hash: Some("sha256:abcd".to_string()),
+                imported_account_type_names: String::new(),
             }],
         };
         write(tmp.path(), &lock).unwrap();
@@ -912,6 +941,7 @@ spec_hash = "sha256:abc"
                 upstream_version: None,
                 verified: true,
                 proof_hash: Some("sha256:p".to_string()),
+                imported_account_type_names: String::new(),
             }],
         };
         write(tmp.path(), &lock).unwrap();
@@ -988,6 +1018,7 @@ spec_hash = "sha256:abc"
                 upstream_version: None,
                 verified: true,
                 proof_hash: Some("sha256:OLD".to_string()),
+                imported_account_type_names: String::new(),
             }],
         };
         write(tmp.path(), &old).unwrap();
@@ -1006,6 +1037,7 @@ spec_hash = "sha256:abc"
                 upstream_version: None,
                 verified: true,
                 proof_hash: Some("sha256:NEW".to_string()),
+                imported_account_type_names: String::new(),
             }],
         };
         let findings = handle_lock(tmp.path(), &computed, LockMode::Frozen)
@@ -1041,6 +1073,7 @@ spec_hash = "sha256:abc"
             upstream_version: None,
             verified: true,
             proof_hash: Some("sha256:proof_OLD".to_string()),
+            imported_account_type_names: String::new(),
         };
         write(
             tmp.path(),
@@ -1172,6 +1205,7 @@ spec_hash = "sha256:abc"
             upstream_version: Some("4.0.3".to_string()),
             verified: false,
             proof_hash: None,
+            imported_account_type_names: String::new(),
         };
         let old_lock = LockFile {
             version: LOCK_VERSION,
@@ -1214,6 +1248,7 @@ spec_hash = "sha256:abc"
             upstream_version: None,
             verified: false,
             proof_hash: None,
+            imported_account_type_names: String::new(),
         };
         let old_lock = LockFile {
             version: LOCK_VERSION,

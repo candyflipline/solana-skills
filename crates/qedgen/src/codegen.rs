@@ -737,6 +737,14 @@ fn generate_lib(
     if !spec.ref_impls.is_empty() {
         out.push_str("pub mod ref_impls;\n");
     }
+    // v2.29 Slice H — local mirror of imported account types.
+    // Generated under `src/imported/<ns>.rs` (one file per imported
+    // namespace) by `generate_imported_mirror`. Empty for specs that
+    // import only interface stubs (the bundled SPL Token / System
+    // Program / Metaplex stubs declare no `type`s; nothing to mirror).
+    if !spec.imported_namespaces.is_empty() {
+        out.push_str("pub mod imported;\n");
+    }
     out.push('\n');
 
     out.push_str(&format!("declare_id!(\"{}\");\n\n", program_id));
@@ -1197,6 +1205,243 @@ fn generate_state(
     out.push_str("// ---- END GENERATED ----\n");
 
     std::fs::write(src_dir.join("state.rs"), &out)?;
+    Ok(())
+}
+
+/// v2.29 Slice H — generate `src/imported/<ns>.rs` per imported
+/// namespace plus a `src/imported/mod.rs` re-exporter. The handler's
+/// accounts block can then name `<ns>::<Type>` as the account type
+/// without depending on the foreign crate at compile time: the
+/// mirror struct carries the same field layout, so an `Account<'info,
+/// <ns>::<Type>>` deserializes the foreign bytes exactly the way the
+/// foreign program would.
+///
+/// The mirror is fully regenerated on every `qedgen codegen`; users
+/// should not hand-edit anything under `src/imported/`. Drift
+/// detection (`qedgen check --regen-drift`) treats these files as
+/// generated, same shape as `state.rs` / `errors.rs` / `events.rs`.
+///
+/// Single-variant account types lower to plain `pub struct`s.
+/// Multi-variant ADTs (the `WrongState`-gated wrapper + inner enum
+/// pattern) reuse the wrapper-struct + inner-enum shape so an
+/// `Account<'info, Wrapper>` matches the foreign program's
+/// account discriminator. The same accessor-method emission from
+/// `generate_state` runs here so consumer-side reads via
+/// `imported_acct.inner.<field>()` work identically to local
+/// multi-variant state.
+///
+/// Plain record types referenced by the imported account types are
+/// emitted in the same file so the mirror is self-contained — no
+/// cross-file `use crate::imported::<other>::*;` chasing.
+#[allow(dead_code)]
+fn generate_imported_mirror(
+    spec: &ParsedSpec,
+    fp: &SpecFingerprint,
+    output_dir: &Path,
+    target: Target,
+) -> Result<()> {
+    if spec.imported_namespaces.is_empty() {
+        return Ok(());
+    }
+    let surface = FrameworkSurface::for_target(target);
+    let src_dir = output_dir.join("src");
+    let imported_dir = src_dir.join("imported");
+    std::fs::create_dir_all(&imported_dir)?;
+
+    // Per-namespace file emission. The BTreeMap iteration order is
+    // sorted by local name so the generated mod.rs re-exports stay
+    // deterministic across runs.
+    for (local_name, ns) in &spec.imported_namespaces {
+        let mut out = String::new();
+        let file_rel = format!("src/imported/{}.rs", local_name);
+        out.push_str(&marker("DO NOT EDIT", fp, &file_rel));
+        out.push_str(&format!(
+            "//! v2.29 Slice H mirror of `{0}`'s account types\n\
+             //! (sourced from dep `{1}`).\n\
+             //!\n\
+             //! Hand-editing is unsafe: every `qedgen codegen` regenerates\n\
+             //! this file from the imported `.qedspec`'s `type` declarations.\n\
+             //! To change a field, change the imported spec and re-resolve.\n\n",
+            local_name, ns.dep_key,
+        ));
+        out.push_str(surface.prelude_import);
+        out.push('\n');
+
+        // Plain record types first (account types may reference them).
+        // Anchor-only: Quasar's zero-copy/Pod path needs a different
+        // derive set + `#[repr(C)]` discipline that v2.29 doesn't
+        // wire for imports — flagged as future work alongside the
+        // larger Quasar import story.
+        for record in &ns.records {
+            out.push_str("#[repr(C)]\n");
+            let derives = match target {
+                Target::Anchor => "#[derive(AnchorSerialize, AnchorDeserialize, InitSpace, Clone, Copy, Debug, PartialEq)]\n",
+                _ => "#[derive(Clone, Copy)]\n",
+            };
+            out.push_str(derives);
+            out.push_str(&format!("pub struct {} {{\n", record.name));
+            for (fname, ftype) in &record.fields {
+                let rust_ty = map_type_for_target(ftype, spec, target)?;
+                out.push_str(&format!("    pub {}: {},\n", fname, rust_ty));
+            }
+            out.push_str("}\n\n");
+        }
+
+        // Account types. Two shapes mirror `generate_state`:
+        //   1. Single-variant (no `WrongState`): plain `#[account]`
+        //      struct with fields at the top level.
+        //   2. Multi-variant ADT (wrapper + inner enum): only emit
+        //      when there's more than one variant. Inner enum gets
+        //      the accessor-impl block from `generate_state`'s
+        //      Slice B work so consumer reads through
+        //      `imported_acct.inner.<field>()` resolve.
+        for (idx, acct) in ns.account_types.iter().enumerate() {
+            let is_multi_variant = acct.variants.len() > 1;
+            let account_attr = if surface.explicit_account_discriminator {
+                format!("#[account(discriminator = {})]\n", idx + 1)
+            } else {
+                "#[account]\n".to_string()
+            };
+            if !is_multi_variant {
+                // Flat struct path. Lifecycle status field follows the
+                // same convention as `generate_state` — without it the
+                // consumer's `requires` clauses that reference
+                // `<acct>.status` wouldn't compile against the mirror.
+                out.push_str(&format!("{}pub struct {} {{\n", account_attr, acct.name));
+                for (fname, ftype) in &acct.fields {
+                    let rust_ty = map_type_for_target(ftype, spec, target)?;
+                    out.push_str(&format!("    pub {}: {},\n", fname, rust_ty));
+                }
+                if !acct.lifecycle.is_empty() && !acct.fields.iter().any(|(n, _)| n == "status") {
+                    out.push_str("    pub status: u8,\n");
+                }
+                out.push_str("}\n\n");
+
+                if !acct.lifecycle.is_empty() {
+                    out.push_str(&format!(
+                        "/// {} lifecycle states (mirrored from `{}`).\n",
+                        acct.name, ns.dep_key
+                    ));
+                    out.push_str("#[derive(Clone, Copy, PartialEq, Eq)]\n");
+                    out.push_str("#[repr(u8)]\n");
+                    out.push_str(&format!("pub enum {}Status {{\n", acct.name));
+                    for (i, state) in acct.lifecycle.iter().enumerate() {
+                        out.push_str(&format!("    {} = {},\n", state, i));
+                    }
+                    out.push_str("}\n\n");
+                }
+                continue;
+            }
+
+            // Multi-variant ADT — same wrapper + inner enum shape as
+            // generate_state's `is_multi_variant_adt_state` path so
+            // the mirror deserializes the foreign account exactly
+            // the way the foreign program does.
+            let inner_name = format!("{}Inner", acct.name);
+            out.push_str(&format!("{}pub struct {} {{\n", account_attr, acct.name));
+            out.push_str(&format!("    pub inner: {},\n", inner_name));
+            out.push_str("}\n\n");
+
+            out.push_str(&format!(
+                "/// Variant-payload state for `{0}` (mirrored from `{1}`).\n",
+                acct.name, ns.dep_key
+            ));
+            out.push_str(
+                "#[derive(AnchorSerialize, AnchorDeserialize, InitSpace, Clone, Debug, PartialEq)]\n",
+            );
+            out.push_str(&format!("pub enum {} {{\n", inner_name));
+            for variant in &acct.variants {
+                if variant.fields.is_empty() {
+                    out.push_str(&format!("    {},\n", variant.name));
+                } else {
+                    out.push_str(&format!("    {} {{\n", variant.name));
+                    for (fname, ftype) in &variant.fields {
+                        out.push_str(&format!(
+                            "        {}: {},\n",
+                            fname,
+                            map_type_for_target(ftype, spec, target)?
+                        ));
+                    }
+                    out.push_str("    },\n");
+                }
+            }
+            out.push_str("}\n\n");
+
+            // Reuse the Slice B accessor pattern (fields that appear
+            // across variants with a consistent type get an accessor
+            // method on the inner enum). Consumer-side reads like
+            // `imported_acct.inner.balance()` then resolve through
+            // the same shape used for locally-declared multi-variant
+            // ADT state.
+            let mut field_index: std::collections::BTreeMap<String, Vec<(String, String)>> =
+                std::collections::BTreeMap::new();
+            for variant in &acct.variants {
+                for (fname, ftype) in &variant.fields {
+                    field_index
+                        .entry(fname.clone())
+                        .or_default()
+                        .push((variant.name.clone(), ftype.clone()));
+                }
+            }
+            if !field_index.is_empty() {
+                out.push_str(&format!("impl {} {{\n", inner_name));
+                for (fname, occurrences) in &field_index {
+                    let first_ty = &occurrences[0].1;
+                    if occurrences.iter().any(|(_, t)| t != first_ty) {
+                        continue;
+                    }
+                    let rust_ty = map_type_for_target(first_ty, spec, target)?;
+                    out.push_str(&format!(
+                        "    /// v2.29 Slice H accessor for `{0}`. Panics on variants\n\
+                         /// that don't carry the field — the per-handler lifecycle\n\
+                         /// check at the top of each `crate::guards::*` fn prevents\n\
+                         /// the panic arm from being reached at runtime.\n",
+                        fname
+                    ));
+                    out.push_str(&format!(
+                        "    pub fn {}(&self) -> &{} {{\n        match self {{\n",
+                        fname, rust_ty
+                    ));
+                    for (variant_name, _) in occurrences {
+                        out.push_str(&format!(
+                            "            Self::{} {{ {}, .. }} => {},\n",
+                            variant_name, fname, fname
+                        ));
+                    }
+                    if occurrences.len() < acct.variants.len() {
+                        out.push_str(&format!(
+                            "            _ => panic!(\"{}::{}() called on a variant without `{}`\"),\n",
+                            inner_name, fname, fname
+                        ));
+                    }
+                    out.push_str("        }\n    }\n");
+                }
+                out.push_str("}\n\n");
+            }
+        }
+
+        out.push_str("// ---- END GENERATED ----\n");
+        std::fs::write(imported_dir.join(format!("{}.rs", local_name)), &out)?;
+    }
+
+    // `mod.rs` re-exports each namespace as `pub mod <ns>;`. Slice G
+    // (the parser+codegen for `Ident.Ident` type refs) consumes this
+    // to resolve `<ns>::<Type>` references in the consumer's spec
+    // against the local mirror. `#![allow(non_snake_case)]` covers
+    // the common case where the imported spec's bound name is
+    // PascalCase (e.g. `import Config from "config_program"` keeps
+    // the module name `Config`); rustc otherwise warns on every
+    // module-decl line.
+    let mut mod_out = String::new();
+    mod_out.push_str(&marker("DO NOT EDIT", fp, "src/imported/mod.rs"));
+    mod_out.push_str("//! v2.29 Slice H — re-exports for imported namespace mirrors.\n\n");
+    mod_out.push_str("#![allow(non_snake_case)]\n\n");
+    for local_name in spec.imported_namespaces.keys() {
+        mod_out.push_str(&format!("pub mod {};\n", local_name));
+    }
+    mod_out.push_str("\n// ---- END GENERATED ----\n");
+    std::fs::write(imported_dir.join("mod.rs"), mod_out)?;
+
     Ok(())
 }
 
@@ -4548,6 +4793,14 @@ pub fn generate(spec_path: &Path, output_dir: &Path, target: crate::Target) -> R
     // v2.26 Slice 3: emit ref_impls module so program code can call
     // declared `ref_impl` fns from guards / handlers / properties.
     generate_ref_impls(&spec, &fp, output_dir, target)?;
+    // v2.29 Slice H: emit `src/imported/<ns>.rs` mirrors so handler
+    // accounts blocks can name `<ns>::<Type>` without depending on
+    // the foreign crate. No-op for specs that import only interface
+    // stubs (bundled SPL Token / System Program / Metaplex carry no
+    // `type` declarations).
+    if !spec.imported_namespaces.is_empty() {
+        generate_imported_mirror(&spec, &fp, output_dir, target)?;
+    }
     generate_cargo_toml(&spec, &fp, output_dir, target)?;
 
     let file_count = 4
@@ -4563,6 +4816,7 @@ pub fn generate(spec_path: &Path, output_dir: &Path, target: crate::Target) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::check::{ImportedNamespace, ParsedAccountType, ParsedVariant};
 
     fn empty_spec() -> ParsedSpec {
         ParsedSpec::default()
@@ -6560,6 +6814,159 @@ handler close : State.Open -> State.Closed {
         assert!(
             body.contains("y: x,"),
             "expected `y: x,` referencing the destructured local; got:\n{body}"
+        );
+    }
+
+    /// v2.29 Slice H — when a spec's `imported_namespaces` carries an
+    /// account type, codegen emits `src/imported/<ns>.rs` with the
+    /// mirrored struct plus a `src/imported/mod.rs` re-exporter, and
+    /// `src/lib.rs` declares `pub mod imported;`. Bundled-stub-only
+    /// imports leave the map empty and the mirror dir is never
+    /// created.
+    #[test]
+    fn imported_namespace_emits_local_mirror() {
+        let mut spec = ParsedSpec {
+            program_name: "ConsumerProgram".into(),
+            ..ParsedSpec::default()
+        };
+        spec.account_types.push(ParsedAccountType {
+            name: "Consumer".into(),
+            fields: vec![("balance".into(), "U64".into())],
+            lifecycle: vec![],
+            pda_ref: None,
+            variants: vec![],
+        });
+        // Inject an imported namespace by hand (the resolver path is
+        // exercised by check.rs tests; this test focuses on the
+        // codegen-side mirror emission).
+        let mut imported = ImportedNamespace {
+            dep_key: "foreign_dep".into(),
+            account_types: vec![ParsedAccountType {
+                name: "ForeignState".into(),
+                fields: vec![
+                    ("admin".into(), "Pubkey".into()),
+                    ("counter".into(), "U64".into()),
+                ],
+                lifecycle: vec![],
+                pda_ref: None,
+                variants: vec![],
+            }],
+            records: vec![],
+        };
+        let _ = &mut imported;
+        spec.imported_namespaces.insert("Foreign".into(), imported);
+
+        let fp = crate::fingerprint::compute_fingerprint(&spec);
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path().join("programs");
+        std::fs::create_dir_all(out_dir.join("src")).unwrap();
+
+        generate_imported_mirror(&spec, &fp, &out_dir, Target::Anchor)
+            .expect("imported mirror generation should succeed");
+
+        let ns_file = out_dir.join("src/imported/Foreign.rs");
+        let body =
+            std::fs::read_to_string(&ns_file).expect("namespace mirror file should be written");
+        assert!(
+            body.contains("pub struct ForeignState"),
+            "expected `ForeignState` mirror struct; got:\n{body}"
+        );
+        assert!(
+            body.contains("pub admin: Pubkey,"),
+            "expected `admin: Pubkey` field; got:\n{body}"
+        );
+        assert!(
+            body.contains("#[account]"),
+            "expected `#[account]` attr (Anchor target); got:\n{body}"
+        );
+
+        let mod_file = out_dir.join("src/imported/mod.rs");
+        let mod_body =
+            std::fs::read_to_string(&mod_file).expect("imported mod.rs should be written");
+        assert!(
+            mod_body.contains("pub mod Foreign;"),
+            "expected `pub mod Foreign;` re-export; got:\n{mod_body}"
+        );
+    }
+
+    /// v2.29 Slice H — multi-variant imported account types lower to
+    /// the wrapper-struct + inner-enum shape and emit accessor
+    /// methods on the inner enum (mirrors `generate_state`'s Slice B
+    /// accessor work).
+    #[test]
+    fn imported_multi_variant_namespace_emits_accessors() {
+        let mut spec = ParsedSpec {
+            program_name: "Consumer".into(),
+            ..ParsedSpec::default()
+        };
+        spec.account_types.push(ParsedAccountType {
+            name: "Local".into(),
+            fields: vec![("x".into(), "U64".into())],
+            lifecycle: vec![],
+            pda_ref: None,
+            variants: vec![],
+        });
+        let imported = ImportedNamespace {
+            dep_key: "amm_dep".into(),
+            account_types: vec![ParsedAccountType {
+                name: "Pool".into(),
+                fields: vec![],
+                lifecycle: vec![],
+                pda_ref: None,
+                variants: vec![
+                    ParsedVariant {
+                        name: "Open".into(),
+                        fields: vec![
+                            ("admin".into(), "Pubkey".into()),
+                            ("balance".into(), "U64".into()),
+                        ],
+                    },
+                    ParsedVariant {
+                        name: "Closed".into(),
+                        fields: vec![("admin".into(), "Pubkey".into())],
+                    },
+                ],
+            }],
+            records: vec![],
+        };
+        spec.imported_namespaces.insert("AMM".into(), imported);
+
+        let fp = crate::fingerprint::compute_fingerprint(&spec);
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path().join("programs");
+        std::fs::create_dir_all(out_dir.join("src")).unwrap();
+
+        generate_imported_mirror(&spec, &fp, &out_dir, Target::Anchor)
+            .expect("imported mirror generation should succeed");
+
+        let body = std::fs::read_to_string(out_dir.join("src/imported/AMM.rs"))
+            .expect("AMM mirror file should be written");
+        assert!(
+            body.contains("pub struct Pool"),
+            "expected wrapper struct; got:\n{body}"
+        );
+        assert!(
+            body.contains("pub inner: PoolInner,"),
+            "expected `inner: PoolInner` field; got:\n{body}"
+        );
+        assert!(
+            body.contains("pub enum PoolInner"),
+            "expected inner enum; got:\n{body}"
+        );
+        // `admin` exists in both variants — accessor emitted, no
+        // panic arm because the match exhausts.
+        assert!(
+            body.contains("pub fn admin(&self) -> &Pubkey"),
+            "expected `admin` accessor; got:\n{body}"
+        );
+        // `balance` only in Open — accessor emits with a panic arm.
+        assert!(
+            body.contains("pub fn balance(&self) -> &u64"),
+            "expected `balance` accessor; got:\n{body}"
+        );
+        assert!(
+            body.contains("PoolInner::balance() called on a variant without `balance`"),
+            "expected panic message for missing variant; got:\n{body}"
         );
     }
 }

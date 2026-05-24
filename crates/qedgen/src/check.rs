@@ -1240,6 +1240,20 @@ pub struct ParsedSpec {
     /// Empty when no imports ship proofs.
     #[allow(dead_code)]
     pub verified_proof_pkgs: Vec<std::path::PathBuf>,
+
+    /// v2.29 Slice F — per-import account type bookkeeping. Maps the
+    /// local name (alias if declared, otherwise the source-side
+    /// `bound_name`) to its `ImportedNamespace`. Populated by
+    /// `resolve_and_merge_imports` whenever an imported source
+    /// carries `type` declarations beyond the v2.27 interface stub
+    /// shape. Empty for interface-only imports (SPL Token / System
+    /// Program / Metaplex bundled stubs).
+    ///
+    /// Consumed by Slice H's `generate_imported_mirror` to emit
+    /// `src/imported/<ns>.rs` and by Slice G's type-ref resolver to
+    /// recognize `<ns>.<Type>` in account-binding positions.
+    #[allow(dead_code)]
+    pub imported_namespaces: std::collections::BTreeMap<String, ImportedNamespace>,
 }
 
 /// v2.25 — adapted form of `ast::RefImplDecl`. Carries both Lean and
@@ -1294,6 +1308,44 @@ pub struct ParsedImport {
     pub name: String,
     pub from: String,
     pub as_name: Option<String>,
+}
+
+/// v2.29 Slice F — full-spec import bookkeeping.
+///
+/// When the imported source declares full `type <Name> { ... }` /
+/// `type <Name> | Variant of { ... }` blocks (i.e. a complete qedspec
+/// rather than an interface stub), the resolver captures the account
+/// types and records alongside the existing `ParsedInterface` merge.
+/// The data persists on `ParsedSpec::imported_namespaces` keyed by the
+/// local name the consumer uses (alias if declared, otherwise
+/// `bound_name`), and Slice H consumes it to emit a local Rust mirror
+/// at `src/imported/<ns>.rs` so handler accounts blocks can name
+/// `<ns>::<Type>` without depending on the foreign crate.
+///
+/// Interface-only imports (SPL Token / System Program / Metaplex
+/// bundled stdlib stubs) leave this map empty — they ship handlers +
+/// `upstream { binary_hash }` pins but no `type` declarations, so
+/// there's nothing to mirror. The v2.27 stance-1 / stance-2 paths
+/// continue to flow through `ParsedSpec::interfaces` exactly as
+/// before.
+#[derive(Debug, Default, Clone)]
+#[allow(dead_code)]
+pub struct ImportedNamespace {
+    /// Manifest dep key (`from "..."` value). Used in the file
+    /// banner comment of the generated mirror so users can trace
+    /// which dep produced each `src/imported/<ns>.rs`.
+    pub dep_key: String,
+    /// Full copy of every `type Account { ... }` / `type State |
+    /// Variant of { ... }` block in the imported spec. Codegen
+    /// re-emits each as a local Rust struct (or wrapper + inner
+    /// enum) via the same `emit_account_type` path used for the
+    /// consumer's own state.
+    pub account_types: Vec<ParsedAccountType>,
+    /// Plain record types referenced by the imported account types
+    /// (e.g. `UFixValue64` if the imported `State` carries a
+    /// `pool_balance : UFixValue64` field). Emitted alongside the
+    /// account types so the mirror is self-contained.
+    pub records: Vec<ParsedRecordType>,
 }
 
 impl ParsedImport {
@@ -1646,21 +1698,44 @@ fn resolve_and_merge_imports(
         } else {
             None
         };
-        let iface = match (explicit, &synthesized) {
-            (Some(i), _) => i,
-            (None, Some(i)) => i,
-            (None, None) => {
+        // v2.29 Slice F — pure data-shape import. When the imported
+        // source declares neither an `interface <bound>` block nor
+        // any top-level handlers BUT carries at least one `type`
+        // declaration, treat it as a data-only import: synthesize a
+        // minimal empty interface (program_id only) so the rest of
+        // the merge loop runs and `imported_namespaces` gets
+        // populated. The consumer-side use case is `acct :
+        // Foreign.State` in an accounts block — no CPI, just field
+        // reads — which doesn't need any handler / requires /
+        // ensures on the interface side.
+        let data_only_iface: Option<ParsedInterface> =
+            if explicit.is_none() && synthesized.is_none() && !imported.account_types.is_empty() {
+                Some(ParsedInterface {
+                    name: r.bound_name.clone(),
+                    doc: None,
+                    program_id: imported.program_id.clone(),
+                    upstream: None,
+                    state_fields: Vec::new(),
+                    handlers: Vec::new(),
+                })
+            } else {
+                None
+            };
+        let iface = match (explicit, &synthesized, &data_only_iface) {
+            (Some(i), _, _) => i,
+            (None, Some(i), _) => i,
+            (None, None, Some(i)) => i,
+            (None, None, None) => {
                 let where_clause = if r.sources.len() == 1 {
                     format!("at {}", r.sources[0].0.display())
                 } else {
                     format!("(merged from {} fragments)", r.sources.len())
                 };
                 anyhow::bail!(
-                    "import `{}` from `{}` — imported source {} declares no `interface {}` block and has no top-level handlers to synthesize one from. Add either an `interface {} {{ ... }}` block or at least one top-level `handler` to the imported spec.",
+                    "import `{}` from `{}` — imported source {} declares no `interface {}` block, no top-level handlers, and no `type` declarations. Add an `interface {{ ... }}`, at least one `handler`, or at least one `type` block to the imported spec.",
                     r.bound_name,
                     r.dep_key,
                     where_clause,
-                    r.bound_name,
                     r.bound_name,
                 );
             }
@@ -1675,10 +1750,21 @@ fn resolve_and_merge_imports(
         // `manifest.dependencies`; their lock entry uses a synthetic
         // `builtin:<key>` source identifier so reproducibility is still
         // recorded but no manifest entry is consulted.
+        // v2.29 Slice F — record imported account-type names on the
+        // lock entry so `--frozen` notices a renamed / removed type
+        // before codegen breaks on a missing mirror. Comma-joined to
+        // keep the on-disk shape one TOML string (rather than an
+        // array that complicates serde defaults).
+        let imported_type_names = imported
+            .account_types
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
         let lock_entry = if let Some(dep) = manifest.dependencies.get(&r.dep_key) {
-            crate::qed_lock::entry_for_resolved(&r, dep, iface)
+            crate::qed_lock::entry_for_resolved(&r, dep, iface, &imported_type_names)
         } else {
-            crate::qed_lock::entry_for_builtin(&r, iface)
+            crate::qed_lock::entry_for_builtin(&r, iface, &imported_type_names)
         };
         lock.dependencies.push(lock_entry);
 
@@ -1709,7 +1795,31 @@ fn resolve_and_merge_imports(
                 parsed.verified_proof_pkgs.push(pkg_root.clone());
             }
         }
+        let local_ns_name = merged.name.clone();
         parsed.interfaces.push(merged);
+
+        // v2.29 Slice F — capture full-spec import bookkeeping.
+        // Whenever the imported source carries account types beyond
+        // what an interface stub would (the bundled SPL Token /
+        // System Program / Metaplex stubs declare none), record
+        // them under the local namespace name so Slice H can emit
+        // a Rust mirror at `src/imported/<ns>.rs` and Slice G's
+        // type-ref resolver can recognize `<ns>.<Type>` in
+        // account-binding positions.
+        //
+        // The local name follows the same alias-or-bound-name rule
+        // as the interface merge so the consumer-side type ref
+        // matches the consumer-side call name. Bundled stubs flow
+        // through the same loop but leave the map empty — their
+        // `imported.account_types` is empty by construction.
+        if !imported.account_types.is_empty() {
+            let ns = ImportedNamespace {
+                dep_key: r.dep_key.clone(),
+                account_types: imported.account_types.clone(),
+                records: imported.records.clone(),
+            };
+            parsed.imported_namespaces.insert(local_ns_name, ns);
+        }
     }
     // Dedup while preserving first-seen DFS order — handles diamond
     // dep shapes where the same provider is reached via two import

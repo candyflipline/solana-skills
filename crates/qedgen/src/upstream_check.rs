@@ -614,6 +614,7 @@ mod tests {
             upstream_version: None,
             verified: false,
             proof_hash: None,
+            imported_account_type_names: String::new(),
         }
     }
 
@@ -1102,6 +1103,7 @@ mod tests {
                 upstream_version: Some("4.0.3".to_string()),
                 verified: false,
                 proof_hash: None,
+                imported_account_type_names: String::new(),
             }],
         };
         crate::qed_lock::write(dir, &lock).expect("write qed.lock");
