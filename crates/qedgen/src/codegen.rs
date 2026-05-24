@@ -246,6 +246,14 @@ impl FrameworkSurface {
         }
     }
 
+    /// v2.29 Slice G — imported account type via the local mirror at
+    /// `crate::imported::<ns>::<source_type>`. Anchor target only;
+    /// Quasar imported-namespace support is reserved for v2.30.
+    fn imported_account_type(&self, ns: &str, source_type: &str, _mutable: bool) -> String {
+        let lt = self.accounts_lifetime;
+        format!("Account<{}, crate::imported::{}::{}>", lt, ns, source_type)
+    }
+
     fn unchecked_account_type(&self, mutable: bool) -> String {
         let lt = self.accounts_lifetime;
         if self.is_quasar() {
@@ -343,6 +351,16 @@ fn render_account_field_type(
         surface.token_account_type(acct.is_writable)
     } else if acct.account_type.as_deref() == Some("mint") {
         surface.mint_account_type(acct.is_writable)
+    } else if let (Some(ns), Some(ty)) = (&acct.imported_namespace, &acct.account_type) {
+        // v2.29 Slice G — imported account type. Routes through the
+        // local mirror at `src/imported/<ns>.rs` so the wrapper's
+        // field layout matches the foreign program's on-chain
+        // representation. `is_writable` flips between `Account<'info,
+        // T>` (read-only) and the same — Anchor doesn't have a
+        // separate read-only Account type; the macro's writability
+        // is driven by the `#[account(mut)]` attribute, not the
+        // wrapper choice.
+        surface.imported_account_type(ns, ty, acct.is_writable)
     } else if is_state_account {
         surface.state_account_type(state_name, acct.is_writable)
     } else {
@@ -4218,6 +4236,17 @@ fn generate_guards(
         // approver` where `approver` resolves to nothing in scope.
         let handler_account_names: Vec<String> =
             handler.accounts.iter().map(|a| a.name.clone()).collect();
+        // v2.29 Slice G.4 — index handler accounts by name so the
+        // `<acct>.<field>` rewriting can dispatch on
+        // `imported_namespace` and route through the local mirror.
+        let handler_accounts_by_name: std::collections::HashMap<
+            &str,
+            &crate::check::ParsedHandlerAccount,
+        > = handler
+            .accounts
+            .iter()
+            .map(|a| (a.name.as_str(), a))
+            .collect();
         let bind_state = |expr: &str| -> String {
             // Step 1: rewrite handler-account idents to address loads.
             let mut after_accounts = String::with_capacity(expr.len() + 32);
@@ -4252,6 +4281,53 @@ fn generate_guards(
                                     i = after_dot_end;
                                     matched = true;
                                     break;
+                                }
+                                // v2.29 Slice G.4 — `<imported_acct>.<field>`
+                                // routes through the local mirror at
+                                // `crate::imported::<ns>::<Type>`. Multi-
+                                // variant ADT goes through the accessor
+                                // (`(*ctx.<name>.inner.<field>())`); flat
+                                // structs read directly off the wrapper's
+                                // auto-deref (`ctx.<name>.<field>`).
+                                if after < bytes.len() && bytes[after] == b'.' {
+                                    if let Some(acct_meta) =
+                                        handler_accounts_by_name.get(name.as_str())
+                                    {
+                                        if let (Some(ns), Some(ty)) =
+                                            (&acct_meta.imported_namespace, &acct_meta.account_type)
+                                        {
+                                            // Extract the field ident.
+                                            let mut j = after + 1;
+                                            while j < bytes.len() && is_ident_char(bytes[j]) {
+                                                j += 1;
+                                            }
+                                            let field = &expr[after + 1..j];
+                                            if !field.is_empty() {
+                                                let imported_ns =
+                                                    spec.imported_namespaces.get(ns.as_str());
+                                                let imported_ty = imported_ns.and_then(|ins| {
+                                                    ins.account_types.iter().find(|a| &a.name == ty)
+                                                });
+                                                let is_multi_variant = imported_ty
+                                                    .map(|a| a.variants.len() > 1)
+                                                    .unwrap_or(false);
+                                                if is_multi_variant {
+                                                    after_accounts.push_str(&format!(
+                                                        "(*ctx.{}.inner.{}())",
+                                                        name, field
+                                                    ));
+                                                } else {
+                                                    after_accounts.push_str(&format!(
+                                                        "ctx.{}.{}",
+                                                        name, field
+                                                    ));
+                                                }
+                                                i = j;
+                                                matched = true;
+                                                break;
+                                            }
+                                        }
+                                    }
                                 }
                                 // Don't rewrite `name.` (field access on
                                 // the handler-account is a different

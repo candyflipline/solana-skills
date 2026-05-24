@@ -3138,6 +3138,7 @@ pub fn adapt(spec: &a::Spec) -> ParsedSpec {
                 account_type: Some("State".to_string()),
                 authority: None,
                 default_pubkey: None,
+                imported_namespace: None,
             });
         }
     }
@@ -3469,6 +3470,7 @@ fn adapt_handler(h: &a::HandlerDecl, consts: ConstTable, env: &TypeEnv) -> Parse
                         account_type: None,
                         authority: None,
                         default_pubkey: None,
+                        imported_namespace: None,
                     };
                     for attr in &d.attrs {
                         match attr {
@@ -3479,7 +3481,22 @@ fn adapt_handler(h: &a::HandlerDecl, consts: ConstTable, env: &TypeEnv) -> Parse
                                 "program" => acc.is_program = true,
                                 _ => acc.account_type = Some(s.clone()),
                             },
-                            a::AccountAttr::Type(t) => acc.account_type = Some(t.clone()),
+                            a::AccountAttr::Type(t) => {
+                                // v2.29 Slice G — dotted type ref
+                                // (`Foreign.State`) splits into namespace
+                                // alias + source type. Bare types
+                                // (`token`, `State`) keep `imported_namespace
+                                // = None`. Slice F's `imported_namespaces`
+                                // population happens BEFORE handler
+                                // adapt, so the resolver step in check.rs
+                                // validates that the namespace is known.
+                                if let Some((ns, ty)) = t.split_once('.') {
+                                    acc.imported_namespace = Some(ns.to_string());
+                                    acc.account_type = Some(ty.to_string());
+                                } else {
+                                    acc.account_type = Some(t.clone());
+                                }
+                            }
                             a::AccountAttr::Authority(x) => acc.authority = Some(x.clone()),
                             a::AccountAttr::Pda(seeds) => acc.pda_seeds = Some(seeds.clone()),
                         }
@@ -3809,6 +3826,7 @@ fn adapt_interface_handler<'a>(
                         account_type: None,
                         authority: None,
                         default_pubkey: None,
+                        imported_namespace: None,
                     };
                     for attr in &d.attrs {
                         match attr {
@@ -3819,7 +3837,14 @@ fn adapt_interface_handler<'a>(
                                 "program" => acc.is_program = true,
                                 _ => acc.account_type = Some(s.clone()),
                             },
-                            a::AccountAttr::Type(t) => acc.account_type = Some(t.clone()),
+                            a::AccountAttr::Type(t) => {
+                                if let Some((ns, ty)) = t.split_once('.') {
+                                    acc.imported_namespace = Some(ns.to_string());
+                                    acc.account_type = Some(ty.to_string());
+                                } else {
+                                    acc.account_type = Some(t.clone());
+                                }
+                            }
                             a::AccountAttr::Authority(x) => acc.authority = Some(x.clone()),
                             a::AccountAttr::Pda(seeds) => acc.pda_seeds = Some(seeds.clone()),
                         }

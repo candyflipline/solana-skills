@@ -1136,10 +1136,23 @@ fn account_attr<'a>() -> impl Parser<'a, &'a str, AccountAttr, Err<'a>> + Clone 
         .then_ignore(wsc())
         .then_ignore(just(']'))
         .map(AccountAttr::Pda);
+    // v2.29 Slice G — accept dotted type refs like `Foreign.State`
+    // alongside the bare `token` / `mint` / `State` shapes. The
+    // first ident is either a built-in (`token`, `mint`), a local
+    // `account_type` name, or an imported namespace; the optional
+    // second ident is the type name inside that namespace. The
+    // adapter splits on `.` to populate
+    // `ParsedHandlerAccount::imported_namespace` so downstream
+    // codegen routes through `src/imported/<ns>.rs` for imported
+    // types.
     let type_attr = just("type")
         .then_ignore(wsc())
         .ignore_then(non_keyword_ident())
-        .map(AccountAttr::Type);
+        .then(just('.').ignore_then(non_keyword_ident()).or_not())
+        .map(|(head, tail)| match tail {
+            Some(t) => AccountAttr::Type(format!("{}.{}", head, t)),
+            None => AccountAttr::Type(head),
+        });
     let authority_attr = just("authority")
         .then_ignore(wsc())
         .ignore_then(non_keyword_ident())

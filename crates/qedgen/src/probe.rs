@@ -1731,6 +1731,7 @@ mod tests {
             account_type: Some("token".to_string()),
             authority: Some("pool".to_string()),
             default_pubkey: None,
+            imported_namespace: None,
         });
         let f = predicate_arbitrary_cpi(&h).expect("expected arbitrary_cpi finding");
         assert_eq!(f.category_tag, "arbitrary_cpi");
@@ -1750,6 +1751,7 @@ mod tests {
             account_type: Some("token".to_string()),
             authority: None,
             default_pubkey: None,
+            imported_namespace: None,
         });
         h.transfers.push(ParsedTransfer {
             from: "src".into(),
@@ -1783,6 +1785,7 @@ mod tests {
             account_type: Some("token".to_string()),
             authority: None,
             default_pubkey: None,
+            imported_namespace: None,
         });
         assert!(predicate_arbitrary_cpi(&h).is_none());
     }

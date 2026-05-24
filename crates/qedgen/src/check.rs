@@ -1028,6 +1028,17 @@ pub struct ParsedHandlerAccount {
     /// `solana_pubkey::pubkey!("...")` for these instead of generating a
     /// keypair the fuzzer would have to populate.
     pub default_pubkey: Option<String>,
+
+    /// v2.29 Slice G — when set, this account's `account_type` resolves
+    /// to a type declared in an imported spec. Carries the namespace
+    /// alias (matches `ParsedSpec::imported_namespaces` key) and the
+    /// raw type name on the foreign side. Anchor codegen lowers to
+    /// `Account<'info, imported::<ns>::<source_type>>` plus an
+    /// optional `seeds::program = <ns>_PROGRAM_ID` constraint when
+    /// the binding carries `pda [...]` seeds. Field reads on the
+    /// account route through the local mirror at
+    /// `src/imported/<ns>.rs`.
+    pub imported_namespace: Option<String>,
 }
 
 /// A token transfer intent within a handler's `transfers` block.
@@ -1560,6 +1571,7 @@ pub fn parse_spec_file_with_opts(
     crate::chumsky_adapter::typecheck_spec(&typed, &parsed)?;
     let manifest_dir = path.parent().unwrap_or_else(|| Path::new("."));
     resolve_and_merge_imports(&mut parsed, manifest_dir, lock_mode, cache_opts)?;
+    validate_imported_account_refs(&parsed)?;
     Ok(parsed)
 }
 
@@ -1623,7 +1635,82 @@ fn parse_spec_dir_with_opts(
     let mut parsed = crate::chumsky_adapter::adapt(&merged);
     crate::chumsky_adapter::typecheck_spec(&merged, &parsed)?;
     resolve_and_merge_imports(&mut parsed, dir, lock_mode, cache_opts)?;
+    validate_imported_account_refs(&parsed)?;
     Ok(parsed)
+}
+
+/// v2.29 Slice G — every handler account binding of the form
+/// `acct : Ident.Ident` (parsed into
+/// `ParsedHandlerAccount::imported_namespace`) must reference a known
+/// namespace populated by [`resolve_and_merge_imports`] AND a known
+/// type within that namespace. Bare bindings (`acct : signer`,
+/// `acct : token`, `acct : LocalState`) bypass this validator.
+fn validate_imported_account_refs(parsed: &ParsedSpec) -> Result<()> {
+    for handler in &parsed.handlers {
+        for acct in &handler.accounts {
+            let Some(ref ns) = acct.imported_namespace else {
+                continue;
+            };
+            let Some(ref ty) = acct.account_type else {
+                anyhow::bail!(
+                    "handler `{}` account `{}` declares an imported namespace `{}` \
+                     but no type name after the `.` — write `type {}.<TypeName>`",
+                    handler.name,
+                    acct.name,
+                    ns,
+                    ns,
+                );
+            };
+            let imported_ns = parsed.imported_namespaces.get(ns).ok_or_else(|| {
+                let known = if parsed.imported_namespaces.is_empty() {
+                    "no imports declared".to_string()
+                } else {
+                    format!(
+                        "known namespaces: {}",
+                        parsed
+                            .imported_namespaces
+                            .keys()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    )
+                };
+                anyhow::anyhow!(
+                    "handler `{}` account `{}` references unknown namespace `{}` \
+                     (in `type {}.{}`); {}. Add `import {} from \"<dep_key>\"` \
+                     at the top of the spec.",
+                    handler.name,
+                    acct.name,
+                    ns,
+                    ns,
+                    ty,
+                    known,
+                    ns,
+                )
+            })?;
+            let known_in_ns = imported_ns.account_types.iter().any(|a| &a.name == ty);
+            if !known_in_ns {
+                anyhow::bail!(
+                    "handler `{}` account `{}` references type `{}.{}` but namespace \
+                     `{}` declares no such type (known types in namespace: {}). \
+                     Check the imported spec at dep `{}`.",
+                    handler.name,
+                    acct.name,
+                    ns,
+                    ty,
+                    ns,
+                    imported_ns
+                        .account_types
+                        .iter()
+                        .map(|a| a.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    imported_ns.dep_key,
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Resolve every `import Name from "key"` statement against `qed.toml` in
@@ -7500,6 +7587,7 @@ handler init { effect { balance := 0 } }
                 account_type: None,
                 authority: None,
                 default_pubkey: None,
+                imported_namespace: None,
             },
             ParsedHandlerAccount {
                 name: "source".to_string(),
@@ -7510,6 +7598,7 @@ handler init { effect { balance := 0 } }
                 account_type: Some("token".to_string()),
                 authority: None,
                 default_pubkey: None,
+                imported_namespace: None,
             },
             ParsedHandlerAccount {
                 name: "dest".to_string(),
@@ -7520,6 +7609,7 @@ handler init { effect { balance := 0 } }
                 account_type: Some("token".to_string()),
                 authority: None,
                 default_pubkey: None,
+                imported_namespace: None,
             },
             ParsedHandlerAccount {
                 name: "token_program".to_string(),
@@ -7530,6 +7620,7 @@ handler init { effect { balance := 0 } }
                 account_type: Some("token".to_string()),
                 authority: None,
                 default_pubkey: None,
+                imported_namespace: None,
             },
         ];
         let spec = ParsedSpec {
@@ -7567,6 +7658,7 @@ handler init { effect { balance := 0 } }
                 account_type: None,
                 authority: None,
                 default_pubkey: None,
+                imported_namespace: None,
             },
             ParsedHandlerAccount {
                 name: "vault".to_string(),
@@ -7577,6 +7669,7 @@ handler init { effect { balance := 0 } }
                 account_type: Some("token".to_string()),
                 authority: Some("vault_pda".to_string()),
                 default_pubkey: None,
+                imported_namespace: None,
             },
             ParsedHandlerAccount {
                 name: "token_program".to_string(),
@@ -7587,6 +7680,7 @@ handler init { effect { balance := 0 } }
                 account_type: Some("token".to_string()),
                 authority: None,
                 default_pubkey: None,
+                imported_namespace: None,
             },
         ];
         let spec = ParsedSpec {
@@ -7625,6 +7719,7 @@ handler init { effect { balance := 0 } }
                 account_type: None,
                 authority: None,
                 default_pubkey: None,
+                imported_namespace: None,
             },
             ParsedHandlerAccount {
                 name: "source".to_string(),
@@ -7635,6 +7730,7 @@ handler init { effect { balance := 0 } }
                 account_type: Some("token".to_string()),
                 authority: None,
                 default_pubkey: None,
+                imported_namespace: None,
             },
             ParsedHandlerAccount {
                 name: "token_program".to_string(),
@@ -7645,6 +7741,7 @@ handler init { effect { balance := 0 } }
                 account_type: Some("token".to_string()),
                 authority: None,
                 default_pubkey: None,
+                imported_namespace: None,
             },
         ];
         let spec = ParsedSpec {

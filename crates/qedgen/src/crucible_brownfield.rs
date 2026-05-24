@@ -420,6 +420,7 @@ fn accounts_per_handler_from_idl(
                     account_type: None,
                     authority: None,
                     default_pubkey,
+                    imported_namespace: None,
                 })
             })
             .collect();
