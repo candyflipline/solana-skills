@@ -1200,11 +1200,16 @@ handler foo (n : U64) : Active -> Active {
         let real_spec_hash = spec_hash::spec_hash_for_handler(spec_src, "foo").unwrap();
 
         // Compute the body hash so only `spec_hash` is stale.
+        // `scan_file` needs the `#[qed(verified)]` marker to recognize
+        // the fn — without it, the entries Vec is empty.
         let body_only = r#"
+            #[qed(verified)]
             pub fn foo(n: u64) -> u64 { n + 1 }
         "#;
         let f0 = write_temp_rs(body_only);
-        let body_hash = match &scan_file(f0.path()).unwrap()[0].status {
+        let entries = scan_file(f0.path()).unwrap();
+        assert!(!entries.is_empty(), "scan_file should find the verified fn");
+        let body_hash = match &entries[0].status {
             DriftStatus::NoHash { computed } => computed.clone(),
             _ => panic!("expected NoHash"),
         };

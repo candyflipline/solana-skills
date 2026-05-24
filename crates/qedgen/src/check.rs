@@ -6828,7 +6828,7 @@ handler deposit (idx : U64) (amt : U64) {
     // as a Record named "Error" with field declarations rather than
     // populating `spec.error_codes`. Lint fires with a fix-it
     // pointing at the pipe form.
-    #[test]
+    //
     // v2.24.x Phase A.5 — `modifies [X]` + no effect write + no
     // ensures referencing X = completely unconstrained field. Lint
     // fires P0 telling the author to either constrain via ensures

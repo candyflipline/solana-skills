@@ -555,6 +555,7 @@ fn emit_kani_account_section(
             let args: String = op
                 .takes_params
                 .iter()
+                .chain(op.abstract_binders.iter())
                 .map(|(n, _)| format!(", {}", n))
                 .collect();
             out.push_str(&format!("    assert!(!{}(&mut s{}),\n", op.name, args));
@@ -619,6 +620,7 @@ fn emit_kani_account_section(
                 let args: String = op
                     .takes_params
                     .iter()
+                    .chain(op.abstract_binders.iter())
                     .map(|(n, _)| format!(", {}", n))
                     .collect();
                 out.push_str(&format!("    assert!(!{}(&mut s{}),\n", op.name, args));
@@ -830,6 +832,7 @@ fn emit_kani_account_section(
                 let args: String = op
                     .takes_params
                     .iter()
+                    .chain(op.abstract_binders.iter())
                     .map(|(n, _)| format!(", {}", n))
                     .collect();
                 out.push_str(&format!("    if {}(&mut post{}) {{\n", op_name, args));
@@ -948,6 +951,7 @@ fn emit_kani_account_section(
                 let args: String = op
                     .takes_params
                     .iter()
+                    .chain(op.abstract_binders.iter())
                     .map(|(n, _)| format!(", {}", n))
                     .collect();
                 out.push_str(&format!("    if {}(&mut s{}) {{\n", op.name, args));
@@ -1103,6 +1107,7 @@ fn emit_kani_account_section(
                 let args: String = op
                     .takes_params
                     .iter()
+                    .chain(op.abstract_binders.iter())
                     .map(|(n, _)| format!(", {}", n))
                     .collect();
                 out.push_str(&format!("    if {}(&mut s{}) {{\n", op.name, args));
@@ -1250,6 +1255,7 @@ fn emit_kani_account_section(
                 let args: String = op
                     .takes_params
                     .iter()
+                    .chain(op.abstract_binders.iter())
                     .map(|(n, _)| format!(", {}", n))
                     .collect();
                 out.push_str(&format!("    if {}(&mut s{}) {{\n", op.name, args));
@@ -1363,6 +1369,7 @@ fn emit_kani_account_section(
             let args: String = op
                 .takes_params
                 .iter()
+                .chain(op.abstract_binders.iter())
                 .map(|(n, _)| format!(", {}", n))
                 .collect();
             out.push_str(&format!(
@@ -1522,6 +1529,7 @@ fn emit_file_level_features(
                     .map(|o| {
                         o.takes_params
                             .iter()
+                            .chain(o.abstract_binders.iter())
                             .map(|(n, _)| format!(", {}", n))
                             .collect()
                     })

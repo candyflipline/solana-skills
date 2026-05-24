@@ -1694,6 +1694,7 @@ mod tests {
             schema_includes: vec![],
             calls: vec![],
             effect_branches: None,
+            abstract_binders: vec![],
         }
     }
 

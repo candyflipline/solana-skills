@@ -7857,6 +7857,7 @@ handler noop : State -> State {
             schema_includes: vec![],
             calls: vec![],
             effect_branches: None,
+            abstract_binders: vec![],
         };
         let constants = vec![("ZERO".to_string(), "0".to_string())];
         let test_spec = crate::check::ParsedSpec::default();

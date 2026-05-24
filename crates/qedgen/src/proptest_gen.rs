@@ -1079,6 +1079,7 @@ fn emit_preservation_tests_for(
                 .map(|o| {
                     o.takes_params
                         .iter()
+                        .chain(o.abstract_binders.iter())
                         .map(|(n, _)| format!(", {}", n))
                         .collect()
                 })
@@ -1209,6 +1210,7 @@ fn emit_invariant_preservation_tests_for(
             let args: String = op
                 .takes_params
                 .iter()
+                .chain(op.abstract_binders.iter())
                 .map(|(n, _)| format!(", {}", n))
                 .collect();
             out.push_str(&format!("        if {}(&mut s{}) {{\n", op_name, args));
@@ -1277,6 +1279,7 @@ fn emit_guard_tests(
         let args: String = op
             .takes_params
             .iter()
+            .chain(op.abstract_binders.iter())
             .map(|(n, _)| format!(", {}", n))
             .collect();
         out.push_str(&format!(
@@ -1357,6 +1360,7 @@ fn emit_overflow_tests_for(
             let args: String = op
                 .takes_params
                 .iter()
+                .chain(op.abstract_binders.iter())
                 .map(|(n, _)| format!(", {}", n))
                 .collect();
             out.push_str(&format!("        if {}(&mut s{}) {{\n", op.name, args));

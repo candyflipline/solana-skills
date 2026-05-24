@@ -1082,9 +1082,16 @@ pub fn emit_transition_fn(
     let params: String = op
         .takes_params
         .iter()
+        .chain(op.abstract_binders.iter())
         .map(|(n, t)| map_type_fn(t).map(|rt| format!(", {}: {}", n, rt)))
         .collect::<anyhow::Result<Vec<_>>>()?
         .concat();
+    // v2.29 Slice A (#8) — abstract binders ride alongside the
+    // real handler params in the spec-model transition signature.
+    // Callers (Kani / proptest harnesses, integration tests) pass
+    // a symbolic / arbitrary value for each binder, and the
+    // transition body references it the same way it would
+    // reference a real param.
     out.push_str(&format!(
         "fn {}(s: &mut State{}) -> bool {{\n",
         op.name, params
