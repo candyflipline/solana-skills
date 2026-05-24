@@ -954,31 +954,80 @@ fn expr<'a>() -> impl Parser<'a, &'a str, Node<Expr>, Err<'a>> + Clone {
 // ----------------------------------------------------------------------------
 
 fn const_decl<'a>() -> impl Parser<'a, &'a str, TopItem, Err<'a>> + Clone {
-    // v2.29 Slice A (#3) — accept an optional leading `-` so spec
-    // authors can write `const N6 = -6` directly instead of forcing
-    // the `0 - 6` workaround. The full const-expression grammar
-    // (arithmetic + paren + const refs + shifts) is deferred — this
-    // pass only widens the immediate-literal case. The friction-report
-    // primary use case (fixed-point exponent constants) only needs
-    // the negative literal.
+    // v2.29 Slice A (#3) — accept any const-foldable expression on the
+    // RHS, not just an immediate `[-]integer`. The expression grammar
+    // is the full `expr()` parser; `try_const_fold` then walks the AST
+    // and either reduces to a single `i128` or fails with a clear
+    // error that names the non-const subterm. Supported shapes:
+    // integer literals (positive via `Int`, negative via the desugared
+    // `Sub(Int(0), Int(N))`), arithmetic operators (+, -, *, /, %),
+    // and parenthesised sub-expressions. Bare ident references to
+    // other consts and shifts are deferred — the friction-report's
+    // primary use case (`const N6 = 0 - 6` for fixed-point exponents,
+    // `const FP_SCALE = 1000 * 1000` for fixed-point scales) is
+    // covered by the literal + arithmetic + paren subset.
     kw("const")
         .ignore_then(non_keyword_ident())
         .then_ignore(wsc())
         .then_ignore(just('='))
         .then_ignore(wsc())
-        .then(
-            just('-')
-                .or_not()
-                .then(integer())
-                .try_map(|(sign, v), span| {
-                    if v > i128::MAX as u128 {
-                        return Err(Rich::custom(span, "const value overflows i128"));
-                    }
-                    let as_i = v as i128;
-                    Ok(if sign.is_some() { -as_i } else { as_i })
-                }),
-        )
+        .then(expr().try_map(|node, span| {
+            try_const_fold(&node.node).map_err(|reason| {
+                Rich::custom(
+                    span,
+                    format!("const RHS isn't a const expression: {}", reason),
+                )
+            })
+        }))
         .map(|(name, value)| TopItem::Const { name, value })
+}
+
+/// v2.29 Slice A (#3) — fold a `const NAME = <expr>` body into an
+/// `i128`. Accepts integer literals, paren, and arithmetic over
+/// constants; rejects any subterm that depends on runtime state
+/// (paths, function calls, quantifiers, etc.). Used from
+/// `const_decl::try_map` so the error message carries the parse span
+/// and points at the unsupported subterm.
+fn try_const_fold(e: &Expr) -> std::result::Result<i128, String> {
+    match e {
+        Expr::Int(v) => {
+            i128::try_from(*v).map_err(|_| "integer literal overflows i128".to_string())
+        }
+        Expr::Paren(inner) => try_const_fold(&inner.node),
+        Expr::Arith { op, lhs, rhs } => {
+            let l = try_const_fold(&lhs.node)?;
+            let r = try_const_fold(&rhs.node)?;
+            let result = match op {
+                ArithOp::Add => l.checked_add(r),
+                ArithOp::Sub => l.checked_sub(r),
+                ArithOp::Mul => l.checked_mul(r),
+                ArithOp::Div => {
+                    if r == 0 {
+                        return Err("division by zero in const expression".to_string());
+                    }
+                    l.checked_div(r)
+                }
+                ArithOp::Mod => {
+                    if r == 0 {
+                        return Err("modulo by zero in const expression".to_string());
+                    }
+                    l.checked_rem(r)
+                }
+            };
+            result.ok_or_else(|| "arithmetic overflow in const expression".to_string())
+        }
+        Expr::Bool(_) => Err("boolean literal not allowed in const expression".to_string()),
+        Expr::Path(_) => Err(
+            "path / bare identifier references in const expressions are deferred to v2.30; \
+             inline the literal value here for now"
+                .to_string(),
+        ),
+        _ => Err(
+            "unsupported subterm — const expressions accept integer literals, paren, and \
+             arithmetic (+ - * / %) only"
+                .to_string(),
+        ),
+    }
 }
 
 fn typed_field<'a>() -> impl Parser<'a, &'a str, TypedField, Err<'a>> + Clone {
