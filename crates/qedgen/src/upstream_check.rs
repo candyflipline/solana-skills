@@ -488,44 +488,6 @@ pub(crate) fn is_sentinel_hash(pinned: &str) -> bool {
 // Reporting
 // ----------------------------------------------------------------------------
 
-/// Render a human-readable report. Returns true if any mismatch or
-/// error was reported (caller exits non-zero).
-#[allow(dead_code)]
-pub fn print_report(results: &[DepCheckResult]) -> bool {
-    let mut any_failure = false;
-    for r in results {
-        match &r.outcome {
-            DepCheckOutcome::Match { program_id, hash } => {
-                eprintln!("  ✓ {} ({}): {}", r.name, program_id, hash);
-            }
-            DepCheckOutcome::Mismatch {
-                program_id,
-                pinned,
-                on_chain,
-            } => {
-                any_failure = true;
-                eprintln!("  ✗ {} ({}): MISMATCH", r.name, program_id);
-                eprintln!("      pinned:   {}", pinned);
-                eprintln!("      on-chain: {}", on_chain);
-            }
-            DepCheckOutcome::ProofHashMismatch { pinned, computed } => {
-                any_failure = true;
-                eprintln!("  ✗ {}: PROOF_HASH MISMATCH", r.name);
-                eprintln!("      pinned:   {}", pinned);
-                eprintln!("      computed: {}", computed);
-            }
-            DepCheckOutcome::Skipped { reason } => {
-                eprintln!("  · {}: skipped — {}", r.name, reason);
-            }
-            DepCheckOutcome::Error { message } => {
-                any_failure = true;
-                eprintln!("  ! {}: error — {}", r.name, message);
-            }
-        }
-    }
-    any_failure
-}
-
 /// v2.26 Slice 4c — render a [`RoutedReport`] with severity-tagged
 /// findings. Matches stay informational, mismatches / errors carry the
 /// gate-derived severity. Returns true if the caller should exit non-zero
@@ -851,39 +813,6 @@ mod tests {
         let hash = format_hash(&bytes);
         assert_eq!(hash, format_hash(&bytes), "deterministic");
         assert!(hash.starts_with("sha256:"));
-    }
-
-    #[test]
-    fn print_report_returns_true_on_mismatch() {
-        let results = vec![DepCheckResult {
-            name: "x".to_string(),
-            outcome: DepCheckOutcome::Mismatch {
-                program_id: "Xyz".to_string(),
-                pinned: "sha256:a".to_string(),
-                on_chain: "sha256:b".to_string(),
-            },
-        }];
-        assert!(print_report(&results));
-    }
-
-    #[test]
-    fn print_report_returns_false_when_all_skipped_or_match() {
-        let results = vec![
-            DepCheckResult {
-                name: "skipped".to_string(),
-                outcome: DepCheckOutcome::Skipped {
-                    reason: "no pin".to_string(),
-                },
-            },
-            DepCheckResult {
-                name: "matched".to_string(),
-                outcome: DepCheckOutcome::Match {
-                    program_id: "Xyz".to_string(),
-                    hash: "sha256:a".to_string(),
-                },
-            },
-        ];
-        assert!(!print_report(&results));
     }
 
     // ----------------------------------------------------------------------

@@ -133,14 +133,6 @@ pub fn load_from_dir(spec_dir: &Path) -> Result<Option<Manifest>> {
     Ok(Some(manifest))
 }
 
-/// Parse a manifest from a TOML string. Useful for tests and for callers
-/// that already have the bytes in memory.
-#[allow(dead_code)]
-pub fn parse_str(src: &str) -> Result<Manifest> {
-    let raw: RawManifest = toml::from_str(src).context("parsing qed.toml")?;
-    validate(raw)
-}
-
 // ----------------------------------------------------------------------------
 // Validation
 // ----------------------------------------------------------------------------
@@ -225,6 +217,15 @@ fn validate_dep(name: &str, raw: RawDependency) -> Result<Dependency> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Test-only inline of the former `parse_str` helper: production
+    // callers always reach the manifest through `load_from_dir`. Keeping
+    // the parse-and-validate shape here lets the suite exercise the
+    // validator branches directly without round-tripping through disk.
+    fn parse_str(src: &str) -> Result<Manifest> {
+        let raw: RawManifest = toml::from_str(src).context("parsing qed.toml")?;
+        validate(raw)
+    }
 
     #[test]
     fn parses_github_dep_with_tag() {

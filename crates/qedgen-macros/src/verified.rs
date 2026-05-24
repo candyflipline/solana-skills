@@ -146,15 +146,6 @@ pub(crate) fn canonical_token_string(stream: TokenStream) -> String {
     out
 }
 
-/// Compute a deterministic content hash for a free `fn`. Kept for
-/// backward compatibility with callers that already have an `ItemFn`.
-/// New code should prefer `FnLike::content_hash` so impl-methods work
-/// out of the box.
-#[allow(dead_code)] // public API surface — used by external callers and tests
-pub fn content_hash(func: &ItemFn) -> String {
-    FnLike::Item(func.clone()).content_hash()
-}
-
 /// SHA-256 hash of a string, truncated to 16 hex characters.
 pub(crate) fn sha256_hex16(input: &str) -> String {
     let mut hasher = Sha256::new();
@@ -268,6 +259,13 @@ mod tests {
         syn::parse2(tokens).unwrap()
     }
 
+    /// Test helper preserving the legacy free-fn shape: every site here
+    /// hashes a free `ItemFn`, so wrap the `FnLike::Item` constructor
+    /// once and keep the call sites readable.
+    fn content_hash_item(func: &ItemFn) -> String {
+        FnLike::Item(func.clone()).content_hash()
+    }
+
     #[test]
     fn hash_deterministic() {
         let func = parse_fn(quote! {
@@ -275,8 +273,8 @@ mod tests {
                 amount + 1
             }
         });
-        let h1 = content_hash(&func);
-        let h2 = content_hash(&func);
+        let h1 = content_hash_item(&func);
+        let h2 = content_hash_item(&func);
         assert_eq!(h1, h2);
         assert_eq!(h1.len(), 16);
     }
@@ -295,7 +293,10 @@ mod tests {
                 amount + 1
             }
         });
-        assert_eq!(content_hash(&with_attr), content_hash(&without_attr));
+        assert_eq!(
+            content_hash_item(&with_attr),
+            content_hash_item(&without_attr)
+        );
     }
 
     #[test]
@@ -310,7 +311,7 @@ mod tests {
                 amount + 2
             }
         });
-        assert_ne!(content_hash(&v1), content_hash(&v2));
+        assert_ne!(content_hash_item(&v1), content_hash_item(&v2));
     }
 
     #[test]
@@ -325,7 +326,7 @@ mod tests {
                 amount
             }
         });
-        assert_ne!(content_hash(&v1), content_hash(&v2));
+        assert_ne!(content_hash_item(&v1), content_hash_item(&v2));
     }
 
     #[test]
@@ -340,7 +341,7 @@ mod tests {
                 amount
             }
         });
-        assert_ne!(content_hash(&v1), content_hash(&v2));
+        assert_ne!(content_hash_item(&v1), content_hash_item(&v2));
     }
 
     #[test]
@@ -351,7 +352,7 @@ mod tests {
         let v2 = parse_fn(quote! {
             pub fn withdraw(amount: u64) {}
         });
-        assert_ne!(content_hash(&v1), content_hash(&v2));
+        assert_ne!(content_hash_item(&v1), content_hash_item(&v2));
     }
 
     #[test]

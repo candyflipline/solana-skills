@@ -826,19 +826,6 @@ impl<'a, 'env> RustOpts<'a, 'env> {
     }
 }
 
-/// Empty `RustOpts` for callsites that don't have a real `TypeEnv` (e.g.
-/// pre-spec rendering). Shape is identical to passing through the legacy
-/// signature: no Pod-awareness, no kind promotion.
-#[allow(dead_code)]
-fn rust_opts_default<'a>() -> RustOpts<'a, 'a> {
-    RustOpts {
-        pod_aware: false,
-        env: Box::leak(Box::new(TypeEnv::default())),
-        state_mode: StateMode::Unary,
-        inside_old: false,
-    }
-}
-
 /// `RustOpts` matching the legacy non-Pod-aware behavior. Used for the
 /// `rust_expr` field that codegen consumes when emitting for Anchor (or
 /// for any consumer that expects native Rust integer types).
@@ -1268,30 +1255,6 @@ fn type_ref_to_string(t: &a::TypeRef) -> String {
         }
         a::TypeRef::Fin { bound } => format!("Fin[{}]", bound),
     }
-}
-
-/// Resolve a type reference through a table of aliases until we hit a
-/// non-alias target. Cyclic aliases bottom out on a fixed number of hops.
-///
-/// Scaffolding: used once the adapter grows alias-aware coercion for guard
-/// expressions (e.g., `type Amount = U128` appearing in a requires/effect).
-/// Kept near the typed-AST surface so it's ready when that pass lands.
-#[allow(dead_code)]
-fn resolve_type_alias<'a>(
-    name: &str,
-    aliases: &'a std::collections::BTreeMap<String, a::TypeRef>,
-) -> Option<&'a a::TypeRef> {
-    let mut current = aliases.get(name)?;
-    for _ in 0..16 {
-        if let a::TypeRef::Named(n) = current {
-            if let Some(next) = aliases.get(n) {
-                current = next;
-                continue;
-            }
-        }
-        return Some(current);
-    }
-    Some(current)
 }
 
 // ============================================================================
