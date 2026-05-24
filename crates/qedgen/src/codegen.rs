@@ -945,8 +945,18 @@ fn generate_state(
         // zero-copy structs whose serialization comes from `#[repr(C)]`
         // alignment, not from Borsh, so the extra derives only fire
         // for the Anchor target.
+        // v2.29 Slice B (#14) — bring record derives up to the same
+        // set the multi-variant inner enum uses (line 1053):
+        // `Debug` so spec authors can `println!("{:?}", record)` in
+        // tests; `PartialEq` so `requires record1 != record2` and
+        // `ensures state.x == record_literal` compile; `InitSpace`
+        // so an `#[account]` outer struct that nests a record
+        // satisfies Anchor's space calculation. Quasar's
+        // zero-copy/Pod path can't use these (PartialEq doesn't
+        // auto-derive on Pod), so the extra derives stay
+        // Anchor-only.
         let derives = match target {
-            Target::Anchor => "#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]\n",
+            Target::Anchor => "#[derive(AnchorSerialize, AnchorDeserialize, InitSpace, Clone, Copy, Debug, PartialEq)]\n",
             _ => "#[derive(Clone, Copy)]\n",
         };
         out.push_str(derives);
@@ -1344,6 +1354,36 @@ fn generate_instructions(
 /// Rust identifier.
 fn is_ident_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// v2.29 Slice B — word-boundary substring search. Returns `true`
+/// when `needle` appears in `haystack` as a complete identifier
+/// (i.e. neither neighbouring byte is an identifier character). Used
+/// to detect whether a `requires` rust expression actually references
+/// an `abstract` binder by name without false-matching on
+/// `<binder>_x` / `prefix<binder>` substrings.
+fn contains_word_boundary(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let hb = haystack.as_bytes();
+    let nb = needle.as_bytes();
+    if nb.len() > hb.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i + nb.len() <= hb.len() {
+        if &hb[i..i + nb.len()] == nb {
+            let prev_ok = i == 0 || !is_ident_char(hb[i - 1]);
+            let next_idx = i + nb.len();
+            let next_ok = next_idx >= hb.len() || !is_ident_char(hb[next_idx]);
+            if prev_ok && next_ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Rewrite each `[<idx>]` substring to `[(<idx>) as usize]`. Used by
@@ -3916,6 +3956,16 @@ fn generate_guards(
         // `x: PodU128` and `y: PodI128`.
         let pod_target = matches!(target, Target::Quasar);
 
+        // v2.29 Slice B — collect abstract-binder names. Requires that
+        // reference an abstract binder can't run in the guard fn (the
+        // binder is computed AFTER the guard fires in the handler
+        // scaffold). Defer to the handler body and document the skip.
+        let abstract_binder_names: Vec<&str> = handler
+            .abstract_binders
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect();
+
         for req in &handler.requires {
             // Emit as a comment for human readers + an executable check.
             out.push_str(&format!("    // requires: {}\n", req.lean_expr.trim()));
@@ -3925,6 +3975,29 @@ fn generate_guards(
             } else {
                 req.rust_expr.trim()
             };
+
+            // v2.29 Slice B — abstract-binder defer. The guard runs
+            // before the user's handler body computes the binder; the
+            // verifier still enforces this clause via the binder's
+            // symbolic value. The user should re-assert it in their
+            // handler body after the binder is computed.
+            let references_abstract = !abstract_binder_names.is_empty()
+                && abstract_binder_names
+                    .iter()
+                    .any(|name| contains_word_boundary(raw, name));
+            if references_abstract {
+                out.push_str(
+                    "    //   DEFERRED — references an `abstract` binder; verifier still\n",
+                );
+                out.push_str(
+                    "    //   enforces the clause symbolically. Re-assert in the handler body\n",
+                );
+                out.push_str(
+                    "    //   after the `let <binder> = …;` line if you want a runtime check.\n",
+                );
+                continue;
+            }
+
             let rust = bind_state(raw);
             if let Some(err) = &req.error_name {
                 out.push_str(&format!(
@@ -5401,9 +5474,13 @@ handler initialize : State.Uninitialized -> State.Active {
         generate_state(&spec, &fp, &out_dir, Target::Anchor).unwrap();
 
         let state = std::fs::read_to_string(out_dir.join("src/state.rs")).unwrap();
+        // v2.29 Slice B (#14): records now carry `InitSpace, Debug,
+        // PartialEq` alongside the Borsh + Clone/Copy derives so
+        // `requires record != record` / `state.x == record_literal`
+        // expressions compile against the generated structs.
         assert!(
-            state.contains("#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]\npub struct Holding"),
-            "Holding record should carry AnchorSerialize/AnchorDeserialize derives so the outer #[account] struct's recursive Borsh bound is satisfied; got:\n{state}"
+            state.contains("#[derive(AnchorSerialize, AnchorDeserialize, InitSpace, Clone, Copy, Debug, PartialEq)]\npub struct Holding"),
+            "Holding record should carry the v2.29 derive set (AnchorSerialize, AnchorDeserialize, InitSpace, Clone, Copy, Debug, PartialEq); got:\n{state}"
         );
         // Field types should be the native Anchor mappings, not the
         // standalone harness aliases (Address, etc.).
