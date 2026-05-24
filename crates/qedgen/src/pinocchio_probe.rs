@@ -29,7 +29,7 @@
 //! subagent and `references/probes/pinocchio/*.md`) map sites → findings
 //! via per-site predicates the agent applies.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use regex::Regex;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -727,12 +727,6 @@ fn nearby_text(lines: &[&str], idx: usize, radius: usize) -> String {
     let lo = idx.saturating_sub(radius);
     let hi = (idx + radius + 1).min(lines.len());
     lines[lo..hi].join("\n")
-}
-
-/// Convenience: deserialize result to JSON string for stdout.
-#[allow(dead_code)]
-pub fn to_json_pretty(cat: &PinocchioCatalogue) -> Result<String> {
-    serde_json::to_string_pretty(cat).context("serialize PinocchioCatalogue")
 }
 
 /// Map each site in the catalogue to a candidate `Finding` carrying the

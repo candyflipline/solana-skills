@@ -717,58 +717,6 @@ impl ParsedHandler {
     /// `transfers` field entirely. The `transfers { ... }` keyword
     /// itself stays as user-facing sugar — it just desugars at parse
     /// time. See the v2.10 transfers/calls unification thread.
-    #[allow(dead_code)] // v2.10+ canonical reader; existing modules read transfers/calls directly until v3.0
-    pub fn all_cpi_calls(&self) -> Vec<ParsedCall> {
-        let mut out: Vec<ParsedCall> = self
-            .transfers
-            .iter()
-            .map(|t| ParsedCall {
-                target_interface: "Token".to_string(),
-                target_handler: "transfer".to_string(),
-                args: vec![
-                    ParsedCallArg {
-                        name: "from".to_string(),
-                        lean_expr: t.from.clone(),
-                        rust_expr: t.from.clone(),
-                        rust_expr_pod: t.from.clone(),
-                    },
-                    ParsedCallArg {
-                        name: "to".to_string(),
-                        lean_expr: t.to.clone(),
-                        rust_expr: t.to.clone(),
-                        rust_expr_pod: t.to.clone(),
-                    },
-                    ParsedCallArg {
-                        name: "amount".to_string(),
-                        lean_expr: t.amount.clone().unwrap_or_default(),
-                        rust_expr: t.amount.clone().unwrap_or_default(),
-                        rust_expr_pod: t.amount.clone().unwrap_or_default(),
-                    },
-                    ParsedCallArg {
-                        name: "authority".to_string(),
-                        lean_expr: t.authority.clone().unwrap_or_default(),
-                        rust_expr: t.authority.clone().unwrap_or_default(),
-                        rust_expr_pod: t.authority.clone().unwrap_or_default(),
-                    },
-                ],
-                result_binding: None,
-                // v2.27 Track A — legacy `transfers { ... }` sugar
-                // never carried abstract-State binders. v2.26 callee-
-                // frame axiom shape unchanged.
-                state_binders: Vec::new(),
-            })
-            .collect();
-        out.extend(self.calls.iter().cloned());
-        out
-    }
-    #[allow(dead_code)]
-    pub fn has_when(&self) -> bool {
-        self.pre_status.is_some()
-    }
-    #[allow(dead_code)]
-    pub fn has_takes(&self) -> bool {
-        !self.takes_params.is_empty()
-    }
     /// Find the first signer account in this handler.
     pub fn signer_account(&self) -> Option<&ParsedHandlerAccount> {
         self.accounts.iter().find(|a| a.is_signer)
@@ -6175,23 +6123,6 @@ fn check_map_and_subscript(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
     }
 
     warnings
-}
-
-/// Run standalone lint — returns structured JSON for agent consumption.
-/// Lint a spec end-to-end, including resolving any `import` statements
-/// against the manifest. `lock_mode` controls qed.lock behavior — Auto
-/// auto-writes on drift; Frozen errors on drift (used by
-/// `qedgen check --frozen` in CI).
-#[allow(dead_code)]
-pub fn lint_with_lock(
-    spec_path: &std::path::Path,
-    lock_mode: crate::qed_lock::LockMode,
-) -> Result<Vec<CompletenessWarning>> {
-    lint_with_opts(
-        spec_path,
-        lock_mode,
-        crate::import_resolver::CacheOpts::default(),
-    )
 }
 
 /// Lint with explicit control over both lock behavior and cache policy.

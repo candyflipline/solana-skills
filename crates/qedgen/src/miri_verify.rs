@@ -373,69 +373,6 @@ pub fn run(project_root: &Path) -> BackendReport {
     }
 }
 
-/// Dual-execution divergence comparator: when a finding-id has both
-/// Mollusk and Miri repros and Miri fires while Mollusk passes
-/// (or vice versa), emit an `ExecutionDivergence` Critical finding.
-///
-/// Input is the Miri results plus the project root (we look for
-/// Mollusk repros under `target/qedgen-repros/<id>/`).
-#[allow(dead_code)]
-pub fn detect_divergence(
-    project_root: &Path,
-    miri_results: &[MiriRunResult],
-) -> Vec<crate::probe::Finding> {
-    use crate::probe::{Category, Finding, Severity};
-
-    let mut out = Vec::new();
-    for miri in miri_results {
-        let mollusk_dir = project_root
-            .join("target")
-            .join("qedgen-repros")
-            .join(&miri.finding_id);
-        if !mollusk_dir.exists() {
-            continue;
-        }
-        // Heuristic: a Mollusk "pass" is the .qed/probes/.../result.json
-        // marking status=ok, OR no result.json which we treat as "not
-        // yet run, can't compare". Miri "fail" with no Mollusk
-        // confirmation is the divergence signal.
-        if !matches!(miri.status, MiriStatus::Failed) {
-            continue;
-        }
-        // Look for `mollusk_passed` marker file the verifier writes.
-        let mollusk_marker = mollusk_dir.join("mollusk_passed");
-        if mollusk_marker.exists() {
-            out.push(Finding {
-                id: format!("{}-divergence", miri.finding_id),
-                category: Category::ExecutionDivergence,
-                severity: Severity::Critical,
-                handler: "<unknown>".to_string(),
-                spec_silent_on: format!(
-                    "Miri flagged UB on host for finding {} but Mollusk's SVM \
-                     execution accepted the same input — the deployed `.so`'s \
-                     release-mode wrap hides UB the host interpreter exposes",
-                    miri.finding_id
-                ),
-                suppression_hint: "Investigate the divergence. Common causes: \
-                    release-mode wrap-around on integer overflow, BPF alignment \
-                    relaxation, runtime checks short-circuiting under SVM"
-                    .to_string(),
-                investigation_hint: format!(
-                    "Read .qed/probes/pinocchio/{}/repro_miri.rs (Miri-failing) \
-                     and target/qedgen-repros/{}/ (Mollusk-passing). Reconcile \
-                     the divergence: either the Miri repro is over-strict, or \
-                     the Mollusk pass hides a real bug.",
-                    miri.finding_id, miri.finding_id
-                ),
-                category_tag: "execution_divergence".to_string(),
-                reproducer: None,
-                gated_by: None,
-            });
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

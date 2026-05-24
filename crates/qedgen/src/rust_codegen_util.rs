@@ -841,18 +841,9 @@ pub fn has_lifecycle(spec: &crate::check::ParsedSpec) -> bool {
 /// actually constrain reachable behavior: without a status field, a
 /// lifecycle-only handler's transition function has nothing to write, so
 /// every harness against it is vacuous.
-#[allow(dead_code)]
-pub fn emit_lifecycle_status_enum(
-    out: &mut String,
-    spec: &crate::check::ParsedSpec,
-    derives: &str,
-) {
-    emit_lifecycle_status_enum_from(out, &spec.lifecycle_states, derives);
-}
-
-/// Same as `emit_lifecycle_status_enum` but takes the lifecycle slice
-/// explicitly. Used by per-account codegen (kani + proptest multi-ADT modes)
-/// where each `mod <acct> { ... }` needs its own Status enum populated from
+/// Emit a Status enum from a per-account or per-spec lifecycle slice.
+/// Used by per-account codegen (kani + proptest multi-ADT modes) where
+/// each `mod <acct> { ... }` needs its own Status enum populated from
 /// `acct.lifecycle` rather than the (single-ADT-flavored) spec-level
 /// lifecycle. Fixes a v2.21 regression where multi-ADT specs (lending)
 /// emitted `enum Status` with Pool's variants inside both `mod pool` AND
@@ -874,37 +865,17 @@ pub fn emit_lifecycle_status_enum_from(
     out.push_str("}\n\n");
 }
 
-/// Initial lifecycle state — first entry in `lifecycle_states`. Returns
-/// `None` when the spec has no lifecycle.
-#[allow(dead_code)]
-pub fn initial_lifecycle_state(spec: &crate::check::ParsedSpec) -> Option<&str> {
-    spec.lifecycle_states.first().map(|s| s.as_str())
-}
-
 /// Emit a State struct with configurable `#[derive(...)]` attributes.
 /// `map_type_fn` converts DSL types (U64, Pubkey, etc.) to Rust types; it
 /// returns an error on unrecognized types so codegen fails loudly rather
 /// than emitting broken Rust.
 ///
-/// When the spec has a multi-state lifecycle (`has_lifecycle(spec)`), this
-/// also appends a synthetic `status: Status` field. Callers must have
-/// already emitted the `Status` enum via `emit_lifecycle_status_enum`.
-#[allow(dead_code)]
-pub fn emit_state_struct(
-    out: &mut String,
-    fields: &[&(String, String)],
-    derives: &str,
-    map_type_fn: impl Fn(&str) -> anyhow::Result<String>,
-    spec: &crate::check::ParsedSpec,
-) -> anyhow::Result<()> {
-    emit_state_struct_with_lifecycle(out, fields, derives, map_type_fn, has_lifecycle(spec))
-}
-
-/// Same as `emit_state_struct` but takes the `has_lifecycle` discriminator
-/// explicitly. Multi-ADT codegen uses this to thread the per-account
-/// lifecycle (`acct.lifecycle.len() >= 2`) rather than the spec-level one,
-/// so each module's State struct gets a `status: Status` field iff that
-/// ADT actually has a lifecycle.
+/// `has_lifecycle` is the multi-state-lifecycle discriminator. Multi-ADT
+/// codegen threads the per-account lifecycle (`acct.lifecycle.len() >= 2`)
+/// rather than the spec-level one, so each module's State struct gets a
+/// `status: Status` field iff that ADT actually has a lifecycle. Callers
+/// must have already emitted the `Status` enum via
+/// `emit_lifecycle_status_enum_from`.
 pub fn emit_state_struct_with_lifecycle(
     out: &mut String,
     fields: &[&(String, String)],
@@ -958,16 +929,7 @@ pub fn emit_invariant_predicates(out: &mut String, invariants: &[&crate::check::
     }
 }
 
-/// Legacy entry point kept for callers that don't need the per-slot binder
-/// type mapping (e.g. tests, third-party tools). All internal callers route
-/// through `emit_property_predicates_with` so binder types resolve against
-/// the active target's `map_type`. Slated for removal in v3.0.
-#[allow(dead_code)]
-pub fn emit_property_predicates(out: &mut String, properties: &[ParsedProperty], wrapping: bool) {
-    emit_property_predicates_with(out, properties, wrapping, |t| Ok(t.to_string()))
-}
-
-/// Like `emit_property_predicates`, but threads a `map_type` closure so the
+/// Emit property predicate functions. Threads a `map_type` closure so the
 /// per-slot `<prop>_at(s, <binder>)` predicate (v2.20 §S1.1) can render a
 /// target-specific binder type — Quasar Pod vs native Rust differ for
 /// non-primitive binders.
@@ -1393,12 +1355,12 @@ handler close : State.Open -> State.Closed { effect { x := 0 } }
         let spec = parse_str(src).expect("parse");
         let mutable = mutable_fields(&spec.state_fields);
         let mut out = String::new();
-        emit_state_struct(
+        emit_state_struct_with_lifecycle(
             &mut out,
             &mutable,
             "Clone, Copy",
             |t| Ok(t.to_string()),
-            &spec,
+            has_lifecycle(&spec),
         )
         .expect("emit");
         assert!(
