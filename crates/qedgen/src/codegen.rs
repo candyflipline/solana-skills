@@ -1080,7 +1080,72 @@ fn generate_state(
                 out.push_str("    },\n");
             }
         }
-        out.push_str("}\n");
+        out.push_str("}\n\n");
+
+        // v2.29 Slice B (#12) — accessor methods for inner-enum
+        // fields. The multi-variant ADT wrapper exposes the inner
+        // enum directly; spec authors who write
+        // `requires state.<field>` expect direct access against
+        // the runtime `Account<Wrapper>` even though `<field>`
+        // lives in one or more variant payloads. Without
+        // accessors, every guard / requires emission would have
+        // to destructure on every read. Accessors take the
+        // pre_status gate as a given (every handler emits the
+        // `matches!(...inner, Variant { .. })` lifecycle check
+        // first) and panic on the unreachable arms — a bug if a
+        // caller ever lands here without the gate.
+        let mut field_index: std::collections::BTreeMap<String, Vec<(String, String)>> =
+            std::collections::BTreeMap::new();
+        for variant in &acct.variants {
+            for (fname, ftype) in &variant.fields {
+                field_index
+                    .entry(fname.clone())
+                    .or_default()
+                    .push((variant.name.clone(), ftype.clone()));
+            }
+        }
+        if !field_index.is_empty() {
+            out.push_str(&format!("impl {} {{\n", inner_name));
+            for (fname, occurrences) in &field_index {
+                // Single-type-across-variants check. If a field
+                // name appears with different types across
+                // variants (rare; usually a spec smell), skip the
+                // accessor — the user can destructure manually.
+                let first_ty = &occurrences[0].1;
+                if occurrences.iter().any(|(_, t)| t != first_ty) {
+                    continue;
+                }
+                let rust_ty = map_type_for_target(first_ty, spec, target)?;
+                out.push_str(&format!(
+                    "    /// v2.29 Slice B accessor for `{0}`. Panics on variants\n\
+                     /// that don't carry the field — guarded against by the\n\
+                     /// per-handler lifecycle check that fires before any\n\
+                     /// `requires` emission in `crate::guards`.\n",
+                    fname
+                ));
+                out.push_str(&format!(
+                    "    pub fn {}(&self) -> &{} {{\n        match self {{\n",
+                    fname, rust_ty
+                ));
+                for (variant_name, _) in occurrences {
+                    out.push_str(&format!(
+                        "            Self::{} {{ {}, .. }} => {},\n",
+                        variant_name, fname, fname
+                    ));
+                }
+                // Only emit the catch-all when at least one
+                // variant DOESN'T carry the field.
+                let all_variants = acct.variants.len();
+                if occurrences.len() < all_variants {
+                    out.push_str(&format!(
+                        "            _ => panic!(\"{}::{}() called on a variant without `{}`\"),\n",
+                        inner_name, fname, fname
+                    ));
+                }
+                out.push_str("        }\n    }\n");
+            }
+            out.push_str("}\n");
+        }
     } else {
         let state_name = format!("{}Account", to_pascal_case(&spec.program_name));
 
@@ -1661,7 +1726,7 @@ fn try_emit_anchor_cpi(
     // burn / initialize_account / close_account helpers — fewer lines of
     // generated code, idiomatic for the bulk of CPI traffic).
     if iface.program_id.as_deref() == Some(SPL_TOKEN_PROGRAM_ID) {
-        return emit_spl_token_cpi(call, handler);
+        return emit_spl_token_cpi(call, handler, spec);
     }
 
     // Every other Anchor program gets the generic `invoke` shape
@@ -1673,7 +1738,11 @@ fn try_emit_anchor_cpi(
 /// SPL Token dispatcher. Routes to the right `anchor_spl::token` helper
 /// per the called handler's name. Returns None on unrecognized handlers
 /// (the caller falls back to comment + `todo!()`).
-fn emit_spl_token_cpi(call: &crate::check::ParsedCall, handler: &ParsedHandler) -> Option<String> {
+fn emit_spl_token_cpi(
+    call: &crate::check::ParsedCall,
+    handler: &ParsedHandler,
+    spec: &ParsedSpec,
+) -> Option<String> {
     let token_program_acct = find_token_program_account(handler)?;
     let prog_name = &token_program_acct.name;
 
@@ -1681,6 +1750,7 @@ fn emit_spl_token_cpi(call: &crate::check::ParsedCall, handler: &ParsedHandler) 
         "transfer" => emit_spl(
             call,
             handler,
+            spec,
             prog_name,
             "Transfer",
             &[("from", "from"), ("to", "to"), ("authority", "authority")],
@@ -1690,6 +1760,7 @@ fn emit_spl_token_cpi(call: &crate::check::ParsedCall, handler: &ParsedHandler) 
         "mint_to" => emit_spl(
             call,
             handler,
+            spec,
             prog_name,
             "MintTo",
             &[
@@ -1707,6 +1778,7 @@ fn emit_spl_token_cpi(call: &crate::check::ParsedCall, handler: &ParsedHandler) 
         "burn" => emit_spl(
             call,
             handler,
+            spec,
             prog_name,
             "Burn",
             &[
@@ -1720,6 +1792,7 @@ fn emit_spl_token_cpi(call: &crate::check::ParsedCall, handler: &ParsedHandler) 
         "initialize_account" => emit_spl(
             call,
             handler,
+            spec,
             prog_name,
             "InitializeAccount",
             &[
@@ -1737,6 +1810,7 @@ fn emit_spl_token_cpi(call: &crate::check::ParsedCall, handler: &ParsedHandler) 
         "close_account" => emit_spl(
             call,
             handler,
+            spec,
             prog_name,
             "CloseAccount",
             &[
@@ -1909,7 +1983,7 @@ fn emit_generic_anchor_cpi(
     ));
     for (param_name, _) in &iface_handler.params {
         let arg = call.args.iter().find(|a| &a.name == param_name)?;
-        let resolved = resolve_call_arg_for_amount(&arg.rust_expr, handler);
+        let resolved = resolve_call_arg_for_amount(&arg.rust_expr, handler, spec);
         out.push_str(&format!(
             "            AnchorSerialize::serialize(&{}, &mut ix_data).map_err(|_| ProgramError::Custom(0))?;\n",
             resolved,
@@ -2014,9 +2088,11 @@ fn emit_generic_anchor_cpi(
 /// accounts struct expects. Most are identity (`("from", "from")`) but
 /// some interfaces expose a more semantic name than anchor_spl uses
 /// (e.g. `mint_authority` vs `authority`).
+#[allow(clippy::too_many_arguments)]
 fn emit_spl(
     call: &crate::check::ParsedCall,
     handler: &ParsedHandler,
+    spec: &ParsedSpec,
     token_program: &str,
     accounts_struct: &str,
     field_to_arg: &[(&str, &str)],
@@ -2039,7 +2115,7 @@ fn emit_spl(
     let scalar_rhs = match scalar_arg {
         Some(name) => {
             let arg = call.args.iter().find(|a| a.name == name)?;
-            Some(resolve_call_arg_for_amount(&arg.rust_expr, handler))
+            Some(resolve_call_arg_for_amount(&arg.rust_expr, handler, spec))
         }
         None => None,
     };
@@ -2080,8 +2156,15 @@ fn emit_spl(
 /// Resolve a numeric / value argument's rust_expr to a form that's in
 /// scope inside the handler `impl` block. Bare identifiers that match a
 /// state field get the `self.<state_acct>.` prefix; handler params and
-/// literals pass through unchanged.
-fn resolve_call_arg_for_amount(rust_expr: &str, handler: &ParsedHandler) -> String {
+/// literals pass through unchanged. Multi-variant ADT state fields
+/// route through the v2.29 Slice B accessor (`.inner.<field>()`)
+/// since the wrapper struct only exposes `inner`, not the variant
+/// payload fields directly.
+fn resolve_call_arg_for_amount(
+    rust_expr: &str,
+    handler: &ParsedHandler,
+    spec: &ParsedSpec,
+) -> String {
     let is_simple_ident = rust_expr
         .chars()
         .all(|c| c.is_alphanumeric() || c == '_' || c == '-');
@@ -2092,6 +2175,23 @@ fn resolve_call_arg_for_amount(rust_expr: &str, handler: &ParsedHandler) -> Stri
         return rust_expr.to_string();
     }
     if let Some(sa) = find_state_account(handler) {
+        if is_multi_variant_adt_state(spec) {
+            // v2.29 Slice B (#12 deep): variant-payload field reads
+            // route through the accessor emitted in generate_state.
+            // Bail to the bare form when the field isn't a known
+            // variant payload — flat-state-like access against the
+            // wrapper's own non-inner fields stays valid (e.g.
+            // `bump`).
+            if let Some(acct) = spec.account_types.first() {
+                let is_variant_field = acct
+                    .variants
+                    .iter()
+                    .any(|v| v.fields.iter().any(|(n, _)| n == rust_expr));
+                if is_variant_field {
+                    return format!("(*self.{}.inner.{}())", sa.name, rust_expr);
+                }
+            }
+        }
         return format!("self.{}.{}", sa.name, rust_expr);
     }
     rust_expr.to_string()
@@ -3933,15 +4033,74 @@ fn generate_guards(
             let Some(sa) = state_acct else {
                 return after_accounts;
             };
-            let target = format!("ctx.{}.", sa.name);
+            // v2.29 Slice B (#12 deep) — when the state is a multi-
+            // variant ADT, fields that live on variant payloads can't
+            // be reached through `ctx.<state>.<field>` directly
+            // (the wrapper only carries `inner`). Route through the
+            // accessor method emitted in generate_state. We look
+            // ahead after each `s.` match to grab the identifier and
+            // dispatch: known variant-payload field → accessor call,
+            // otherwise → the bare `ctx.<state>.<field>` rewrite for
+            // flat-state compatibility.
+            let multi_variant = is_multi_variant_adt_state(spec);
+            let accessor_fields: std::collections::HashSet<String> = if multi_variant {
+                let mut set = std::collections::HashSet::new();
+                if let Some(acct) = spec.account_types.first() {
+                    let total = acct.variants.len();
+                    let mut idx: std::collections::BTreeMap<String, usize> =
+                        std::collections::BTreeMap::new();
+                    let mut tys: std::collections::BTreeMap<String, String> =
+                        std::collections::BTreeMap::new();
+                    let mut consistent: std::collections::BTreeMap<String, bool> =
+                        std::collections::BTreeMap::new();
+                    for variant in &acct.variants {
+                        for (fname, ftype) in &variant.fields {
+                            *idx.entry(fname.clone()).or_insert(0) += 1;
+                            if let Some(existing) = tys.get(fname) {
+                                if existing != ftype {
+                                    consistent.insert(fname.clone(), false);
+                                }
+                            } else {
+                                tys.insert(fname.clone(), ftype.clone());
+                                consistent.insert(fname.clone(), true);
+                            }
+                        }
+                    }
+                    let _ = total;
+                    for fname in idx.keys() {
+                        if *consistent.get(fname).unwrap_or(&true) {
+                            set.insert(fname.clone());
+                        }
+                    }
+                }
+                set
+            } else {
+                std::collections::HashSet::new()
+            };
+            let bare_target = format!("ctx.{}.", sa.name);
             let bytes = after_accounts.as_bytes();
             let mut out = String::with_capacity(after_accounts.len());
             let mut i = 0;
             while i < bytes.len() {
                 let prev_ok = i == 0 || !is_ident_char(bytes[i - 1]);
                 if prev_ok && i + 1 < bytes.len() && bytes[i] == b's' && bytes[i + 1] == b'.' {
-                    out.push_str(&target);
-                    i += 2;
+                    // Look ahead to extract the field identifier.
+                    let mut j = i + 2;
+                    while j < bytes.len() && is_ident_char(bytes[j]) {
+                        j += 1;
+                    }
+                    let field = &after_accounts[i + 2..j];
+                    if !field.is_empty() && accessor_fields.contains(field) {
+                        // v2.29 Slice B accessor call. Wrap in
+                        // parens + deref so subsequent ops (e.g.
+                        // `!*paused`, `state.lp_supply.bits`) parse
+                        // against the accessor return value.
+                        out.push_str(&format!("(*ctx.{}.inner.{}())", sa.name, field));
+                        i = j;
+                    } else {
+                        out.push_str(&bare_target);
+                        i += 2;
+                    }
                 } else {
                     out.push(bytes[i] as char);
                     i += 1;
