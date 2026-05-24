@@ -2438,6 +2438,32 @@ fn resolve_call_arg_for_amount(
     handler: &ParsedHandler,
     spec: &ParsedSpec,
 ) -> String {
+    // v2.29 — handle `s.<field>` shape coming from `expr_to_rust`
+    // on `state.<field>` paths (Ctx::Guard lowers `state` → `s`).
+    // The CPI emission contexts don't have an `s` binding in scope,
+    // so route directly to the runtime `self.<state_acct>.<field>`
+    // form — the same shape the `bind_state` closure produces in
+    // guards.rs. Without this, `call Token.transfer(amount =
+    // state.total_deposits)` lowered to a bare `s.total_deposits`
+    // reference and rustc rejected with `cannot find value 's'`.
+    if let Some(field) = rust_expr.strip_prefix("s.") {
+        if field.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            if let Some(sa) = find_state_account(handler) {
+                if is_multi_variant_adt_state(spec) {
+                    if let Some(acct) = spec.account_types.first() {
+                        let is_variant_field = acct
+                            .variants
+                            .iter()
+                            .any(|v| v.fields.iter().any(|(n, _)| n == field));
+                        if is_variant_field {
+                            return format!("(*self.{}.inner.{}())", sa.name, field);
+                        }
+                    }
+                }
+                return format!("self.{}.{}", sa.name, field);
+            }
+        }
+    }
     let is_simple_ident = rust_expr
         .chars()
         .all(|c| c.is_alphanumeric() || c == '_' || c == '-');

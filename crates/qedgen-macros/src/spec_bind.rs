@@ -42,6 +42,44 @@ fn sha256_hex16(input: &str) -> String {
     full[..16].to_string()
 }
 
+/// v2.29 — recursively read every `*.qedspec` file under `dir`, sort
+/// by path, and concatenate (with newline separation). Mirrors
+/// `check::read_spec_source`'s directory branch so the spec_hash
+/// the macro recomputes matches the codegen-time hash byte-for-byte.
+fn read_spec_dir(dir: &std::path::Path) -> std::io::Result<String> {
+    let mut files = Vec::new();
+    collect_qedspec_files(dir, &mut files)?;
+    files.sort();
+    let mut out = String::new();
+    for f in &files {
+        let src = std::fs::read_to_string(f)?;
+        out.push_str(&src);
+        if !src.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    Ok(out)
+}
+
+fn collect_qedspec_files(
+    dir: &std::path::Path,
+    out: &mut Vec<std::path::PathBuf>,
+) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            collect_qedspec_files(&path, out)?;
+        } else if file_type.is_file()
+            && path.extension().and_then(|e| e.to_str()) == Some("qedspec")
+        {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
 /// Parse all `key = "value"` pairs from the attribute stream.
 pub(crate) fn parse_args(attr: &TokenStream) -> Result<Args, syn::Error> {
     let tokens: Vec<proc_macro2::TokenTree> = attr.clone().into_iter().collect();
@@ -560,17 +598,40 @@ pub fn expand_bound(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Locate the spec file relative to CARGO_MANIFEST_DIR.
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into());
     let full_path = std::path::Path::new(&manifest_dir).join(&spec_path);
-    let source = match std::fs::read_to_string(&full_path) {
-        Ok(s) => s,
-        Err(e) => {
-            let msg = format!(
-                "qed(verified): could not read spec file `{}` (resolved to `{}`): {}",
-                spec_path,
-                full_path.display(),
-                e
-            );
-            let err = syn::Error::new(func_span, msg).to_compile_error();
-            return quote::quote! { #err #func_tokens };
+    // v2.29 — accept directory `spec = "..."` paths so multi-file
+    // specs (handlers/, properties/ subdirs alongside the root
+    // spec) work without forcing users to point the macro at a
+    // single "primary" file. Mirrors `check::read_spec_source`:
+    // walk the dir, collect `*.qedspec`, sort, concatenate. spec_hash
+    // recomputation then operates on the same merged content the
+    // codegen-time hash was computed against.
+    let source = if full_path.is_dir() {
+        match read_spec_dir(&full_path) {
+            Ok(s) => s,
+            Err(e) => {
+                let msg = format!(
+                    "qed(verified): could not read spec dir `{}` (resolved to `{}`): {}",
+                    spec_path,
+                    full_path.display(),
+                    e
+                );
+                let err = syn::Error::new(func_span, msg).to_compile_error();
+                return quote::quote! { #err #func_tokens };
+            }
+        }
+    } else {
+        match std::fs::read_to_string(&full_path) {
+            Ok(s) => s,
+            Err(e) => {
+                let msg = format!(
+                    "qed(verified): could not read spec file `{}` (resolved to `{}`): {}",
+                    spec_path,
+                    full_path.display(),
+                    e
+                );
+                let err = syn::Error::new(func_span, msg).to_compile_error();
+                return quote::quote! { #err #func_tokens };
+            }
         }
     };
 
