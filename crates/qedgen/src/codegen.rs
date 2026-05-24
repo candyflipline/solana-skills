@@ -2450,6 +2450,165 @@ fn emit_spl(
     Some(out)
 }
 
+/// v2.29.2 — resolve the state-bearing account for a handler with a
+/// spec-wide canonical fallback. `find_state_account(handler)` returns
+/// `None` when multiple writable candidates exist and no PDA /
+/// `on_account` disambiguator picks one (real-world specs often declare
+/// the state account `readonly` in handlers that only read it, leaving
+/// the per-handler resolver stuck among unrelated token / mint
+/// accounts). When that happens, fall back to the spec-wide canonical
+/// state account name and re-find it in this handler.
+fn resolve_handler_state_account<'a>(
+    handler: &'a ParsedHandler,
+    spec: &ParsedSpec,
+) -> Option<&'a crate::check::ParsedHandlerAccount> {
+    if let Some(direct) = find_state_account(handler) {
+        return Some(direct);
+    }
+    let canon = find_canonical_state_account_name(spec)?;
+    handler.accounts.iter().find(|a| a.name == canon)
+}
+
+/// v2.29.2 — pick the most-likely state-bearing account name across the
+/// whole spec. Used as a fallback when a handler's accounts block has
+/// multiple writable candidates and no PDA/`on_account` disambiguator
+/// (real-world specs frequently mark the state account `readonly` in
+/// handlers that only read it, leaving the per-handler resolver stuck
+/// among unrelated token / mint accounts).
+///
+/// Heuristic: count, for each non-signer / non-program / non-token /
+/// non-mint account name across the whole spec:
+///   1. how many handlers list it `writable`, then
+///   2. how many handlers list it at all (writable or readonly).
+///
+/// The pair `(writable, total)` is compared lexicographically with the
+/// highest pair winning; ties broken alphabetically (earlier name
+/// first) for determinism. Returns `None` when no name accumulates a
+/// non-zero pair.
+///
+/// The total-mentions tiebreaker is what makes the heuristic robust
+/// against specs where the canonical state account is `readonly` in
+/// most handlers (read-heavy programs): an account that's mentioned
+/// in every handler is almost certainly the shared state, even when
+/// individual writable counts tie with unrelated per-handler accounts.
+fn find_canonical_state_account_name(spec: &ParsedSpec) -> Option<String> {
+    let mut writable: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut total: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for h in &spec.handlers {
+        for a in &h.accounts {
+            if a.is_signer || a.is_program {
+                continue;
+            }
+            if matches!(a.account_type.as_deref(), Some("token") | Some("mint")) {
+                continue;
+            }
+            *total.entry(a.name.clone()).or_insert(0) += 1;
+            if a.is_writable {
+                *writable.entry(a.name.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+    total
+        .into_iter()
+        .filter(|(name, _)| writable.get(name).copied().unwrap_or(0) > 0)
+        .max_by(|(an, at), (bn, bt)| {
+            let aw = writable.get(an).copied().unwrap_or(0);
+            let bw = writable.get(bn).copied().unwrap_or(0);
+            aw.cmp(&bw)
+                .then_with(|| at.cmp(bt))
+                .then_with(|| bn.cmp(an))
+        })
+        .map(|(name, _)| name)
+}
+
+/// Rewrite `s.<field>` patterns in a pre-rendered Rust expression so it
+/// compiles inside the user-owned handler `impl` block (where the state
+/// binder is `self`, not `ctx`). Mirrors the Step-2 logic from
+/// `generate_guards::bind_state` but with `self.<state_acct>` as the
+/// prefix.
+///
+/// Multi-variant ADT state fields route through the v2.29 Slice B
+/// accessor (`(*self.<state>.inner.<field>())`); flat-state fields take
+/// the bare `self.<state>.<field>` path. Word-bounded so identifiers
+/// like `accounts[i].fee_credits` don't get corrupted.
+///
+/// v2.29.2 (friction-report follow-up, #12 deep): the existing
+/// `resolve_call_arg_for_amount` only handles top-level CPI argument
+/// expressions. Handler-body `let X = ref_impl(state.f, ...)` sites
+/// emit pre-rendered RHS strings whose `s.<field>` references stayed
+/// raw — `rustc` then rejected with `cannot find value 's'`. This
+/// helper closes that gap for any in-`impl` emission site.
+fn rewrite_state_refs_for_self(expr: &str, handler: &ParsedHandler, spec: &ParsedSpec) -> String {
+    // v2.29.2 — when this handler has multiple writable candidates and
+    // no PDA or `on_account` disambiguator (real-world shape: state
+    // account declared `readonly` here while several token / mint
+    // accounts are writable in this handler), `find_state_account
+    // (handler)` bails with `None` and the rewrite would no-op leaving
+    // `s.<field>` unbound. Fall back to the spec-wide canonical state
+    // account: the non-signer / non-program / non-token / non-mint
+    // account name that's writable in the most handlers, then look it
+    // up by name in THIS handler's accounts.
+    let Some(sa) = resolve_handler_state_account(handler, spec) else {
+        return expr.to_string();
+    };
+    let multi_variant = is_multi_variant_adt_state(spec);
+    let accessor_fields: std::collections::HashSet<String> = if multi_variant {
+        let mut set = std::collections::HashSet::new();
+        if let Some(acct) = spec.account_types.first() {
+            let mut tys: std::collections::BTreeMap<String, String> =
+                std::collections::BTreeMap::new();
+            let mut consistent: std::collections::BTreeMap<String, bool> =
+                std::collections::BTreeMap::new();
+            for variant in &acct.variants {
+                for (fname, ftype) in &variant.fields {
+                    if let Some(existing) = tys.get(fname) {
+                        if existing != ftype {
+                            consistent.insert(fname.clone(), false);
+                        }
+                    } else {
+                        tys.insert(fname.clone(), ftype.clone());
+                        consistent.insert(fname.clone(), true);
+                    }
+                }
+            }
+            for fname in tys.keys() {
+                if *consistent.get(fname).unwrap_or(&true) {
+                    set.insert(fname.clone());
+                }
+            }
+        }
+        set
+    } else {
+        std::collections::HashSet::new()
+    };
+    let bare_target = format!("self.{}.", sa.name);
+    let bytes = expr.as_bytes();
+    let mut out = String::with_capacity(expr.len() + 16);
+    let mut i = 0;
+    while i < bytes.len() {
+        let prev_ok = i == 0 || !is_ident_char(bytes[i - 1]);
+        if prev_ok && i + 1 < bytes.len() && bytes[i] == b's' && bytes[i + 1] == b'.' {
+            let mut j = i + 2;
+            while j < bytes.len() && is_ident_char(bytes[j]) {
+                j += 1;
+            }
+            let field = &expr[i + 2..j];
+            if !field.is_empty() && accessor_fields.contains(field) {
+                out.push_str(&format!("(*self.{}.inner.{}())", sa.name, field));
+                i = j;
+                continue;
+            } else if !field.is_empty() {
+                out.push_str(&bare_target);
+                i += 2;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
 /// Resolve a numeric / value argument's rust_expr to a form that's in
 /// scope inside the handler `impl` block. Bare identifiers that match a
 /// state field get the `self.<state_acct>.` prefix; handler params and
@@ -3359,7 +3518,14 @@ fn render_handler_accounts_struct(
     out.push_str(&format!("pub struct {}{} {{\n", pascal, struct_lifetime));
 
     if !handler.accounts.is_empty() {
-        let state_acct = find_state_account(handler);
+        // v2.29.2 — use the canonical-fallback resolver so multi-
+        // writable handlers whose state account is declared `readonly`
+        // (or otherwise ambiguous) still get the state account typed
+        // as `Account<'info, <StateStruct>>` rather than falling
+        // through to `AccountInfo<'info>`. Without this, downstream
+        // `self.<acct>.<field>` reads in let-bindings / guards / CPI
+        // args fail with `no field on type __AccountInfo`.
+        let state_acct = resolve_handler_state_account(handler, spec);
         for acct in &handler.accounts {
             let inferred_name = if is_multi {
                 infer_state_name(acct, spec, default_state_name)
@@ -3662,8 +3828,14 @@ fn render_handler_scaffold(
     // must be emitted BEFORE the effect block — effect RHSs reference them.
     // Pre-fix: they were dropped on the Rust side, leaving undefined-variable
     // errors on `cargo build`.
+    //
+    // v2.29.2 — RHS is rendered with the spec's `s.<field>` shorthand
+    // (the in-spec lowering of `state.<field>`), which is unbound in the
+    // handler-body context. Rewrite through the same accessor logic the
+    // CPI-arg path uses so multi-variant ADT state reads compile.
     for (binding_name, _lean_expr, rust_expr) in &handler.let_bindings {
-        out.push_str(&format!("        let {} = {};\n", binding_name, rust_expr));
+        let rewritten = rewrite_state_refs_for_self(rust_expr, handler, spec);
+        out.push_str(&format!("        let {} = {};\n", binding_name, rewritten));
     }
 
     // v2.24 #11 — `let X = call …` bindings must be in scope when
@@ -4391,7 +4563,12 @@ fn generate_guards(
         // When we can identify a single state account, rewrite `s.` to that
         // path so the guards compile. Multi-state handlers fall through with
         // the raw `s.` form — caller must hand-edit. R12 fix.
-        let state_acct = find_state_account(handler);
+        //
+        // v2.29.2 — use the canonical-fallback resolver so multi-
+        // writable handlers whose state account is `readonly` still
+        // get `s.<field>` rewritten to `ctx.<canonical>.<field>`
+        // instead of left unbound.
+        let state_acct = resolve_handler_state_account(handler, spec);
         // Bare handler-account idents in spec expressions (e.g. the
         // `approver` in `state.members[i] == approver`) need to be
         // lowered to the runtime pubkey load `*ctx.<name>.to_account_view().address()`.
@@ -4609,6 +4786,23 @@ fn generate_guards(
             .map(|(n, _)| n.as_str())
             .collect();
 
+        // v2.29.2 — emit spec-level `let X = ref_impl(...)` bindings
+        // here so `requires X > 0` clauses can reference them. Without
+        // this, guards.rs emitted the requires check against a name
+        // that's only bound later in the handler body (`let lp_out =
+        // lp_token_out(...)` lives in the user-owned handler stub),
+        // tripping `cannot find value 'lp_out' in this scope`. Each
+        // RHS goes through `bind_state` so `s.<field>` reads route
+        // through `ctx.<state>.<field>` (the guards binder).
+        for (binding_name, _lean_expr, rust_expr) in &handler.let_bindings {
+            let rewritten = bind_state(rust_expr);
+            out.push_str(&format!(
+                "    // let-binding from spec: {} = {}\n",
+                binding_name, rust_expr
+            ));
+            out.push_str(&format!("    let {} = {};\n", binding_name, rewritten));
+        }
+
         for req in &handler.requires {
             // Emit as a comment for human readers + an executable check.
             out.push_str(&format!("    // requires: {}\n", req.lean_expr.trim()));
@@ -4759,7 +4953,21 @@ fn generate_cargo_toml(
 
 fn render_qedgen_cargo_toml(spec: &ParsedSpec, fp: &SpecFingerprint, target: Target) -> String {
     let program_name = spec.program_name.to_lowercase().replace('_', "-");
-    let needs_spl = spec.handlers.iter().any(|h| h.has_token_accounts());
+    // v2.29.2 — also detect Token CPIs via `call Token.*` (or the
+    // `transfers { ... }` sugar that desugars to it). Pre-v2.29.2 the
+    // gate only checked for accounts declared as `type token`. Specs
+    // that left their token accounts bare-typed (relying on Anchor's
+    // `init, associated_token::*` constraints to resolve the type)
+    // missed the `anchor-spl` dep even though their handler stubs
+    // emitted `use anchor_spl::token::{self, Transfer}` for the
+    // Token CPI bodies, producing `unresolved import anchor_spl`
+    // compile errors. The Token interface is the canonical SPL
+    // identifier across the bundled stdlib.
+    let needs_spl = spec.handlers.iter().any(|h| {
+        h.has_token_accounts()
+            || h.calls.iter().any(|c| c.target_interface == "Token")
+            || !h.transfers.is_empty()
+    });
     let hash = fp
         .file_hashes
         .get("Cargo.toml")
@@ -7206,6 +7414,130 @@ handler close : State.Open -> State.Closed {
         assert!(
             body.contains("PoolInner::balance() called on a variant without `balance`"),
             "expected panic message for missing variant; got:\n{body}"
+        );
+    }
+
+    /// v2.29.2 — `anchor-spl` must be added to Cargo.toml whenever a
+    /// handler issues a Token CPI, even when no account is declared
+    /// `type token`. Real specs frequently leave their token accounts
+    /// bare-typed and rely on Anchor's init constraints to resolve the
+    /// type at scaffold time. Pre-v2.29.2 the deps gate only checked
+    /// for accounts declared as `type token`; the resulting Cargo.toml
+    /// missed `anchor-spl` while the handler stub still emitted `use
+    /// anchor_spl::token::{self, Transfer}`, producing `unresolved
+    /// import anchor_spl` compile errors. Now keyed on the unified
+    /// CPI surface (calls + transfers) plus the original account-type
+    /// check.
+    #[test]
+    fn cargo_toml_includes_anchor_spl_when_token_cpi_without_typed_account() {
+        const SRC: &str = r#"
+spec Vault
+
+import Token from "spl"
+
+type State
+  | Active of { balance : U64 }
+
+type Error | InvalidAmount
+
+handler deposit (amount : U64) : State.Active -> State.Active {
+  permissionless
+  accounts {
+    user           : signer
+    vault          : writable
+    source         : writable
+    dest           : writable
+    token_program  : program, type token
+  }
+  requires amount > 0 else InvalidAmount
+  call Token.transfer(
+    from      = source,
+    to        = dest,
+    authority = user,
+    amount    = amount,
+  )
+  effect { balance := balance }
+}
+"#;
+        let spec = crate::chumsky_adapter::parse_str(SRC).expect("fixture should parse");
+        let fp = SpecFingerprint {
+            file_hashes: std::collections::BTreeMap::new(),
+        };
+        let toml = render_qedgen_cargo_toml(&spec, &fp, Target::Anchor);
+        assert!(
+            toml.contains("anchor-spl"),
+            "Cargo.toml must include `anchor-spl` when any handler issues \
+             a Token CPI (v2.29.2); none of the spec's writable accounts \
+             carries `type token` — pre-v2.29.2 detector missed this. \
+             Generated:\n{toml}"
+        );
+    }
+
+    /// v2.29.2 — `rewrite_state_refs_for_self` must work on handlers
+    /// whose accounts block has multiple writable candidates and no
+    /// PDA / `on_account` disambiguator (real-world specs frequently
+    /// mark the state account `readonly` in handlers that only read
+    /// it, so the per-handler resolver returns None). The spec-wide
+    /// canonical-state heuristic picks the account name that's
+    /// writable in the most other handlers and uses it as the binder
+    /// target, even when this handler declares it `readonly`.
+    #[test]
+    fn rewrite_state_refs_uses_canonical_fallback_when_handler_state_acct_is_readonly() {
+        const SRC: &str = r#"
+spec Pool
+
+type State
+  | Active of {
+      balance : U64,
+    }
+
+type Error | E
+
+handler init (initial : U64) : State.Active -> State.Active {
+  permissionless
+  accounts {
+    user        : signer
+    pool_config : writable
+  }
+  effect { balance := initial }
+}
+
+handler read_via_writable_decoy (amt : U64) : State.Active -> State.Active {
+  permissionless
+  accounts {
+    user        : signer
+    pool_config : readonly
+    decoy_a     : writable
+    decoy_b     : writable
+  }
+  requires amt <= state.balance else E
+  effect { balance := balance }
+}
+"#;
+        let spec = crate::chumsky_adapter::parse_str(SRC).expect("fixture should parse");
+        let handler = spec
+            .handlers
+            .iter()
+            .find(|h| h.name == "read_via_writable_decoy")
+            .expect("handler not found");
+        // `find_state_account` alone returns None for this handler (two
+        // writable candidates: decoy_a, decoy_b — neither is the state
+        // account; pool_config is readonly so it's only included in the
+        // require_writable=false fallback, which then yields multiple
+        // candidates too).
+        assert!(
+            find_state_account(handler).is_none(),
+            "pre-condition: this fixture must surface the canonical-fallback path"
+        );
+        // The canonical fallback picks `pool_config` (writable in
+        // `init`) and the rewriter routes `s.balance` through
+        // `self.pool_config.balance`.
+        let rewritten = rewrite_state_refs_for_self("s.balance + 1", handler, &spec);
+        assert_eq!(
+            rewritten, "self.pool_config.balance + 1",
+            "v2.29.2 canonical-fallback rewrite must produce \
+             `self.pool_config.balance` even when pool_config is \
+             readonly in this handler; got: `{rewritten}`"
         );
     }
 }

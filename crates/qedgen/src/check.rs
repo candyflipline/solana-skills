@@ -3643,26 +3643,49 @@ pub fn check_completeness(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
     // associated_token::mint = X, associated_token::authority = Y)]` (or
     // `init, token::authority = Y, token::mint = X`) handles the
     // SPL Token CPI implicitly via the init macro — no explicit
-    // `transfers` or `call Token.*` is needed. The DSL-level signal is
-    // `pre_status in {Uninitialized, Empty}` combined with at least one
-    // writable token-type account, which is exactly the shape codegen
-    // lowers to Anchor's `init` constraint set (see
-    // `quasar_account_attr` in this file). Without this suppression
-    // every Anchor `initialize` handler that sets up a vault/TA fires
-    // a spurious lint.
+    // `transfers` or `call Token.*` is needed.
+    //
+    // v2.29.2 — the v2.29 detection keyed on `pre_status in
+    // {Uninitialized, Empty}` (hardcoded names) and over-fired on any
+    // user spec whose lifecycle ADT named the pre-state differently
+    // (`Uninit`, `Created`, `NotInitialized`, etc.). Switched to a
+    // shape predicate: the pre-state variant carries no payload
+    // fields — exactly the "freshly-created account, no inner state
+    // to read" semantic the suppression was meant for.
+    // State ADT variants live on `account_types[*].variants` (the
+    // multi-variant inner-enum carrier); other declared sum types
+    // (lifecycle enums on non-state records, key types, etc.) live on
+    // `sum_types`. Pull unit variants from both — the suppression
+    // applies whenever the pre-state has no payload fields.
+    let unit_variant_names: std::collections::HashSet<&str> = spec
+        .account_types
+        .iter()
+        .flat_map(|a| a.variants.iter())
+        .chain(spec.sum_types.iter().flat_map(|s| s.variants.iter()))
+        .filter(|v| v.fields.is_empty())
+        .map(|v| v.name.as_str())
+        .collect();
     for handler in &spec.handlers {
         if !handler.has_token_program() {
             continue;
         }
         if !handler.has_calls() {
-            let is_lifecycle_init = matches!(
-                handler.pre_status.as_deref(),
-                Some("Uninitialized") | Some("Empty")
-            );
-            let has_writable_token_account = handler.accounts.iter().any(|a| {
-                a.is_writable && a.account_type.as_deref() == Some("token") && !a.is_program
-            });
-            if is_lifecycle_init && has_writable_token_account {
+            let is_lifecycle_init = handler
+                .pre_status
+                .as_deref()
+                .map(|s| unit_variant_names.contains(s))
+                .unwrap_or(false);
+            // v2.29.2 — drop the previous `&& has_writable_token_account`
+            // sub-condition. Real specs frequently leave token accounts
+            // bare-typed (`stablecoin_pool : writable`) and let Anchor
+            // resolve the type via `#[account(init,
+            // associated_token::mint = X, associated_token::authority =
+            // Y)]` constraints. Requiring an explicit `type token` on
+            // the writable account didn't add safety — `is_lifecycle_init
+            // && !has_calls()` (the outer guard) is already the
+            // "freshly-created account, no explicit CPI" shape Anchor's
+            // init macro covers implicitly.
+            if is_lifecycle_init {
                 continue;
             }
             let writable_tokens: Vec<&str> = handler
@@ -5315,6 +5338,29 @@ fn check_unbound_auth(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
             .iter()
             .any(|r| r.lean_expr.contains(who) && r.lean_expr.contains("s."));
         if manually_bound {
+            continue;
+        }
+        // v2.29.2 — also accept the dotted-auth desugar / cross-program
+        // shape, where the binding clause reads an imported-account
+        // field rather than a state field. Pattern: `<acct>.<field> =
+        // <who>.pubkey` (Lean form) where `<acct>` is a non-signer
+        // account on this handler. Covers both the v2.29.1 `auth
+        // <acct>.<field>` sugar (which `adapt()` rewrites to this
+        // synthesized clause) and the equivalent hand-written
+        // `requires` longhand. Without this escape,
+        // `examples/rust/cross-program-vault/` trips unbound_auth on
+        // the v2.29.1 feature it was meant to showcase.
+        let who_pubkey = format!("{who}.pubkey");
+        let auth_bound_via_account = handler.requires.iter().any(|r| {
+            if !r.lean_expr.contains(&who_pubkey) {
+                return false;
+            }
+            handler
+                .accounts
+                .iter()
+                .any(|a| !a.is_signer && r.lean_expr.contains(&format!("{}.", a.name)))
+        });
+        if auth_bound_via_account {
             continue;
         }
         warnings.push(CompletenessWarning {
@@ -7679,6 +7725,22 @@ handler init { effect { balance := 0 } }
         let spec = ParsedSpec {
             handlers: vec![h],
             lifecycle_states: vec!["Uninitialized".to_string(), "Active".to_string()],
+            account_types: vec![ParsedAccountType {
+                name: "State".to_string(),
+                fields: vec![],
+                lifecycle: vec![],
+                pda_ref: None,
+                variants: vec![
+                    ParsedVariant {
+                        name: "Uninitialized".to_string(),
+                        fields: vec![],
+                    },
+                    ParsedVariant {
+                        name: "Active".to_string(),
+                        fields: vec![("balance".to_string(), "U64".to_string())],
+                    },
+                ],
+            }],
             ..empty_spec()
         };
         let warnings = check_completeness(&spec);
@@ -7688,6 +7750,174 @@ handler init { effect { balance := 0 } }
                 .any(|w| w.rule == "missing_cpi_for_token_context"),
             "lifecycle-init handler creating a token account should NOT fire \
              missing_cpi_for_token_context; got: {:?}",
+            warnings.iter().map(|w| &w.rule).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_missing_cpi_for_token_context_suppressed_on_non_canonical_init_name() {
+        // v2.29.2 — the v2.29 suppression hardcoded `pre_status in
+        // {Uninitialized, Empty}`. User specs that named the pre-init
+        // variant differently (`Uninit`, `Created`, `NotInitialized`,
+        // `Setup`, ...) tripped the lint spuriously. The shape
+        // predicate keys on "pre-state variant has no payload" and
+        // correctly suppresses regardless of name. Mirror of the
+        // canonical-name test above with `Uninit` substituted; both
+        // must stay silent.
+        let mut h = make_handler("initialize");
+        h.pre_status = Some("Uninit".to_string());
+        h.post_status = Some("Active".to_string());
+        h.accounts = vec![
+            ParsedHandlerAccount {
+                name: "authority".to_string(),
+                is_signer: true,
+                is_writable: false,
+                is_program: false,
+                pda_seeds: None,
+                account_type: None,
+                authority: None,
+                default_pubkey: None,
+                imported_namespace: None,
+            },
+            ParsedHandlerAccount {
+                name: "vault".to_string(),
+                is_signer: false,
+                is_writable: true,
+                is_program: false,
+                pda_seeds: Some(vec!["vault".to_string(), "authority".to_string()]),
+                account_type: Some("token".to_string()),
+                authority: Some("vault_pda".to_string()),
+                default_pubkey: None,
+                imported_namespace: None,
+            },
+            ParsedHandlerAccount {
+                name: "token_program".to_string(),
+                is_signer: false,
+                is_writable: false,
+                is_program: true,
+                pda_seeds: None,
+                account_type: Some("token".to_string()),
+                authority: None,
+                default_pubkey: None,
+                imported_namespace: None,
+            },
+        ];
+        let spec = ParsedSpec {
+            handlers: vec![h],
+            lifecycle_states: vec!["Uninit".to_string(), "Active".to_string()],
+            account_types: vec![ParsedAccountType {
+                name: "State".to_string(),
+                fields: vec![],
+                lifecycle: vec![],
+                pda_ref: None,
+                variants: vec![
+                    ParsedVariant {
+                        name: "Uninit".to_string(),
+                        fields: vec![],
+                    },
+                    ParsedVariant {
+                        name: "Active".to_string(),
+                        fields: vec![("balance".to_string(), "U64".to_string())],
+                    },
+                ],
+            }],
+            ..empty_spec()
+        };
+        let warnings = check_completeness(&spec);
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.rule == "missing_cpi_for_token_context"),
+            "init handler with non-canonical pre-state variant `Uninit` \
+             must NOT fire missing_cpi_for_token_context (v2.29.2 shape \
+             predicate); got: {:?}",
+            warnings.iter().map(|w| &w.rule).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_missing_cpi_for_token_context_suppressed_when_no_typed_token_account() {
+        // v2.29.2 — the v2.29.2 suppression required BOTH lifecycle-init
+        // AND at least one writable account with `account_type ==
+        // Some("token")`. Real specs frequently leave token accounts
+        // bare-typed (`stablecoin_pool : writable`) and rely on Anchor's
+        // `#[account(init, associated_token::mint = X, associated_token::
+        // authority = Y)]` constraints to resolve the type at scaffold
+        // time. Pre-v2.29.2 those specs tripped the lint despite shipping
+        // the exact "Anchor init handles SPL implicitly" shape. Drop the
+        // writable-token-account precondition; `is_lifecycle_init && !
+        // has_calls()` is sufficient.
+        let mut h = make_handler("initialize");
+        h.pre_status = Some("Uninit".to_string());
+        h.post_status = Some("Active".to_string());
+        h.accounts = vec![
+            ParsedHandlerAccount {
+                name: "authority".to_string(),
+                is_signer: true,
+                is_writable: false,
+                is_program: false,
+                pda_seeds: None,
+                account_type: None,
+                authority: None,
+                default_pubkey: None,
+                imported_namespace: None,
+            },
+            ParsedHandlerAccount {
+                // Bare writable, no `type token` — Anchor would type it
+                // via an `init, associated_token::*` constraint set the
+                // spec doesn't repeat.
+                name: "pool_balance_account".to_string(),
+                is_signer: false,
+                is_writable: true,
+                is_program: false,
+                pda_seeds: None,
+                account_type: None,
+                authority: None,
+                default_pubkey: None,
+                imported_namespace: None,
+            },
+            ParsedHandlerAccount {
+                name: "token_program".to_string(),
+                is_signer: false,
+                is_writable: false,
+                is_program: true,
+                pda_seeds: None,
+                account_type: Some("token".to_string()),
+                authority: None,
+                default_pubkey: None,
+                imported_namespace: None,
+            },
+        ];
+        let spec = ParsedSpec {
+            handlers: vec![h],
+            lifecycle_states: vec!["Uninit".to_string(), "Active".to_string()],
+            account_types: vec![ParsedAccountType {
+                name: "State".to_string(),
+                fields: vec![],
+                lifecycle: vec![],
+                pda_ref: None,
+                variants: vec![
+                    ParsedVariant {
+                        name: "Uninit".to_string(),
+                        fields: vec![],
+                    },
+                    ParsedVariant {
+                        name: "Active".to_string(),
+                        fields: vec![("balance".to_string(), "U64".to_string())],
+                    },
+                ],
+            }],
+            ..empty_spec()
+        };
+        let warnings = check_completeness(&spec);
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.rule == "missing_cpi_for_token_context"),
+            "lifecycle-init handler with token_program but no `type token` \
+             writable account must NOT fire missing_cpi_for_token_context \
+             (v2.29.2 — Anchor init handles SPL implicitly via constraint \
+             set); got: {:?}",
             warnings.iter().map(|w| &w.rule).collect::<Vec<_>>()
         );
     }
@@ -7994,6 +8224,59 @@ handler withdraw (amount : U64) : State.Active -> State.Active {
             !unbound.is_empty(),
             "expected unbound_auth to fire on a spec with `auth authority` and no state field; got: {:?}",
             warnings.iter().map(|w| &w.rule).collect::<Vec<_>>()
+        );
+    }
+
+    /// v2.29.2 — dotted-auth desugar (v2.29.1 `auth <acct>.<field>`)
+    /// synthesizes a `requires <acct>.<field> == <signer>.pubkey else
+    /// Unauthorized` clause and rewrites `who` to the signer name.
+    /// Pre-v2.29.2 the `unbound_auth` lint then read the stripped-down
+    /// `auth <signer>` bare form and falsely flagged it, because the
+    /// "manually bound by requires" escape only matched `s.<field>`
+    /// state references. This regression locks in the imported-account
+    /// shape escape — the fixture is the bundled cross-program-vault's
+    /// `emergency_close` shape distilled to its essence.
+    const DOTTED_AUTH_BOUND_FIXTURE: &str = r#"
+spec Vault
+
+type State
+  | Active of {
+      total_deposits : U64,
+    }
+
+type AdminConfig
+  | Active of {
+      admin : Pubkey,
+    }
+
+type Error | Unauthorized
+
+handler close : State.Active -> State.Active {
+  auth admin_config.admin
+  accounts {
+    admin        : signer
+    vault        : writable
+    admin_config : type AdminConfig
+  }
+  effect { total_deposits := 0 }
+}
+"#;
+
+    #[test]
+    fn lint_unbound_auth_silent_on_dotted_auth_desugar() {
+        let spec = crate::chumsky_adapter::parse_str(DOTTED_AUTH_BOUND_FIXTURE)
+            .expect("dotted-auth fixture should parse");
+        let warnings = check_completeness(&spec);
+        let unbound: Vec<&CompletenessWarning> = warnings
+            .iter()
+            .filter(|w| w.rule == "unbound_auth")
+            .collect();
+        assert!(
+            unbound.is_empty(),
+            "unbound_auth must stay silent when the synthesized `requires \
+             <acct>.<field> == <signer>.pubkey` clause binds the signer \
+             via an imported account (v2.29.2 escape); got: {:?}",
+            unbound.iter().map(|w| &w.message).collect::<Vec<_>>()
         );
     }
 
