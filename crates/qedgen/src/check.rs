@@ -2794,8 +2794,8 @@ pub fn check_completeness(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
         // `pool.balance += amount` writes the `pool` record field.
         // Pre-fix the lint only matched whole-field LHS, so any
         // through-indexing write to a Map produced a false-positive
-        // `[P4] unused_field` (~once per Map field on percolator /
-        // Hylo specs).
+        // `[P4] unused_field` (~once per Map field on Map-heavy
+        // specs).
         let modified = spec.handlers.iter().any(|op| {
             op.effects.iter().any(|(f, _, _)| {
                 let lhs = normalize_lhs(f);
@@ -3580,9 +3580,8 @@ pub fn check_completeness(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
         // slot, which modern specs leave as `None` — every requires-
         // only / property-only / invariant-only read was invisible
         // to the lint, producing ~30 false-positive `write_without_read`
-        // hits on real specs (Hylo / percolator). Now we scan every
-        // requires / ensures / property body / invariant the spec
-        // declares.
+        // hits on real specs. Now we scan every requires / ensures /
+        // property body / invariant the spec declares.
         let mut texts: Vec<&str> = Vec::new();
         for op in &spec.handlers {
             if let Some(ref guard) = op.guard_str {

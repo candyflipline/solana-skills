@@ -3870,8 +3870,7 @@ mod tests {
     /// names a unit-only enum (sum type whose variants all have no
     /// payload). Pre-fix the `map_bound_not_const` lint hard-errored
     /// because only `const` bounds were accepted; spec authors with
-    /// one-PDA-per-enum-variant patterns (e.g. Hylo's
-    /// AddressUpdateProposal per AddressField) had to fall back to
+    /// one-PDA-per-enum-variant patterns had to fall back to
     /// per-variant flat fields.
     #[test]
     fn map_keyed_by_enum_routes_to_sum_types() {
