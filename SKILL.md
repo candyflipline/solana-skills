@@ -331,17 +331,31 @@ When you need the **data shape** of another program's account (not its CPI surfa
 
 ## When the spec hits a wall: fail fast, file an issue
 
-**Hard rule for spec-authoring agents:** if `qedgen check` or `qedgen codegen` emits an error or lint you don't have a documented path past, **stop and file an issue at <https://github.com/qedgen/solana-skills/issues>**. Do *not* invent workarounds — phantom state fields to satisfy `auth`, manual `transfers` blocks to silence `missing_cpi_for_token_context`, hand-edited generated files, parser-tricking renames, etc. Those workarounds:
+**Hard rule for spec-authoring agents:** if **any of these** emits an error you don't have a documented path past, **stop and file an issue at <https://github.com/qedgen/solana-skills/issues>**:
 
-- Erode the spec's correctness story (the spec stops describing what the program actually does).
-- Hide the real bug from the next user, who will reinvent the same workaround.
-- Outlive the upstream fix — the workaround is in the spec forever, even after the underlying limitation lands a proper fix.
+- `qedgen check` lint or hard error (spec doesn't validate)
+- `qedgen codegen` hard error
+- **`cargo check` / `cargo build` on the generated Rust crate** (Anchor or Quasar scaffold doesn't compile)
+- **`cargo kani` / `cargo test --release` on the generated Kani harness** (proof fails to elaborate, not just fails to verify)
+- **`cargo test` on the generated proptest harness** (proptest doesn't compile or panics outside the property body)
+- **`lake build` on the generated Lean `Spec.lean` / `Proofs.lean`** (proof file doesn't elaborate — missing import, unknown identifier, type mismatch in the generated theorem statement)
+
+In every case, the failure is a **codegen bug**, not a spec bug — the user wrote a valid spec and the generator emitted broken output. Hand-editing the generated file (guards.rs, state.rs, lib.rs's Accounts structs, Spec.lean, kani.rs, proptest.rs, the imported/ mirror) is the worst possible response: the next `qedgen codegen` regenerates over your edit and the fix evaporates.
+
+Do *not* invent any of these workarounds:
+
+- Phantom state fields to satisfy `auth` or to make `requires` reference resolve
+- Manual `transfers` blocks to silence `missing_cpi_for_token_context`
+- Hand-edited generated files (anything under `programs/src/` other than `instructions/<name>.rs` handler bodies, or anything in `formal_verification/` that qedgen wrote)
+- Parser-tricking renames (`admin_` instead of `admin` to dodge a keyword collision, etc.)
+- Spec-side type changes that "happen to make codegen work" but no longer describe the program
+- Removing the failing handler / property / requires from the spec to make the build green
 
 The fail-fast script:
 
-1. **Surface the error verbatim.** The lint name (`unsupported_quantifier_shape`, `no_access_control`, `missing_cpi_for_token_context`, etc.) and the spec fragment that tripped it.
-2. **Check `docs/limitations.md`** — many shapes already have documented status (deferred, workaround, won't-fix). If your shape is listed, follow the documented path.
-3. **If the shape isn't documented OR the documented workaround is itself a phantom-state / manual-rewrite anti-pattern**, file an issue:
+1. **Surface the error verbatim.** The exact lint name (`unsupported_quantifier_shape`, `no_access_control`, `missing_cpi_for_token_context`, etc.) or the exact compiler / Kani / Lake error message, plus the spec fragment and (for codegen-output failures) the generated line that tripped it.
+2. **Check `docs/limitations.md`** — many shapes already have documented status (deferred, workaround, won't-fix). If your shape is listed and the documented workaround doesn't lie about the spec, follow it.
+3. **If the shape isn't documented OR the documented workaround is itself an anti-pattern**, file an issue:
    ```bash
    gh issue create \
      --title "qedgen: <one-line summary of the wall>" \
@@ -356,11 +370,15 @@ The fail-fast script:
 
    <one paragraph: the program shape, why the spec needs this construct>
 
-   ## What qedgen says
+   ## What qedgen / cargo / kani / lake says
 
    \`\`\`
-   <verbatim error / lint output>
+   <verbatim error output, including file:line for codegen-output failures>
    \`\`\`
+
+   ## Generated file (if a codegen-output failure)
+
+   <path inside programs/ or formal_verification/ that won't compile, plus the offending lines>
 
    ## Workarounds rejected
 
@@ -368,9 +386,9 @@ The fail-fast script:
    EOF
    )"
    ```
-4. **Then pause and tell the user.** Don't auto-apply a workaround "for now." Auto-workarounds in a spec are how `phantom_admin: Pubkey` ends up in production state forever (the friction-report's #6 was exactly this shape).
+4. **Then pause and tell the user.** Don't auto-apply a workaround "for now." Auto-workarounds — in the spec OR in the generated output — are how `phantom_admin: Pubkey` ends up in production state forever (the friction-report's #6 was exactly this shape) and how generated Anchor crates accumulate hand-edited drift that regen overwrites.
 
-The exception: if the user explicitly tells you to ship a workaround (with phrasing like "just inline it for now" / "phantom field is fine" / "we'll fix it later"), apply the workaround AND leave a `// FIXME(qedgen-issue: <url>):` comment pointing at the issue. The marker makes the regression auditable later.
+The exception: if the user explicitly tells you to ship a workaround (with phrasing like "just inline it for now" / "phantom field is fine" / "we'll fix it later" / "hand-edit the guard for this PR"), apply the workaround AND leave a `// FIXME(qedgen-issue: <url>):` comment pointing at the issue. The marker makes the regression auditable later. For hand-edits to generated files, ALSO note in the issue body that the edit will be overwritten on the next `qedgen codegen` — the user needs to know.
 
 ## References
 
