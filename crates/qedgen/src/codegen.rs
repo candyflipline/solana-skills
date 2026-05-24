@@ -3378,8 +3378,29 @@ fn render_handler_scaffold(
     // struct lives in lib.rs (already imports state); the handler
     // scaffold body only references guards + bumps, so the import would
     // be flagged unused until the agent fills the body.
-    if render_struct {
+    //
+    // v2.29 (#15) — Anchor needs `use crate::state::*;` too whenever
+    // any handler param's type names a user-defined record or sum
+    // type (so the scaffold body's `fn handler(&mut self, snap:
+    // Snapshot, …)` resolves). The pre-v2.29 path skipped the
+    // import on Anchor and emitted `pub fn handler(&mut self, snap:
+    // Snapshot, …)` with `Snapshot` unresolved.
+    let handler_param_uses_user_type = handler.takes_params.iter().any(|(_, ty)| {
+        let bare = ty.trim();
+        spec.records.iter().any(|r| r.name == bare)
+            || spec.sum_types.iter().any(|s| s.name == bare)
+            || spec.account_types.iter().any(|a| a.name == bare)
+    });
+    if render_struct || handler_param_uses_user_type {
         out.push_str("use crate::state::*;\n");
+    }
+    // v2.29 (#13) — handler body may reference `ref_impl` fns by name
+    // (the spec's `let scaled = scale(snap.total, factor)` lowers to
+    // a bare `scale(...)` call). Without this import the call doesn't
+    // resolve. Spec declares no ref_impls → no import → no unused-
+    // import warning.
+    if !spec.ref_impls.is_empty() {
+        out.push_str("use crate::ref_impls::*;\n");
     }
     out.push_str("use crate::guards;\n");
     out.push_str("use qedgen_macros::qed;\n");
