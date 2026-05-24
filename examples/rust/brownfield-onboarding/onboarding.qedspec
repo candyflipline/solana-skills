@@ -25,6 +25,9 @@ type Error
 // "monotonic counter under a pause gate" — the audit demo's target.
 handler bump (delta : U64) : State.Active -> State.Active {
   permissionless
+  accounts {
+    state : writable, pda ["state"]
+  }
   requires state.paused == 0 else Paused
   effect {
     counter += delta
@@ -34,6 +37,9 @@ handler bump (delta : U64) : State.Active -> State.Active {
 // `pause` flips the gate; counter stops advancing.
 handler pause : State.Active -> State.Active {
   permissionless
+  accounts {
+    state : writable, pda ["state"]
+  }
   effect {
     paused := 1
   }
@@ -42,6 +48,9 @@ handler pause : State.Active -> State.Active {
 // `unpause` reopens the gate.
 handler unpause : State.Active -> State.Active {
   permissionless
+  accounts {
+    state : writable, pda ["state"]
+  }
   effect {
     paused := 0
   }

@@ -817,10 +817,6 @@ impl ParsedHandlerAccount {
         let _ = state_name;
         let mut parts = Vec::new();
 
-        if self.is_writable {
-            parts.push("mut".to_string());
-        }
-
         // Infer init from lifecycle: handler creates the account.
         //
         // In multi-state specs (e.g. lending: Loan + Pool ADTs), only the
@@ -844,10 +840,49 @@ impl ParsedHandlerAccount {
         let is_init =
             lifecycle_is_init && on_account_matches && !self.is_signer && self.pda_seeds.is_some();
 
+        // v2.29 — `mut` is mutually exclusive with `init` in Anchor
+        // (init implies mut). Emit `mut` only when the account is
+        // writable AND we're NOT init'ing it. Pre-fix the writable
+        // PDAs in lifecycle-init handlers got both flags and
+        // Anchor's macro rejected with `mut cannot be provided with
+        // init`.
+        if self.is_writable && !is_init {
+            parts.push("mut".to_string());
+        }
+
         if is_init {
             parts.push("init".to_string());
             if let Some(signer) = handler.signer_account() {
                 parts.push(format!("payer = {}", signer.name));
+            }
+            // v2.29 — Anchor requires `space = <bytes>` whenever
+            // `init` is set so the runtime knows the allocation size.
+            // We derive `InitSpace` on every account type / inner
+            // enum / record, so the canonical form is `space = 8 +
+            // <AccountStruct>::INIT_SPACE` (8 bytes for the Anchor
+            // account discriminator). The account name is the
+            // PascalCase of the account_type or the inferred
+            // multi-state name; matching the wrapper struct codegen
+            // emits in `generate_state`.
+            let space_target = match (target, handler.on_account.as_deref()) {
+                // Multi-state spec: per-handler `on_account` names
+                // the ADT being driven. The wrapper struct is
+                // `<Name>Account`.
+                (_, Some(adt_name)) => format!("{}Account", adt_name),
+                // Single-state spec on Anchor: the wrapper is
+                // `<Program>Account` (matches `generate_state`'s
+                // non-multi branch).
+                (crate::Target::Anchor, None) => format!(
+                    "{}Account",
+                    crate::codegen::to_pascal_case(&spec.program_name)
+                ),
+                // Quasar handles space differently — its `init`
+                // analogue takes size from the typed `Account<T>`
+                // wrapper. Skip the `space` attribute on Quasar.
+                _ => String::new(),
+            };
+            if !space_target.is_empty() {
+                parts.push(format!("space = 8 + {}::INIT_SPACE", space_target));
             }
         }
 

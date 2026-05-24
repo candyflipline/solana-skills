@@ -1012,7 +1012,17 @@ fn generate_state(
             } else {
                 "#[account]\n".to_string()
             };
-            out.push_str(&format!("{}pub struct {} {{\n", account_attr, struct_name));
+            out.push_str(&account_attr);
+            // v2.29 — `#[derive(InitSpace)]` on every multi-account
+            // wrapper so handler `#[account(init, space = 8 +
+            // <Name>Account::INIT_SPACE, …)]` resolves. Anchor's
+            // `#[account]` macro doesn't auto-derive InitSpace; we
+            // emit it explicitly here, matching the single-account
+            // path that already does so a few branches down.
+            if matches!(target, Target::Anchor) {
+                out.push_str("#[derive(InitSpace)]\n");
+            }
+            out.push_str(&format!("pub struct {} {{\n", struct_name));
 
             for (fname, ftype) in &acct.fields {
                 out.push_str(&format!(
@@ -3287,7 +3297,16 @@ fn render_handler_accounts_struct(
     let lifetime_params = surface.lifetime_params();
     let mut out = String::new();
     out.push_str("#[derive(Accounts)]\n");
-    out.push_str(&format!("pub struct {}{} {{\n", pascal, lifetime_params));
+    // v2.29 — drop the `<'info>` lifetime parameter when the handler
+    // declares no accounts AND no implicit signer is added below.
+    // Anchor's `#[derive(Accounts)]` still validates a unit struct,
+    // but rustc rejects the empty `<'info>` since no field references
+    // it. Pre-fix the empty-accounts case (e.g. permissionless
+    // handlers without account binds) emitted `pub struct
+    // Initialize<'info> {}` and tripped E0392.
+    let needs_lifetime = !handler.accounts.is_empty() || handler.who.is_some();
+    let struct_lifetime: &str = if needs_lifetime { &lifetime_params } else { "" };
+    out.push_str(&format!("pub struct {}{} {{\n", pascal, struct_lifetime));
 
     if !handler.accounts.is_empty() {
         let state_acct = find_state_account(handler);
@@ -3339,7 +3358,16 @@ fn render_handler_scaffold(
     let pascal = to_pascal_case(&handler.name);
     let bumps_name = format!("{}Bumps", pascal);
     let any_mut = handler.accounts.iter().any(|a| a.is_writable);
-    let lifetime_params = surface.lifetime_params();
+    // v2.29 — drop `<'info>` from the impl + guard sigs when the
+    // Accounts struct itself dropped it (zero accounts AND no
+    // implicit signer). Keeps the impl / guard fn signatures
+    // consistent with `render_handler_accounts_struct`'s decision.
+    let handler_needs_lifetime = !handler.accounts.is_empty() || handler.who.is_some();
+    let lifetime_params: String = if handler_needs_lifetime {
+        surface.lifetime_params()
+    } else {
+        String::new()
+    };
     // Anchor puts the `#[derive(Accounts)]` struct at crate root (in
     // lib.rs) so the `#[program]` macro can find it; Quasar keeps
     // struct + impl together in `instructions/<name>.rs`. The flag
@@ -4062,7 +4090,16 @@ fn generate_guards(
         let pascal = to_pascal_case(&handler.name);
         let any_mut = handler.accounts.iter().any(|a| a.is_writable);
         let self_ref = if any_mut { "&mut " } else { "&" };
-        let mut params = vec![format!("ctx: {}{}{}", self_ref, pascal, lifetime_params)];
+        // v2.29 — match the handler-scaffold + Accounts-struct
+        // lifetime decision so the guard fn's ctx ref doesn't
+        // reference an unused `<'info>` on a unit Accounts struct.
+        let handler_needs_lifetime = !handler.accounts.is_empty() || handler.who.is_some();
+        let lp: &str = if handler_needs_lifetime {
+            &lifetime_params
+        } else {
+            ""
+        };
+        let mut params = vec![format!("ctx: {}{}{}", self_ref, pascal, lp)];
         for (pname, ptype) in &handler.takes_params {
             params.push(format!(
                 "{}: {}",
@@ -4077,7 +4114,7 @@ fn generate_guards(
         out.push_str(&format!(
             "pub fn {}{}({}) -> {} {{\n",
             handler.name,
-            lifetime_params,
+            lp,
             params.join(", "),
             surface.handler_result_type
         ));
