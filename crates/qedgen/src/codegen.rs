@@ -922,6 +922,12 @@ fn generate_lib(
 ///
 /// Single-record account types, single-variant ADTs, multi-account
 /// specs, and any spec lacking `WrongState` all stay on the flat path.
+/// Public re-export of `is_multi_variant_adt_state` for callers in
+/// other modules (check.rs's seeds-suppression logic).
+pub fn is_multi_variant_adt_state_pub(spec: &ParsedSpec) -> bool {
+    is_multi_variant_adt_state(spec)
+}
+
 fn is_multi_variant_adt_state(spec: &ParsedSpec) -> bool {
     let has_wrong_state = spec.error_codes.iter().any(|c| c == "WrongState");
     has_wrong_state
@@ -1550,9 +1556,12 @@ fn generate_errors(
         !pre.is_empty() && !is_init
     });
     // R28: same shape — when guards.rs emits a runtime PDA verification
-    // (driven by R13 suppression on Quasar non-init handlers), it raises
-    // `<Program>Error::InvalidPda` on mismatch. Auto-add similarly.
-    let needs_invalid_pda = matches!(target, Target::Quasar)
+    // (driven by R13 suppression on Quasar non-init handlers, or by
+    // v2.29's Anchor seed-suppression for multi-variant ADT field
+    // seeds), it raises `<Program>Error::InvalidPda` on mismatch.
+    // Auto-add the variant either way.
+    let needs_invalid_pda = (matches!(target, Target::Quasar)
+        || (matches!(target, Target::Anchor) && is_multi_variant_adt_state(spec)))
         && spec.handlers.iter().any(|h| {
             let bound: std::collections::HashSet<&str> =
                 h.accounts.iter().map(|a| a.name.as_str()).collect();
@@ -1580,7 +1589,22 @@ fn generate_errors(
                 }
                 seeds.iter().any(|seed| {
                     let is_literal = seed.starts_with('"') && seed.ends_with('"');
-                    !is_literal && !bound.contains(seed.as_str())
+                    if is_literal || bound.contains(seed.as_str()) {
+                        return false;
+                    }
+                    // For Anchor: only count variant-payload field seeds
+                    // (those are the ones that trigger our seed
+                    // suppression). State-field seeds at the wrapper's
+                    // top level work via the macro just fine.
+                    if matches!(target, Target::Anchor) {
+                        spec.account_types.iter().any(|a| {
+                            a.variants
+                                .iter()
+                                .any(|v| v.fields.iter().any(|(n, _)| n == seed))
+                        })
+                    } else {
+                        true
+                    }
                 })
             })
         });
@@ -4221,7 +4245,30 @@ fn generate_guards(
                 let is_literal = seed.starts_with('"') && seed.ends_with('"');
                 !is_literal && !bound_account_names.contains(seed.as_str())
             });
-            if !matches!(target, Target::Quasar) || !needs_state_field_seed {
+            // v2.29 — Anchor extension: when the seed references a
+            // variant-payload field on a multi-variant ADT, the
+            // `seeds = [...]` macro can't route through the
+            // accessor and we suppressed it in
+            // `quasar_account_attr`. Emit the runtime check here
+            // instead. Quasar still fires on any state-field seed
+            // (its R13 suppression is broader).
+            let anchor_variant_field_seed = matches!(target, Target::Anchor)
+                && needs_state_field_seed
+                && is_multi_variant_adt_state(spec)
+                && seeds.iter().any(|seed| {
+                    let is_literal = seed.starts_with('"') && seed.ends_with('"');
+                    if is_literal || bound_account_names.contains(seed.as_str()) {
+                        return false;
+                    }
+                    spec.account_types.iter().any(|a| {
+                        a.variants
+                            .iter()
+                            .any(|v| v.fields.iter().any(|(n, _)| n == seed))
+                    })
+                });
+            let fire_r28 = (matches!(target, Target::Quasar) && needs_state_field_seed)
+                || anchor_variant_field_seed;
+            if !fire_r28 {
                 continue;
             }
 
@@ -4231,22 +4278,54 @@ fn generate_guards(
                     seed_exprs.push(format!("b\"{}\"", inner));
                 } else if bound_account_names.contains(seed.as_str()) {
                     // Handler-bound account: read its address.
-                    seed_exprs.push(format!("ctx.{}.to_account_view().address().as_ref()", seed));
+                    match target {
+                        Target::Anchor => seed_exprs.push(format!("ctx.{}.key().as_ref()", seed)),
+                        _ => seed_exprs
+                            .push(format!("ctx.{}.to_account_view().address().as_ref()", seed)),
+                    }
                 } else {
                     // State-field seed: read off the same PDA's stored
-                    // value (the field that R13 couldn't pass through
-                    // the macro's seeds method).
-                    seed_exprs.push(format!("ctx.{}.{}.as_ref()", acct.name, seed));
+                    // value. For multi-variant ADTs on Anchor, route
+                    // through the v2.29 Slice B accessor; for Quasar
+                    // / flat-state, read the field directly.
+                    let is_variant_field = matches!(target, Target::Anchor)
+                        && spec.account_types.iter().any(|a| {
+                            a.variants
+                                .iter()
+                                .any(|v| v.fields.iter().any(|(n, _)| n == seed))
+                        });
+                    if is_variant_field {
+                        seed_exprs.push(format!("ctx.{}.inner.{}().as_ref()", acct.name, seed));
+                    } else {
+                        seed_exprs.push(format!("ctx.{}.{}.as_ref()", acct.name, seed));
+                    }
                 }
             }
-            seed_exprs.push(format!("&[ctx.{}.bump]", acct.name));
 
-            out.push_str(&format!(
-                "    // R28 PDA check: ctx.{acct} matches its declared seeds\n    {{\n        let __seeds: &[&[u8]] = &[{seeds}];\n        if quasar_lang::pda::verify_program_address(__seeds, &crate::ID, ctx.{acct}.to_account_view().address()).is_err() {{\n            return Err(ProgramError::from({err_enum}::InvalidPda));\n        }}\n    }}\n",
-                acct = acct.name,
-                seeds = seed_exprs.join(", "),
-                err_enum = err_enum_name_r28,
-            ));
+            match target {
+                Target::Anchor => {
+                    // Anchor PDA verification uses
+                    // `anchor_lang::solana_program::pubkey::Pubkey::
+                    // create_program_address` with the stored bump
+                    // to avoid the find_program_address syscall cost.
+                    seed_exprs.push(format!("&[ctx.{}.bump]", acct.name));
+                    out.push_str(&format!(
+                        "    // R28 PDA check: ctx.{acct} matches its declared seeds (Anchor)\n    {{\n        let __seeds: &[&[u8]] = &[{seeds}];\n        let __expected = anchor_lang::solana_program::pubkey::Pubkey::create_program_address(__seeds, &crate::ID).map_err(|_| {err_enum}::InvalidPda)?;\n        if ctx.{acct}.key() != __expected {{\n            return Err({err_enum}::InvalidPda.into());\n        }}\n    }}\n",
+                        acct = acct.name,
+                        seeds = seed_exprs.join(", "),
+                        err_enum = err_enum_name_r28,
+                    ));
+                }
+                _ => {
+                    seed_exprs.push(format!("&[ctx.{}.bump]", acct.name));
+                    out.push_str(&format!(
+                        "    // R28 PDA check: ctx.{acct} matches its declared seeds\n    {{\n        let __seeds: &[&[u8]] = &[{seeds}];\n        if quasar_lang::pda::verify_program_address(__seeds, &crate::ID, ctx.{acct}.to_account_view().address()).is_err() {{\n            return Err(ProgramError::from({err_enum}::InvalidPda));\n        }}\n    }}\n",
+                        acct = acct.name,
+                        seeds = seed_exprs.join(", "),
+                        err_enum = err_enum_name_r28,
+                    ));
+                }
+            }
         }
 
         // R27: token-vault authority binding. The spec declares

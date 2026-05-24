@@ -900,8 +900,35 @@ impl ParsedHandlerAccount {
                 !is_literal && !bound_account_names.contains(seed.as_str())
             });
 
+            // v2.29 — extend the suppress to Anchor too when the
+            // seed references a field that lives in a variant payload
+            // of a multi-variant ADT. Anchor's `#[account(seeds =
+            // […])]` macro requires syntactic field access; the
+            // accessor `inner.<field>()` we emit for multi-variant
+            // ADTs returns a `&Pubkey` via a method call which the
+            // macro can't parse. Drop the macro-side `seeds = [...]`
+            // for those accounts; the generic-guards.rs R28 pass
+            // (below) emits a runtime PDA check that uses the
+            // accessor directly.
+            let anchor_variant_field_seed = matches!(target, crate::Target::Anchor)
+                && !is_init
+                && needs_state_field_seed
+                && crate::codegen::is_multi_variant_adt_state_pub(spec)
+                && seeds.iter().any(|seed| {
+                    let is_literal = seed.starts_with('"') && seed.ends_with('"');
+                    if is_literal || bound_account_names.contains(seed.as_str()) {
+                        return false;
+                    }
+                    // Is this a variant-payload field?
+                    spec.account_types.iter().any(|a| {
+                        a.variants
+                            .iter()
+                            .any(|v| v.fields.iter().any(|(n, _)| n == seed))
+                    })
+                });
             let suppress_seeds =
-                matches!(target, crate::Target::Quasar) && !is_init && needs_state_field_seed;
+                (matches!(target, crate::Target::Quasar) && !is_init && needs_state_field_seed)
+                    || anchor_variant_field_seed;
 
             if !suppress_seeds {
                 let seed_parts: Vec<String> = seeds
