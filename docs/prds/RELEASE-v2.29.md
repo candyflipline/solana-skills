@@ -1,13 +1,13 @@
-# QEDGen v2.29 — Friction Close-Out + Unified Imports
+# QEDGen v2.29 — DSL Close-Out + Unified Imports
 
 **Date:** 2026-05-24
 **PRD:** `docs/prds/PRD-v2.29.md`
 
 ## Headline
 
-**The v2.26 friction report is closed.** v2.29 absorbs 10 of the 13
-unresolved items from the v2.26.0 friction sweep into the shipped
-DSL — negative literals, abstract binders, payload-pre →
+**The long-standing v2.26-era DSL gaps are closed.** v2.29 absorbs
+ten of the thirteen unresolved items from the v2.26.0 sweep into
+the shipped DSL — negative literals, abstract binders, payload-pre →
 payload-post variant promotion, lint refinement, the `#[qed(verified)]`
 drift UX, and **unified imports**: a single `import` keyword that now
 covers both interface-only CPI stubs (v2.8) AND full-spec data-shape
@@ -19,35 +19,34 @@ surface gaps stay deferred to v2.29.1+.
 
 ## What's in
 
-| # | Item (v2.26 friction-report wording) | Status |
-|---|---|---|
-| 1 | Payload-pre → payload-post variant promotion (per-field preamble) | shipped (Slice C) |
-| 2 | Negative integer literals in expressions | shipped (Slice A) |
-| 3 | Negative integer literals in `const` bodies | shipped (Slice A) |
-| 4 | Cross-program data-shape imports (resolver) | shipped (Slice F) |
-| 5 | Imported-account local mirror (codegen) | shipped (Slice H) |
-| 6 | Cross-namespace type refs (`acct : type Foreign.State`) | shipped (Slice G) |
-| 8 | `abstract <name> : <Type>` handler clause | shipped (Slice A — Lean defer to v2.29.1) |
-| 9 | `missing_cpi_for_token_context` lint suppression on init handlers | shipped (Slice D) |
-| 10 | `<account>.pubkey` accessor discoverability | shipped (Slice E) |
-| 16 | `#[qed(verified)]` post-codegen drift surfacing | shipped (Slice E) |
+| Item | Status |
+|---|---|
+| Payload-pre → payload-post variant promotion (per-field preamble) | shipped (Slice C) |
+| Negative integer literals in expressions | shipped (Slice A) |
+| Negative integer literals in `const` bodies | shipped (Slice A) |
+| Cross-program data-shape imports (resolver) | shipped (Slice F) |
+| Imported-account local mirror (codegen) | shipped (Slice H) |
+| Cross-namespace type refs (`acct : type Foreign.State`) | shipped (Slice G) |
+| `abstract <name> : <Type>` handler clause | shipped (Slice A — Lean defer to v2.29.1) |
+| `missing_cpi_for_token_context` lint suppression on init handlers | shipped (Slice D) |
+| `<account>.pubkey` accessor discoverability | shipped (Slice E) |
+| `#[qed(verified)]` post-codegen drift surfacing | shipped (Slice E) |
 
-Three friction-report items stay deferred:
+Three items stay deferred:
 
-| # | Item | Reason |
-|---|---|---|
-| 7 | Multi-variant ADT seeds (proptest) | one-variant cap holds in v2.29; full coverage queued behind the broader proptest record-derives pass |
-| 11 | Cross-program data-shape imports for Quasar / Pinocchio | Slice F/G/H emit Anchor-only lowering in v2.29 |
-| 12-15 | Misc Lean / Kani gaps named in the friction report | each rolls into a v2.29.1 or v2.30 line item |
+| Item | Reason |
+|---|---|
+| Multi-variant ADT seeds (proptest) | one-variant cap holds in v2.29; full coverage queued behind the broader proptest record-derives pass |
+| Cross-program data-shape imports for Quasar / Pinocchio | Slice F/G/H emit Anchor-only lowering in v2.29 |
+| Misc Lean / Kani surface gaps | each rolls into a v2.29.1 or v2.30 line item |
 
 ## Slice-by-slice changes
 
-### Slice A — DSL gap-close (#2, #3, #8)
+### Slice A — DSL gap-close
 
 - **Negative integer literals** desugar to `Sub(0, N)` at the
   expression atom layer so `state.x.exp == -4` and `pool_balance := {
-  exp := -6 }` parse without the inline `0 - 6` workaround the
-  friction report flagged.
+  exp := -6 }` parse without the inline `0 - 6` workaround.
 - **`const_decl`** widened to accept `(maybe '-') integer`;
   `TopItem::Const` + `InstructionItem::Const` now carry `i128`, the
   `const_literals` HashMap widened to `i128` so negative consts
@@ -65,7 +64,7 @@ Three friction-report items stay deferred:
   treats the binder as a let-bound undefined value until the
   existential-wrapping codegen lands.
 
-### Slice C — payload-pre → payload-post variant promotion (#1)
+### Slice C — payload-pre → payload-post variant promotion
 
 - Lift the bail in `emit_cross_variant_promotion`; emit a `let (f1,
   f2) = match &self.<acct>.inner { Inner::Pre { f1, f2, .. } =>
@@ -80,7 +79,7 @@ Three friction-report items stay deferred:
 - `check_effect_targets` accepts bare `state` LHS on multi-variant
   ADT specs as a safety net for shapes the desugaring doesn't catch.
 
-### Slice D — `missing_cpi_for_token_context` lint refinement (#9)
+### Slice D — `missing_cpi_for_token_context` lint refinement
 
 - Suppress on lifecycle-init handlers (Uninitialized / Empty → X)
   that carry a writable token-typed account — Anchor's
@@ -89,7 +88,7 @@ Three friction-report items stay deferred:
 - Regression tests cover both the suppression and the still-firing
   non-init case.
 
-### Slice E — `#[qed(verified)]` drift UX + `.pubkey` discoverability (#16, #10)
+### Slice E — `#[qed(verified)]` drift UX + `.pubkey` discoverability
 
 - New `drift::check_stamped_drift` walks the codegen output directory
   after generation, recomputes `spec_hash` / `accounts_hash` / body
@@ -122,7 +121,7 @@ Three friction-report items stay deferred:
   not before (the binder is in-scope only inside the body, not the
   signature).
 
-### Slices F + H — unified imports resolver + local mirror (#4, #5)
+### Slices F + H — unified imports resolver + local mirror
 
 - **Slice F (resolver).** `ParsedSpec` grows `imported_namespaces:
   BTreeMap<String, ImportedNamespace>` (keyed by the consumer-side
@@ -155,7 +154,7 @@ Three friction-report items stay deferred:
   account types are emitted in the same file so the mirror is
   self-contained.
 
-### Slice G — cross-namespace type refs end-to-end (#6)
+### Slice G — cross-namespace type refs end-to-end
 
 - **Parser.** `AccountAttr::Type` now accepts a dotted form via an
   optional second `.<ident>` after the head: `type Foreign.State`
@@ -214,8 +213,8 @@ Three friction-report items stay deferred:
   imported account's fields in v2.29. Spec.lean for a property that
   references `foreign_acct.admin` from Lean will fail to compile
   until v2.29.1 closes the wiring.
-- **Multi-variant ADT seeds in proptest** (#7). One-variant cap
-  holds in v2.29 — proptest's `arb_<Name>` strategy picks the first
+- **Multi-variant ADT seeds in proptest.** One-variant cap holds in
+  v2.29 — proptest's `arb_<Name>` strategy picks the first
   variant; the broader record-derives pass that lifts the cap is
   queued behind the Slice B accessor work.
 - **Pinocchio + Quasar imported-types backends.** Slice F/G/H emit
@@ -243,7 +242,7 @@ Three friction-report items stay deferred:
   Foreign.State`, and read fields directly (`requires
   foreign_acct.admin == signer.pubkey`). The local mirror at
   `src/imported/<ns>.rs` is regenerated on every codegen — do not
-  hand-edit. See the v2.29 friction-close walkthrough in
+  hand-edit. See the cross-program walkthrough in
   `references/qedspec-dsl.md#importing-another-programs-spec` for
   the step-by-step.
 - **`qed.lock` schema bump.** The `imported_account_type_names`

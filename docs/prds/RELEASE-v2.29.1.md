@@ -15,13 +15,13 @@ the v2.29-era cross-program shape.
 `crates/qedgen/src/chumsky_adapter.rs`). The `auth` clause now accepts a
 qualified path so the signing identity can live on an imported program's
 account without a phantom state field workaround. Closes the canonical
-shape from friction-report item #4 directly (v2.29.0 closed it via the
+cross-program-auth shape directly (v2.29.0 closed it via the
 `requires <acct>.<field> == <signer>.pubkey else Unauthorized` longhand
 form, which still works for multi-signer handlers).
 
 ```fsharp
 handler emergency_close : State.Active -> State.Active {
-  auth admin_config.admin           // ← reads from imported AdminConfig.State
+  auth admin_config.admin           // reads from imported AdminConfig.State
   accounts {
     admin         : signer
     admin_config  : type AdminConfig.State
@@ -40,9 +40,9 @@ shapes).
 
 **`examples/rust/cross-program-vault/`** — first bundled regression for
 v2.29's cross-program-state + CPI shape end-to-end. Vault imports an
-`AdminConfig` data-shape spec (cross-program state, friction items
-#4/#5/#6) AND issues SPL Token CPIs (`call Token.transfer(amount =
-state.total_deposits, …)`). The companion `examples/imports/cross-program-vault-admin/`
+`AdminConfig` data-shape spec (cross-program state read via the v2.29
+unified-import path) AND issues SPL Token CPIs (`call Token.transfer(amount
+= state.total_deposits, …)`). The companion `examples/imports/cross-program-vault-admin/`
 holds the foreign data-shape spec — located outside `examples/rust/`
 because the `--regen-drift` gate walks `examples/rust/*` as separate
 examples and the admin-side has no handlers to codegen.
