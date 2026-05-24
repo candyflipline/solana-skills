@@ -1,0 +1,2 @@
+[dependencies.admin_config]
+path = "../../imports/cross-program-vault-admin"

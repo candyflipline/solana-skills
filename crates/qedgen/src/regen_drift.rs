@@ -227,6 +227,14 @@ fn copy_interfaces(repo_root: &Path, temp_repo_root: &Path) -> Result<()> {
     copy_dir_if_exists(
         &repo_root.join("interfaces"),
         &temp_repo_root.join("interfaces"),
+    )?;
+    // v2.29 — also copy `examples/imports/` so bundled examples can
+    // reference per-example data-shape dep specs via relative path
+    // (`path = "../../imports/<name>"` in qed.toml) without the
+    // drift-check temp dir losing the dependency tree.
+    copy_dir_if_exists(
+        &repo_root.join("examples/imports"),
+        &temp_repo_root.join("examples/imports"),
     )
 }
 

@@ -1,0 +1,18 @@
+// Foreign admin-config program for the cross-program-vault demo
+// (the consumer lives at examples/rust/cross-program-vault/).
+// Located outside `examples/rust/` so the `--regen-drift` gate
+// (which walks `examples/rust/*` only) doesn't try to codegen this
+// no-handlers data-shape spec.
+
+spec AdminConfig
+
+program_id "11111111111111111111111111111111"
+
+type State
+  | Active of {
+      admin            : Pubkey,
+      pause_authority  : Pubkey,
+    }
+
+type Error
+  | NotActive

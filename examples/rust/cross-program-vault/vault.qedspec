@@ -1,0 +1,100 @@
+// v2.29 bundled regression example: a vault program that calls
+// another program (SPL Token via `call Token.transfer(...)`) AND
+// depends on cross-program state (`AdminConfig.State` for the
+// emergency-close auth gate).
+//
+// This spec exercises the friction-report items #4 / #5 / #6
+// (cross-program auth without phantom state fields) plus the
+// CPI integration with v2.29's accessor-routed state field reads
+// (`amount = state.total_deposits` correctly lowers to
+// `(*self.vault.inner.total_deposits())` in the SPL transfer arg).
+//
+// Generated artifacts:
+//   - `src/imported/AdminConfig.rs` mirror (Slice F + H)
+//   - `pub admin_config: Account<'info, crate::imported::AdminConfig::State>` in handler accounts (Slice G)
+//   - SPL Token CPI builder for both deposit + emergency_close
+//   - guards.rs cross-program auth check
+//
+// Pre-fix the SPL `token::transfer(...)` arg lowered to `s.<field>`
+// (unbound `s`); v2.29 routes it through the v2.29 Slice B accessor
+// on multi-variant ADT state.
+
+spec Vault
+
+program_id "11111111111111111111111111111111"
+
+import AdminConfig from "admin_config"
+import Token from "spl"
+
+type State
+  | Uninitialized
+  | Active of {
+      total_deposits : U64,
+    }
+
+type Error
+  | WrongState
+  | Unauthorized
+  | VaultPaused
+  | InvalidAmount
+  | MathOverflow
+
+handler initialize : State.Uninitialized -> State.Active {
+  accounts {
+    payer           : signer, writable
+    vault           : writable, pda ["vault", payer]
+    vault_ta        : writable, type token
+    token_program   : program, type token
+  }
+  effect {
+    state := .Active { total_deposits := 0 }
+  }
+}
+
+// User deposit — SPL Token CPI + own-state update.
+handler deposit (amount : U64) : State.Active -> State.Active {
+  accounts {
+    user             : signer
+    vault            : writable
+    vault_ta         : writable, type token
+    user_ta          : writable, type token
+    token_program    : program, type token
+    admin_config     : type AdminConfig.State
+  }
+  requires amount > 0 else InvalidAmount
+  modifies [total_deposits]
+  effect {
+    total_deposits += amount
+  }
+  call Token.transfer(
+    from      = user_ta,
+    to        = vault_ta,
+    authority = user,
+    amount    = amount,
+  )
+}
+
+// Admin-only emergency close: drains the vault. Auth gate reads
+// `admin_config.admin` (cross-program state, friction items #4/#5/#6)
+// and the CPI amount reads `state.total_deposits` (v2.29 CPI arg
+// lowering for multi-variant ADT).
+handler emergency_close : State.Active -> State.Active {
+  accounts {
+    admin         : signer
+    vault         : writable
+    vault_ta      : writable, type token
+    sink_ta       : writable, type token
+    token_program : program, type token
+    admin_config  : type AdminConfig.State
+  }
+  requires admin_config.admin == admin.pubkey else Unauthorized
+  call Token.transfer(
+    from      = vault_ta,
+    to        = sink_ta,
+    authority = admin,
+    amount    = state.total_deposits,
+  )
+  effect {
+    total_deposits := 0
+  }
+}
