@@ -131,6 +131,13 @@ pub struct Mir {
     /// (distinct from `uninterpreted_helpers`: those are axiomatic,
     /// these carry executable bodies).
     pub ref_impls: Vec<RefImpl>,
+    /// Top-level `property name { ... } preserved_by [op, ...]`
+    /// declarations. Each emits a Lean predicate `def` + a master
+    /// preservation theorem (and per-handler sub-lemmas). Per-slot
+    /// proptest forms (`PerSlotForm`) and quantifier-lint metadata
+    /// stay on `ParsedSpec` for now — those are proptest-codegen
+    /// concerns that don't need MIR lifting until that target ports.
+    pub properties: Vec<PropertyMir>,
 }
 
 // ----------------------------------------------------------------------
@@ -552,6 +559,22 @@ pub struct UninterpretedHelper {
     pub return_type: String,
 }
 
+/// Spec-level property declaration.
+///
+/// Body lives in `expression` as a pre-rendered Lean expression
+/// (parsing as `Prop`). `preserved_by` names the handlers that must
+/// preserve the property — codegen emits per-(property × handler)
+/// preservation sub-lemmas plus a master case-split theorem.
+#[derive(Debug, Clone)]
+pub struct PropertyMir {
+    pub name: Symbol,
+    /// Lean-rendered predicate body, `None` for description-only
+    /// properties (no theorem to emit).
+    pub expression: Option<Expr>,
+    /// Handler names this property is preserved by.
+    pub preserved_by: Vec<Symbol>,
+}
+
 /// `ref_impl <name> (params) : <return_type> = <expr>` declaration.
 /// Carries pre-rendered body strings per backend, same opaque-string
 /// discipline as `Expr`.
@@ -754,6 +777,21 @@ pub fn lower(parsed: &ParsedSpec) -> Mir {
                 return_type: r.return_type.clone(),
                 lean_body: r.lean_body.clone(),
                 rust_body: r.rust_body.clone(),
+            })
+            .collect(),
+        properties: parsed
+            .properties
+            .iter()
+            .map(|p| PropertyMir {
+                name: p.name.clone(),
+                expression: p.expression.as_ref().map(|lean| Expr {
+                    lean: lean.clone(),
+                    rust: p.rust_expression.clone().unwrap_or_default(),
+                    rust_pod: p.rust_expression_pod.clone().unwrap_or_default(),
+                    rust_binary: String::new(),
+                    source_span: None,
+                }),
+                preserved_by: p.preserved_by.clone(),
             })
             .collect(),
     }
@@ -1220,6 +1258,7 @@ mod tests {
             constants: vec![],
             uninterpreted_helpers: vec![],
             ref_impls: vec![],
+            properties: vec![],
         };
         assert_eq!(mir.name, "Test");
         assert!(mir.handlers.is_empty());

@@ -160,14 +160,15 @@ fn render_single_account(mir: &Mir) -> String {
     emit_transitions(&mut out, mir);
     emit_operation_inductive(&mut out, mir);
     emit_invariants(&mut out, mir);
+    emit_properties(&mut out, mir);
     emit_aborts_if(&mut out, mir);
     emit_ensures(&mut out, mir);
     emit_frame_conditions(&mut out, mir);
 
-    // TODO Phase 1c (subsequent slices): CPI theorems, properties,
-    // cover, liveness, environments, overflow.
+    // TODO Phase 1c (subsequent slices): CPI theorems, cover,
+    // liveness, environments, overflow.
     out.push_str("-- TODO(mir-phase-1c-later): CPI theorems\n\n");
-    out.push_str("-- TODO(mir-phase-1c-later): properties / cover / liveness / overflow\n\n");
+    out.push_str("-- TODO(mir-phase-1c-later): cover / liveness / environments / overflow\n\n");
 
     emit_namespace_close(&mut out, mir);
     out
@@ -455,6 +456,117 @@ fn emit_handler_transition(out: &mut String, _mir: &Mir, h: &crate::mir::Handler
         out.push_str("  else\n");
         out.push_str("    none\n\n");
     }
+}
+
+/// Emit property declarations + preservation theorems. Mirrors
+/// `lean_gen::render_properties_inner` for the structural shape:
+///
+/// ```text
+/// def <name> (s : State) : Prop := <body>
+///
+/// theorem <name>_preserved_by_<handler> (s s' : State) (signer : Pubkey) <params>
+///     (h_inv : <name> s) (h : <handler>Transition s signer <args> = some s') :
+///     <name> s' := sorry
+///
+/// /-- <name> is preserved by every operation. Auto-proven by case split. -/
+/// theorem <name>_invariant (s s' : State) (signer : Pubkey) (op : Operation)
+///     (h_inv : <name> s) (h : applyOp s signer op = some s') :
+///     <name> s' := sorry
+/// ```
+///
+/// Phase 1c-5: emits the theorem statements with `sorry` bodies for
+/// every preservation sub-lemma. lean_gen.rs's `preservation_proof_script`
+/// generates discharged proofs via `if_neg` / `dsimp + omega`
+/// projection; that's a follow-up. Properties with no
+/// `expression` body emit a structured comment only.
+fn emit_properties(out: &mut String, mir: &Mir) {
+    if mir.properties.is_empty() {
+        return;
+    }
+
+    for prop in &mir.properties {
+        // Predicate def (when body is present).
+        if let Some(expr) = &prop.expression {
+            // lean_gen.rs:2716-2737 strips a leading `∀ s : State,`
+            // binder since the surrounding def already introduces
+            // `(s : State)`. Mirror that — but only when the binder
+            // ident is exactly `s`.
+            let body = strip_state_forall(&expr.lean);
+            out.push_str(&format!(
+                "def {} (s : State) : Prop := {}\n\n",
+                safe_name(&prop.name),
+                body
+            ));
+        } else {
+            out.push_str(&format!(
+                "-- PROPERTY OBLIGATION (declared, no predicate body): {}\n\n",
+                prop.name
+            ));
+            continue;
+        }
+
+        // Per-handler preservation sub-lemmas.
+        let covered: Vec<&crate::mir::HandlerMir> = mir
+            .handlers
+            .iter()
+            .filter(|h| prop.preserved_by.contains(&h.name))
+            .collect();
+        for h in &covered {
+            let trans_name = safe_name(&format!("{}Transition", h.name));
+            let param_sig = param_sig_str(&h.params);
+            let param_args = param_args_str(&h.params);
+            let sub_lemma = safe_name(&format!("{}_preserved_by_{}", prop.name, h.name));
+            out.push_str(&format!(
+                "theorem {} (s s' : State) (signer : Pubkey){}\n",
+                sub_lemma, param_sig
+            ));
+            out.push_str(&format!(
+                "    (h_inv : {} s) (h : {} s signer{} = some s') :\n",
+                safe_name(&prop.name),
+                trans_name,
+                param_args
+            ));
+            out.push_str(&format!("    {} s' := sorry\n\n", safe_name(&prop.name)));
+        }
+
+        // Master theorem: preserved by every Operation case.
+        if !covered.is_empty() {
+            out.push_str(&format!(
+                "/-- {} is preserved by every operation. -/\n",
+                prop.name
+            ));
+            out.push_str(&format!(
+                "theorem {}_invariant (s s' : State) (signer : Pubkey) (op : Operation)\n",
+                safe_name(&prop.name)
+            ));
+            out.push_str(&format!(
+                "    (h_inv : {} s) (h : applyOp s signer op = some s') :\n",
+                safe_name(&prop.name)
+            ));
+            out.push_str(&format!("    {} s' := sorry\n\n", safe_name(&prop.name)));
+        }
+    }
+}
+
+/// If `expr` starts with `∀ s : T,` or `forall s : T,`, strip the
+/// quantifier prefix and return the body — the surrounding `def
+/// <prop> (s : State)` already binds `s`. Other quantified bodies
+/// (value binders) pass through unchanged. Mirrors lean_gen.rs:2716.
+fn strip_state_forall(expr: &str) -> String {
+    let trimmed = expr.trim();
+    let rest = trimmed
+        .strip_prefix('\u{2200}')
+        .or_else(|| trimmed.strip_prefix("forall"));
+    if let Some(rest) = rest {
+        let rest_trim = rest.trim_start();
+        // Only strip if the quantified binder is literally `s`.
+        if rest_trim.starts_with("s ") || rest_trim.starts_with("s:") {
+            if let Some(comma_pos) = rest.find(',') {
+                return rest[comma_pos + 1..].trim().to_string();
+            }
+        }
+    }
+    trimmed.to_string()
 }
 
 /// Emit invariant theorems. Mirrors `lean_gen::render_invariants_theorem_form`.
@@ -1229,6 +1341,7 @@ mod tests {
                 return_type: "Bool".to_string(),
             }],
             ref_impls: vec![],
+            properties: vec![],
         };
         let out = render(&mir);
         assert!(
@@ -1263,6 +1376,7 @@ mod tests {
                 lean_body: "a * b".to_string(),
                 rust_body: "a * b".to_string(),
             }],
+            properties: vec![],
         };
         let out = render(&mir);
         assert!(
@@ -1270,6 +1384,30 @@ mod tests {
             "expected ref_impl scale lowered:\n{}",
             out
         );
+    }
+
+    #[test]
+    fn render_emits_properties_with_preservation() {
+        // Lending declares `property pool_solvency : ...` and
+        // names handlers it's preserved by. Confirm the predicate
+        // def, per-handler preservation sub-lemmas, and master
+        // theorem all emit.
+        let mir = lower_fixture("examples/rust/lending/lending.qedspec");
+        let out = render(&mir);
+
+        // Must have a Lean def for the property.
+        assert!(
+            out.contains("def pool_solvency (s : State) : Prop :="),
+            "expected pool_solvency predicate def:\n{}",
+            &out[..out.len().min(3000)]
+        );
+
+        // Master preservation theorem with applyOp.
+        assert!(
+            out.contains("theorem pool_solvency_invariant"),
+            "expected pool_solvency_invariant master theorem"
+        );
+        assert!(out.contains("(op : Operation)"));
     }
 
     #[test]
