@@ -14,6 +14,7 @@ mod chumsky_adapter;
 mod chumsky_parser;
 mod cluster;
 mod codegen;
+mod codegen_mir;
 mod consolidate;
 mod cpi_substitute;
 mod crucible_brownfield;
@@ -3128,7 +3129,22 @@ async fn dispatch(cmd: Commands) -> Result<()> {
             // (handled above + here so `--all` on Pinocchio still
             // works for the backend artifacts).
             if !pinocchio_no_scaffold {
-                codegen::generate(&spec, &output_dir, target)?;
+                // v2.30 Phase 4a — `QEDGEN_USE_MIR_CODEGEN=1` routes
+                // the Anchor/Quasar program emit through the
+                // MIR-consuming path. Default stays on legacy
+                // `codegen::generate` until the full sub-generator
+                // walk lands + snapshot equivalence ratifies every
+                // pilot fixture (mirrors Lean Phase 1 / Kani Phase 3
+                // sequencing). Phase 4a's MIR side is pure delegation
+                // — calls each legacy `generate_<X>` in order; future
+                // slices port them one at a time.
+                if std::env::var("QEDGEN_USE_MIR_CODEGEN").is_ok() {
+                    let parsed = check::parse_spec_file(&spec)?;
+                    let mir = mir::lower(&parsed);
+                    codegen_mir::generate(&mir, &parsed, &spec, &output_dir, target)?;
+                } else {
+                    codegen::generate(&spec, &output_dir, target)?;
+                }
             }
 
             if kani || all {

@@ -696,7 +696,7 @@ fn marker(label: &str, fp: &SpecFingerprint, file_key: &str) -> String {
 /// stamped custom imports or extra modules onto the crate shell, regenerating
 /// it would silently clobber that edit. Paired with the per-handler
 /// `instructions/<name>.rs` skip, this keeps `qedgen codegen` idempotent.
-fn generate_lib(
+pub(crate) fn generate_lib(
     spec: &ParsedSpec,
     fp: &SpecFingerprint,
     output_dir: &Path,
@@ -950,7 +950,7 @@ fn is_multi_variant_adt_state(spec: &ParsedSpec) -> bool {
 }
 
 /// Generate src/state.rs
-fn generate_state(
+pub(crate) fn generate_state(
     spec: &ParsedSpec,
     fp: &SpecFingerprint,
     output_dir: &Path,
@@ -1278,7 +1278,7 @@ fn generate_state(
 /// emitted in the same file so the mirror is self-contained — no
 /// cross-file `use crate::imported::<other>::*;` chasing.
 #[allow(dead_code)]
-fn generate_imported_mirror(
+pub(crate) fn generate_imported_mirror(
     spec: &ParsedSpec,
     fp: &SpecFingerprint,
     output_dir: &Path,
@@ -1510,7 +1510,7 @@ fn generate_imported_mirror(
 }
 
 /// Generate src/events.rs (only if events are declared)
-fn generate_events(
+pub(crate) fn generate_events(
     spec: &ParsedSpec,
     fp: &SpecFingerprint,
     output_dir: &Path,
@@ -1554,7 +1554,7 @@ fn generate_events(
 }
 
 /// Generate src/errors.rs (only if error codes are declared)
-fn generate_errors(
+pub(crate) fn generate_errors(
     spec: &ParsedSpec,
     fp: &SpecFingerprint,
     output_dir: &Path,
@@ -1667,7 +1667,7 @@ fn generate_errors(
 /// agent to fill in business logic. The `#[qed(verified, spec, handler,
 /// hash, spec_hash)]` attribute ties the body and the spec contract
 /// together at compile time.
-fn generate_instructions(
+pub(crate) fn generate_instructions(
     spec: &ParsedSpec,
     fp: &SpecFingerprint,
     spec_path: &Path,
@@ -4187,7 +4187,7 @@ pub(crate) fn guards_use_math_helpers(spec: &ParsedSpec) -> bool {
 /// because any non-trivial DeFi spec eventually wants them and the cost is
 /// a few inlined functions; suppressing them would just create a
 /// "generated-vs-not" coupling between the parser and codegen.
-fn generate_math(fp: &SpecFingerprint, output_dir: &Path) -> Result<()> {
+pub(crate) fn generate_math(fp: &SpecFingerprint, output_dir: &Path) -> Result<()> {
     let src_dir = output_dir.join("src");
     std::fs::create_dir_all(&src_dir)?;
     let mut out = String::new();
@@ -4236,7 +4236,7 @@ pub fn mul_div_ceil_u128(a: u128, b: u128, d: u128) -> u128 {\n\
 /// File is always regenerated; gated on `spec.ref_impls.is_empty()` at
 /// the caller — when no ref_impls exist, no file is written and lib.rs
 /// doesn't declare the module.
-fn generate_ref_impls(
+pub(crate) fn generate_ref_impls(
     spec: &ParsedSpec,
     fp: &SpecFingerprint,
     output_dir: &Path,
@@ -4286,7 +4286,7 @@ fn generate_ref_impls(
 /// Generate src/guards.rs — one function per handler containing all the
 /// spec-declared guard checks. This file is always regenerated; any edit
 /// is clobbered on the next `qedgen codegen` (by design).
-fn generate_guards(
+pub(crate) fn generate_guards(
     spec: &ParsedSpec,
     fp: &SpecFingerprint,
     output_dir: &Path,
@@ -4965,7 +4965,7 @@ const QEDGEN_OWNED_DEPS: &[&str] = &[
 /// rewritten on every run. Inside `[dependencies]`, qedgen upserts its
 /// owned crates (`QEDGEN_OWNED_DEPS`) and leaves any other dep lines
 /// untouched. Greenfield runs (no existing file) emit a fresh skeleton.
-fn generate_cargo_toml(
+pub(crate) fn generate_cargo_toml(
     spec: &ParsedSpec,
     fp: &SpecFingerprint,
     output_dir: &Path,

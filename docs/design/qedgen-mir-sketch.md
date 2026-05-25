@@ -1,8 +1,8 @@
 # qedgen MIR — design sketch
 
-**Status:** Phase 1 + Phase 2 complete (Lean: MIR default, `QEDGEN_LEGACY_LEAN=1` escape hatch). **Phase 3 complete (Kani: MIR default, `QEDGEN_LEGACY_KANI=1` escape hatch).** Both codegens follow the same lifecycle: scaffold → section walk → byte-equivalent on every pilot fixture → snapshot tests + dispatch flip. Kani per-pilot byte-identical: escrow 268 / escrow-split 179 / bundled-stdlib-demo 155 / multisig 1324 / percolator 2365 / lending 511 lines. Pilot-scope guard sends sBPF (`pragma sbpf`) to legacy unconditionally (`is_sbpf` is a Phase-0 MIR stub); records are MIR-supported via shared `rust_codegen_util::emit_record_structs`, so percolator-class fixtures stay on MIR. Remaining MIR carry-through: Anchor (`codegen.rs`, 7572 LoC) and proptest (2110 LoC) — same scaffold-then-section-walk pattern.
+**Status:** Phase 1 + 2 complete (Lean MIR-default). Phase 3 complete (Kani MIR-default, `QEDGEN_LEGACY_KANI=1` escape hatch). **Phase 4a in progress (Anchor/Quasar codegen)**: `codegen_mir.rs` scaffold shipped with pure-delegation `generate` body — `QEDGEN_USE_MIR_CODEGEN=1` opt-in routes through MIR, which calls each promoted-pub(crate) `codegen::generate_<X>` sub-generator in legacy's order. Byte-identical to default across the entire `programs/` tree on every pilot (90 files total). Phase 4b+ migrates sub-generators one at a time, smallest-first. Remaining: proptest (2,110 LoC).
 
-**Last revised:** 2026-05-25 (Phase 3f Kani snapshot tests + dispatch flip — Kani port complete).
+**Last revised:** 2026-05-25 (Phase 4a Anchor codegen scaffold).
 
 **Companion docs** (read these first if you want measured evidence behind the claims here):
 
@@ -410,8 +410,18 @@ unconditionally — MIR's `is_sbpf` is still a Phase-0 stub; records
 `rust_codegen_util::emit_record_structs`, so no records carve-out
 needed (unlike the Lean side).
 
-**Anchor / proptest.** Untouched — still consume `ParsedSpec`
-directly. Same Phase-3-style port shape applies when picked up.
+**Anchor.** Phase 4a shipped: `codegen_mir.rs` scaffold with
+pure-delegation `generate` that calls each promoted-pub(crate)
+`codegen::generate_<X>` sub-generator. Byte-identical across the
+entire `programs/` tree on every pilot. Future slices migrate the
+sub-generators one at a time, smallest-first (4b: cargo_toml +
+math + events; 4c: errors + ref_impls; 4d: imported_mirror;
+4e: lib; 4f: state; 4g: guards — largest; 4h: instructions;
+4i: snapshot tests + dispatch flip).
+
+**Proptest.** Untouched — `proptest_gen.rs` (2,110 LoC) still
+consumes `ParsedSpec` directly. Same Phase-3-style port shape
+applies when picked up.
 
 ## Next-session handoff
 
