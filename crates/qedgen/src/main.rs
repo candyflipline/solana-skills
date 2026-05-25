@@ -51,6 +51,7 @@ mod project;
 mod prompts;
 mod proofs_bootstrap;
 mod proptest_gen;
+mod proptest_gen_mir;
 mod qed_lock;
 mod qed_manifest;
 mod quantifier;
@@ -3217,7 +3218,23 @@ async fn dispatch(cmd: Commands) -> Result<()> {
                 unit_test::generate(&spec, &test_output)?;
             }
             if proptest || all {
-                proptest_gen::generate(&spec, &proptest_output)?;
+                // v2.30 Phase 5 — MIR is the default proptest
+                // codegen path. The scaffold delegates the full emit
+                // to legacy `proptest_gen::generate` (the per-handler
+                // arb_state / preservation / invariant / guard /
+                // overflow / sequence harnesses are tightly coupled
+                // to `ParsedHandler` fields with no clean structural
+                // seam; meaningful sub-emitter ports are deferred to
+                // v3.0, same as Anchor Phase 4g `generate_guards`).
+                // `QEDGEN_LEGACY_PROPTEST=1` opts back into the
+                // legacy path as an escape hatch.
+                if std::env::var("QEDGEN_LEGACY_PROPTEST").is_ok() {
+                    proptest_gen::generate(&spec, &proptest_output)?;
+                } else {
+                    let parsed = check::parse_spec_file(&spec)?;
+                    let mir = mir::lower(&parsed);
+                    proptest_gen_mir::generate(&mir, &parsed, &spec, &proptest_output)?;
+                }
             }
             if crucible || all {
                 let parsed = check::parse_spec_file(&spec)?;

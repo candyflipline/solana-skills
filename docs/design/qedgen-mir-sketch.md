@@ -1,8 +1,8 @@
 # qedgen MIR — design sketch
 
-**Status:** Phase 1 + 2 complete (Lean MIR-default). Phase 3 complete (Kani MIR-default). **Phase 4 complete (Anchor/Quasar codegen MIR-default)**: 9 of 10 sub-generators MIR-direct (cargo_toml / math / events / errors / ref_impls / imported_mirror / lib / state / instructions); `guards` (636L) stays delegated to legacy pending a typed-Stmt MIR refactor (v3.0). `QEDGEN_LEGACY_CODEGEN=1` escape hatch. Snapshot tests in `tests/codegen_snapshot.rs` gate every pilot via concatenated `programs/` tree dumps (6 pilots — cross-program-vault skipped due to sibling-import resolution). All 7 fixtures (incl. cross-program-vault) byte-identical default-vs-forced-legacy. Remaining: proptest (2,110 LoC).
+**Status:** Phase 1 + 2 (Lean), Phase 3 (Kani), Phase 4 (Anchor/Quasar), Phase 5 (proptest) all complete. **All four primary codegens are MIR-default and snapshot-gated.** Escape hatches: `QEDGEN_LEGACY_LEAN=1`, `QEDGEN_LEGACY_KANI=1`, `QEDGEN_LEGACY_CODEGEN=1`, `QEDGEN_LEGACY_PROPTEST=1`. Snapshot suites: `mir_snapshot` (Lean, 6 pilots), `kani_snapshot` (6), `codegen_snapshot` (6, multi-file dump), `proptest_snapshot` (6). Two known carve-outs: `generate_guards` (636L, Anchor) and the full proptest emit body stay delegated to legacy pending the typed-Stmt MIR refactor (v3.0); the dispatch surfaces are MIR-default so future cleanups land without touching callers.
 
-**Last revised:** 2026-05-25 (Phase 4i Anchor codegen dispatch flip — Phase 4 complete).
+**Last revised:** 2026-05-25 (Phase 5 proptest scaffold + snapshot + dispatch flip — MIR carry-through complete across all four primary codegens).
 
 **Companion docs** (read these first if you want measured evidence behind the claims here):
 
@@ -424,9 +424,17 @@ v3.0-class refactor). Snapshot tests in `tests/codegen_snapshot.rs`
 gate every pilot via concatenated `programs/` tree dumps with
 `--- <relpath> ---` headers between files.
 
-**Proptest.** Untouched — `proptest_gen.rs` (2,110 LoC) still
-consumes `ParsedSpec` directly. Same Phase-3-style port shape
-applies when picked up.
+**Proptest.** Phase 5 shipped. MIR is the default proptest codegen
+path (`QEDGEN_LEGACY_PROPTEST=1` escape hatch). Same pure-
+delegation scaffold pattern as Anchor's `generate_guards` deferral:
+`proptest_gen_mir.rs::generate(&Mir, &ParsedSpec, &Path, &Path)`
+delegates the full emit to legacy `proptest_gen::generate`
+(per-handler `arb_state` / preservation / invariant / guard /
+overflow / sequence harnesses are tightly coupled to ParsedHandler
+fields — per-slot binders, abstract binders, effect lowering,
+`old(...)` resolution — without a clean structural seam). Snapshot
+tests in `tests/proptest_snapshot.rs` gate every pilot;
+sub-emitter ports are a v3.0 cleanup.
 
 ## Next-session handoff
 
