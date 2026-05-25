@@ -30,14 +30,18 @@
 //! `generate(&Mir, &ParsedSpec, &Path, Target)` calls each promoted-
 //! pub(crate) `codegen::generate_<X>` sub-generator in legacy's order.
 //!
-//! Phase 4b (this commit): `generate_cargo_toml` ported to consume
-//! `Mir` directly. Replaces the delegated call with `emit_cargo_toml`,
-//! which derives `program_name` from `Mir.name`, computes `needs_spl`
-//! from MIR account kinds (`AccountKind::Token` / `Mint`) +
-//! `Stmt::TokenTransfer` + `Stmt::Cpi { target: "Token", ... }`, and
-//! delegates the on-disk merge to `codegen::merge_cargo_toml` (now
-//! pub(crate)). First sub-generator port; remaining 9 follow in
-//! subsequent slices.
+//! Phase 4b in progress: smallest + most deterministic sub-
+//! generators ported one at a time.
+//!   * 4b/1 — `emit_cargo_toml` (Mir.name + needs_spl predicate
+//!     from MIR account kinds / Stmt::TokenTransfer / Stmt::Cpi).
+//!   * 4b/2 — `emit_math` (no spec dependency; pure text emit
+//!     against the fingerprint hash).
+//!   * 4b/3 — `emit_events` (mir.events for structure; falls back
+//!     to parsed.events for field-type strings until a shared
+//!     `Ty → DSL string` helper lands).
+//!
+//! Remaining sub-generators delegate to their legacy
+//! `crate::codegen::generate_<X>` for now.
 //!
 //! Why pure-delegation first instead of porting any sub-generator
 //! immediately: codegen.rs's blast radius (`programs/lib.rs` and
@@ -113,12 +117,17 @@ pub fn generate(
     // port in a later Phase 4 slice.
     crate::codegen::generate_lib(parsed, &fp, output_dir, target)?;
     crate::codegen::generate_state(parsed, &fp, output_dir, target)?;
-    crate::codegen::generate_events(parsed, &fp, output_dir, target)?;
+    // Phase 4b/3 — MIR-direct port.
+    emit_events(mir, parsed, &fp, output_dir, target)?;
     crate::codegen::generate_errors(parsed, &fp, output_dir, target)?;
     crate::codegen::generate_instructions(parsed, &fp, spec_path, output_dir, target)?;
     crate::codegen::generate_guards(parsed, &fp, output_dir, target)?;
+    // Phase 4b/2 — MIR-direct port. `generate_math` body is
+    // fully deterministic (no spec read at all), so the gate is
+    // still the parsed-side `guards_use_math_helpers` predicate
+    // until that predicate gets its own MIR port.
     if crate::codegen::guards_use_math_helpers(parsed) {
-        crate::codegen::generate_math(&fp, output_dir)?;
+        emit_math(&fp, output_dir)?;
     }
     crate::codegen::generate_ref_impls(parsed, &fp, output_dir, target)?;
     crate::codegen::generate_imported_mirror(parsed, &fp, output_dir, target)?;
@@ -232,6 +241,126 @@ fn render_cargo_toml(
     out.push_str("\n[workspace]\n");
 
     out
+}
+
+/// Emit `src/events.rs` — one `#[event] pub struct <EventName> {
+/// ... }` per declared event. MIR-direct port of
+/// `codegen::generate_events`.
+///
+/// Iteration source is `mir.events` (typed event structure); the
+/// field-type strings come from a parallel lookup against
+/// `parsed.events` because `map_type_for_target` consumes the raw
+/// DSL string (not the MIR `Ty` enum). Once `Ty → DSL-string`
+/// conversion lands as a shared helper, this can read fields
+/// entirely from MIR.
+fn emit_events(
+    mir: &Mir,
+    parsed: &ParsedSpec,
+    fp: &crate::fingerprint::SpecFingerprint,
+    output_dir: &Path,
+    target: Target,
+) -> Result<()> {
+    if mir.events.is_empty() {
+        return Ok(());
+    }
+    let src_dir = output_dir.join("src");
+    std::fs::create_dir_all(&src_dir)?;
+
+    // Per-target framework surface. Hardcoded here for events only
+    // (the full `FrameworkSurface` struct stays module-private in
+    // `codegen.rs`; Phase 4b ports use the minimal slice they need).
+    let (prelude_import, explicit_discriminator): (&str, bool) = match target {
+        Target::Anchor => ("use anchor_lang::prelude::*;\n", false),
+        Target::Quasar => ("use quasar_lang::prelude::*;\n", true),
+        Target::Pinocchio => unreachable!("Pinocchio is rejected at the init dispatcher"),
+    };
+
+    let mut out = String::new();
+    out.push_str(&crate::codegen::marker("DO NOT EDIT", fp, "src/events.rs"));
+    out.push_str(prelude_import);
+    out.push('\n');
+
+    for (i, event) in mir.events.iter().enumerate() {
+        // Look up the corresponding ParsedEvent for the raw DSL
+        // field-type strings (`map_type_for_target` consumes
+        // String, not MIR `Ty`).
+        let parsed_event = parsed
+            .events
+            .iter()
+            .find(|e| e.name == event.name)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "MIR event '{}' has no matching ParsedEvent (parser/lowering mismatch)",
+                    event.name
+                )
+            })?;
+
+        if explicit_discriminator {
+            out.push_str(&format!("#[event(discriminator = {})]\n", i + 1));
+        } else {
+            out.push_str("#[event]\n");
+        }
+        out.push_str(&format!("pub struct {} {{\n", event.name));
+        for (fname, ftype) in &parsed_event.fields {
+            out.push_str(&format!(
+                "    pub {}: {},\n",
+                fname,
+                crate::codegen::map_type_for_target(ftype, parsed, target)?
+            ));
+        }
+        out.push_str("}\n\n");
+    }
+
+    out.push_str("// ---- END GENERATED ----\n");
+
+    std::fs::write(src_dir.join("events.rs"), &out)?;
+    Ok(())
+}
+
+/// Emit `src/math.rs` — fixed-point math helpers used by spec-
+/// derived guards / properties. MIR-direct port of
+/// `codegen::generate_math`; body is fully deterministic (no spec
+/// dependency), so the port reproduces the legacy text verbatim.
+/// The only data input is the `tests/math.rs` fingerprint hash via
+/// the marker banner.
+fn emit_math(fp: &crate::fingerprint::SpecFingerprint, output_dir: &Path) -> Result<()> {
+    let src_dir = output_dir.join("src");
+    std::fs::create_dir_all(&src_dir)?;
+    let mut out = String::new();
+    out.push_str(&crate::codegen::marker("DO NOT EDIT", fp, "src/math.rs"));
+    out.push_str("//! Fixed-point math helpers used by spec-derived guards and properties.\n\n");
+    out.push_str("#![allow(dead_code)]\n\n");
+    out.push_str(
+        "/// Floor of `(a * b) / d`. Returns `0` if `d == 0` (caller must guard).\n\
+/// Uses saturating multiplication as a safe approximation; specs that need\n\
+/// exact u256-width fixed-point math should pin a checked widening crate\n\
+/// once the spec language exposes one.\n\
+#[inline]\n\
+pub fn mul_div_floor_u128(a: u128, b: u128, d: u128) -> u128 {\n\
+    if d == 0 {\n\
+        return 0;\n\
+    }\n\
+    a.saturating_mul(b) / d\n\
+}\n\n",
+    );
+    out.push_str(
+        "/// Ceiling of `(a * b) / d`. Same caveats as `mul_div_floor_u128`.\n\
+#[inline]\n\
+pub fn mul_div_ceil_u128(a: u128, b: u128, d: u128) -> u128 {\n\
+    if d == 0 {\n\
+        return 0;\n\
+    }\n\
+    let prod = a.saturating_mul(b);\n\
+    if prod % d == 0 {\n\
+        prod / d\n\
+    } else {\n\
+        (prod / d).saturating_add(1)\n\
+    }\n\
+}\n",
+    );
+    out.push_str("// ---- END GENERATED ----\n");
+    std::fs::write(src_dir.join("math.rs"), &out)?;
+    Ok(())
 }
 
 /// MIR predicate for `needs_spl` — true when the program crate's
