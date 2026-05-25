@@ -162,28 +162,48 @@ def pool_solvency (s : State) : Prop := s.total_deposits ≥ s.total_borrows
 
 theorem pool_solvency_preserved_by_init_pool (s s' : State) (signer : Pubkey) (rate : Nat)
     (h_inv : pool_solvency s) (h : init_poolTransition s signer rate = some s') :
-    pool_solvency s' := sorry
+    pool_solvency s' := by
+  unfold init_poolTransition at h; split at h
+  · next hg => cases h; unfold pool_solvency at h_inv ⊢; dsimp; omega
+  · contradiction
 
 theorem pool_solvency_preserved_by_deposit (s s' : State) (signer : Pubkey) (amount : Nat)
     (h_inv : pool_solvency s) (h : depositTransition s signer amount = some s') :
-    pool_solvency s' := sorry
+    pool_solvency s' := by
+  unfold depositTransition at h; split at h
+  · next hg => cases h; unfold pool_solvency at h_inv ⊢; dsimp; omega
+  · contradiction
 
 theorem pool_solvency_preserved_by_borrow (s s' : State) (signer : Pubkey) (amount : Nat) (collateral : Nat)
     (h_inv : pool_solvency s) (h : borrowTransition s signer amount collateral = some s') :
-    pool_solvency s' := sorry
+    pool_solvency s' := by
+  unfold borrowTransition at h; split at h
+  · cases h; exact h_inv
+  · contradiction
 
 theorem pool_solvency_preserved_by_repay (s s' : State) (signer : Pubkey)
     (h_inv : pool_solvency s) (h : repayTransition s signer = some s') :
-    pool_solvency s' := sorry
+    pool_solvency s' := by
+  unfold repayTransition at h; split at h
+  · cases h; exact h_inv
+  · contradiction
 
 theorem pool_solvency_preserved_by_liquidate (s s' : State) (signer : Pubkey)
     (h_inv : pool_solvency s) (h : liquidateTransition s signer = some s') :
-    pool_solvency s' := sorry
+    pool_solvency s' := by
+  unfold liquidateTransition at h; split at h
+  · cases h; exact h_inv
+  · contradiction
 
-/-- pool_solvency is preserved by every operation. -/
-theorem pool_solvency_invariant (s s' : State) (signer : Pubkey) (op : Operation)
-    (h_inv : pool_solvency s) (h : applyOp s signer op = some s') :
-    pool_solvency s' := sorry
+/-- pool_solvency is preserved by every operation. Auto-proven by case split. -/
+theorem pool_solvency_inductive (s s' : State) (signer : Pubkey) (op : Operation)
+    (h_inv : pool_solvency s) (h : applyOp s signer op = some s') : pool_solvency s' := by
+  cases op with
+  | init_pool rate => exact pool_solvency_preserved_by_init_pool s s' signer rate h_inv h
+  | deposit amount => exact pool_solvency_preserved_by_deposit s s' signer amount h_inv h
+  | borrow amount collateral => exact pool_solvency_preserved_by_borrow s s' signer amount collateral h_inv h
+  | repay => exact pool_solvency_preserved_by_repay s s' signer h_inv h
+  | liquidate => exact pool_solvency_preserved_by_liquidate s s' signer h_inv h
 
 -- ============================================================================
 -- Abort conditions — operations must reject under specified conditions
@@ -280,6 +300,12 @@ theorem deposit_overflow_safe (s s' : State) (signer : Pubkey) (amount : Nat)
     (h_valid : valid_u64 s.total_deposits ∧ valid_u64 s.total_borrows ∧ valid_u64 s.interest_rate)
     (h_inv_pool_solvency : pool_solvency s)
     (h : depositTransition s signer amount = some s') :
-    valid_u64 s'.total_deposits ∧ valid_u64 s'.total_borrows ∧ valid_u64 s'.interest_rate := sorry
+    valid_u64 s'.total_deposits ∧ valid_u64 s'.total_borrows ∧ valid_u64 s'.interest_rate := by
+  unfold depositTransition at h; split at h
+  · next hg =>
+    cases h
+    refine ⟨?_, h_valid.2.1, h_valid.2.2⟩
+    simp only [valid_u64, Valid.valid_u64, Valid.U64_MAX]; omega
+  · contradiction
 
 end Lending

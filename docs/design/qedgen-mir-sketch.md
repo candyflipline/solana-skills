@@ -1,8 +1,8 @@
 # qedgen MIR — design sketch
 
-**Status:** Phase 1c-7 (unified imports), Phase 1c-8 (multi-variant ADT path), Phase 1d (snapshot equivalence), and §15 `cover_trace_proof` auto-discharge shipped on the `mir` branch. All 16 emit sections + ADT path emit content; snapshot tests gate every pilot fixture. ADT-path byte-equivalence achieved on `bundled-stdlib-demo`, `cross-program-vault`, AND `escrow-split` against fresh-legacy regen. Flat-path divergences (`escrow` / `lending` / `multisig`) pre-date Phase 1 and are the v2.30 follow-on — the remaining §15 / §11 auto-proof scripts (`liveness_proof_script`, `overflow_proof_script`, `preservation_proof_script`) are blocked on that flat-path alignment, since they pattern-match on the legacy transition body's `split`/`cases` structure. Handoff notes in §"Next-session handoff" below.
+**Status:** Phase 1c-7 (unified imports), Phase 1c-8 (multi-variant ADT path), Phase 1d (snapshot equivalence), §15 `cover_trace_proof` auto-discharge, Phase 1c-11 (§11 overflow + §15 preservation auto-proof scripts + master theorem rename `_invariant → _inductive`), and Phase 1e (indexed-state lowering — `multisig` byte-equivalent to legacy) shipped on the `mir` branch. All 16 emit sections + ADT path emit content; snapshot tests gate every pilot fixture. ADT-path byte-equivalence achieved on `bundled-stdlib-demo`, `cross-program-vault`, AND `escrow-split`. Flat-path proof bodies for overflow + per-handler preservation + master `_inductive` match legacy verbatim. Indexed-state path (`multisig`) is byte-equivalent to legacy. The remaining gap is `lending` — its legacy renderer takes the multi-account path (separate `PoolState`/`LoanState` per account group), which is Phase 2.
 
-**Last revised:** 2026-05-25 (Phase 1d + §15 cover-proof close-out).
+**Last revised:** 2026-05-25 (Phase 1e indexed-state lowering close-out).
 
 **Companion docs** (read these first if you want measured evidence behind the claims here):
 
@@ -416,25 +416,91 @@ For the next session picking up this work:
 - `crates/qedgen/src/main.rs:3194` — dispatch gate (`if QEDGEN_USE_MIR { mir::lower → lean_gen_mir } else { lean_gen }`).
 
 **Suggested first move in the next session:**
-1. **Remaining §11 + §15 auto-proof scripts** —
-   `liveness_proof_script` shipped with Phase 1c-10 alongside the
-   flat-path alignment; `overflow_proof_script` and
-   `preservation_proof_script` remain. Both pattern-match on the
-   flat transition body's `split` / `cases` structure that Phase
-   1c-10 unblocked. After they land, every flat-state `:= sorry`
-   becomes a real tactic discharge. ~1–2 days.
-2. **Indexed-state lowering** — `multisig` still diverges because
-   MIR doesn't emit `import Mathlib.Algebra.BigOperators.Fin`,
-   the `IndexedState` import, the `AccountIdx` abbrev, or the
-   `Map MAX_MEMBERS T` form (vs MIR's literal `Map[MAX_MEMBERS] T`
-   render). Smaller than multi-account but distinct from Phase 2.
-   ~1–2 days.
-3. **Phase 2 — multi-account codegen** (`render_multi_account`
-   stub today). Closes the lending diff and is the largest
-   remaining piece; budgeted at ~1 week in §"Phase ordering
-   implication".
+1. **Phase 2 — multi-account codegen** (`render_multi_account`
+   stub today). Closes the `lending` diff. Legacy detects multi-
+   account specs (`>= 2` `type Account` blocks, where one shape
+   is *not* `Map`-keyed) and emits per-account `<Account>State`
+   structs + per-group `applyOp` dispatchers (`applyPoolOp`,
+   `applyLoanOp`) instead of a single flat `State`. MIR currently
+   collapses multi-account into a single `StateAdt` at lowering
+   time (`fn lower` in `mir.rs:~1300`); Phase 2 needs MIR to
+   carry per-account grouping AND a `render_multi_account`
+   function that walks the group set. Largest remaining piece;
+   budgeted at ~1 week in §"Phase ordering implication".
+2. **Examples drift sweep** — after Phase 2 + Phase 1e, all six
+   pilot fixtures emit byte-equivalent (or intentionally
+   different — `lending` still diverges until Phase 2) Lean
+   between MIR and legacy. Time to flip the default: change
+   `main.rs:3199`'s `if QEDGEN_USE_MIR { … }` from opt-in to
+   opt-out (`QEDGEN_LEGACY_LEAN=1` for the escape hatch), refresh
+   every bundled example's `.qed.lock`, and update
+   `references/cli.md` / `SKILL.md` to drop the env-var mention.
+3. **MIR carry-through for the non-Lean codegens** — Anchor /
+   Kani / proptest still consume `ParsedSpec` directly. Phase 1
+   pilot was Lean-only by design. Picking the next codegen is a
+   scope call: Kani impact (auto-CPI substitution) > Anchor
+   impact (handler shape) > proptest impact (per-slot lowering).
 
-**What Phase 1c-10 closed** (this session, 2026-05-25):
+**What Phase 1e closed** (this session, 2026-05-25):
+- `Ty::Map { capacity, value }` capacity field is now `Symbol`
+  (`String`) instead of `u32`, so `Map[MAX_MEMBERS] Pubkey`
+  parses correctly (previously fell through to
+  `Ty::Custom("Map[MAX_MEMBERS] Pubkey")` because the matcher
+  required a numeric literal). Unblocks `is_indexed` detection
+  for fixtures using const-name capacities.
+- `render_indexed_state` MIR renderer ported (replaces the
+  Phase-1-stretch stub). Emits the legacy `import
+  Mathlib.Algebra.BigOperators.Fin` / `QEDGen.Solana.Account` /
+  `QEDGenMathlib.IndexedState` triple; `open QEDGen.Solana.IndexedState`;
+  `abbrev AccountIdx : Type := Fin <bound>` (via
+  `pick_account_idx_bound_mir`); `inductive Status`; flat-State
+  struct projecting the active variant's fields with `Map N T`
+  rendering; transitions with `Fin N` param promotion +
+  parenthesized requires + `Function.update`-collapsed
+  indexed effects; `inductive Operation` (no `deriving`); `def
+  applyOp`; property predicate `def`s only (no preservation
+  theorems — `Proofs.lean` carries those).
+- Helpers added: `rewrite_subscripts_lean`, `parse_indexed_lhs`,
+  `infer_idx_promotions_mir`, `scan_indexed_in_expr`,
+  `effect_value_to_lean_mir`, `pick_account_idx_bound_mir`,
+  `collect_map_roots`, `emit_indexed_transition`,
+  `emit_indexed_operation_inductive`, `render_ty_indexed`. All
+  mirror their `lean_gen.rs` counterparts byte-for-byte.
+
+Result: `multisig` snapshot byte-identical to fresh-legacy
+regen. The MIR path now covers every pilot fixture except
+`lending`, whose legacy multi-account renderer is Phase 2.
+
+**What Phase 1c-11 closed** (prior session, 2026-05-25):
+- `overflow_proof_script` ported to MIR (`emit_overflow_inner`):
+  flat-state overflow theorems now discharge via `unfold + split
+  + cases + refine ⟨h_valid.*, ?_⟩ + simp [valid_*, Valid.valid_*,
+  Valid.*_MAX]; omega`, byte-identical to legacy.
+- `preservation_proof_script` ported to MIR
+  (`preservation_proof_script` helper): per-handler
+  `<prop>_preserved_by_<op>` sub-lemmas now discharge by
+  `unfold <Trans>; split at h` + `(touches-prop-field ? unfold
+  <prop>; dsimp; omega : exact h_inv)` + `contradiction`. Matches
+  legacy verbatim modulo state-type names (multi-account legacy
+  uses `PoolState`/`LoanState`; MIR flat-state uses `State`).
+- Master `<prop>_invariant` theorem now auto-proves by `cases op
+  with` (`master_invariant_proof_script` helper) — delegates to
+  `<prop>_preserved_by_<op>` for handlers in `preserved_by`;
+  inline proof for the rest (trivial `subst` + `exact h_inv` when
+  no field overlap, else `simp [applyOp]` + nested
+  unfold/split/dsimp/omega). Naming still `_invariant` vs
+  legacy's `_inductive` — see "Suggested first move" item 3.
+- Tests: `mir_snapshot` refreshed for `lending` + `multisig`
+  (the only fixtures with `property` blocks); `escrow`,
+  `escrow-split`, `bundled-stdlib-demo`, `cross-program-vault`
+  unaffected.
+
+Result: every flat-state overflow + preservation `:= sorry`
+becomes a real tactic discharge. Remaining flat-vs-legacy
+divergences are structural (Phase 2 multi-account split, Mathlib
+indexed-state imports, master theorem name) and tracked above.
+
+**What Phase 1c-10 closed** (prior session, 2026-05-25):
 - `inductive Status` deriving order + bare-variant shape
 - `structure State` deriving order (`Repr, DecidableEq, BEq`)
 - Transition body conjuncts: signer-equality (`signer = s.<who>`

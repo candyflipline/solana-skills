@@ -551,9 +551,13 @@ pub enum Ty {
     /// User-declared type name (a record, sum type, or imported type).
     Custom(Symbol),
     /// Bounded map keyed by `Pubkey` with value type `Custom(_)` and
-    /// capacity `N`. e.g., `Map[N] TokenAccount`.
+    /// capacity carried verbatim as a string. Accepts both numeric
+    /// literals (`Map[10] TokenAccount`) and constant-name references
+    /// (`Map[MAX_MEMBERS] Pubkey`); the latter resolves via a top-
+    /// level `const` declaration that the indexed-state renderer
+    /// emits as `abbrev <name> : Nat := <value>`.
     Map {
-        capacity: u32,
+        capacity: Symbol,
         value: Box<Ty>,
     },
 }
@@ -1569,14 +1573,18 @@ fn parse_ty(s: &str) -> Ty {
         "Bool" => Ty::Bool,
         "Pubkey" => Ty::Pubkey,
         other => {
-            // Crude `Map[N] T` matcher — `Map[10] TokenAccount` etc.
+            // `Map[N] T` matcher. Accepts either a numeric literal
+            // (`Map[10] TokenAccount`) or a constant-name reference
+            // (`Map[MAX_MEMBERS] Pubkey`). The capacity passes through
+            // as a string; the indexed-state renderer resolves
+            // identifier capacities via the spec's `const` table.
             if let Some(rest) = other.strip_prefix("Map[") {
                 if let Some(close) = rest.find(']') {
-                    let cap_str = &rest[..close];
+                    let cap_str = rest[..close].trim().to_string();
                     let inner = rest[close + 1..].trim();
-                    if let Ok(cap) = cap_str.parse::<u32>() {
+                    if !cap_str.is_empty() {
                         return Ty::Map {
-                            capacity: cap,
+                            capacity: cap_str,
                             value: Box::new(parse_ty(inner)),
                         };
                     }
@@ -1669,8 +1677,18 @@ mod tests {
         let m = parse_ty("Map[10] TokenAccount");
         match m {
             Ty::Map { capacity, value } => {
-                assert_eq!(capacity, 10);
+                assert_eq!(capacity, "10");
                 assert!(matches!(*value, Ty::Custom(s) if s == "TokenAccount"));
+            }
+            other => panic!("expected Map, got {:?}", other),
+        }
+        // Constant-name capacity also lifts to Ty::Map (the indexed-
+        // state renderer resolves the name via the spec's const table).
+        let m = parse_ty("Map[MAX_MEMBERS] Pubkey");
+        match m {
+            Ty::Map { capacity, value } => {
+                assert_eq!(capacity, "MAX_MEMBERS");
+                assert!(matches!(*value, Ty::Pubkey));
             }
             other => panic!("expected Map, got {:?}", other),
         }
