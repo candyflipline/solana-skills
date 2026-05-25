@@ -1,8 +1,8 @@
 # qedgen MIR — design sketch
 
-**Status:** Phase 1 + Phase 2 complete. MIR is the default Lean codegen path (`QEDGEN_LEGACY_LEAN=1` escape hatch). **Phase 3a-3d (Kani MIR carry-through — single-account complete end-to-end)** shipped: structural prefix (3a), per-account structural body (3b), guard-enforcement + state-init helper promotion (3c1), abort-condition (3c2), property-preservation (3c3), invariant-preservation (3c4), effect-conformance (3c5), overflow-detection (3c6), ensures-preservation (3c7), file-level features (3d — covers / liveness / environment in single-account mode). **Byte-equivalent to legacy on 5 of 6 pilots** end-to-end: escrow 267 / escrow-split 178 / bundled-stdlib-demo 154 / multisig 1323 / percolator 2364 lines byte-identical; lending diverges (multi-account → Phase 3e). `QEDGEN_USE_MIR_KANI=1` opt-in; default stays on legacy. Remaining: 3e (multi-account `mod` wrapping) + 3f (snapshot tests + dispatch flip).
+**Status:** Phase 1 + Phase 2 complete. MIR is the default Lean codegen path (`QEDGEN_LEGACY_LEAN=1` escape hatch). **Phase 3a-3e (Kani MIR carry-through — every pilot full-file byte-identical)** shipped: scaffold (3a), per-account body (3b), every per-account harness section (3c1–3c7: guard / abort / property / ensures / invariant / effect / overflow), file-level features (3d), multi-account `mod <lowercase>` wrapping with per-account scoped `ParsedSpec` (3e). **All 6 pilot fixtures full-file byte-identical to legacy**: escrow 268 / escrow-split 179 / bundled-stdlib-demo 155 / multisig 1324 / percolator 2365 / lending 511 lines. `QEDGEN_USE_MIR_KANI=1` opt-in; default stays on legacy. Remaining: 3f (snapshot tests + dispatch flip — mirrors Lean's Phase 1d + Phase 2 close-out).
 
-**Last revised:** 2026-05-25 (Phase 3d file-level features).
+**Last revised:** 2026-05-25 (Phase 3e multi-account mod wrapping — Kani byte-equivalence complete).
 
 **Companion docs** (read these first if you want measured evidence behind the claims here):
 
@@ -398,18 +398,16 @@ to the legacy renderer**, gated by `cargo test --test mir_snapshot`.
 all four state shapes (ADT, flat single-account, indexed, multi-
 account). MIR is the default Lean codegen path post v2.30 Phase 2.
 
-**Kani.** Phase 3a–3d shipped: scaffold + structural prefix (3a),
-per-account structural body (3b), per-account harnesses
-(3c1–3c7: guard / abort / property / invariant / effect / overflow
-/ ensures), file-level features (3d: covers / liveness /
-environment in single-account mode). Section order matches legacy
-verbatim. **Single-account Kani codegen is now end-to-end MIR-
-ported**; byte-equivalent to legacy on 5 of 6 pilots (escrow 267 /
-escrow-split 178 / bundled-stdlib-demo 154 / multisig 1323 /
-percolator 2364 lines byte-identical). Lending diverges on multi-
-account `mod <name>` wrapping (Phase 3e). `QEDGEN_USE_MIR_KANI=1`
-opt-in; default stays on legacy. Remaining: multi-account wrapping
-→ Phase 3e, snapshot tests + dispatch flip → Phase 3f.
+**Kani.** Phase 3a–3e shipped. **All 6 pilot fixtures full-file
+byte-identical to legacy** (escrow 268 / escrow-split 179 /
+bundled-stdlib-demo 155 / multisig 1324 / percolator 2365 / lending
+511 lines). Section order matches legacy verbatim. Multi-account
+specs (lending) emit one `mod <lowercase> { use super::*; ... }`
+per `account_type` driven by a per-account scoped `ParsedSpec`
+(`scope_parsed_to_account` filters handlers / properties /
+invariants per legacy heuristics). `QEDGEN_USE_MIR_KANI=1` opt-in;
+default stays on legacy. Remaining: snapshot tests + dispatch flip
+→ Phase 3f (mirrors Lean Phase 1d + Phase 2 close-out).
 
 **Anchor / proptest.** Untouched — still consume `ParsedSpec`
 directly. Same Phase-3-style port shape applies when picked up.

@@ -210,7 +210,7 @@ pub struct ParsedEnvironment {
 /// keep them on the shared struct so downstream passes can reach them without
 /// re-parsing. The struct-level `allow(dead_code)` covers fields that the
 /// active binary feature set doesn't touch yet.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct ParsedOperation {
     pub name: String,
@@ -356,7 +356,7 @@ pub fn rust_expr_is_unsupported(rust_expr: &str) -> bool {
 }
 
 /// PDA seed declaration from a qedspec block.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct ParsedPda {
     pub name: String,
@@ -364,7 +364,7 @@ pub struct ParsedPda {
 }
 
 /// Event declaration from a qedspec block.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct ParsedEvent {
     pub name: String,
@@ -372,7 +372,7 @@ pub struct ParsedEvent {
 }
 
 /// Account entry within an operation's context: block.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct ParsedAccountEntry {
     pub name: String,
@@ -391,7 +391,7 @@ pub struct ParsedAccountEntry {
 }
 
 /// Per-operation account context.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct ParsedContext {
     pub operation: String,
@@ -1070,7 +1070,7 @@ pub struct ParsedTransfer {
 }
 
 /// Full parsed spec context.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ParsedSpec {
     /// Unified handlers (v3). Populated from handler/operation/instruction blocks.
     pub handlers: Vec<ParsedHandler>,
