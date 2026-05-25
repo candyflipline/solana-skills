@@ -250,6 +250,12 @@ pub struct HandlerMir {
     /// Empty after Phase 3 lowering (passes synthesize them into `body`);
     /// populated during parser→MIR before the pass runs.
     pub requires_or_abort: Vec<RequireOrAbortClause>,
+    /// Legacy `aborts_if <pred> Error` clauses. Parallel to
+    /// `requires_or_abort` but with the predicate already in the
+    /// "abort triggers when this holds" sense (not negated).
+    /// Carries the predicate alongside the error for theorem emission
+    /// (Lean's `theorem h_aborts_if_Err (s) (h : <pred>) : ... = none`).
+    pub aborts_if: Vec<AbortClause>,
     pub body: Block,
     /// Post-conditions (`ensures`).
     pub post: Vec<Predicate>,
@@ -276,6 +282,16 @@ pub struct HandlerMir {
 
 #[derive(Debug, Clone)]
 pub struct RequireOrAbortClause {
+    pub pred: Predicate,
+    pub err: ErrorRef,
+}
+
+/// Legacy `aborts_if <pred> Error` clause. Functionally inverse of
+/// `RequireOrAbortClause` — here the predicate IS the abort
+/// condition, not its negation. Kept distinct so the emitted Lean
+/// theorem hypothesis matches the source shape.
+#[derive(Debug, Clone)]
+pub struct AbortClause {
     pub pred: Predicate,
     pub err: ErrorRef,
 }
@@ -808,6 +824,20 @@ fn lower_handler(h: &crate::check::ParsedHandler) -> HandlerMir {
     };
 
     let (pre, requires_or_abort) = split_requires(&h.requires);
+    let aborts_if: Vec<AbortClause> = h
+        .aborts_if
+        .iter()
+        .map(|a| AbortClause {
+            pred: Predicate(Expr {
+                lean: a.lean_expr.clone(),
+                rust: a.rust_expr.clone(),
+                rust_pod: a.rust_expr_pod.clone(),
+                rust_binary: String::new(),
+                source_span: None,
+            }),
+            err: a.error_name.clone(),
+        })
+        .collect();
 
     HandlerMir {
         name: h.name.clone(),
@@ -824,6 +854,7 @@ fn lower_handler(h: &crate::check::ParsedHandler) -> HandlerMir {
         transition,
         pre,
         requires_or_abort,
+        aborts_if,
         body: lower_body(h),
         post: h
             .ensures

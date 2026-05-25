@@ -157,14 +157,14 @@ fn render_single_account(mir: &Mir) -> String {
     emit_state_struct(&mut out, mir);
     emit_transitions(&mut out, mir);
     emit_operation_inductive(&mut out, mir);
+    emit_aborts_if(&mut out, mir);
+    emit_ensures(&mut out, mir);
 
     // TODO Phase 1c (subsequent slices): CPI theorems, invariants,
-    // properties, aborts, ensures, frame, cover, liveness, environments,
-    // overflow obligations. Sections below are placeholders so the
-    // generated file has a clear shape during incremental wiring.
+    // properties, frame, cover, liveness, environments, overflow.
     out.push_str("-- TODO(mir-phase-1c-later): CPI theorems\n\n");
     out.push_str("-- TODO(mir-phase-1c-later): invariants\n\n");
-    out.push_str("-- TODO(mir-phase-1c-later): properties / aborts / ensures / frame\n\n");
+    out.push_str("-- TODO(mir-phase-1c-later): properties / frame / cover / liveness\n\n");
 
     emit_namespace_close(&mut out, mir);
     out
@@ -349,6 +349,216 @@ fn emit_handler_transition(out: &mut String, _mir: &Mir, h: &crate::mir::Handler
         out.push_str("  else\n");
         out.push_str("    none\n\n");
     }
+}
+
+/// Emit abort theorems. Mirrors `lean_gen::render_aborts_if`.
+///
+/// For each handler with abort surface (`aborts_if` clauses or
+/// `requires X else Err`), emits per-clause theorems:
+///
+/// ```text
+/// theorem <h>_aborts_if_<Err> (s : State) (signer : Pubkey) <params>
+///     (h : <pred>) : <h>Transition s signer <args> = none := sorry
+/// ```
+///
+/// For `requires X else Err` the hypothesis is negated form
+/// `¬(<requires-expr>)`. When `aborts_total` is set on the handler,
+/// emits a single `<h>_aborts_iff` theorem with the disjunction of
+/// every abort condition.
+///
+/// Phase 1c approximation: emits the theorem statements with
+/// `:= sorry` bodies for every case. lean_gen.rs has a finer
+/// `abort_requires_proof` path that auto-discharges via `if_neg`
+/// projection on requires-derived aborts; porting that lands later.
+fn emit_aborts_if(out: &mut String, mir: &Mir) {
+    let has_aborts = mir
+        .handlers
+        .iter()
+        .any(|h| !h.aborts_if.is_empty() || !h.requires_or_abort.is_empty());
+    if !has_aborts {
+        return;
+    }
+
+    out.push_str(
+        "-- ============================================================================\n",
+    );
+    out.push_str("-- Abort conditions — operations must reject under specified conditions\n");
+    out.push_str(
+        "-- ============================================================================\n\n",
+    );
+
+    for h in &mir.handlers {
+        if h.aborts_if.is_empty() && h.requires_or_abort.is_empty() {
+            continue;
+        }
+        let trans_name = safe_name(&format!("{}Transition", h.name));
+        let param_sig = param_sig_str(&h.params);
+        let param_args = param_args_str(&h.params);
+
+        // `aborts_total` collapses all abort conditions into a single
+        // iff theorem. Mirror lean_gen.rs:4396.
+        let all_abort_lean: Vec<String> = h
+            .aborts_if
+            .iter()
+            .map(|a| a.pred.0.lean.clone())
+            .chain(
+                h.requires_or_abort
+                    .iter()
+                    .map(|r| format!("\u{00AC}({})", r.pred.0.lean)),
+            )
+            .collect();
+
+        if h.aborts_total && !all_abort_lean.is_empty() {
+            let theorem_name = safe_name(&format!("{}_aborts_iff", h.name));
+            out.push_str(&format!(
+                "theorem {} (s : State) (signer : Pubkey){} :\n",
+                theorem_name, param_sig
+            ));
+            out.push_str(&format!(
+                "    {} s signer{} = none \u{2194}\n",
+                trans_name, param_args
+            ));
+            let disjunction = all_abort_lean.join(" \u{2228} ");
+            out.push_str(&format!("    ({}) := sorry\n\n", disjunction));
+            continue;
+        }
+
+        // Per-clause theorems. Disambiguate when the same error name
+        // appears multiple times on a single handler (issue #8 #3).
+        let mut error_total: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for a in &h.aborts_if {
+            *error_total.entry(a.err.clone()).or_insert(0) += 1;
+        }
+        for r in &h.requires_or_abort {
+            *error_total.entry(r.err.clone()).or_insert(0) += 1;
+        }
+        let mut error_seen: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let theorem_name_for =
+            |err: &str, seen: &mut std::collections::HashMap<String, usize>| -> String {
+                let total = error_total.get(err).copied().unwrap_or(0);
+                let idx = {
+                    let entry = seen.entry(err.to_string()).or_insert(0);
+                    let cur = *entry;
+                    *entry += 1;
+                    cur
+                };
+                if total > 1 {
+                    safe_name(&format!("{}_aborts_if_{}_{}", h.name, err, idx))
+                } else {
+                    safe_name(&format!("{}_aborts_if_{}", h.name, err))
+                }
+            };
+
+        // Legacy aborts_if clauses: hypothesis IS the predicate.
+        for a in &h.aborts_if {
+            let theorem_name = theorem_name_for(&a.err, &mut error_seen);
+            out.push_str(&format!(
+                "theorem {} (s : State) (signer : Pubkey){}\n",
+                theorem_name, param_sig
+            ));
+            out.push_str(&format!(
+                "    (h : {}) : {} s signer{} = none := sorry\n\n",
+                a.pred.0.lean, trans_name, param_args
+            ));
+        }
+
+        // requires-else clauses: hypothesis is ¬(predicate). Skip
+        // clauses that reference a handler account's `.pubkey` /
+        // `.key()` — those identifiers aren't in Lean scope, so the
+        // theorem would mention free variables. Mirrors
+        // lean_gen.rs:4467. Skipping here keeps the Lean compilable;
+        // the runtime-side check still fires in Rust.
+        for r in &h.requires_or_abort {
+            if mentions_handler_account_pubkey(&r.pred.0.lean, &h.accounts) {
+                continue;
+            }
+            let theorem_name = theorem_name_for(&r.err, &mut error_seen);
+            out.push_str(&format!(
+                "theorem {} (s : State) (signer : Pubkey){}\n",
+                theorem_name, param_sig
+            ));
+            out.push_str(&format!(
+                "    (h : \u{00AC}({})) : {} s signer{} = none := sorry\n\n",
+                r.pred.0.lean, trans_name, param_args
+            ));
+        }
+    }
+}
+
+/// Emit ensures theorems. Mirrors `lean_gen::render_ensures`.
+///
+/// Per handler, one theorem per `ensures` clause:
+///
+/// ```text
+/// theorem <h>_ensures_<i> (s s' : State) (signer : Pubkey) <params>
+///     (h : <h>Transition s signer <args> = some s') :
+///     <ensures-lean-expr> := sorry
+/// ```
+fn emit_ensures(out: &mut String, mir: &Mir) {
+    let has_ensures = mir.handlers.iter().any(|h| !h.post.is_empty());
+    if !has_ensures {
+        return;
+    }
+
+    out.push_str(
+        "-- ============================================================================\n",
+    );
+    out.push_str("-- Post-conditions (ensures)\n");
+    out.push_str(
+        "-- ============================================================================\n\n",
+    );
+
+    for h in &mir.handlers {
+        let trans_name = safe_name(&format!("{}Transition", h.name));
+        let param_sig = param_sig_str(&h.params);
+        let param_args = param_args_str(&h.params);
+        for (i, ens) in h.post.iter().enumerate() {
+            let theorem_name = safe_name(&format!("{}_ensures_{}", h.name, i));
+            out.push_str(&format!(
+                "theorem {} (s s' : State) (signer : Pubkey){}\n",
+                theorem_name, param_sig
+            ));
+            out.push_str(&format!(
+                "    (h : {} s signer{} = some s') :\n",
+                trans_name, param_args
+            ));
+            out.push_str(&format!("    {} := sorry\n\n", ens.0.lean));
+        }
+    }
+}
+
+/// Detect whether an expression references a handler-account's
+/// `.pubkey` or `.key()`. Account-binding pubkey refs aren't in Lean
+/// scope; emitting theorems that mention them yields unprovable
+/// statements with free identifiers. Mirrors
+/// `lean_gen::mentions_handler_account_pubkey`.
+fn mentions_handler_account_pubkey(
+    expr: &str,
+    accounts: &[crate::mir::AccountBindingShape],
+) -> bool {
+    accounts.iter().any(|a| {
+        let needle_pubkey = format!("{}.pubkey", a.name);
+        let needle_key = format!("{}.key()", a.name);
+        expr.contains(&needle_pubkey) || expr.contains(&needle_key)
+    })
+}
+
+/// Build the call-side argument string for transition function
+/// invocations: `" p1 p2 ..."`. Empty when `params` is empty.
+fn param_args_str(params: &[(crate::mir::Symbol, crate::mir::Ty)]) -> String {
+    if params.is_empty() {
+        return String::new();
+    }
+    format!(
+        " {}",
+        params
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect::<Vec<_>>()
+            .join(" ")
+    )
 }
 
 /// Emit the `inductive Operation` enum + `def applyOp` dispatcher.
@@ -671,6 +881,46 @@ mod tests {
         } else {
             assert!(!out.contains("inductive Status"));
         }
+    }
+
+    #[test]
+    fn render_aborts_if_clauses() {
+        let mir = lower_fixture("examples/rust/escrow/escrow.qedspec");
+        let out = render(&mir);
+
+        // escrow declares `requires deposit_amount > 0 and receive_amount > 0
+        // else InvalidAmount` on initialize — should produce an
+        // `initialize_aborts_if_InvalidAmount` theorem with the
+        // negated predicate as hypothesis.
+        assert!(
+            out.contains("theorem initialize_aborts_if_InvalidAmount"),
+            "expected initialize_aborts_if_InvalidAmount theorem:\n{}",
+            &out[..out.len().min(2000)]
+        );
+        // The hypothesis should be the negation of the requires
+        // predicate.
+        assert!(
+            out.contains("¬(deposit_amount > 0"),
+            "expected negated requires hypothesis"
+        );
+        // The abort-conditions header should appear.
+        assert!(out.contains("Abort conditions"));
+    }
+
+    #[test]
+    fn render_skips_account_pubkey_aborts() {
+        // exchange + cancel both have `requires initializer_ta.pubkey == ...`
+        // — these reference a handler-account's .pubkey field which isn't
+        // in Lean scope. The filter should skip them.
+        let mir = lower_fixture("examples/rust/escrow/escrow.qedspec");
+        let out = render(&mir);
+        // No theorem should reference `initializer_ta.pubkey` in its
+        // hypothesis — it's filtered out.
+        assert!(
+            !out.contains("(h : ¬(initializer_ta.pubkey"),
+            "account-pubkey requires should be filtered from abort theorems:\n{}",
+            out
+        );
     }
 
     #[test]
