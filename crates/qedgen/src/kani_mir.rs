@@ -19,27 +19,28 @@
 //! Default stays on legacy until snapshot equivalence ratifies every
 //! pilot fixture (per the Phase 1 sequencing).
 //!
-//! ## Phase 3a-3b scope
+//! ## Phase 3a-3c1 scope
 //!
 //! Phase 3a (prior commit): scaffold + deterministic structural
 //! prefix (file header, math helpers, state-model header, constants).
 //!
-//! Phase 3b (this commit): per-account section structural body for
+//! Phase 3b (prior commit): per-account section structural body for
 //! single-account specs — records, unit enum sums, `Status` enum,
 //! `State` struct, property predicates, invariant predicates,
-//! transition fns. All delegated to existing
+//! transition fns, ref_impls. All delegated to existing
 //! `rust_codegen_util::emit_*` helpers so the output is byte-identical
-//! to legacy. Multi-account `mod <name> { ... }` wrapping stays at
-//! `MIR-TODO(phase-3e)` marker. Harness-emit sections (guard /
-//! effect / overflow / abort / property-preservation / invariant-
-//! preservation / covers / liveness / environment) stay at
-//! `MIR-TODO(phase-3c+)` marker.
+//! to legacy.
 //!
-//! This commit remains a no-op for users who don't set
-//! `QEDGEN_USE_MIR_KANI`; opt-in users now get a substantively-
-//! populated harness file through the State + transition fns
-//! section, but the harness emissions are still missing — so
-//! the partial output won't compile as a Kani crate yet.
+//! Phase 3c1 (this commit): guard enforcement harnesses — one
+//! `verify_<handler>_rejects_invalid()` per handler with a guard or
+//! requires clause. Calls the newly-promoted
+//! `rust_codegen_util::emit_state_init_symbolic` /
+//! `emit_pre_status_assume` (both now `pub fn`, shared with kani.rs)
+//! plus existing helpers (`collect_full_guard`, `emit_abstract_binders`,
+//! `map_type`). Multi-account `mod <name> { ... }` wrapping stays at
+//! `MIR-TODO(phase-3e)` marker. The other harness sections (abort /
+//! property-preservation / invariant-preservation / effect /
+//! overflow + file-level features) stay at `MIR-TODO(phase-3c2+)`.
 //!
 //! ## What we must replicate from `kani.rs`
 //!
@@ -148,13 +149,20 @@ pub fn render(mir: &Mir, parsed: &ParsedSpec) -> String {
         ));
     }
 
-    // Phase 3c+ stub. The harness-emit sections (guard / effect /
-    // overflow / abort / property-preservation / invariant-
-    // preservation) + file-level features (covers / liveness /
+    if let Err(e) = emit_guard_enforcement_harnesses(&mut out, parsed) {
+        out.push_str(&format!(
+            "// MIR-ERROR: guard-enforcement emit failed: {}\n",
+            e
+        ));
+    }
+
+    // Phase 3c2+ stub. Remaining harness sections (abort, property
+    // preservation, invariant preservation, effect conformance,
+    // overflow detection) + file-level features (covers / liveness /
     // environment) emit here in subsequent slices.
     out.push_str(
-        "// MIR-TODO(phase-3c+): guard / effect / overflow / abort / property / \
-         invariant harnesses + file-level features (covers / liveness / environment) \
+        "// MIR-TODO(phase-3c2+): abort / property-preservation / invariant-preservation / \
+         effect / overflow harnesses + file-level features (covers / liveness / environment) \
          not ported yet — fall back to legacy `kani.rs` for production output.\n",
     );
 
@@ -416,6 +424,116 @@ fn emit_account_section_structural(out: &mut String, parsed: &ParsedSpec) -> Res
 }
 
 // ----------------------------------------------------------------------
+// Section emitters — Phase 3c1 guard-enforcement harnesses
+// ----------------------------------------------------------------------
+
+/// Emit `#[kani::proof] fn verify_<handler>_rejects_invalid()` for
+/// every handler with a guard or `requires` clause. Mirrors
+/// `kani::emit_kani_account_section` lines ~493–568 (single-account
+/// path; multi-account `mod <name>` wrapping is Phase 3e).
+///
+/// One harness per handler:
+///   * Initialize state symbolically (`emit_state_init_symbolic`)
+///   * `kani::assume(s.status == Status::<pre>)` if the handler is
+///     lifecycle-gated
+///   * Declare every param + abstract-binder as `kani::any()`
+///   * `kani::assume(!(full_guard))` — at least one guard component
+///     is violated
+///   * `assert!(!<handler>(&mut s, args...))` — handler must reject
+fn emit_guard_enforcement_harnesses(out: &mut String, parsed: &ParsedSpec) -> Result<()> {
+    use crate::codegen::map_type;
+    use crate::rust_codegen_util as util;
+
+    // Resolve view — same logic as `emit_account_section_structural`.
+    let (state_fields, lifecycle): (&[(String, String)], &[String]) =
+        if parsed.account_types.len() == 1 {
+            (
+                &parsed.account_types[0].fields,
+                parsed.account_types[0].lifecycle.as_slice(),
+            )
+        } else if parsed.account_types.is_empty() {
+            (
+                util::resolve_state_fields(parsed),
+                parsed.lifecycle_states.as_slice(),
+            )
+        } else {
+            (
+                &parsed.account_types[0].fields,
+                parsed.account_types[0].lifecycle.as_slice(),
+            )
+        };
+    let mutable = util::mutable_fields(state_fields);
+
+    let guard_ops: Vec<&crate::check::ParsedHandler> =
+        parsed.handlers.iter().filter(|op| op.has_guard()).collect();
+
+    if guard_ops.is_empty() {
+        return Ok(());
+    }
+
+    out.push_str(
+        "// ============================================================================\n",
+    );
+    out.push_str("// Guard enforcement — transitions reject invalid inputs\n");
+    out.push_str(
+        "// ============================================================================\n\n",
+    );
+
+    for op in &guard_ops {
+        let Some(full_guard) = util::collect_full_guard(op, false) else {
+            // Handler had `has_guard()` set but no expressible
+            // negation — skip to avoid `kani::assume(!(true))`
+            // vacuous harnesses (matches legacy kani.rs:515–519).
+            continue;
+        };
+
+        out.push_str("#[kani::proof]\n");
+        out.push_str("#[kani::unwind(2)]\n");
+        out.push_str("#[kani::solver(cadical)]\n");
+        out.push_str(&format!("fn verify_{}_rejects_invalid() {{\n", op.name));
+
+        util::emit_state_init_symbolic(out, &mutable, lifecycle);
+        util::emit_pre_status_assume(out, op, lifecycle);
+
+        // Symbolic params.
+        for (pname, ptype) in &op.takes_params {
+            out.push_str(&format!(
+                "    let {}: {} = kani::any();\n",
+                pname,
+                map_type(ptype, parsed)?
+            ));
+        }
+
+        // v2.29 Slice A (#8) — abstract binders. Legacy kani.rs:537–546
+        // calls `emit_abstract_binders` TWICE in a row with identical
+        // args (looks like a copy-paste accident; surfaces only for
+        // specs that declare abstract binders, where it would emit
+        // duplicate `let X: T = kani::any();` lines). Per
+        // [[feedback-cleanup-v3]] preserve the bug here for byte-
+        // equivalence; cleanup deferred to v3.0 alongside the legacy.
+        util::emit_abstract_binders(out, op, "    ", "kani::any()", |t| map_type(t, parsed))?;
+        util::emit_abstract_binders(out, op, "    ", "kani::any()", |t| map_type(t, parsed))?;
+
+        out.push_str(&format!("    kani::assume(!({full_guard}));\n"));
+
+        let args: String = op
+            .takes_params
+            .iter()
+            .chain(op.abstract_binders.iter())
+            .map(|(n, _)| format!(", {}", n))
+            .collect();
+        out.push_str(&format!("    assert!(!{}(&mut s{}),\n", op.name, args));
+        out.push_str(&format!(
+            "        \"{} must reject when guard is violated\");\n",
+            op.name
+        ));
+        out.push_str("}\n\n");
+    }
+
+    Ok(())
+}
+
+// ----------------------------------------------------------------------
 // Tests
 // ----------------------------------------------------------------------
 
@@ -488,15 +606,42 @@ mod tests {
     }
 
     #[test]
-    fn render_emits_phase_3c_todo_marker() {
-        // Until subsequent slices port the harness-emit sections,
-        // every rendered file carries the structured TODO marker so
-        // users know what's missing.
+    fn render_emits_phase_3c2_todo_marker() {
+        // Until subsequent slices port the remaining harness-emit
+        // sections (abort / property / invariant / effect / overflow
+        // / file-level features), every rendered file carries the
+        // structured TODO marker so users know what's missing.
         let (mir, parsed) = lower_fixture("examples/rust/escrow/escrow.qedspec");
         let out = render(&mir, &parsed);
         assert!(
-            out.contains("MIR-TODO(phase-3c+)"),
-            "expected phase-3c+ TODO marker"
+            out.contains("MIR-TODO(phase-3c2+)"),
+            "expected phase-3c2+ TODO marker"
+        );
+    }
+
+    #[test]
+    fn render_emits_guard_enforcement_harnesses() {
+        // Phase 3c1 — emit_guard_enforcement_harnesses fires one
+        // `verify_<handler>_rejects_invalid()` per guard-bearing
+        // handler. Escrow's `initialize` has `requires deposit_amount
+        // > 0 && receive_amount > 0`, so the harness emits.
+        let (mir, parsed) = lower_fixture("examples/rust/escrow/escrow.qedspec");
+        let out = render(&mir, &parsed);
+        assert!(
+            out.contains("// Guard enforcement"),
+            "expected guard-enforcement section header"
+        );
+        assert!(
+            out.contains("fn verify_initialize_rejects_invalid()"),
+            "expected initialize rejects_invalid harness"
+        );
+        assert!(
+            out.contains("kani::assume(!("),
+            "expected `kani::assume(!(guard))` negation"
+        );
+        assert!(
+            out.contains("\"initialize must reject when guard is violated\""),
+            "expected assert message"
         );
     }
 
