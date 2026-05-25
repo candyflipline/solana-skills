@@ -30,15 +30,19 @@
 //! `generate(&Mir, &ParsedSpec, &Path, Target)` calls each promoted-
 //! pub(crate) `codegen::generate_<X>` sub-generator in legacy's order.
 //!
-//! Phase 4b in progress: smallest + most deterministic sub-
-//! generators ported one at a time.
+//! Phase 4b–4c in progress: sub-generators ported one at a time,
+//! smallest + most deterministic first.
 //!   * 4b/1 — `emit_cargo_toml` (Mir.name + needs_spl predicate
 //!     from MIR account kinds / Stmt::TokenTransfer / Stmt::Cpi).
 //!   * 4b/2 — `emit_math` (no spec dependency; pure text emit
 //!     against the fingerprint hash).
 //!   * 4b/3 — `emit_events` (mir.events for structure; falls back
-//!     to parsed.events for field-type strings until a shared
-//!     `Ty → DSL string` helper lands).
+//!     to parsed.events for field-type strings).
+//!   * 4c/1 — `emit_errors` (mir.errors.variants + mir.name;
+//!     R26/R28 augmentation predicates stay on parsed).
+//!   * 4c/2 — `emit_ref_impls` (mir.ref_impls — shape-identical
+//!     to parsed.ref_impls; same field-type-string fallback as
+//!     events).
 //!
 //! Remaining sub-generators delegate to their legacy
 //! `crate::codegen::generate_<X>` for now.
@@ -119,7 +123,8 @@ pub fn generate(
     crate::codegen::generate_state(parsed, &fp, output_dir, target)?;
     // Phase 4b/3 — MIR-direct port.
     emit_events(mir, parsed, &fp, output_dir, target)?;
-    crate::codegen::generate_errors(parsed, &fp, output_dir, target)?;
+    // Phase 4c/1 — MIR-direct port.
+    emit_errors(mir, parsed, &fp, output_dir, target)?;
     crate::codegen::generate_instructions(parsed, &fp, spec_path, output_dir, target)?;
     crate::codegen::generate_guards(parsed, &fp, output_dir, target)?;
     // Phase 4b/2 — MIR-direct port. `generate_math` body is
@@ -129,7 +134,8 @@ pub fn generate(
     if crate::codegen::guards_use_math_helpers(parsed) {
         emit_math(&fp, output_dir)?;
     }
-    crate::codegen::generate_ref_impls(parsed, &fp, output_dir, target)?;
+    // Phase 4c/2 — MIR-direct port.
+    emit_ref_impls(mir, parsed, &fp, output_dir, target)?;
     crate::codegen::generate_imported_mirror(parsed, &fp, output_dir, target)?;
     // Phase 4b/1 — MIR-direct port.
     emit_cargo_toml(mir, &fp, output_dir, target)?;
@@ -241,6 +247,188 @@ fn render_cargo_toml(
     out.push_str("\n[workspace]\n");
 
     out
+}
+
+/// Emit `src/errors.rs` — `#[error_code] pub enum <Name>Error { ... }`
+/// for every declared error variant. MIR-direct port of
+/// `codegen::generate_errors`.
+///
+/// Reads from MIR:
+///   * `Mir.name` → enum prefix `<PascalCase(name)>Error`.
+///   * `Mir.errors.variants` → base list of variants.
+///
+/// The `needs_lifecycle` / `needs_invalid_pda` augmentation
+/// predicates read from `parsed` for now — they walk
+/// `ParsedHandler.accounts.pda_seeds`, `ParsedAccountType.variants[*].fields`,
+/// and other compound shapes that don't have direct MIR equivalents
+/// yet. Future slice: lift the predicates into MIR proper.
+fn emit_errors(
+    mir: &Mir,
+    parsed: &ParsedSpec,
+    fp: &crate::fingerprint::SpecFingerprint,
+    output_dir: &Path,
+    target: Target,
+) -> Result<()> {
+    if mir.errors.variants.is_empty() {
+        return Ok(());
+    }
+    let src_dir = output_dir.join("src");
+    std::fs::create_dir_all(&src_dir)?;
+
+    let prelude_import = match target {
+        Target::Anchor => "use anchor_lang::prelude::*;\n",
+        Target::Quasar => "use quasar_lang::prelude::*;\n",
+        Target::Pinocchio => unreachable!("Pinocchio is rejected at the init dispatcher"),
+    };
+
+    let error_name = format!("{}Error", crate::codegen::to_pascal_case(&mir.name));
+
+    let mut out = String::new();
+    out.push_str(&crate::codegen::marker("DO NOT EDIT", fp, "src/errors.rs"));
+    out.push_str(prelude_import);
+    out.push('\n');
+
+    // R26 augmentation: handlers with non-init lifecycle pre-status
+    // trigger the auto-added `InvalidLifecycle` variant. Walks
+    // `parsed.handlers` for now (the predicate reads pre_status as
+    // raw string — MIR carries it as a `VariantTag` via
+    // `HandlerMir.transition`; replacing the read with the MIR
+    // form is a separately-trackable cleanup).
+    let needs_lifecycle = parsed.handlers.iter().any(|h| {
+        let pre = h.pre_status.as_deref().unwrap_or("");
+        let is_init = matches!(pre, "Uninitialized" | "Empty");
+        !pre.is_empty() && !is_init
+    });
+
+    // R28 augmentation: runtime PDA verification triggers
+    // `InvalidPda`. Same complex walk as legacy — the predicate
+    // reads `parsed.handlers[*].accounts.pda_seeds` against
+    // `parsed.account_types.variants[*].fields`, which doesn't have
+    // a single-call MIR equivalent. Use the pub(crate) helper.
+    let needs_invalid_pda = (matches!(target, Target::Quasar)
+        || (matches!(target, Target::Anchor)
+            && crate::codegen::is_multi_variant_adt_state_pub(parsed)))
+        && parsed.handlers.iter().any(|h| {
+            let bound: std::collections::HashSet<&str> =
+                h.accounts.iter().map(|a| a.name.as_str()).collect();
+            let is_init_handler = matches!(
+                h.pre_status.as_deref(),
+                Some("Uninitialized") | Some("Empty")
+            );
+            h.accounts.iter().any(|acct| {
+                let Some(seeds) = &acct.pda_seeds else {
+                    return false;
+                };
+                if acct.is_signer {
+                    return false;
+                }
+                let on_account_matches = match h.on_account.as_deref() {
+                    Some(adt) => {
+                        let lower = adt.to_lowercase();
+                        acct.name == lower || acct.name.starts_with(&lower)
+                    }
+                    None => true,
+                };
+                if is_init_handler && on_account_matches {
+                    return false;
+                }
+                seeds.iter().any(|seed| {
+                    let is_literal = seed.starts_with('"') && seed.ends_with('"');
+                    if is_literal || bound.contains(seed.as_str()) {
+                        return false;
+                    }
+                    if matches!(target, Target::Anchor) {
+                        parsed.account_types.iter().any(|a| {
+                            a.variants
+                                .iter()
+                                .any(|v| v.fields.iter().any(|(n, _)| n == seed))
+                        })
+                    } else {
+                        true
+                    }
+                })
+            })
+        });
+
+    let mut codes: Vec<String> = mir.errors.variants.clone();
+    if needs_lifecycle && !codes.iter().any(|c| c == "InvalidLifecycle") {
+        codes.push("InvalidLifecycle".to_string());
+    }
+    if needs_invalid_pda && !codes.iter().any(|c| c == "InvalidPda") {
+        codes.push("InvalidPda".to_string());
+    }
+
+    out.push_str("#[error_code]\n");
+    out.push_str(&format!("pub enum {} {{\n", error_name));
+    for (i, code) in codes.iter().enumerate() {
+        out.push_str(&format!("    {} = {},\n", code, i));
+    }
+    out.push_str("}\n");
+    out.push_str("// ---- END GENERATED ----\n");
+
+    std::fs::write(src_dir.join("errors.rs"), &out)?;
+    Ok(())
+}
+
+/// Emit `src/ref_impls.rs` — one `pub fn` per declared `ref_impl`.
+/// MIR-direct port of `codegen::generate_ref_impls`.
+///
+/// Iteration source is `mir.ref_impls` (shape-identical to
+/// `parsed.ref_impls` since MIR mirrors the fields verbatim). Param +
+/// return type strings still flow through `codegen::map_type_for_target`
+/// against `parsed` — same `Ty → DSL string` gap as `emit_events`,
+/// closes when the shared helper lands.
+fn emit_ref_impls(
+    mir: &Mir,
+    parsed: &ParsedSpec,
+    fp: &crate::fingerprint::SpecFingerprint,
+    output_dir: &Path,
+    target: Target,
+) -> Result<()> {
+    if mir.ref_impls.is_empty() {
+        return Ok(());
+    }
+    let src_dir = output_dir.join("src");
+    std::fs::create_dir_all(&src_dir)?;
+    let mut out = String::new();
+    out.push_str(&crate::codegen::marker(
+        "DO NOT EDIT",
+        fp,
+        "src/ref_impls.rs",
+    ));
+    out.push_str(
+        "//! Reference implementations (from qedspec `ref_impl` declarations).\n\
+         //! Pure expressions — no state mutation, no side effects.\n\
+         //! Generated alongside guards.rs so `requires` / `ensures` clauses\n\
+         //! and user handler bodies can call them by name.\n\n",
+    );
+    out.push_str("#![allow(dead_code, clippy::too_many_arguments)]\n\n");
+    for r in &mir.ref_impls {
+        let params = r
+            .params
+            .iter()
+            .map(|(n, t)| {
+                let ty = crate::codegen::map_type_for_target(t, parsed, target)
+                    .unwrap_or_else(|_| t.clone());
+                format!("{}: {}", n, ty)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let ret = crate::codegen::map_type_for_target(&r.return_type, parsed, target)
+            .unwrap_or_else(|_| r.return_type.clone());
+        if let Some(doc) = &r.doc {
+            for line in doc.lines() {
+                out.push_str(&format!("/// {}\n", line.trim_start_matches("///").trim()));
+            }
+        }
+        out.push_str(&format!(
+            "#[inline]\npub fn {}({}) -> {} {{\n    {}\n}}\n\n",
+            r.name, params, ret, r.rust_body
+        ));
+    }
+    out.push_str("// ---- END GENERATED ----\n");
+    std::fs::write(src_dir.join("ref_impls.rs"), &out)?;
+    Ok(())
 }
 
 /// Emit `src/events.rs` — one `#[event] pub struct <EventName> {
