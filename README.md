@@ -492,7 +492,10 @@ bash scripts/check-version-consistency.sh
 bash scripts/check-readme-drift.sh
 bash scripts/check-lake-build.sh --strict
 qedgen check --regen-drift
-cargo audit --deny warnings --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2024-0388
+cargo audit --deny warnings \
+    --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2024-0388 \
+    --ignore RUSTSEC-2025-0141 --ignore RUSTSEC-2025-0161 \
+    --ignore RUSTSEC-2026-0097
 cargo deny check
 ```
 

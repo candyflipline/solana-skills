@@ -43,6 +43,23 @@ ignore = [
     # by ark-* crates. Arkworks has a tracking issue; drop this
     # ignore when ark-* releases switch to `educe` or roll their own.
     "RUSTSEC-2024-0388",
+    # `bincode 1.x` — RUSTSEC-2025-0141 (unmaintained). Pulled by
+    # multiple Solana/Anza crates. Anza is migrating to bincode 2.x
+    # at the SDK level; we inherit the tag until that lands. No
+    # exploit path in our usage.
+    "RUSTSEC-2025-0141",
+    # `libsecp256k1 0.6.0` — RUSTSEC-2025-0161 (unmaintained).
+    # Pulled by `agave-syscalls` (Anza). Anza-side dep; we don't
+    # invoke it directly. Drop when Anza upgrades the syscall
+    # crate's secp256k1 backend.
+    "RUSTSEC-2025-0161",
+    # `rand 0.7.3` + `rand 0.9.2` — RUSTSEC-2026-0097 (unsound with
+    # a custom logger using `rand::rng()`). Pulled transitively by
+    # `libsecp256k1` (Anza) and `quinn-proto` (reqwest). qedgen
+    # doesn't install a custom logger; the unsoundness vector
+    # doesn't fire in our usage. Tracking upstream `rand` 0.9.x
+    # for a patched release.
+    "RUSTSEC-2026-0097",
 ]
 
 # ── Licenses ──────────────────────────────────────────────────────────
