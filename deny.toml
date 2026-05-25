@@ -97,6 +97,25 @@ confidence-threshold = 0.8
 name = "ring"
 allow = ["LicenseRef-ring"]
 
+# mollusk-svm crates ship under Apache-2.0 (per the
+# anza-xyz/mollusk repo) but the Cargo.toml manifests don't carry
+# a `license = "..."` line, so cargo-deny can't auto-detect.
+# Clarify expression here so the license check passes.
+[[licenses.clarify]]
+name = "mollusk-svm"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+name = "mollusk-svm-error"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+name = "mollusk-svm-result"
+expression = "Apache-2.0"
+license-files = []
+
 [licenses.private]
 ignore = true
 
