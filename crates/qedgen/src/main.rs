@@ -3139,22 +3139,35 @@ async fn dispatch(cmd: Commands) -> Result<()> {
                 if let Err(e) = deps::require_kani() {
                     eprintln!("warning: {e}");
                 }
-                // v2.30 Phase 3a — `QEDGEN_USE_MIR_KANI=1` routes the
-                // Kani harness emit through the MIR-consuming path.
-                // Default stays on legacy `kani::generate` until the
-                // full section walk lands + snapshot equivalence
-                // ratifies every pilot fixture (mirrors Lean's
-                // Phase 1 sequencing). The MIR scaffold currently
-                // emits only the structural prefix (banner / math
-                // helpers / state-model header / constants) and a
-                // `MIR-TODO(phase-3b)` marker where the next slice
-                // picks up.
-                if std::env::var("QEDGEN_USE_MIR_KANI").is_ok() {
-                    let parsed = check::parse_spec_file(&spec)?;
+                // v2.30 Phase 3f — MIR is the default Kani-codegen
+                // path. All 6 pilot fixtures are full-file byte-
+                // identical between MIR and legacy through Phase 3e
+                // (escrow / escrow-split / bundled-stdlib-demo /
+                // multisig / percolator / lending — including
+                // multi-account `mod` wrapping). `QEDGEN_LEGACY_KANI=1`
+                // opts back into the ParsedSpec-direct renderer as
+                // an escape hatch.
+                //
+                // Pilot-scope guard: sBPF (`pragma sbpf`) routes to
+                // legacy unconditionally. The Kani-MIR scaffold's
+                // `is_sbpf` is a Phase-0 stub (pragmas aren't lifted
+                // into MIR), so forcing MIR would emit Anchor-shaped
+                // harnesses for an sBPF spec. Mirrors the Lean
+                // dispatch guard added in Phase 2 followup.
+                //
+                // Records (`type T { … }`) work correctly on the
+                // Kani-MIR path — `emit_record_structs` ships via
+                // the shared `rust_codegen_util` helper, so
+                // percolator-class fixtures stay on MIR (no records
+                // carve-out needed, unlike Lean).
+                let parsed = check::parse_spec_file(&spec)?;
+                let mir_out_of_scope = parsed.is_assembly_target();
+                let use_legacy = std::env::var("QEDGEN_LEGACY_KANI").is_ok() || mir_out_of_scope;
+                if use_legacy {
+                    kani::generate(&spec, &kani_output)?;
+                } else {
                     let mir = mir::lower(&parsed);
                     kani_mir::generate(&mir, &parsed, &kani_output)?;
-                } else {
-                    kani::generate(&spec, &kani_output)?;
                 }
             }
 

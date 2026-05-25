@@ -110,10 +110,10 @@ pub fn generate(mir: &Mir, parsed: &ParsedSpec, output_path: &Path) -> Result<()
     let content = render(mir, parsed);
     std::fs::write(output_path, &content)?;
 
-    eprintln!(
-        "[MIR-pilot] Generated Kani harness scaffold at {} (Phase 3a — structural sections only)",
-        output_path.display()
-    );
+    // Default Kani-codegen path post v2.30 Phase 3f. The legacy
+    // `kani.rs` is still reachable via `QEDGEN_LEGACY_KANI=1` for
+    // any spec where MIR diverges unexpectedly.
+    eprintln!("Generated Kani harnesses in {}", output_path.display());
     Ok(())
 }
 

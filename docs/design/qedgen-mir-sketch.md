@@ -1,8 +1,8 @@
 # qedgen MIR — design sketch
 
-**Status:** Phase 1 + Phase 2 complete. MIR is the default Lean codegen path (`QEDGEN_LEGACY_LEAN=1` escape hatch). **Phase 3a-3e (Kani MIR carry-through — every pilot full-file byte-identical)** shipped: scaffold (3a), per-account body (3b), every per-account harness section (3c1–3c7: guard / abort / property / ensures / invariant / effect / overflow), file-level features (3d), multi-account `mod <lowercase>` wrapping with per-account scoped `ParsedSpec` (3e). **All 6 pilot fixtures full-file byte-identical to legacy**: escrow 268 / escrow-split 179 / bundled-stdlib-demo 155 / multisig 1324 / percolator 2365 / lending 511 lines. `QEDGEN_USE_MIR_KANI=1` opt-in; default stays on legacy. Remaining: 3f (snapshot tests + dispatch flip — mirrors Lean's Phase 1d + Phase 2 close-out).
+**Status:** Phase 1 + Phase 2 complete (Lean: MIR default, `QEDGEN_LEGACY_LEAN=1` escape hatch). **Phase 3 complete (Kani: MIR default, `QEDGEN_LEGACY_KANI=1` escape hatch).** Both codegens follow the same lifecycle: scaffold → section walk → byte-equivalent on every pilot fixture → snapshot tests + dispatch flip. Kani per-pilot byte-identical: escrow 268 / escrow-split 179 / bundled-stdlib-demo 155 / multisig 1324 / percolator 2365 / lending 511 lines. Pilot-scope guard sends sBPF (`pragma sbpf`) to legacy unconditionally (`is_sbpf` is a Phase-0 MIR stub); records are MIR-supported via shared `rust_codegen_util::emit_record_structs`, so percolator-class fixtures stay on MIR. Remaining MIR carry-through: Anchor (`codegen.rs`, 7572 LoC) and proptest (2110 LoC) — same scaffold-then-section-walk pattern.
 
-**Last revised:** 2026-05-25 (Phase 3e multi-account mod wrapping — Kani byte-equivalence complete).
+**Last revised:** 2026-05-25 (Phase 3f Kani snapshot tests + dispatch flip — Kani port complete).
 
 **Companion docs** (read these first if you want measured evidence behind the claims here):
 
@@ -398,16 +398,17 @@ to the legacy renderer**, gated by `cargo test --test mir_snapshot`.
 all four state shapes (ADT, flat single-account, indexed, multi-
 account). MIR is the default Lean codegen path post v2.30 Phase 2.
 
-**Kani.** Phase 3a–3e shipped. **All 6 pilot fixtures full-file
-byte-identical to legacy** (escrow 268 / escrow-split 179 /
-bundled-stdlib-demo 155 / multisig 1324 / percolator 2365 / lending
-511 lines). Section order matches legacy verbatim. Multi-account
-specs (lending) emit one `mod <lowercase> { use super::*; ... }`
-per `account_type` driven by a per-account scoped `ParsedSpec`
-(`scope_parsed_to_account` filters handlers / properties /
-invariants per legacy heuristics). `QEDGEN_USE_MIR_KANI=1` opt-in;
-default stays on legacy. Remaining: snapshot tests + dispatch flip
-→ Phase 3f (mirrors Lean Phase 1d + Phase 2 close-out).
+**Kani.** Phase 3a–3f shipped. **MIR is the default Kani-codegen
+path** post Phase 3f flip (`QEDGEN_LEGACY_KANI=1` escape hatch).
+All 6 pilot fixtures full-file byte-identical to legacy (escrow
+268 / escrow-split 179 / bundled-stdlib-demo 155 / multisig 1324
+/ percolator 2365 / lending 511 lines). Snapshot tests gate every
+pilot via `tests/kani_snapshot.rs` (mirrors `tests/mir_snapshot.rs`
+for Lean). Pilot-scope guard sends sBPF (`pragma sbpf`) to legacy
+unconditionally — MIR's `is_sbpf` is still a Phase-0 stub; records
+(`type T { … }`) are MIR-supported via shared
+`rust_codegen_util::emit_record_structs`, so no records carve-out
+needed (unlike the Lean side).
 
 **Anchor / proptest.** Untouched — still consume `ParsedSpec`
 directly. Same Phase-3-style port shape applies when picked up.
@@ -421,36 +422,30 @@ For the next session picking up this work:
 - Local: `.cargo/config.toml` carries `rustflags = ["-C", "symbol-mangling-version=v0"]` for the macOS linker workaround. See [[reference-macos-linker-workaround]].
 
 **Smoke commands:**
-- `cargo test -p qedgen-solana-skills --bins lean_gen_mir::tests` — MIR-codegen unit tests.
+- `cargo test -p qedgen-solana-skills --bins lean_gen_mir::tests` — Lean MIR-codegen unit tests.
+- `cargo test -p qedgen-solana-skills --bins kani_mir::tests` — Kani MIR-codegen unit tests.
 - `cargo test -p qedgen-solana-skills --bins mir::tests` — MIR lowering tests.
-- `cargo test -p qedgen-solana-skills --test mir_snapshot` — Phase 1d snapshot equivalence over every pilot fixture. Use `UPDATE_SNAPSHOTS=1 cargo test --test mir_snapshot` to refresh after an intentional codegen change.
+- `cargo test -p qedgen-solana-skills --test mir_snapshot` — Phase 1d Lean snapshot equivalence over every pilot fixture.
+- `cargo test -p qedgen-solana-skills --test kani_snapshot` — Phase 3f Kani snapshot equivalence over every pilot fixture. Use `UPDATE_SNAPSHOTS=1` to refresh after an intentional codegen change.
 - `cargo fmt --check` + `cargo clippy -p qedgen-solana-skills -- -D warnings` — CI gates.
-- `qedgen codegen --spec examples/rust/bundled-stdlib-demo/pool.qedspec --lean` — run MIR (the default) end-to-end on an ADT fixture; prefix with `QEDGEN_LEGACY_LEAN=1` for the legacy renderer. The bundled-stdlib-demo is byte-identical to legacy and exercises §8 CPI theorems + §S5 inductive State; restore with `git checkout -- examples/rust/bundled-stdlib-demo/` after eyeballing — codegen rewrites `programs/` too.
+- `qedgen codegen --spec examples/rust/bundled-stdlib-demo/pool.qedspec --lean --kani` — run MIR (the default for both) end-to-end. Prefix with `QEDGEN_LEGACY_LEAN=1` / `QEDGEN_LEGACY_KANI=1` for the respective legacy renderers. Restore after eyeballing: `git checkout -- examples/rust/bundled-stdlib-demo/`.
 
 **Where the pieces live:**
-- `crates/qedgen/src/mir.rs` — typed IR + lowering. Section dividers (`// ---- ----`) split the file. Search anchors: `pub struct Mir`, `pub enum Stmt`, `pub fn lower`.
+- `crates/qedgen/src/mir.rs` — typed IR + lowering. Search anchors: `pub struct Mir`, `pub enum Stmt`, `pub fn lower`.
 - `crates/qedgen/src/lean_gen_mir.rs` — Lean emission. Section emitters are `emit_*` fns; the order in `render_single_account` mirrors `lean_gen.rs::render_single_account` (line 1177).
-- `crates/qedgen/src/main.rs:3194` — dispatch gate. Pilot-scope
-  guard sends sBPF (`pragma sbpf`) and record-bearing specs
-  (`type T { … }`) to legacy unconditionally; pilot specs route
-  through `mir::lower → lean_gen_mir`; `QEDGEN_LEGACY_LEAN=1`
-  forces legacy regardless of shape.
+- `crates/qedgen/src/kani_mir.rs` — Kani emission. Section emitters mirror `kani.rs::emit_kani_account_section` order: structural → guard → abort → property → ensures → invariant → effect → overflow. Multi-account dispatch (`emit_multi_account_sections`) wraps each `account_type` in `mod <lowercase> { use super::*; ... }` driven by `scope_parsed_to_account`.
+- `crates/qedgen/src/main.rs` — dispatch gates. Lean (`--lean`): pilot-scope guard sends sBPF + record-bearing specs to legacy; pilot specs route through MIR; `QEDGEN_LEGACY_LEAN=1` forces legacy. Kani (`--kani`): pilot-scope guard sends sBPF to legacy (records are MIR-supported); `QEDGEN_LEGACY_KANI=1` forces legacy.
 
 **Suggested first move in the next session:**
-1. **MIR carry-through for the non-Lean codegens — Kani Phase 3c
-   (guard / effect / overflow / abort harnesses) + 3d (property /
-   invariant preservation) + 3e (multi-account `mod` wrapping) +
-   3f (covers / liveness / environment file-level features).**
-   Phase 3a-3b shipped the structural prefix + per-account body
-   (records / enums / Status / State / property+invariant predicates
-   / transitions / ref_impls) byte-equivalent to legacy on 5 of 6
-   pilots. The harness-emit machinery is the bulk of `kani.rs`'s
-   remaining LoC — `emit_kani_account_section` lines ~493 onward
-   (guard rejection harnesses, property preservation, invariant
-   preservation, effect conformance, overflow detection, abort
-   conditions) and `emit_file_level_features` (covers / liveness /
-   environment). After Kani: Anchor (handler shape impact); then
-   proptest (per-slot lowering impact).
+1. **MIR carry-through for the remaining non-Lean codegens.** Kani
+   (`kani.rs`, 2,437 LoC) and Lean (`lean_gen.rs`, 8,661 LoC) are
+   both MIR-default and snapshot-gated. The remaining work is
+   Anchor (`codegen.rs`, 7,572 LoC — handler shape impact) and
+   proptest (`proptest_gen.rs`, 2,110 LoC — per-slot lowering
+   impact). Same scaffold-then-section-walk pattern as Kani Phase
+   3a-3f: create `<X>_mir.rs` mirroring the legacy entry shape,
+   add an opt-in env var, port section-by-section, add a snapshot
+   harness, flip the default, add the pilot-scope guard.
 2. **Close the MIR pilot-scope carve-outs.** The dispatch guard
    currently sends two shape classes to legacy: (a) sBPF — needs
    `pragmas` lifted into MIR and `is_sbpf` un-stubbed (then a
