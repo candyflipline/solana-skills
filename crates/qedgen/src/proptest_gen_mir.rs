@@ -2,9 +2,6 @@
 // `proptest_gen.rs` until snapshot equivalence is validated on every
 // pilot fixture; then `proptest_gen.rs` is retired.
 //
-// Dead-code warnings expected during incremental wiring.
-#![allow(dead_code)]
-
 //! qedgen proptest codegen — MIR consumer.
 //!
 //! Phase 5 of the v2.30 refactor. The existing `proptest_gen.rs`

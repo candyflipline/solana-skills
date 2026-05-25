@@ -3,9 +3,6 @@
 // `lean_gen.rs` is reachable via `QEDGEN_LEGACY_LEAN=1` as an
 // escape hatch and stays in-tree until the non-Lean codegens
 // finish their MIR carry-through.
-//
-// Dead-code warnings during incremental wiring.
-#![allow(dead_code)]
 
 //! qedgen Lean codegen — MIR consumer.
 //!

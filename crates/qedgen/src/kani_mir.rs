@@ -2,9 +2,6 @@
 // `kani.rs` until snapshot equivalence is validated on every pilot
 // fixture; then `kani.rs` is retired.
 //
-// Dead-code warnings expected during incremental wiring.
-#![allow(dead_code)]
-
 //! qedgen Kani codegen — MIR consumer.
 //!
 //! Phase 3 of the v2.30 refactor. The existing `kani.rs` (2,437 LoC)

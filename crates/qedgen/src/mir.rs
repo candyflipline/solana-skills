@@ -1,6 +1,11 @@
-// Dead-code warnings expected during Phase 0 — types are defined ahead of
-// the codegens that consume them. Re-enable once Phase 0c lowering wires
-// these into a `lower()` body that codegen tests can exercise.
+// v2.30 MIR — typed IR consumed by lean_gen_mir / kani_mir /
+// codegen_mir / proptest_gen_mir. A handful of fields and enum
+// variants are reserved for the v3.0 cleanup that lifts requires +
+// effects into typed `Stmt` nodes (the deferred guards / proptest
+// sub-emitter ports — see Phase 4g + Phase 5 deferral comments).
+// Removing them now would force re-adding when that work starts;
+// keeping `allow(dead_code)` here ratifies the "IR ahead of
+// consumers" design.
 #![allow(dead_code)]
 
 //! qedgen MIR — typed Solana-native intermediate representation between

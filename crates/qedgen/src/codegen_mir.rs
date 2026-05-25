@@ -2,9 +2,6 @@
 // to `codegen.rs` until snapshot equivalence is validated on every
 // pilot fixture; then `codegen.rs` is retired.
 //
-// Dead-code warnings expected during incremental wiring.
-#![allow(dead_code)]
-
 //! qedgen Anchor/Quasar codegen — MIR consumer.
 //!
 //! Phase 4 of the v2.30 refactor. The existing `codegen.rs` (7,572
