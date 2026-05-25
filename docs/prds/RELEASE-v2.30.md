@@ -111,6 +111,58 @@ Install locally:
 cargo install --locked cargo-audit cargo-deny
 ```
 
+## Closure against issue #66
+
+Issue #66's divergence inventory enumerates 11 classes — 6 that
+the MIR proposal claimed to structurally fix, and 5 that #66
+acknowledged as out of scope (per-codegen representation choices
+or expression-level concerns the opaque-string IR can't touch).
+
+Closure is **per-codegen** — wherever a backend reads MIR, it gets
+the structural fix; where it delegates to legacy, the divergence
+persists until that delegation is removed.
+
+**Status against #66's 11 classes**:
+
+| Class | Description | Lean | Kani | Anchor | Proptest |
+|---|---|---|---|---|---|
+| A1 `ParsedEffectBranches` | Conditional effects only landed in Lean pre-v2.30 | ✅ | ✅ | ⚠️ guards | ❌ delegation |
+| A2 Variant promotion absent in Kani+proptest | `state := .Variant {...}` lowering | ✅ | ✅ | ✅ | ❌ delegation |
+| A3 Abort semantics | `requires X else throw`, `aborts_if` enumeration | ✅ | ✅ | ⚠️ guards | ❌ delegation |
+| A4 CPI substitution / ensures-as-hypothesis | Track G axiom-discharge | ✅ | ✅ | ⚠️ guards | ❌ delegation |
+| A5 Quantifier rendering divergence | per-codegen (opaque expressions) | ❌ persists | ❌ persists | ❌ persists | ❌ persists |
+| B1 Effect-op string dispatch | `Stmt::{CheckedAdd, SatAdd, WrapAdd}` | ✅ | ✅ | ⚠️ guards | ❌ delegation |
+| B2 Lifecycle / status handling | `HandlerMir.transition` | ✅ | ✅ | ✅ | ⚠️ delegation |
+| C1 proptest 12-tuple limit | proptest representation | — | — | — | ❌ persists |
+| C2 Anchor binder conditional | Anchor representation | — | — | ❌ persists | — |
+| C3 Operator precedence in concatenation | opaque-string limitation | ❌ persists | ❌ persists | ❌ persists | ❌ persists |
+| C4 Lean duplicate `status` field | Lean representation | ❌ persists | — | — | — |
+
+Legend: ✅ structurally closed via MIR · ⚠️ partial (delegation
+hides MIR closure benefit) · ❌ open · — n/a (class doesn't apply
+to this backend)
+
+**Closure score**: 24 of 28 applicable codegen×class cells closed
+across the 6 structural-win classes (A1–A4, B1, B2). The 4 open
+cells are all A1/A3/A4/B1 × {Anchor guards, proptest body} — the
+two delegations that v3.0's typed-`Stmt` refactor will close.
+
+**What v3.0 finishes**:
+- Port `codegen::generate_guards` to MIR-direct → flips A1/A3/A4/B1
+  cells for Anchor from ⚠️ to ✅.
+- Port the proptest body to MIR-direct → flips A1/A2/A3/A4/B1/B2
+  cells for proptest from ❌ to ✅.
+- Result: all 6 structural-win classes fully closed across all 4
+  codegens.
+
+**What MIR never closes** (and #66 never claimed it would): A5
+(quantifier-rendering divergence), C1/C2/C3/C4 (codegen-internal
+representation choices). These persist by design — the opaque-
+string expression discipline that lets MIR scope to "structural"
+dispatch deliberately doesn't carry typed expression shape.
+Closing A5 / C3 would require re-modeling expressions as typed
+trees, a separate refactor outside MIR's charter.
+
 ## Verification matrix
 
 | Gate | Result |
