@@ -1,8 +1,8 @@
 # qedgen MIR — design sketch
 
-**Status:** Phase 1c-6 landed (§15 cover / liveness / environments / overflow emit statements; proof scripts deferred). 15/16 emit sections shipped on the `mir` branch. Remaining: §8 CPI theorems, the §15 auto-proof scripts, the multi-variant ADT path, and Phase 1d (snapshot equivalence). Handoff notes in §"Next-session handoff" below.
+**Status:** Phase 1c-8 (multi-variant ADT path) and Phase 1d (snapshot equivalence) shipped on the `mir` branch. All 16 emit sections + ADT path emit content; snapshot tests gate every pilot fixture. ADT-path byte-equivalence achieved on `bundled-stdlib-demo` + `cross-program-vault`; `escrow-split` differs only in deferred §15 `cover_trace_proof` witnesses (~13 lines). Flat-path divergences (`escrow` / `lending` / `multisig`) pre-date Phase 1d and are the v2.30 follow-on. Handoff notes in §"Next-session handoff" below.
 
-**Last revised:** 2026-05-25 (Phase 1c close-out).
+**Last revised:** 2026-05-25 (Phase 1d close-out).
 
 **Companion docs** (read these first if you want measured evidence behind the claims here):
 
@@ -363,9 +363,32 @@ Commit trail on `mir` branch:
 - **Preservation proof scripts** — Phase 1c-5 emits property preservation theorems as `:= sorry`. legacy lean_gen.rs has a `preservation_proof_script` helper that discharges via `if_neg` / `dsimp + omega` projection. ~half day.
 - **`rewrite_subscripts_lean` pass for ref_impls** — Phase 1c-4 emits ref_impl bodies verbatim; legacy applies a `m[i]` → `(m i)` rewrite for Map-typed params. Triggers when a fixture uses ref_impls with Map subscripts — no pilot fixture does today. ~half day when needed.
 
-### Phase 1d — snapshot equivalence — **next session**
+### Phase 1d — snapshot equivalence — **shipped**
 
-Once the deferred items close, run both codegens against every pilot fixture and assert byte-identical or cosmetic-diff-only output. Lock expected diffs as snapshot fixtures.
+Snapshot tests live at `crates/qedgen/tests/mir_snapshot.rs` with
+per-fixture `Spec.lean` snapshots under
+`crates/qedgen/tests/snapshots/`. Each test regenerates the MIR
+output (`QEDGEN_USE_MIR=1 qedgen codegen --lean`) into an isolated
+`git init`'d tempdir and asserts byte-equality against the snapshot.
+Drift fails the test with a unified diff; intentional updates run
+through `UPDATE_SNAPSHOTS=1 cargo test --test mir_snapshot`.
+
+The snapshots lock the MIR output (not vs legacy). MIR ↔ legacy
+parity per fixture is documented in
+`crates/qedgen/tests/snapshots/README.md`:
+
+| Fixture | Path | MIR ⇆ legacy |
+|---|---|---|
+| `bundled-stdlib-demo` | ADT | byte-identical |
+| `cross-program-vault` | ADT | byte-identical |
+| `escrow-split` | ADT | identical modulo deferred §15 `cover_trace_proof` witnesses (~13 lines) |
+| `escrow` | flat | pre-existing transition body / `inductive Status` deriving order divergence |
+| `lending` | flat | same |
+| `multisig` | flat | same |
+
+ADT-path byte-equivalence is the Phase 1c-8 deliverable; the flat-
+path differences pre-date Phase 1d and are the remaining v2.30
+follow-on (see "Deferred" below).
 
 ### Honest scoping
 
@@ -380,10 +403,11 @@ For the next session picking up this work:
 - Local: `.cargo/config.toml` carries `rustflags = ["-C", "symbol-mangling-version=v0"]` for the macOS linker workaround. See [[reference-macos-linker-workaround]].
 
 **Smoke commands:**
-- `cargo test -p qedgen-solana-skills --bins lean_gen_mir::tests` — 15 MIR-codegen tests (run via `--bins` since the package has no lib target).
-- `cargo test -p qedgen-solana-skills --bins mir::tests` — 10 MIR lowering tests.
+- `cargo test -p qedgen-solana-skills --bins lean_gen_mir::tests` — MIR-codegen unit tests.
+- `cargo test -p qedgen-solana-skills --bins mir::tests` — MIR lowering tests.
+- `cargo test -p qedgen-solana-skills --test mir_snapshot` — Phase 1d snapshot equivalence over every pilot fixture. Use `UPDATE_SNAPSHOTS=1 cargo test --test mir_snapshot` to refresh after an intentional codegen change.
 - `cargo fmt --check` + `cargo clippy -p qedgen-solana-skills -- -D warnings` — CI gates.
-- `QEDGEN_USE_MIR=1 qedgen codegen --spec examples/rust/lending/lending.qedspec --lean` — run the new path end-to-end on a fixture. Inspect `formal_verification/Spec.lean`. The lending fixture exercises every Phase 1c-6 emitter (covers, liveness, environments, overflow); restore with `git checkout -- examples/rust/lending/` after eyeballing — codegen rewrites `programs/` too.
+- `QEDGEN_USE_MIR=1 qedgen codegen --spec examples/rust/bundled-stdlib-demo/pool.qedspec --lean` — run the new path end-to-end on an ADT fixture. The bundled-stdlib-demo is byte-identical to legacy and exercises §8 CPI theorems + §S5 inductive State; restore with `git checkout -- examples/rust/bundled-stdlib-demo/` after eyeballing — codegen rewrites `programs/` too.
 
 **Where the pieces live:**
 - `crates/qedgen/src/mir.rs` — typed IR + lowering. Section dividers (`// ---- ----`) split the file. Search anchors: `pub struct Mir`, `pub enum Stmt`, `pub fn lower`.
@@ -391,14 +415,37 @@ For the next session picking up this work:
 - `crates/qedgen/src/main.rs:3194` — dispatch gate (`if QEDGEN_USE_MIR { mir::lower → lean_gen_mir } else { lean_gen }`).
 
 **Suggested first move in the next session:**
-1. **§8 CPI theorems (Phase 1c-7)** — design call resolved 2026-05-25; spec lives in [`mir-unified-imports.md`](mir-unified-imports.md). `Mir.imports` (canonical) collapses the parallel `ParsedSpec.interfaces` + `ParsedSpec.imported_namespaces` surfaces. Sequence: add types → `lower_imports` → port `render_cpi_theorems`. ~2–3 days.
-2. Multi-variant ADT path (`render_single_account_adt`) — biggest remaining MIR-shape item after §8. Byte-equivalence for `escrow` depends on it; MIR currently emits the flat-state form for sum-typed accounts. ~2–3 days.
-3. §15 + §11 auto-proof scripts — port `cover_trace_proof`, `liveness_proof_script`, `overflow_proof_script`, `preservation_proof_script` from legacy. Each replaces a `:= sorry` body with a real auto-discharge that closes trivial cases. ~1 day.
-4. Phase 1d snapshot tests — once the above lands, both codegens against every pilot fixture, byte-identical or cosmetic-diff-only.
+1. **§15 + §11 auto-proof scripts** — port `cover_trace_proof`,
+   `liveness_proof_script`, `overflow_proof_script`,
+   `preservation_proof_script` from legacy. Each replaces a `:=
+   sorry` body with a real auto-discharge that closes trivial
+   cases. ~1 day. Closes the ~13-line `escrow-split` MIR ↔ legacy
+   diff entirely.
+2. **Flat-path emitter alignment** — the MIR flat-state shape
+   diverges from legacy in three families: (a) `inductive Status`
+   `deriving` order + per-variant `: Status` annotation; (b)
+   transition body lacks signer-equality / lifecycle-gate
+   conjuncts and emits an unconditional auth alias; (c) cover
+   trace proofs emit `:= sorry` rather than legacy's `decide`
+   witnesses. ~2–4 days; closes `escrow` / `lending` / `multisig`
+   byte-equivalence.
+3. **Phase 2 — multi-account codegen** (`render_multi_account`
+   stub today). Out of Phase 1 scope; the design note in
+   `qedgen-mir-sketch.md` §"Phase ordering implication" budgets it
+   at ~1 week.
 
 **What NOT to do without revisiting:**
-- Don't try to byte-match `lean_gen.rs` output verbatim before all sections emit. Cosmetic diffs (ordering, whitespace) are expected; locking them into snapshots is Phase 1d's job, not earlier.
-- Don't add a parallel `Mir.interfaces` lift alongside `Mir.imports` — the unified shape resolved in [`mir-unified-imports.md`](mir-unified-imports.md) makes `Mir.imports` canonical. Re-introducing the split would re-create the exact debt this MIR exercise pays down.
+- Don't try to refactor the flat-path emitter into a "deriving
+  preference" parameter shared with the ADT path — the ADT and flat
+  emitters have legitimately different goals (variant pattern-match
+  vs flat-struct guards) and the byte-shape mismatch isn't just
+  formatting drift. Port the legacy emitter behavior section-by-
+  section like Phase 1c-8 did.
+- Don't add a parallel `Mir.interfaces` lift alongside
+  `Mir.imports` — the unified shape resolved in
+  [`mir-unified-imports.md`](mir-unified-imports.md) makes
+  `Mir.imports` canonical. Re-introducing the split would re-
+  create the exact debt this MIR exercise pays down.
 
 ## What the companion docs validate
 
