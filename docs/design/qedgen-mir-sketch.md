@@ -316,7 +316,7 @@ Tracking what's shipped on the `mir` branch vs. what's still planned. Commits re
 ### Phase 1b — lean_gen_mir scaffold + flag — **shipped** (`f670404`)
 
 - `crates/qedgen/src/lean_gen_mir.rs` mirrors `lean_gen::{generate, render}` entry-point shape.
-- `QEDGEN_USE_MIR=1` env var routes `qedgen codegen --lean` through the new path. Default stays on legacy.
+- `QEDGEN_USE_MIR=1` env var (Phase 1b–Phase 2) routed `qedgen codegen --lean` through the new path; post Phase 2 MIR is the default and `QEDGEN_LEGACY_LEAN=1` is the escape hatch back to `lean_gen`.
 - Shape-detection dispatch (sBPF / indexed / multi-account / single-account) matches legacy; non-pilot branches emit marker stubs.
 
 ### Phase 1c — Lean emission for pilot scope — **closed for this session (14/16 + adjacents)**
@@ -413,22 +413,23 @@ For the next session picking up this work:
 - `cargo test -p qedgen-solana-skills --bins mir::tests` — MIR lowering tests.
 - `cargo test -p qedgen-solana-skills --test mir_snapshot` — Phase 1d snapshot equivalence over every pilot fixture. Use `UPDATE_SNAPSHOTS=1 cargo test --test mir_snapshot` to refresh after an intentional codegen change.
 - `cargo fmt --check` + `cargo clippy -p qedgen-solana-skills -- -D warnings` — CI gates.
-- `QEDGEN_USE_MIR=1 qedgen codegen --spec examples/rust/bundled-stdlib-demo/pool.qedspec --lean` — run the new path end-to-end on an ADT fixture. The bundled-stdlib-demo is byte-identical to legacy and exercises §8 CPI theorems + §S5 inductive State; restore with `git checkout -- examples/rust/bundled-stdlib-demo/` after eyeballing — codegen rewrites `programs/` too.
+- `qedgen codegen --spec examples/rust/bundled-stdlib-demo/pool.qedspec --lean` — run MIR (the default) end-to-end on an ADT fixture; prefix with `QEDGEN_LEGACY_LEAN=1` for the legacy renderer. The bundled-stdlib-demo is byte-identical to legacy and exercises §8 CPI theorems + §S5 inductive State; restore with `git checkout -- examples/rust/bundled-stdlib-demo/` after eyeballing — codegen rewrites `programs/` too.
 
 **Where the pieces live:**
 - `crates/qedgen/src/mir.rs` — typed IR + lowering. Section dividers (`// ---- ----`) split the file. Search anchors: `pub struct Mir`, `pub enum Stmt`, `pub fn lower`.
 - `crates/qedgen/src/lean_gen_mir.rs` — Lean emission. Section emitters are `emit_*` fns; the order in `render_single_account` mirrors `lean_gen.rs::render_single_account` (line 1177).
-- `crates/qedgen/src/main.rs:3194` — dispatch gate (`if QEDGEN_USE_MIR { mir::lower → lean_gen_mir } else { lean_gen }`).
+- `crates/qedgen/src/main.rs:3194` — dispatch gate (`if QEDGEN_LEGACY_LEAN { lean_gen } else { mir::lower → lean_gen_mir }`).
 
 **Suggested first move in the next session:**
-1. **Examples drift sweep — flip the default.** All six pilot
-   fixtures now emit byte-equivalent Lean between MIR and legacy.
-   Change `main.rs:3199`'s `if QEDGEN_USE_MIR { … }` from opt-in to
-   opt-out (`QEDGEN_LEGACY_LEAN=1` for the escape hatch), refresh
-   every bundled example's `.qed.lock`, run
-   `bash scripts/check-lake-build.sh --strict` to confirm Lean
-   builds, and update `references/cli.md` / `SKILL.md` to drop the
-   env-var mention.
+1. **Bundled-example regen sweep.** Now that MIR is the default,
+   regenerate every committed `examples/rust/*/formal_verification/Spec.lean`
+   so the in-repo Lean stays in lock-step with the renderer. Pre-flip
+   spot-check showed `escrow`'s committed Spec.lean had drifted from
+   BOTH MIR and legacy (older v2.24 §S5 ADT shape rather than the
+   current flat shape). Run `bash scripts/check-lake-build.sh --strict`
+   afterwards to confirm every example still builds. Separate commit
+   from the dispatch flip so the renderer-output churn is clearly
+   attributable.
 2. **MIR carry-through for the non-Lean codegens** — Anchor /
    Kani / proptest still consume `ParsedSpec` directly. Phase 1
    pilot was Lean-only by design. Picking the next codegen is a

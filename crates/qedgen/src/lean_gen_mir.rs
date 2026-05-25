@@ -1,17 +1,24 @@
-// Phase 1 (v2.30) MIR-based Lean codegen. Lives in parallel to
-// `lean_gen.rs` until snapshot equivalence is validated on every pilot
-// fixture; then `lean_gen.rs` is retired.
+// v2.30 MIR-based Lean codegen. This module is the default
+// Lean-codegen path post Phase 2; the legacy ParsedSpec-direct
+// `lean_gen.rs` is reachable via `QEDGEN_LEGACY_LEAN=1` as an
+// escape hatch and stays in-tree until the non-Lean codegens
+// finish their MIR carry-through.
 //
 // Dead-code warnings during incremental wiring.
 #![allow(dead_code)]
 
 //! qedgen Lean codegen — MIR consumer.
 //!
-//! This is Phase 1 of the v2.30 refactor. The existing `lean_gen.rs`
-//! (8,661 LoC) consumes `ParsedSpec` directly; this module replicates
-//! the same emitted output but consumes `mir::Mir`. The flag
-//! `QEDGEN_USE_MIR=1` switches the `qedgen codegen --lean` call site to
-//! this module; without the flag, legacy `lean_gen` runs.
+//! Default Lean codegen path post v2.30 Phase 2. The existing
+//! `lean_gen.rs` (8,661 LoC) consumes `ParsedSpec` directly; this
+//! module replicates the same emitted output but consumes `mir::Mir`.
+//! Every pilot fixture (escrow, escrow-split, lending, multisig,
+//! bundled-stdlib-demo, cross-program-vault) is byte-identical
+//! MIR ↔ legacy, gated by `cargo test --test mir_snapshot`.
+//!
+//! `QEDGEN_LEGACY_LEAN=1` forces the call site back onto `lean_gen`
+//! as an escape hatch for any spec where MIR diverges unexpectedly;
+//! file an issue so the snapshot test can catch the case next regen.
 //!
 //! ## Phase 1a survey — what we must replicate
 //!

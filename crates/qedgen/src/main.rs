@@ -3192,15 +3192,20 @@ async fn dispatch(cmd: Commands) -> Result<()> {
                     eprintln!("warning: {e}");
                 }
                 let parsed = check::parse_spec_file(&spec)?;
-                // v2.30 Phase 1: `QEDGEN_USE_MIR=1` routes Lean codegen
-                // through the MIR-consuming path. Default stays on
-                // legacy until snapshot equivalence ratifies the new
-                // path across every pilot fixture (Phase 1d).
-                if std::env::var("QEDGEN_USE_MIR").is_ok() {
+                // v2.30: MIR is the default Lean-codegen path after
+                // Phase 2 closed the last pilot-fixture parity gap
+                // (lending). `QEDGEN_LEGACY_LEAN=1` opts back into the
+                // ParsedSpec-direct renderer as an escape hatch while
+                // the non-Lean codegens (Kani / proptest / Anchor)
+                // finish their MIR carry-through. The legacy path
+                // remains reachable for any spec where MIR diverges
+                // unexpectedly — file an issue so the snapshot test
+                // can catch it next regen.
+                if std::env::var("QEDGEN_LEGACY_LEAN").is_ok() {
+                    lean_gen::generate(&parsed, &lean_output)?;
+                } else {
                     let mir = mir::lower(&parsed);
                     lean_gen_mir::generate(&mir, &parsed, &lean_output)?;
-                } else {
-                    lean_gen::generate(&parsed, &lean_output)?;
                 }
                 // Bootstrap Proofs.lean alongside Spec.lean. Never overwrites
                 // an existing file — the user-owned theorems survive regen.
