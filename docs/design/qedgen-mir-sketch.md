@@ -1,8 +1,8 @@
 # qedgen MIR — design sketch
 
-**Status:** in active implementation, on the `mir` branch. Phase 0 + Phase 1b + Phase 1c (slices 1–3) shipped; remaining work tracked in §"Implementation status" below.
+**Status:** Phase 1c closed for this session (14/16 emit sections shipped), on the `mir` branch. Phase 1d (snapshot equivalence) + the deferred Phase 1c items (§8 CPI theorems, §15 cover/liveness/etc, multi-variant ADT path) pick up in a dedicated next session — handoff notes in §"Next-session handoff" below.
 
-**Last revised:** 2026-05-25 (Phase 1c-3 + progress catchup).
+**Last revised:** 2026-05-25 (Phase 1c close-out).
 
 **Companion docs** (read these first if you want measured evidence behind the claims here):
 
@@ -319,7 +319,7 @@ Tracking what's shipped on the `mir` branch vs. what's still planned. Commits re
 - `QEDGEN_USE_MIR=1` env var routes `qedgen codegen --lean` through the new path. Default stays on legacy.
 - Shape-detection dispatch (sBPF / indexed / multi-account / single-account) matches legacy; non-pilot branches emit marker stubs.
 
-### Phase 1c — Lean emission for pilot scope — **in progress**
+### Phase 1c — Lean emission for pilot scope — **closed for this session (14/16 + adjacents)**
 
 Sub-slices shipped:
 
@@ -327,37 +327,77 @@ Sub-slices shipped:
 |---|---|---|---|
 | 1 | `emit_header` (imports) | 1b | ✅ |
 | 2 | `emit_namespace_open/close` | 1b | ✅ |
-| 3 | uninterpreted helpers + ref_impls | — | TODO (MIR doesn't carry these yet) |
-| 4 | `emit_constants` | — | TODO (MIR doesn't carry these yet) |
+| 3 | `emit_uninterpreted_helpers` + `emit_ref_impls` | 1c-4 | ✅ |
+| 4 | `emit_constants` | 1c-4 | ✅ |
 | 5 | `emit_lifecycle_marker` (Status inductive) | 1b | ✅ |
 | 6 | `emit_state_struct` (cross-variant union) | 1c-1 | ✅ |
 | 7 | `emit_transitions` (per-handler) | 1c-1 | ✅ |
-| 8 | CPI theorems | — | TODO (needs `Mir.interfaces` populated) |
+| 8 | CPI theorems | — | **deferred** (needs `Mir.interfaces` populated) |
 | 9 | `emit_invariants` | 1c-3 | ✅ |
 | 10 | `emit_operation_inductive` + applyOp | 1c-1 | ✅ |
-| 11 | property theorems | — | TODO |
+| 11 | `emit_properties` + preservation | 1c-5 | ✅ |
 | 12 | `emit_aborts_if` (legacy + requires-else) | 1c-2 | ✅ |
 | 13 | `emit_ensures` | 1c-2 | ✅ |
 | 14 | `emit_frame_conditions` | 1c-3 | ✅ |
-| 15 | cover / liveness / environments / overflow | — | TODO |
+| 15 | cover / liveness / environments / overflow | — | **deferred** |
 | 16 | namespace close | 1b | ✅ |
 
-**12 of 16 sections emit content; 4 stubbed.** End-to-end smoke-confirmed on `examples/rust/{escrow,lending,multisig,bundled-stdlib-demo}/*.qedspec` with `QEDGEN_USE_MIR=1`. 13 lean_gen_mir tests pass.
+**14 of 16 sections emit content.** End-to-end smoke-confirmed on `examples/rust/{escrow,lending,multisig,bundled-stdlib-demo,percolator}/*.qedspec` with `QEDGEN_USE_MIR=1`. 11 lean_gen_mir tests + 10 mir tests pass. Full suite 962 + 21 = 983 passing.
 
-### Phase 1c — remaining sub-slices
+Commit trail on `mir` branch:
+- `ab4bdbe` Phase 0 — typed IR + lowering
+- `f670404` Phase 1b — scaffold + `QEDGEN_USE_MIR=1` flag
+- `60a8a38` Phase 1c-1 — transitions + Operation + applyOp
+- `b9be609` Phase 1c-2 — aborts + ensures
+- `01578c6` Phase 1c-3 — invariants + frame
+- `c403089` docs — sketch progress catchup
+- `42bdb06` Phase 1c-4 — constants + helpers + ref_impls
+- `040a8b4` Phase 1c-5 — properties + preservation
 
-- **MIR extension for §3 + §4.** Lift `ParsedSpec.constants`, `ParsedSpec.uninterpreted_helpers`, `ParsedSpec.ref_impls` into MIR top-level fields. Mechanical port of the corresponding `emit_*` from `lean_gen.rs`. ~half day.
-- **§8 CPI theorems.** Requires populating `Mir.interfaces` from `ParsedSpec.imported_namespaces` + the interface ensures registry. Intersects with Phase 3's `cpi_substitute` pass — see §"Cross-cutting passes" above. ~1–2 days.
-- **§11 property theorems + §15 cover/liveness/environments/overflow.** Each its own emit fn with mechanical translation from `lean_gen.rs`. ~1–2 days each.
-- **Multi-variant ADT path (`render_single_account_adt`).** Currently lean_gen.rs takes this branch for `escrow` (Uninitialized | Open | Closed). The MIR path lowers escrow through the flat-state form, which diverges from legacy. Byte-equivalence requires implementing the inductive-State emission. ~2–3 days.
+### Deferred — return in a dedicated Phase 1d session
 
-### Phase 1d — snapshot equivalence — **not started**
+- **§8 CPI theorems** — `render_cpi_theorems` in legacy lean_gen.rs:`grep -n "^fn render_cpi_theorems"`. Requires populating `Mir.interfaces` from `ParsedSpec.imported_namespaces` + the bundled stdlib registry (SPL Token / System Program / Metaplex). Intersects with Phase 3's `cpi_substitute` MIR→MIR pass. ~1–2 days.
+- **§15 cover / liveness / environments / overflow** — four small emit fns. `render_covers`, `render_liveness`, `render_environments`, `render_overflow_obligations` in legacy. Each touches `ParsedSpec` fields not yet lifted into MIR (`covers`, `liveness_props`, `environments`, plus per-handler overflow analysis). ~1–2 days total.
+- **Multi-variant ADT path (`render_single_account_adt`)** — currently lean_gen.rs takes this branch for `escrow` (Uninitialized | Open | Closed); the MIR path emits the flat-state form, which diverges from legacy. Byte-equivalence for escrow requires implementing the inductive-State emission. ~2–3 days. Largest single deferred item.
+- **Preservation proof scripts** — Phase 1c-5 emits property preservation theorems as `:= sorry`. legacy lean_gen.rs has a `preservation_proof_script` helper that discharges via `if_neg` / `dsimp + omega` projection. ~half day.
+- **`rewrite_subscripts_lean` pass for ref_impls** — Phase 1c-4 emits ref_impl bodies verbatim; legacy applies a `m[i]` → `(m i)` rewrite for Map-typed params. Triggers when a fixture uses ref_impls with Map subscripts — no pilot fixture does today. ~half day when needed.
 
-Once the §3/§4/§8/§11/§15 gaps close, run both codegens against every pilot fixture and assert byte-identical or cosmetic-diff-only output. Lock the expected diffs as snapshot fixtures.
+### Phase 1d — snapshot equivalence — **next session**
+
+Once the deferred items close, run both codegens against every pilot fixture and assert byte-identical or cosmetic-diff-only output. Lock expected diffs as snapshot fixtures.
 
 ### Honest scoping
 
-Phase 1 to byte-equivalence is realistically ~1 more week of focused porting work. The pattern is locked in — each remaining gap is mechanical translation from a known `lean_gen.rs` section. The biggest risk is the multi-variant ADT path, which has its own rendering logic and ~500 LoC of helpers in legacy.
+Phase 1 to byte-equivalence is ~4–7 more focused days. The pattern is locked in — each remaining gap is mechanical translation from a known `lean_gen.rs` section. Multi-variant ADT path is the biggest single item.
+
+## Next-session handoff
+
+For the next session picking up this work:
+
+**Branch & toolchain:**
+- Branch: `mir` (8 commits ahead of `main`; `main` is v2.29.2).
+- Local: `.cargo/config.toml` carries `rustflags = ["-C", "symbol-mangling-version=v0"]` for the macOS linker workaround. See [[reference-macos-linker-workaround]].
+
+**Smoke commands:**
+- `cargo test -p qedgen-solana-skills lean_gen_mir::tests` — 11 MIR-codegen tests.
+- `cargo test -p qedgen-solana-skills mir::tests` — 10 MIR lowering tests.
+- `cargo fmt --check` + `cargo clippy -p qedgen-solana-skills -- -D warnings` — CI gates.
+- `QEDGEN_USE_MIR=1 qedgen codegen --spec examples/rust/lending/lending.qedspec --lean` — run the new path end-to-end on a fixture. Inspect `formal_verification/Spec.lean`.
+
+**Where the pieces live:**
+- `crates/qedgen/src/mir.rs` — typed IR + lowering. Section dividers (`// ---- ----`) split the file. Search anchors: `pub struct Mir`, `pub enum Stmt`, `pub fn lower`.
+- `crates/qedgen/src/lean_gen_mir.rs` — Lean emission. Section emitters are `emit_*` fns; the order in `render_single_account` mirrors `lean_gen.rs::render_single_account` (line 1177).
+- `crates/qedgen/src/main.rs:3194` — dispatch gate (`if QEDGEN_USE_MIR { mir::lower → lean_gen_mir } else { lean_gen }`).
+
+**Suggested first move in the next session:**
+1. Pick the simplest deferred item — §15 cover/liveness/environments/overflow — and implement it as four small `emit_*` fns + four small MIR field additions. Mechanical work that warms the pattern back up.
+2. Then tackle the multi-variant ADT path (`render_single_account_adt`) since byte-equivalence for `escrow` depends on it.
+3. Last: §8 CPI theorems (the biggest lift; intersects with Phase 3 work).
+4. Then Phase 1d snapshot tests.
+
+**What NOT to do without revisiting:**
+- Don't try to byte-match `lean_gen.rs` output verbatim before all sections emit. Cosmetic diffs (ordering, whitespace) are expected; locking them into snapshots is Phase 1d's job, not earlier.
+- Don't lift `ParsedSpec.imported_namespaces` into `Mir.interfaces` without a design pass — that field intersects v2.29 Slice F's unified-imports work and the bundled-stdlib registry. Cross-reference [[feedback-unified-imports-semantics]] before designing the MIR shape.
 
 ## What the companion docs validate
 
