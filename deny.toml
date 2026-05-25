@@ -83,6 +83,13 @@ allow = [
     "0BSD",
     "MPL-2.0",
     "MIT-0",
+    # `webpki-roots 1.0.6` (rustls dep) ships under the Linux
+    # Foundation's CDLA-Permissive-2.0. It's a data-license rather
+    # than a code-license; the underlying root certs are public-
+    # interest infrastructure with attribution-only restrictions.
+    # Functionally equivalent to a permissive code license for our
+    # purposes.
+    "CDLA-Permissive-2.0",
 ]
 # OpenSSL has a custom license that's permissive in practice but
 # needs an explicit allow; we route TLS through rustls so this
