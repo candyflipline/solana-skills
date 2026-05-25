@@ -152,6 +152,8 @@ fn render_single_account(mir: &Mir) -> String {
     let mut out = String::new();
     emit_header(&mut out, mir);
     emit_namespace_open(&mut out, mir);
+    emit_uninterpreted_helpers(&mut out, mir);
+    emit_ref_impls(&mut out, mir);
     emit_constants(&mut out, mir);
     emit_lifecycle_marker(&mut out, mir);
     emit_state_struct(&mut out, mir);
@@ -203,11 +205,114 @@ fn emit_namespace_close(out: &mut String, mir: &Mir) {
     out.push_str(&format!("end {}\n", mir.name));
 }
 
-fn emit_constants(_out: &mut String, _mir: &Mir) {
-    // TODO(mir-phase-1c): MIR doesn't yet carry `ParsedSpec.constants`.
-    // Lift in a future Phase 0 patch + emit `abbrev NAME : Nat := VALUE`
-    // lines here. For pilot fixtures that don't declare constants
-    // (escrow, lending, multisig), this is a no-op.
+/// Emit `abbrev NAME : Nat := VALUE` lines for top-level constants.
+/// Mirrors `lean_gen::render_single_account` line ~1203.
+fn emit_constants(out: &mut String, mir: &Mir) {
+    if mir.constants.is_empty() {
+        return;
+    }
+    for (name, val) in &mir.constants {
+        out.push_str(&format!("abbrev {} : Nat := {}\n", safe_name(name), val));
+    }
+    out.push('\n');
+}
+
+/// Emit uninterpreted-helper declarations.
+/// Mirrors `lean_gen::emit_uninterpreted_helpers`.
+///
+/// Each helper becomes a Lean `opaque <name> : T1 → T2 → ... → R`
+/// declaration. `opaque` (not `axiom`) so transition functions stay
+/// computable.
+fn emit_uninterpreted_helpers(out: &mut String, mir: &Mir) {
+    if mir.uninterpreted_helpers.is_empty() {
+        return;
+    }
+    out.push_str(
+        "-- Uninterpreted helpers: declared opaquely so generated\n\
+         -- transitions typecheck even though the DSL doesn't model\n\
+         -- their semantics. Treat each as an abstract Bool predicate;\n\
+         -- strengthen into a concrete definition in your support\n\
+         -- module if you want to discharge it (rather than trust it).\n\
+         -- `opaque` keeps the transition functions computable\n\
+         -- (axioms would force them noncomputable).\n",
+    );
+    for h in &mir.uninterpreted_helpers {
+        let sig = if h.arg_types.is_empty() {
+            h.return_type.clone()
+        } else {
+            let mut parts: Vec<String> = h.arg_types.clone();
+            parts.push(h.return_type.clone());
+            parts.join(" \u{2192} ") // →
+        };
+        out.push_str(&format!("opaque {} : {}\n", safe_name(&h.name), sig));
+    }
+    out.push('\n');
+}
+
+/// Emit `def`-style reference-implementation declarations.
+/// Mirrors `lean_gen::emit_ref_impls`.
+///
+/// `ref_impl` bodies are emitted as Lean `def`s. Map-indexed subscripts
+/// (`m[i]`) in the Lean body get rewritten to function-application
+/// form (`(m i)`) since `Map N T = Fin N → T` doesn't have a GetElem
+/// instance — handled by a small rewrite pass that lean_gen.rs ships
+/// as `rewrite_subscripts_lean`. For Phase 1c-4 we emit the body
+/// verbatim; the subscript-rewrite port lands in a follow-up if any
+/// pilot fixture trips on it.
+fn emit_ref_impls(out: &mut String, mir: &Mir) {
+    if mir.ref_impls.is_empty() {
+        return;
+    }
+    out.push_str(
+        "-- Reference implementations: pure expressions named so\n\
+         -- ensures clauses can call them. The user's Rust impl is\n\
+         -- verified to satisfy the ensures referencing these, not\n\
+         -- forced to implement them verbatim.\n",
+    );
+    for r in &mir.ref_impls {
+        let params = r
+            .params
+            .iter()
+            .map(|(n, t)| format!("({} : {})", safe_name(n), map_dsl_ty(t)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let ret = map_dsl_ty(&r.return_type);
+        // Phase 1c-4 emits the lean_body verbatim. lean_gen.rs runs a
+        // `rewrite_subscripts_lean` pass over Map-indexed expressions
+        // (`m[i]` → `(m i)`); port when a pilot fixture needs it.
+        let body = &r.lean_body;
+        if params.is_empty() {
+            out.push_str(&format!(
+                "def {} : {} := {}\n",
+                safe_name(&r.name),
+                ret,
+                body
+            ));
+        } else {
+            out.push_str(&format!(
+                "def {} {} : {} := {}\n",
+                safe_name(&r.name),
+                params,
+                ret,
+                body
+            ));
+        }
+    }
+    out.push('\n');
+}
+
+/// Map a DSL type-string to its Lean form. Mirrors
+/// `lean_gen::map_type_with_compound` for the common cases used by
+/// `ref_impl` parameter / return types. Unknown forms pass through
+/// unchanged — Phase 1c-4 doesn't try for compound-type support
+/// (`Map[N] T`, `Fin[N]`, ...). A future slice can port the legacy's
+/// compound-aware mapper when a fixture demands it.
+fn map_dsl_ty(s: &str) -> String {
+    match s.trim() {
+        "U8" | "U16" | "U32" | "U64" | "U128" => "Nat".to_string(),
+        "I8" | "I16" | "I32" | "I64" | "I128" => "Int".to_string(),
+        other => other.to_string(),
+    }
 }
 
 fn emit_lifecycle_marker(out: &mut String, mir: &Mir) {
@@ -1085,6 +1190,84 @@ mod tests {
         assert!(
             !out.contains("(h : ¬(initializer_ta.pubkey"),
             "account-pubkey requires should be filtered from abort theorems:\n{}",
+            out
+        );
+    }
+
+    #[test]
+    fn render_emits_constants() {
+        // Percolator declares MAX_ACCOUNTS, MAX_VAULT_TVL,
+        // POS_SCALE, MAX_ACCOUNT_NOTIONAL.
+        let mir = lower_fixture("examples/rust/percolator/percolator.qedspec");
+        let out = render(&mir);
+        assert!(
+            out.contains("abbrev MAX_ACCOUNTS : Nat := 1024"),
+            "expected MAX_ACCOUNTS abbrev"
+        );
+        assert!(out.contains("abbrev POS_SCALE : Nat := 1000000"));
+    }
+
+    #[test]
+    fn render_emits_uninterpreted_helpers() {
+        // Synthetic MIR with an uninterpreted helper. Pilot fixtures
+        // don't declare helpers explicitly (check.rs infers them when
+        // an undeclared fn is referenced), so build the MIR by hand
+        // to exercise the emit path.
+        let mir = Mir {
+            name: "T".to_string(),
+            state: crate::mir::StateAdt::default(),
+            accounts: crate::mir::AccountTable::default(),
+            errors: crate::mir::ErrorEnum::default(),
+            interfaces: crate::mir::InterfaceRegistry::default(),
+            handlers: vec![],
+            invariants: vec![],
+            events: vec![],
+            constants: vec![],
+            uninterpreted_helpers: vec![crate::mir::UninterpretedHelper {
+                name: "is_valid".to_string(),
+                arg_types: vec!["Nat".to_string()],
+                return_type: "Bool".to_string(),
+            }],
+            ref_impls: vec![],
+        };
+        let out = render(&mir);
+        assert!(
+            out.contains("opaque is_valid : Nat \u{2192} Bool"),
+            "expected opaque is_valid : Nat → Bool in:\n{}",
+            out
+        );
+        assert!(out.contains("Uninterpreted helpers"));
+    }
+
+    #[test]
+    fn render_emits_ref_impls() {
+        let mir = Mir {
+            name: "T".to_string(),
+            state: crate::mir::StateAdt::default(),
+            accounts: crate::mir::AccountTable::default(),
+            errors: crate::mir::ErrorEnum::default(),
+            interfaces: crate::mir::InterfaceRegistry::default(),
+            handlers: vec![],
+            invariants: vec![],
+            events: vec![],
+            constants: vec![],
+            uninterpreted_helpers: vec![],
+            ref_impls: vec![crate::mir::RefImpl {
+                name: "scale".to_string(),
+                doc: None,
+                params: vec![
+                    ("a".to_string(), "U64".to_string()),
+                    ("b".to_string(), "U64".to_string()),
+                ],
+                return_type: "U64".to_string(),
+                lean_body: "a * b".to_string(),
+                rust_body: "a * b".to_string(),
+            }],
+        };
+        let out = render(&mir);
+        assert!(
+            out.contains("def scale (a : Nat) (b : Nat) : Nat := a * b"),
+            "expected ref_impl scale lowered:\n{}",
             out
         );
     }

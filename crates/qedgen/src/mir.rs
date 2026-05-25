@@ -117,6 +117,20 @@ pub struct Mir {
     /// Declared events. Auxiliary — codegen reads them when lowering
     /// `HandlerMir.emits`; they're not body statements.
     pub events: Vec<EventDecl>,
+    /// Top-level `const NAME = VALUE` declarations. Stored as
+    /// `(name, raw-value-string)` — codegens render `abbrev NAME : Nat
+    /// := VALUE` in Lean, `pub const NAME: u64 = VALUE;` in Rust, etc.
+    pub constants: Vec<(Symbol, String)>,
+    /// Uninterpreted helper functions referenced from spec bodies but
+    /// declared opaquely. Each becomes a Lean `opaque <name> : T1 → T2
+    /// → ... → R` declaration. Issue #8 finding #5.
+    pub uninterpreted_helpers: Vec<UninterpretedHelper>,
+    /// `ref_impl name (params) : T = <expr>` declarations. Reference
+    /// implementations referenced from `ensures` clauses. Lower to
+    /// Lean `def`s and inline at Kani-harness assertion sites
+    /// (distinct from `uninterpreted_helpers`: those are axiomatic,
+    /// these carry executable bodies).
+    pub ref_impls: Vec<RefImpl>,
 }
 
 // ----------------------------------------------------------------------
@@ -525,6 +539,32 @@ pub struct EventDecl {
     pub fields: Vec<FieldDecl>,
 }
 
+/// Uninterpreted helper signature. Codegens lower as `opaque <name> :
+/// T1 → T2 → ... → R` (Lean) or as TODO call-sites (Rust). First
+/// encounter wins for the inferred signature — inconsistent uses
+/// across the spec would need a richer type inference pass.
+#[derive(Debug, Clone)]
+pub struct UninterpretedHelper {
+    pub name: Symbol,
+    /// DSL-form argument types (`U64`, `Pubkey`, ...).
+    pub arg_types: Vec<String>,
+    /// DSL-form return type.
+    pub return_type: String,
+}
+
+/// `ref_impl <name> (params) : <return_type> = <expr>` declaration.
+/// Carries pre-rendered body strings per backend, same opaque-string
+/// discipline as `Expr`.
+#[derive(Debug, Clone)]
+pub struct RefImpl {
+    pub name: Symbol,
+    pub doc: Option<String>,
+    pub params: Vec<(Symbol, String)>,
+    pub return_type: String,
+    pub lean_body: String,
+    pub rust_body: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct InterfaceRegistry {
     /// Interface lookup by name (e.g., `Token` → `Token.transfer`'s
@@ -694,6 +734,28 @@ pub fn lower(parsed: &ParsedSpec) -> Mir {
         handlers: parsed.handlers.iter().map(lower_handler).collect(),
         invariants: lower_invariants(parsed),
         events: lower_events(parsed),
+        constants: parsed.constants.clone(),
+        uninterpreted_helpers: parsed
+            .uninterpreted_helpers
+            .iter()
+            .map(|(name, arg_types, return_type)| UninterpretedHelper {
+                name: name.clone(),
+                arg_types: arg_types.clone(),
+                return_type: return_type.clone(),
+            })
+            .collect(),
+        ref_impls: parsed
+            .ref_impls
+            .iter()
+            .map(|r| RefImpl {
+                name: r.name.clone(),
+                doc: r.doc.clone(),
+                params: r.params.clone(),
+                return_type: r.return_type.clone(),
+                lean_body: r.lean_body.clone(),
+                rust_body: r.rust_body.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -1155,6 +1217,9 @@ mod tests {
             handlers: vec![],
             invariants: vec![],
             events: vec![],
+            constants: vec![],
+            uninterpreted_helpers: vec![],
+            ref_impls: vec![],
         };
         assert_eq!(mir.name, "Test");
         assert!(mir.handlers.is_empty());
