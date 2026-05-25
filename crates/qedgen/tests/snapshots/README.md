@@ -24,7 +24,7 @@ two diverge today:
 |---|---|---|
 | `bundled-stdlib-demo` | ADT | **byte-identical** |
 | `cross-program-vault` | ADT | **byte-identical** |
-| `escrow-split` | ADT | identical modulo deferred §15 `cover_trace_proof` auto-discharge witnesses (~13 lines) |
+| `escrow-split` | ADT | byte-identical (vs fresh-legacy regen) after §15 `cover_trace_proof` port |
 | `escrow` | flat | substantial pre-existing divergence — `inductive Status` deriving order, transition body shape (no signer-equality / lifecycle gate), cover proof witnesses |
 | `lending` | flat | same as escrow |
 | `multisig` | flat | same as escrow |
@@ -34,12 +34,15 @@ flat-path differences predate Phase 1d and are tracked as follow-on
 work. See `docs/design/qedgen-mir-sketch.md` §"Deferred — return in
 a dedicated Phase 1d session" for the open items, notably:
 
-- `cover_trace_proof` / `liveness_proof_script` / `overflow_proof_script`
-  / `preservation_proof_script` auto-discharge ports (§15 + §11) —
-  closes the ~13 lines in `escrow-split` and reduces flat-path diff
-  modestly.
+- §15 `cover_trace_proof` auto-discharge — ported and unlocked
+  `escrow-split` byte-equivalence on 2026-05-25. The companion
+  `liveness_proof_script` / `overflow_proof_script` /
+  `preservation_proof_script` ports remain deferred: they
+  pattern-match on the legacy transition body's `split`/`cases`
+  structure, so they're gated on the flat-path alignment below.
 - Flat-state transition body / `inductive Status` / abort proof shape
-  alignment — closes the bulk of the flat-path diff.
+  alignment — closes the bulk of the flat-path diff and unlocks the
+  remaining auto-proof scripts above.
 
 Tracked in `MEMORY.md` as
 [[project-v230-mir-byte-equivalence]] when it lands as a follow-up.

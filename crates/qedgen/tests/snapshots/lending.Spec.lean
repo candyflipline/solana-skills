@@ -213,14 +213,26 @@ theorem cover_borrow_repay_cycle : ∃ (s0 : State) (signer : Pubkey),
     ∃ (v0_0 : Nat), ∃ (s1 : State), init_poolTransition s0 signer v0_0 = some s1 ∧
       ∃ (v1_0 : Nat), ∃ (s2 : State), depositTransition s1 signer v1_0 = some s2 ∧
         ∃ (v2_0 : Nat) (v2_1 : Nat), ∃ (s3 : State), borrowTransition s2 signer v2_0 v2_1 = some s3 ∧
-repayTransition s3 signer ≠ none := sorry
+repayTransition s3 signer ≠ none := by
+  let pk : Pubkey := ⟨0, 0, 0, 0⟩
+  let s0 : State := ⟨pk, 0, 0, 0, .Uninitialized⟩
+  let s1 : State := ⟨pk, 0, 0, 1, .Active⟩
+  let s2 : State := ⟨pk, 1, 0, 1, .Active⟩
+  let s3 : State := ⟨pk, 1, 0, 1, .Active⟩
+  exact ⟨s0, pk, 1, s1, by decide, 1, s2, by decide, 1, 1, s3, by decide, by decide⟩
 
 /-- liquidation_path — trace [init_pool, deposit, borrow, liquidate] is reachable. -/
 theorem cover_liquidation_path : ∃ (s0 : State) (signer : Pubkey),
     ∃ (v0_0 : Nat), ∃ (s1 : State), init_poolTransition s0 signer v0_0 = some s1 ∧
       ∃ (v1_0 : Nat), ∃ (s2 : State), depositTransition s1 signer v1_0 = some s2 ∧
         ∃ (v2_0 : Nat) (v2_1 : Nat), ∃ (s3 : State), borrowTransition s2 signer v2_0 v2_1 = some s3 ∧
-liquidateTransition s3 signer ≠ none := sorry
+liquidateTransition s3 signer ≠ none := by
+  let pk : Pubkey := ⟨0, 0, 0, 0⟩
+  let s0 : State := ⟨pk, 0, 0, 0, .Uninitialized⟩
+  let s1 : State := ⟨pk, 0, 0, 1, .Active⟩
+  let s2 : State := ⟨pk, 1, 0, 1, .Active⟩
+  let s3 : State := ⟨pk, 1, 0, 1, .Active⟩
+  exact ⟨s0, pk, 1, s1, by decide, 1, s2, by decide, 1, 1, s3, by decide, by decide⟩
 
 -- ============================================================================
 -- Liveness properties — bounded reachability (leads-to)

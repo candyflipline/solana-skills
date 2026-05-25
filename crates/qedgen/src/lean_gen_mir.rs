@@ -231,7 +231,7 @@ fn render_single_account_adt(mir: &Mir) -> String {
     emit_aborts_if_adt(&mut out, mir);
     emit_ensures(&mut out, mir);
     emit_frame_conditions_adt(&mut out, mir);
-    emit_covers(&mut out, mir);
+    emit_covers_adt(&mut out, mir);
     emit_liveness_adt(&mut out, mir);
     emit_environments(&mut out, mir);
     emit_overflow_adt(&mut out, mir);
@@ -1993,18 +1993,307 @@ fn emit_state_struct(out: &mut String, mir: &Mir) {
     out.push_str("  deriving DecidableEq, Repr\n\n");
 }
 
-/// Emit `cover` reachability theorems. Mirrors
-/// `lean_gen::render_covers` for the pilot scope (flat single-account
-/// state). Each `cover <name> [op_1, ..., op_n]` lowers to a nested
-/// existential theorem asserting the trace runs to completion; each
-/// `reachable when <expr>` entry lowers to one theorem per `(op, when)`.
+// ----------------------------------------------------------------------
+// Cover-witness machinery — port of `lean_gen::WitnessState` + helpers
+//
+// Builds concrete state witnesses for cover-trace proofs by symbolically
+// evaluating each handler in a trace. Used by `emit_covers` to replace
+// `:= sorry` with a real `exact ⟨…, by decide, …⟩` discharge when every
+// step of the trace is symbolically computable.
+// ----------------------------------------------------------------------
+
+/// Concrete state used for cover-trace proof synthesis. Field values
+/// are strings rather than typed Lean terms — Pubkey fields hold `"pk"`
+/// (the binding the proof scope introduces), Bool fields hold
+/// `"false"`, numeric fields hold a numeric string.
+struct WitnessState {
+    fields: Vec<(String, String)>,
+    status: Option<String>,
+}
+
+impl WitnessState {
+    fn new(state: &crate::mir::StateAdt) -> Self {
+        // For multi-variant ADT specs, the union of all variant fields
+        // forms the witness's flat-field view. The mirrors of
+        // `lean_gen.rs::WitnessState::new` plus `spec.state_fields`'s
+        // de-duplicated union behavior — first variant defines the order
+        // and any new fields from later variants append.
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut fields: Vec<(String, String)> = Vec::new();
+        for v in &state.variants {
+            for f in &v.fields {
+                if seen.insert(f.name.clone()) {
+                    let val = match &f.ty {
+                        crate::mir::Ty::Pubkey => "pk".to_string(),
+                        crate::mir::Ty::Bool => "false".to_string(),
+                        _ => "0".to_string(),
+                    };
+                    fields.push((f.name.clone(), val));
+                }
+            }
+        }
+        WitnessState {
+            fields,
+            status: state.lifecycle_states.first().cloned(),
+        }
+    }
+
+    /// Render as a positional struct literal `⟨pk, pk, 0, …, .Status⟩`
+    /// — flat-state shape. Multi-variant ADT specs route through
+    /// `witness_state_to_adt` instead.
+    fn to_lean(&self) -> String {
+        let mut parts: Vec<String> = self.fields.iter().map(|(_, v)| v.clone()).collect();
+        if let Some(ref s) = self.status {
+            parts.push(format!(".{}", s));
+        }
+        format!("\u{27E8}{}\u{27E9}", parts.join(", "))
+    }
+
+    /// Walk `handler.body.stmts` and update field values + lifecycle
+    /// status. Mirrors `lean_gen::WitnessState::apply` against MIR's
+    /// `Stmt` shape. Saturating arithmetic for sub so witnesses don't
+    /// underflow when the proof has unsatisfiable conditions.
+    fn apply(
+        &mut self,
+        h: &crate::mir::HandlerMir,
+        params: &[(String, String)],
+        constants: &[(crate::mir::Symbol, String)],
+        mir: &Mir,
+    ) {
+        use crate::mir::Stmt;
+        for stmt in &h.body.stmts {
+            match stmt {
+                Stmt::Assign { path, rhs } => {
+                    if is_account_pubkey_ref(&rhs.rust) {
+                        continue;
+                    }
+                    let key = strip_variant_prefix(path, mir);
+                    let resolved = self.resolve_value(&rhs.rust, params, constants);
+                    if let Some(f) = self.fields.iter_mut().find(|(n, _)| n == &key) {
+                        f.1 = resolved;
+                    }
+                }
+                Stmt::CheckedAdd { path, delta, .. }
+                | Stmt::WrapAdd { path, delta }
+                | Stmt::SatAdd { path, delta } => {
+                    let key = strip_variant_prefix(path, mir);
+                    let resolved = self.resolve_value(&delta.rust, params, constants);
+                    if let Some(f) = self.fields.iter_mut().find(|(n, _)| n == &key) {
+                        let cur: u128 = f.1.parse().unwrap_or(0);
+                        let add: u128 = resolved.parse().unwrap_or(0);
+                        f.1 = cur.saturating_add(add).to_string();
+                    }
+                }
+                Stmt::CheckedSub { path, delta, .. }
+                | Stmt::WrapSub { path, delta }
+                | Stmt::SatSub { path, delta } => {
+                    let key = strip_variant_prefix(path, mir);
+                    let resolved = self.resolve_value(&delta.rust, params, constants);
+                    if let Some(f) = self.fields.iter_mut().find(|(n, _)| n == &key) {
+                        let cur: u128 = f.1.parse().unwrap_or(0);
+                        let sub: u128 = resolved.parse().unwrap_or(0);
+                        f.1 = cur.saturating_sub(sub).to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some((_, post)) = &h.transition {
+            self.status = Some(post.clone());
+        }
+    }
+
+    /// Resolve a value reference: caller-bound parameter → numeric
+    /// literal → spec-constant lookup → self-field lookup → fallback.
+    fn resolve_value(
+        &self,
+        value: &str,
+        params: &[(String, String)],
+        constants: &[(crate::mir::Symbol, String)],
+    ) -> String {
+        let v = value.trim();
+        if let Some((_, x)) = params.iter().find(|(n, _)| n == v) {
+            return x.clone();
+        }
+        if v.parse::<u128>().is_ok() {
+            return v.to_string();
+        }
+        if let Some(f) = self.fields.iter().find(|(n, _)| n == v) {
+            return f.1.clone();
+        }
+        if let Some((_, x)) = constants.iter().find(|(n, _)| n == v) {
+            return x.clone();
+        }
+        "1".to_string()
+    }
+}
+
+/// Multi-variant ADT counterpart of `WitnessState::to_lean` — emits a
+/// `(.Variant arg0 arg1 … : State)` constructor term using the current
+/// witness status to pick the variant.
+fn witness_state_to_adt(
+    ws: &WitnessState,
+    variants: &[crate::mir::StateVariant],
+) -> Option<String> {
+    let status = ws.status.as_deref()?;
+    let variant = variants.iter().find(|v| v.tag == status)?;
+    if variant.fields.is_empty() {
+        return Some(format!("(.{} : State)", variant.tag));
+    }
+    let args: Vec<String> = variant
+        .fields
+        .iter()
+        .map(|f| {
+            ws.fields
+                .iter()
+                .find(|(n, _)| n == &f.name)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| "0".to_string())
+        })
+        .collect();
+    Some(format!("(.{} {} : State)", variant.tag, args.join(" ")))
+}
+
+/// Choose concrete witness values for a handler's parameters.
+/// Mirrors `lean_gen::choose_param_values`:
+///   * Pubkey  → `pk`
+///   * Bool    → `false`
+///   * Index-like numeric params (`param < s.X` without bound) → `0`
+///   * Otherwise → `1` (satisfies common `> 0` / `≤ N` guards)
+fn choose_param_values(h: &crate::mir::HandlerMir) -> Vec<(String, String)> {
+    let mut all_exprs: Vec<&str> = Vec::new();
+    for p in &h.pre {
+        all_exprs.push(&p.0.lean);
+    }
+    for r in &h.requires_or_abort {
+        all_exprs.push(&r.pred.0.lean);
+    }
+    let combined = all_exprs.join(" ");
+    h.params
+        .iter()
+        .map(|(name, ty)| {
+            let val = match ty {
+                crate::mir::Ty::Pubkey => "pk".to_string(),
+                crate::mir::Ty::Bool => "false".to_string(),
+                _ => {
+                    let is_index_like = combined.contains(&format!("{} < s.", name))
+                        && !combined.contains(&format!("{} > 0", name))
+                        && !combined.contains(&format!("{} \u{2265}", name))
+                        && !combined.contains(&format!("\u{2264} {}", name));
+                    if is_index_like {
+                        "0".to_string()
+                    } else {
+                        "1".to_string()
+                    }
+                }
+            };
+            (name.clone(), val)
+        })
+        .collect()
+}
+
+/// Build the auto-proof script for a cover trace theorem. Symbolically
+/// evaluates each handler in `trace` against a witness state, then
+/// emits `let s0, s1, …` declarations and an `exact ⟨…, by decide,
+/// …⟩` term. Returns `None` if any handler in the trace doesn't
+/// resolve — the caller falls back to `:= sorry`.
 ///
-/// **Proof bodies emit `:= sorry`** rather than discharging via
-/// witness construction. The legacy `cover_trace_proof` helper drives
-/// state-field defaults + lifecycle-aware witnesses to auto-prove
-/// some traces; porting it is a separately-tracked deferred item (see
-/// the §15 / preservation-script entries in the MIR sketch).
+/// `adt_form` switches the witness rendering between the flat-state
+/// struct literal and the ADT variant-constructor form. Mirrors
+/// `lean_gen::cover_trace_proof` (flat) and `cover_trace_proof_adt`
+/// (ADT).
+fn cover_trace_proof(mir: &Mir, trace: &[crate::mir::Symbol], adt_form: bool) -> Option<String> {
+    if trace.is_empty() {
+        return None;
+    }
+
+    let mut state = WitnessState::new(&mir.state);
+    type CoverStep = (String, Vec<(String, String)>, WitnessState);
+    let mut steps: Vec<CoverStep> = Vec::new();
+
+    for op_name in trace {
+        let handler = mir.handlers.iter().find(|h| &h.name == op_name)?;
+        let param_values = choose_param_values(handler);
+        let state_before = WitnessState {
+            fields: state.fields.clone(),
+            status: state.status.clone(),
+        };
+        state.apply(handler, &param_values, &mir.constants, mir);
+        steps.push((op_name.clone(), param_values, state_before));
+    }
+
+    let render_witness = |ws: &WitnessState| -> Option<String> {
+        if adt_form {
+            witness_state_to_adt(ws, &mir.state.variants)
+        } else {
+            Some(ws.to_lean())
+        }
+    };
+
+    let mut proof = String::new();
+    proof.push_str(" := by\n");
+    proof.push_str("  let pk : Pubkey := \u{27E8}0, 0, 0, 0\u{27E9}\n");
+
+    if let Some((_, _, ref s0)) = steps.first() {
+        let s0_lean = render_witness(s0)?;
+        proof.push_str(&format!("  let s0 : State := {}\n", s0_lean));
+    }
+
+    for (i, _) in steps.iter().enumerate() {
+        if i < steps.len() - 1 {
+            let mut s = WitnessState::new(&mir.state);
+            for step in steps.iter().take(i + 1) {
+                let h = mir.handlers.iter().find(|x| x.name == step.0)?;
+                s.apply(h, &step.1, &mir.constants, mir);
+            }
+            let s_lean = render_witness(&s)?;
+            proof.push_str(&format!("  let s{} : State := {}\n", i + 1, s_lean));
+        }
+    }
+
+    let mut exact_parts: Vec<String> = Vec::new();
+    exact_parts.push("s0".to_string());
+    exact_parts.push("pk".to_string());
+    for (i, (_, param_values, _)) in steps.iter().enumerate() {
+        for (_, val) in param_values {
+            exact_parts.push(val.clone());
+        }
+        if i < steps.len() - 1 {
+            exact_parts.push(format!("s{}", i + 1));
+            exact_parts.push("by decide".to_string());
+        } else {
+            exact_parts.push("by decide".to_string());
+        }
+    }
+    proof.push_str(&format!(
+        "  exact \u{27E8}{}\u{27E9}\n",
+        exact_parts.join(", ")
+    ));
+    Some(proof)
+}
+
+/// Emit cover theorems — reachability obligations over a sequence of
+/// handler invocations. Each `cover <name> [op_1, ..., op_n]` lowers
+/// to a nested existential asserting the trace runs to completion;
+/// each `reachable when <expr>` entry lowers to one theorem per
+/// `(op, when)` pair.
+///
+/// Trace theorems try `cover_trace_proof` first (witness construction
+/// with `by decide` on each step); they fall back to `:= sorry` when
+/// the witness machinery can't synthesize a discharge. `reachable
+/// when` entries always emit `:= sorry` — no witness chain is
+/// available.
 fn emit_covers(out: &mut String, mir: &Mir) {
+    emit_covers_inner(out, mir, false);
+}
+
+/// ADT-shape cover emitter — same trace structure but witness terms
+/// are rendered as variant constructors via `witness_state_to_adt`.
+fn emit_covers_adt(out: &mut String, mir: &Mir) {
+    emit_covers_inner(out, mir, true);
+}
+
+fn emit_covers_inner(out: &mut String, mir: &Mir, adt_form: bool) {
     if mir.covers.is_empty() {
         return;
     }
@@ -2102,10 +2391,25 @@ fn emit_covers(out: &mut String, mir: &Mir) {
                     } else {
                         format!(" {}", positional_args)
                     };
-                    out.push_str(&format!(
-                        "{} {} signer{} \u{2260} none := sorry\n\n",
-                        trans, s_var, arg_str
-                    ));
+                    // Try witness construction; fall back to `:= sorry`
+                    // when the witness machinery can't synthesize a
+                    // closed term (handler not found, unsupported
+                    // effect shape, etc.).
+                    let proof_script = cover_trace_proof(mir, trace, adt_form);
+                    match proof_script {
+                        Some(script) => {
+                            out.push_str(&format!(
+                                "{} {} signer{} \u{2260} none{}\n",
+                                trans, s_var, arg_str, script
+                            ));
+                        }
+                        None => {
+                            out.push_str(&format!(
+                                "{} {} signer{} \u{2260} none := sorry\n\n",
+                                trans, s_var, arg_str
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -2895,15 +3199,26 @@ mod tests {
             out.contains("theorem cover_liquidation_path"),
             "expected cover_liquidation_path theorem"
         );
-        // Trace witnesses must use `Transition` calls per handler
-        // and end with `\u{2260} none := sorry`.
+        // Trace witnesses use `Transition` calls per handler.
         assert!(
             out.contains("init_poolTransition"),
             "trace should call init_poolTransition"
         );
+        // §15 auto-proof: terminal trace steps close via
+        // `cover_trace_proof` (witness construction + `by decide`)
+        // when the MIR can synthesize a witness. The pilot lending
+        // fixture's two cover traces both succeed, so the output
+        // should NOT contain a bare `:= sorry` at the trace
+        // terminal — every cover theorem ends with `exact ⟨…⟩`.
         assert!(
-            out.contains("\u{2260} none := sorry"),
-            "terminal trace step should emit `\u{2260} none := sorry`"
+            out.contains("exact \u{27E8}"),
+            "expected exact-witness term from cover_trace_proof; got:\n{}",
+            out
+        );
+        assert!(
+            out.contains("by decide"),
+            "expected `by decide` discharge in cover trace proof; got:\n{}",
+            out
         );
     }
 

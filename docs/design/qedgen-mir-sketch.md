@@ -1,8 +1,8 @@
 # qedgen MIR — design sketch
 
-**Status:** Phase 1c-8 (multi-variant ADT path) and Phase 1d (snapshot equivalence) shipped on the `mir` branch. All 16 emit sections + ADT path emit content; snapshot tests gate every pilot fixture. ADT-path byte-equivalence achieved on `bundled-stdlib-demo` + `cross-program-vault`; `escrow-split` differs only in deferred §15 `cover_trace_proof` witnesses (~13 lines). Flat-path divergences (`escrow` / `lending` / `multisig`) pre-date Phase 1d and are the v2.30 follow-on. Handoff notes in §"Next-session handoff" below.
+**Status:** Phase 1c-7 (unified imports), Phase 1c-8 (multi-variant ADT path), Phase 1d (snapshot equivalence), and §15 `cover_trace_proof` auto-discharge shipped on the `mir` branch. All 16 emit sections + ADT path emit content; snapshot tests gate every pilot fixture. ADT-path byte-equivalence achieved on `bundled-stdlib-demo`, `cross-program-vault`, AND `escrow-split` against fresh-legacy regen. Flat-path divergences (`escrow` / `lending` / `multisig`) pre-date Phase 1 and are the v2.30 follow-on — the remaining §15 / §11 auto-proof scripts (`liveness_proof_script`, `overflow_proof_script`, `preservation_proof_script`) are blocked on that flat-path alignment, since they pattern-match on the legacy transition body's `split`/`cases` structure. Handoff notes in §"Next-session handoff" below.
 
-**Last revised:** 2026-05-25 (Phase 1d close-out).
+**Last revised:** 2026-05-25 (Phase 1d + §15 cover-proof close-out).
 
 **Companion docs** (read these first if you want measured evidence behind the claims here):
 
@@ -381,7 +381,7 @@ parity per fixture is documented in
 |---|---|---|
 | `bundled-stdlib-demo` | ADT | byte-identical |
 | `cross-program-vault` | ADT | byte-identical |
-| `escrow-split` | ADT | identical modulo deferred §15 `cover_trace_proof` witnesses (~13 lines) |
+| `escrow-split` | ADT | byte-identical (vs fresh-legacy regen) after §15 `cover_trace_proof` port |
 | `escrow` | flat | pre-existing transition body / `inductive Status` deriving order divergence |
 | `lending` | flat | same |
 | `multisig` | flat | same |
@@ -415,20 +415,26 @@ For the next session picking up this work:
 - `crates/qedgen/src/main.rs:3194` — dispatch gate (`if QEDGEN_USE_MIR { mir::lower → lean_gen_mir } else { lean_gen }`).
 
 **Suggested first move in the next session:**
-1. **§15 + §11 auto-proof scripts** — port `cover_trace_proof`,
+1. **Flat-path emitter alignment** — the MIR flat-state shape
+   diverges from legacy in three families:
+   (a) `inductive Status` `deriving` order + per-variant
+   `: Status` annotation;
+   (b) transition body lacks signer-equality / lifecycle-gate
+   conjuncts and emits an unconditional auth alias;
+   (c) cover-trace witnesses emit `:= sorry` instead of legacy's
+   `exact ⟨…⟩` (the §15 port discharges this for ADT but not the
+   flat path, because the flat-state transition body shape
+   differs).
+   ~2–4 days; closes `escrow` / `lending` / `multisig`
+   byte-equivalence and unlocks the remaining §15 / §11 auto-
+   proof script ports below.
+2. **Remaining §15 + §11 auto-proof scripts** — port
    `liveness_proof_script`, `overflow_proof_script`,
-   `preservation_proof_script` from legacy. Each replaces a `:=
-   sorry` body with a real auto-discharge that closes trivial
-   cases. ~1 day. Closes the ~13-line `escrow-split` MIR ↔ legacy
-   diff entirely.
-2. **Flat-path emitter alignment** — the MIR flat-state shape
-   diverges from legacy in three families: (a) `inductive Status`
-   `deriving` order + per-variant `: Status` annotation; (b)
-   transition body lacks signer-equality / lifecycle-gate
-   conjuncts and emits an unconditional auth alias; (c) cover
-   trace proofs emit `:= sorry` rather than legacy's `decide`
-   witnesses. ~2–4 days; closes `escrow` / `lending` / `multisig`
-   byte-equivalence.
+   `preservation_proof_script`. Each pattern-matches on the
+   legacy transition body's `split` / `cases` structure, so they
+   are gated on the flat-path alignment above. After both this
+   and (1) land, every flat-state `:= sorry` becomes a real
+   tactic discharge. ~1–2 days.
 3. **Phase 2 — multi-account codegen** (`render_multi_account`
    stub today). Out of Phase 1 scope; the design note in
    `qedgen-mir-sketch.md` §"Phase ordering implication" budgets it

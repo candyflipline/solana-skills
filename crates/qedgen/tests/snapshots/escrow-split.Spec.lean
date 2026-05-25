@@ -114,12 +114,20 @@ theorem initialize_aborts_if_InvalidAmount (s : State) (signer : Pubkey) (deposi
 /-- happy_path — trace [initialize, exchange] is reachable. -/
 theorem cover_happy_path : ∃ (s0 : State) (signer : Pubkey),
     ∃ (v0_0 : Nat) (v0_1 : Nat), ∃ (s1 : State), initializeTransition s0 signer v0_0 v0_1 = some s1 ∧
-exchangeTransition s1 signer ≠ none := sorry
+exchangeTransition s1 signer ≠ none := by
+  let pk : Pubkey := ⟨0, 0, 0, 0⟩
+  let s0 : State := (.Uninitialized : State)
+  let s1 : State := (.Open pk pk 1 1 pk : State)
+  exact ⟨s0, pk, 1, 1, s1, by decide, by decide⟩
 
 /-- cancel_path — trace [initialize, cancel] is reachable. -/
 theorem cover_cancel_path : ∃ (s0 : State) (signer : Pubkey),
     ∃ (v0_0 : Nat) (v0_1 : Nat), ∃ (s1 : State), initializeTransition s0 signer v0_0 v0_1 = some s1 ∧
-cancelTransition s1 signer ≠ none := sorry
+cancelTransition s1 signer ≠ none := by
+  let pk : Pubkey := ⟨0, 0, 0, 0⟩
+  let s0 : State := (.Uninitialized : State)
+  let s1 : State := (.Open pk pk 1 1 pk : State)
+  exact ⟨s0, pk, 1, 1, s1, by decide, by decide⟩
 
 -- ============================================================================
 -- Liveness properties — bounded reachability (leads-to)
