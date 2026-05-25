@@ -754,6 +754,76 @@ pub fn emit_abstract_binders(
     Ok(())
 }
 
+/// Emit `let mut s = State { ... };` with every mutable field bound to
+/// `kani::any()`. When the per-account lifecycle has ≥2 states, the
+/// synthetic `status` field is also `kani::any()` so callers can layer
+/// `kani::assume(s.status == Status::<X>)` on top.
+///
+/// Promoted to `rust_codegen_util` in v2.30 Phase 3c1 so both
+/// `kani::generate` and `kani_mir::generate` call the same emitter
+/// (byte-equivalence guarantee). Behavior is unchanged from the
+/// original `kani.rs`-local copy.
+pub fn emit_state_init_symbolic(
+    out: &mut String,
+    mutable_fields: &[&(String, String)],
+    lifecycle_states: &[String],
+) {
+    out.push_str("    let mut s = State {\n");
+    for (fname, _) in mutable_fields {
+        out.push_str(&format!("        {}: kani::any(),\n", fname));
+    }
+    if lifecycle_states.len() >= 2 {
+        out.push_str("        status: kani::any(),\n");
+    }
+    out.push_str("    };\n");
+}
+
+/// Emit `let mut s = State { ... };` with every mutable field zeroed and the
+/// `status` field set to the section's initial lifecycle state. Used by init-
+/// handler harnesses (effect/preservation), where the pre-state is the
+/// canonical "before initialization" state. Type-aware defaults via
+/// `proptest_gen::default_value_for_field`. Promoted to
+/// `rust_codegen_util` alongside `emit_state_init_symbolic` so kani.rs +
+/// kani_mir.rs share a single source of truth.
+pub fn emit_state_init_zeroed(
+    out: &mut String,
+    mutable_fields: &[&(String, String)],
+    lifecycle_states: &[String],
+    spec: &crate::check::ParsedSpec,
+) {
+    out.push_str("    let mut s = State {\n");
+    for (fname, ftype) in mutable_fields {
+        if let Some(default) = crate::proptest_gen::default_value_for_field(ftype, spec) {
+            out.push_str(&format!("        {}: {},\n", fname, default));
+        }
+    }
+    if let Some(initial) = lifecycle_states.first() {
+        if lifecycle_states.len() >= 2 {
+            out.push_str(&format!("        status: Status::{},\n", initial));
+        }
+    }
+    out.push_str("    };\n");
+}
+
+/// Append `kani::assume(s.status == Status::<pre>);` when the handler has a
+/// pre-status declaration AND this section has a lifecycle. No-op otherwise.
+/// Without this, guard-rejection / abort harnesses for lifecycle-gated
+/// handlers can pass for the wrong reason — the handler rejects because the
+/// symbolic status didn't match the pre-state, not because the requires/
+/// guard fired. Promoted from `kani.rs` for kani.rs + kani_mir.rs sharing.
+pub fn emit_pre_status_assume(
+    out: &mut String,
+    op: &crate::check::ParsedHandler,
+    lifecycle_states: &[String],
+) {
+    if lifecycle_states.len() < 2 {
+        return;
+    }
+    if let Some(ref pre) = op.pre_status {
+        out.push_str(&format!("    kani::assume(s.status == Status::{});\n", pre));
+    }
+}
+
 pub fn emit_constants(out: &mut String, constants: &[(String, String)]) {
     for (name, value) in constants {
         let upper = name.to_uppercase();

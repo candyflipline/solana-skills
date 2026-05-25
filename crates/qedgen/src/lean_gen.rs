@@ -463,7 +463,21 @@ fn lean_status_name(acct: &str) -> String {
 
 /// Generate a Lean file from a `ParsedSpec` and write it to `output_path`.
 pub fn generate(spec: &ParsedSpec, output_path: &Path) -> Result<()> {
-    let mut content = render(spec);
+    let content = render(spec);
+    write_spec_with_sidecars(content, spec, output_path)
+}
+
+/// Write the rendered `Spec.lean` plus every pinned-interface sidecar
+/// (sibling axiom module, lakefile roots update, verified-callee
+/// `require` directives). Shared between `lean_gen::generate` and
+/// `lean_gen_mir::generate` (v2.30 MIR codegen) so the codegens emit
+/// identical sidecar layouts regardless of which renderer produced
+/// the `Spec.lean` body.
+pub(crate) fn write_spec_with_sidecars(
+    content: String,
+    spec: &ParsedSpec,
+    output_path: &Path,
+) -> Result<()> {
     let pinned = collect_pinned_interfaces(spec);
 
     // v2.26 Track F: prepend `import <Iface>` lines for every pinned
@@ -472,14 +486,16 @@ pub fn generate(spec: &ParsedSpec, output_path: &Path) -> Result<()> {
     // multi, ADT); we inject the interface-module imports immediately
     // after the existing import block so the namespace order matches
     // Lean's expectation (imports before `namespace`).
-    if !pinned.is_empty() {
-        content = inject_interface_imports(&content, &pinned);
-    }
+    let final_content = if !pinned.is_empty() {
+        inject_interface_imports(&content, &pinned)
+    } else {
+        content
+    };
 
     if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(output_path, &content)?;
+    std::fs::write(output_path, &final_content)?;
     eprintln!("  wrote {}", output_path.display());
 
     // Write sibling `<Iface>.lean` axiom modules for every pinned

@@ -1,0 +1,149 @@
+# cargo-deny configuration — supply-chain gate for qedgen.
+#
+# Run locally: `cargo deny check`
+# CI gate: `.github/workflows/ci.yml` (Supply-chain audit job)
+#
+# Scope is narrow on purpose. This file covers what cargo-audit alone
+# misses (license drift, duplicate-version sprawl, untrusted registries
+# and git sources) and leaves the vuln-DB lookups to cargo-audit, which
+# runs alongside it. Two tools, one gate, no overlap that matters.
+
+[graph]
+# Match the workspace's resolver = "2" so duplicate detection sees the
+# same dep graph the build sees.
+all-features = false
+no-default-features = false
+
+# ── Advisories ────────────────────────────────────────────────────────
+#
+# cargo-audit is the primary vuln source — runs in the same CI job
+# right before `cargo deny check`. This section catches the
+# unmaintained / yanked / unsound classes that cargo-audit reports as
+# warnings, plus our policy for the known transitive informational
+# advisories.
+[advisories]
+version = 2
+# Active vulnerabilities (CVE / RUSTSEC) must fail the gate.
+# Unmaintained / unsound / notice are warnings by default — promote
+# them by ID below if we want to fail on a specific one.
+yanked = "deny"
+
+# Known informational advisories on transitive deps the Solana SDK
+# (Anza) and Arkworks pull in. None are exploitable; all are
+# upstream-ecosystem-level "this crate is no longer actively
+# maintained" tags. Re-evaluate when Anza / Arkworks cuts a release
+# that drops them.
+ignore = [
+    # `paste 1.0.15` — RUSTSEC-2024-0436 (unmaintained). Pulled by
+    # ark-ff-macros and bytemuck_derive; both Arkworks and bytemuck
+    # are actively maintained, paste itself just stopped getting
+    # releases.
+    "RUSTSEC-2024-0436",
+    # `derivative 2.2.0` — RUSTSEC-2024-0388 (unmaintained). Pulled
+    # by ark-* crates. Arkworks has a tracking issue; drop this
+    # ignore when ark-* releases switch to `educe` or roll their own.
+    "RUSTSEC-2024-0388",
+    # `bincode 1.x` — RUSTSEC-2025-0141 (unmaintained). Pulled by
+    # multiple Solana/Anza crates. Anza is migrating to bincode 2.x
+    # at the SDK level; we inherit the tag until that lands. No
+    # exploit path in our usage.
+    "RUSTSEC-2025-0141",
+    # `libsecp256k1 0.6.0` — RUSTSEC-2025-0161 (unmaintained).
+    # Pulled by `agave-syscalls` (Anza). Anza-side dep; we don't
+    # invoke it directly. Drop when Anza upgrades the syscall
+    # crate's secp256k1 backend.
+    "RUSTSEC-2025-0161",
+    # `rand 0.7.3` + `rand 0.9.2` — RUSTSEC-2026-0097 (unsound with
+    # a custom logger using `rand::rng()`). Pulled transitively by
+    # `libsecp256k1` (Anza) and `quinn-proto` (reqwest). qedgen
+    # doesn't install a custom logger; the unsoundness vector
+    # doesn't fire in our usage. Tracking upstream `rand` 0.9.x
+    # for a patched release.
+    "RUSTSEC-2026-0097",
+]
+
+# ── Licenses ──────────────────────────────────────────────────────────
+#
+# Permissive licenses only. The qedgen CLI is MIT; we don't want a
+# transitive GPL/AGPL/SSPL sneaking into the binary.
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "CC0-1.0",
+    "0BSD",
+    "MPL-2.0",
+    "MIT-0",
+    # `webpki-roots 1.0.6` (rustls dep) ships under the Linux
+    # Foundation's CDLA-Permissive-2.0. It's a data-license rather
+    # than a code-license; the underlying root certs are public-
+    # interest infrastructure with attribution-only restrictions.
+    # Functionally equivalent to a permissive code license for our
+    # purposes.
+    "CDLA-Permissive-2.0",
+]
+# OpenSSL has a custom license that's permissive in practice but
+# needs an explicit allow; we route TLS through rustls so this
+# shouldn't fire, but keep the door closed.
+confidence-threshold = 0.8
+
+[[licenses.exceptions]]
+# `ring` ships under a custom non-OSI-blessed license that's
+# effectively ISC + OpenSSL + MIT. Widely used (it's the rustls
+# crypto backend); we accept it here explicitly rather than via
+# `allow` so the exception is visible.
+name = "ring"
+allow = ["LicenseRef-ring"]
+
+# mollusk-svm crates ship under Apache-2.0 (per the
+# anza-xyz/mollusk repo) but the Cargo.toml manifests don't carry
+# a `license = "..."` line, so cargo-deny can't auto-detect.
+# Clarify expression here so the license check passes.
+[[licenses.clarify]]
+name = "mollusk-svm"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+name = "mollusk-svm-error"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+name = "mollusk-svm-result"
+expression = "Apache-2.0"
+license-files = []
+
+[licenses.private]
+ignore = true
+
+# ── Bans / duplicates ─────────────────────────────────────────────────
+#
+# Warn on duplicate versions so we notice when a major-version bump
+# inside a transitive bumps half the tree onto a new copy. Doesn't
+# fail the build — the Solana SDK + mollusk + Arkworks naturally
+# pull in some duplicates (ark-* 0.4 vs 0.5, getrandom 0.1/0.2/0.3,
+# rand 0.7/0.8/0.9) that we can't fix without upstream changes.
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+# ── Sources ───────────────────────────────────────────────────────────
+#
+# Only crates.io. The workspace's Cargo.lock currently has zero
+# git-source dependencies (verified 2026-05-25); this lock-in
+# prevents a future PR from quietly adding a GitHub branch-pin dep.
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

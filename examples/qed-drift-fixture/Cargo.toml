@@ -9,4 +9,8 @@ description = "v2.9 drift-loop fixture. Exercises `#[qed(verified, spec=, handle
 crate-type = ["lib"]
 
 [dependencies]
-qedgen-macros = { path = "../../crates/qedgen-macros" }
+# Explicit version pin alongside the path. cargo-deny's wildcard
+# check rejects path-only deps in workspace fixtures; the version
+# anchor is purely satisfying that policy — Cargo resolves through
+# the path attribute first.
+qedgen-macros = { path = "../../crates/qedgen-macros", version = "0.1.0" }

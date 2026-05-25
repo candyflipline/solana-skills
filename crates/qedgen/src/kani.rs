@@ -18,81 +18,11 @@ struct HarnessCounts {
     abort: usize,
 }
 
-/// Emit `let mut s = State { ... };` with every mutable field bound to
-/// `kani::any()`. When the per-account lifecycle has ≥2 states, the
-/// synthetic `status` field is also `kani::any()` so callers can layer
-/// `kani::assume(s.status == Status::<X>)` on top.
-fn emit_state_init_symbolic(
-    out: &mut String,
-    mutable_fields: &[&(String, String)],
-    lifecycle_states: &[String],
-) {
-    out.push_str("    let mut s = State {\n");
-    for (fname, _) in mutable_fields {
-        out.push_str(&format!("        {}: kani::any(),\n", fname));
-    }
-    if lifecycle_states.len() >= 2 {
-        out.push_str("        status: kani::any(),\n");
-    }
-    out.push_str("    };\n");
-}
-
-/// Emit `let mut s = State { ... };` with every mutable field zeroed and the
-/// `status` field set to the section's initial lifecycle state. Used by init-
-/// handler harnesses (effect/preservation), where the pre-state is the
-/// canonical "before initialization" state.
-///
-/// Defaults are type-aware via `proptest_gen::default_value_for_field`:
-/// `Map[N] T` → `[<inner>; N]`, named records → `<Name>::default()`, named
-/// sums with a zero-payload variant → that variant; primitives → `0`. A
-/// `None` return means "no sensible default" — skip the field and let
-/// rustc surface the missing field with E0063, which is a clearer
-/// diagnostic than emitting wrong-type code.
-///
-/// Same shape (and same helper) as the seed-state init fix landed in
-/// `fix(proptest_gen): type-aware seed-state init for arrays + lifecycle
-/// status` (#45). Without this, every array-typed state field literals
-/// to `{}: 0` and the harness fails to compile:
-///
-///     error[E0308]: mismatched types
-///        --> tests/kani.rs:N:M
-///         |
-///       N |         rfp_milestone_amounts: 0,
-///         |                                ^ expected `[u64; 8]`, found integer
-fn emit_state_init_zeroed(
-    out: &mut String,
-    mutable_fields: &[&(String, String)],
-    lifecycle_states: &[String],
-    spec: &ParsedSpec,
-) {
-    out.push_str("    let mut s = State {\n");
-    for (fname, ftype) in mutable_fields {
-        if let Some(default) = crate::proptest_gen::default_value_for_field(ftype, spec) {
-            out.push_str(&format!("        {}: {},\n", fname, default));
-        }
-    }
-    if let Some(initial) = lifecycle_states.first() {
-        if lifecycle_states.len() >= 2 {
-            out.push_str(&format!("        status: Status::{},\n", initial));
-        }
-    }
-    out.push_str("    };\n");
-}
-
-/// Append `kani::assume(s.status == Status::<pre>);` when the handler has a
-/// pre-status declaration AND this section has a lifecycle. No-op otherwise.
-/// Without this, guard-rejection / abort harnesses for lifecycle-gated
-/// handlers can pass for the wrong reason — the handler rejects because the
-/// symbolic status didn't match the pre-state, not because the requires/
-/// guard fired.
-fn emit_pre_status_assume(out: &mut String, op: &ParsedHandler, lifecycle_states: &[String]) {
-    if lifecycle_states.len() < 2 {
-        return;
-    }
-    if let Some(ref pre) = op.pre_status {
-        out.push_str(&format!("    kani::assume(s.status == Status::{});\n", pre));
-    }
-}
+// v2.30 Phase 3c1 — `emit_state_init_symbolic`,
+// `emit_state_init_zeroed`, and `emit_pre_status_assume` moved to
+// `rust_codegen_util` (now `pub fn`) so both `kani.rs` and
+// `kani_mir.rs` share the same source of truth. The call sites
+// below import them via `rust_codegen_util::emit_*`.
 
 /// Generate Kani proof harnesses from a spec file (.lean or .qedspec).
 ///
@@ -523,8 +453,8 @@ fn emit_kani_account_section(
             out.push_str("#[kani::solver(cadical)]\n");
             out.push_str(&format!("fn verify_{}_rejects_invalid() {{\n", op.name));
 
-            emit_state_init_symbolic(out, mutable_fields, lifecycle_states);
-            emit_pre_status_assume(out, op, lifecycle_states);
+            rust_codegen_util::emit_state_init_symbolic(out, mutable_fields, lifecycle_states);
+            rust_codegen_util::emit_pre_status_assume(out, op, lifecycle_states);
 
             // Symbolic params
             for (pname, ptype) in &op.takes_params {
@@ -593,8 +523,8 @@ fn emit_kani_account_section(
                     op.name, abort.error_name
                 ));
 
-                emit_state_init_symbolic(out, mutable_fields, lifecycle_states);
-                emit_pre_status_assume(out, op, lifecycle_states);
+                rust_codegen_util::emit_state_init_symbolic(out, mutable_fields, lifecycle_states);
+                rust_codegen_util::emit_pre_status_assume(out, op, lifecycle_states);
 
                 // Symbolic params
                 for (pname, ptype) in &op.takes_params {
@@ -919,8 +849,8 @@ fn emit_kani_account_section(
                 out.push_str("#[kani::solver(cadical)]\n");
                 out.push_str(&format!("fn verify_{}_ensures_{}() {{\n", op.name, idx));
 
-                emit_state_init_symbolic(out, mutable_fields, lifecycle_states);
-                emit_pre_status_assume(out, op, lifecycle_states);
+                rust_codegen_util::emit_state_init_symbolic(out, mutable_fields, lifecycle_states);
+                rust_codegen_util::emit_pre_status_assume(out, op, lifecycle_states);
 
                 // Symbolic params declared first so any subsequent
                 // `kani::assume` referencing them resolves.
@@ -1083,10 +1013,19 @@ fn emit_kani_account_section(
                 ));
 
                 if is_init {
-                    emit_state_init_zeroed(out, mutable_fields, lifecycle_states, spec);
+                    rust_codegen_util::emit_state_init_zeroed(
+                        out,
+                        mutable_fields,
+                        lifecycle_states,
+                        spec,
+                    );
                 } else {
-                    emit_state_init_symbolic(out, mutable_fields, lifecycle_states);
-                    emit_pre_status_assume(out, op, lifecycle_states);
+                    rust_codegen_util::emit_state_init_symbolic(
+                        out,
+                        mutable_fields,
+                        lifecycle_states,
+                    );
+                    rust_codegen_util::emit_pre_status_assume(out, op, lifecycle_states);
                     if !is_establish {
                         out.push_str(&format!("    kani::assume({}(&s));\n", inv.name));
                     }
@@ -1192,10 +1131,19 @@ fn emit_kani_account_section(
 
                 // Symbolic state
                 if is_init {
-                    emit_state_init_zeroed(out, mutable_fields, lifecycle_states, spec);
+                    rust_codegen_util::emit_state_init_zeroed(
+                        out,
+                        mutable_fields,
+                        lifecycle_states,
+                        spec,
+                    );
                 } else {
-                    emit_state_init_symbolic(out, mutable_fields, lifecycle_states);
-                    emit_pre_status_assume(out, op, lifecycle_states);
+                    rust_codegen_util::emit_state_init_symbolic(
+                        out,
+                        mutable_fields,
+                        lifecycle_states,
+                    );
+                    rust_codegen_util::emit_pre_status_assume(out, op, lifecycle_states);
                 }
 
                 // Symbolic params
@@ -1349,8 +1297,8 @@ fn emit_kani_account_section(
             out.push_str("#[kani::solver(cadical)]\n");
             out.push_str(&format!("fn verify_{}_no_overflow() {{\n", op.name));
 
-            emit_state_init_symbolic(out, mutable_fields, lifecycle_states);
-            emit_pre_status_assume(out, op, lifecycle_states);
+            rust_codegen_util::emit_state_init_symbolic(out, mutable_fields, lifecycle_states);
+            rust_codegen_util::emit_pre_status_assume(out, op, lifecycle_states);
 
             // Symbolic params
             for (pname, ptype) in &op.takes_params {
@@ -1418,7 +1366,7 @@ fn emit_file_level_features(
                 out.push_str("#[kani::solver(cadical)]\n");
                 out.push_str(&format!("fn cover_{}{}() {{\n", cover.name, suffix));
 
-                emit_state_init_symbolic(out, mutable_fields, lifecycle_states);
+                rust_codegen_util::emit_state_init_symbolic(out, mutable_fields, lifecycle_states);
 
                 // Chain operations with nested ifs
                 let mut indent = "    ".to_string();
@@ -1496,7 +1444,7 @@ fn emit_file_level_features(
             out.push_str("#[kani::solver(cadical)]\n");
             out.push_str(&format!("fn verify_liveness_{}() {{\n", liveness.name));
 
-            emit_state_init_symbolic(out, mutable_fields, lifecycle_states);
+            rust_codegen_util::emit_state_init_symbolic(out, mutable_fields, lifecycle_states);
 
             // Pre-state: assume the from-state. Without this, the harness
             // would explore symbolic-status executions where the via-ops
@@ -1581,7 +1529,7 @@ fn emit_file_level_features(
                     prop.name, env.name
                 ));
 
-                emit_state_init_symbolic(out, mutable_fields, lifecycle_states);
+                rust_codegen_util::emit_state_init_symbolic(out, mutable_fields, lifecycle_states);
                 out.push_str(&format!("    kani::assume({}(&s));\n", prop.name));
 
                 // Apply environment mutation
