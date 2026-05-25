@@ -1,8 +1,8 @@
 # qedgen MIR — design sketch
 
-**Status:** design sketch, on the `mir` branch.
+**Status:** in active implementation, on the `mir` branch. Phase 0 + Phase 1b + Phase 1c (slices 1–3) shipped; remaining work tracked in §"Implementation status" below.
 
-**Last revised:** 2026-05-24, after baseline measurement + divergence inventory + fixture survey + cross-cutting-transform catalog landed on the same branch.
+**Last revised:** 2026-05-25 (Phase 1c-3 + progress catchup).
 
 **Companion docs** (read these first if you want measured evidence behind the claims here):
 
@@ -300,6 +300,64 @@ Total: ~10–13 wks of qedgen-local work. No qedsvm coupling, no qedbridge codeg
 4. **Source-location threading.** Every node carries an `Option<Span>` opaquely. Spans flow from chumsky's positions; renderers can ignore them. No further design needed in Phase 0 — confirm in implementation.
 
 5. **`Mir.invariants` shape.** Issue #67's `rule` vs `invariant` distinction is parallel work. Until #67 lands, treat `invariants` as a `Vec<Predicate>` over `(pre, post): (&State, &State)`. Re-shape when #67's parser changes land.
+
+## Implementation status (mir branch)
+
+Tracking what's shipped on the `mir` branch vs. what's still planned. Commits referenced are short SHAs on `mir`.
+
+### Phase 0 — typed IR + lowering — **shipped** (`ab4bdbe`)
+
+- `crates/qedgen/src/mir.rs` (~870 LoC) — full type definitions per the §"Shape" above: `Mir`, `HandlerMir`, `Stmt` (12 kinds), `Expr` (opaque-string carrier), `AccountTable`, `AccountBindingShape`, plus references / types / errors / events / interfaces.
+- `mir::lower(parsed: &ParsedSpec) -> Mir` for the pilot scope: handler bodies lowered through `RequireOrAbort`, `TokenTransfer`, `Assign`, `CheckedAdd/Sub`, `WrapAdd/Sub`, `SatAdd/Sub`, `Cpi`, `Emit`, `Abort`. `Branch` and `VariantPromote` recognize their source shape but emit stubs (Phase 5).
+- `HandlerMir.transition` lifecycle threaded from pre/post-status.
+- `AccountTable` populated from top-level `pda` declarations + per-handler account bindings.
+- 10 lowering tests including 5 fixture-driven runs (escrow, escrow-split [multi-file], lending, multisig, bundled-stdlib-demo).
+
+### Phase 1b — lean_gen_mir scaffold + flag — **shipped** (`f670404`)
+
+- `crates/qedgen/src/lean_gen_mir.rs` mirrors `lean_gen::{generate, render}` entry-point shape.
+- `QEDGEN_USE_MIR=1` env var routes `qedgen codegen --lean` through the new path. Default stays on legacy.
+- Shape-detection dispatch (sBPF / indexed / multi-account / single-account) matches legacy; non-pilot branches emit marker stubs.
+
+### Phase 1c — Lean emission for pilot scope — **in progress**
+
+Sub-slices shipped:
+
+| § | Emitter | Slice | Status |
+|---|---|---|---|
+| 1 | `emit_header` (imports) | 1b | ✅ |
+| 2 | `emit_namespace_open/close` | 1b | ✅ |
+| 3 | uninterpreted helpers + ref_impls | — | TODO (MIR doesn't carry these yet) |
+| 4 | `emit_constants` | — | TODO (MIR doesn't carry these yet) |
+| 5 | `emit_lifecycle_marker` (Status inductive) | 1b | ✅ |
+| 6 | `emit_state_struct` (cross-variant union) | 1c-1 | ✅ |
+| 7 | `emit_transitions` (per-handler) | 1c-1 | ✅ |
+| 8 | CPI theorems | — | TODO (needs `Mir.interfaces` populated) |
+| 9 | `emit_invariants` | 1c-3 | ✅ |
+| 10 | `emit_operation_inductive` + applyOp | 1c-1 | ✅ |
+| 11 | property theorems | — | TODO |
+| 12 | `emit_aborts_if` (legacy + requires-else) | 1c-2 | ✅ |
+| 13 | `emit_ensures` | 1c-2 | ✅ |
+| 14 | `emit_frame_conditions` | 1c-3 | ✅ |
+| 15 | cover / liveness / environments / overflow | — | TODO |
+| 16 | namespace close | 1b | ✅ |
+
+**12 of 16 sections emit content; 4 stubbed.** End-to-end smoke-confirmed on `examples/rust/{escrow,lending,multisig,bundled-stdlib-demo}/*.qedspec` with `QEDGEN_USE_MIR=1`. 13 lean_gen_mir tests pass.
+
+### Phase 1c — remaining sub-slices
+
+- **MIR extension for §3 + §4.** Lift `ParsedSpec.constants`, `ParsedSpec.uninterpreted_helpers`, `ParsedSpec.ref_impls` into MIR top-level fields. Mechanical port of the corresponding `emit_*` from `lean_gen.rs`. ~half day.
+- **§8 CPI theorems.** Requires populating `Mir.interfaces` from `ParsedSpec.imported_namespaces` + the interface ensures registry. Intersects with Phase 3's `cpi_substitute` pass — see §"Cross-cutting passes" above. ~1–2 days.
+- **§11 property theorems + §15 cover/liveness/environments/overflow.** Each its own emit fn with mechanical translation from `lean_gen.rs`. ~1–2 days each.
+- **Multi-variant ADT path (`render_single_account_adt`).** Currently lean_gen.rs takes this branch for `escrow` (Uninitialized | Open | Closed). The MIR path lowers escrow through the flat-state form, which diverges from legacy. Byte-equivalence requires implementing the inductive-State emission. ~2–3 days.
+
+### Phase 1d — snapshot equivalence — **not started**
+
+Once the §3/§4/§8/§11/§15 gaps close, run both codegens against every pilot fixture and assert byte-identical or cosmetic-diff-only output. Lock the expected diffs as snapshot fixtures.
+
+### Honest scoping
+
+Phase 1 to byte-equivalence is realistically ~1 more week of focused porting work. The pattern is locked in — each remaining gap is mechanical translation from a known `lean_gen.rs` section. The biggest risk is the multi-variant ADT path, which has its own rendering logic and ~500 LoC of helpers in legacy.
 
 ## What the companion docs validate
 
