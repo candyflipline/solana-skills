@@ -138,6 +138,16 @@ pub struct Mir {
     /// stay on `ParsedSpec` for now — those are proptest-codegen
     /// concerns that don't need MIR lifting until that target ports.
     pub properties: Vec<PropertyMir>,
+    /// Top-level `cover` reachability declarations. Each emits an
+    /// existential theorem per trace + per `(op, when)` pair.
+    pub covers: Vec<CoverMir>,
+    /// Top-level `liveness` (leads-to) declarations. Each emits a
+    /// bounded-reachability theorem over a lifecycle-state transition.
+    pub liveness_props: Vec<LivenessMir>,
+    /// Top-level `environment` blocks describing external state
+    /// mutations. Each property × environment cross emits a
+    /// preservation theorem.
+    pub environments: Vec<EnvironmentMir>,
 }
 
 // ----------------------------------------------------------------------
@@ -575,6 +585,66 @@ pub struct PropertyMir {
     pub preserved_by: Vec<Symbol>,
 }
 
+/// Cover (reachability) declaration. Mirrors `check::ParsedCover`.
+///
+/// Each `cover <name> [op1, op2, ...]` line lowers to one `CoverMir`
+/// with a single trace. The `name <ident> reachable when <expr>` shape
+/// lowers to a `(handler, Some(expr))` entry in `reachable`. Codegen
+/// emits one existential theorem per trace (nested `∃` chain
+/// asserting the trace runs to completion) plus one theorem per
+/// `reachable` entry.
+#[derive(Debug, Clone)]
+pub struct CoverMir {
+    pub name: Symbol,
+    /// Each inner Vec is a handler-name sequence to drive from an
+    /// initial state. The outer Vec lets one cover bundle multiple
+    /// trace alternatives.
+    pub traces: Vec<Vec<Symbol>>,
+    /// `(handler-name, optional when-predicate)` reachability claims.
+    /// `when` carries a Lean-rendered Bool predicate over `s : State`.
+    pub reachable: Vec<(Symbol, Option<Predicate>)>,
+}
+
+/// Liveness (leads-to) declaration. Mirrors `check::ParsedLiveness`.
+///
+/// Encodes `liveness <name> : <from> ~> <to> via [op, ...] within N`:
+/// from the source lifecycle state, applying some sequence of `via_ops`
+/// of length ≤ `within_steps` reaches the target lifecycle state.
+/// Codegen emits a single theorem of the form
+/// `∃ ops, ops.length ≤ N ∧ ∀ s', applyOps s signer ops = some s' → s'.status = .<to>`.
+#[derive(Debug, Clone)]
+pub struct LivenessMir {
+    pub name: Symbol,
+    /// Source lifecycle state tag (e.g., `Open`). The leading `State.`
+    /// prefix from the surface DSL is stripped by the parser.
+    pub from_state: Symbol,
+    /// Target lifecycle state tag (e.g., `Closed`).
+    pub leads_to_state: Symbol,
+    /// Handlers eligible to drive the transition. Order is preserved
+    /// because the lifecycle-path search walks them sequentially.
+    pub via_ops: Vec<Symbol>,
+    /// Step bound. `None` is treated as the legacy default of 10 at
+    /// emit time.
+    pub within_steps: Option<u64>,
+}
+
+/// Environment (external-state-change) declaration. Mirrors
+/// `check::ParsedEnvironment`.
+///
+/// Encodes `environment <name> { mutates <field> : <T>; constraint <expr> }`:
+/// every spec property must hold after the listed fields mutate under
+/// the listed constraints. Codegen emits one preservation theorem per
+/// (property × environment) pair, with `new_<field>` parameters and
+/// constraint hypotheses. `mutates` carries field-name and the MIR
+/// `Ty` (pre-resolved from the surface type string at lowering time);
+/// `constraints` carries Lean-rendered predicates.
+#[derive(Debug, Clone)]
+pub struct EnvironmentMir {
+    pub name: Symbol,
+    pub mutates: Vec<(Symbol, Ty)>,
+    pub constraints: Vec<Predicate>,
+}
+
 /// `ref_impl <name> (params) : <return_type> = <expr>` declaration.
 /// Carries pre-rendered body strings per backend, same opaque-string
 /// discipline as `Expr`.
@@ -794,6 +864,9 @@ pub fn lower(parsed: &ParsedSpec) -> Mir {
                 preserved_by: p.preserved_by.clone(),
             })
             .collect(),
+        covers: lower_covers(parsed),
+        liveness_props: lower_liveness(parsed),
+        environments: lower_environments(parsed),
     }
 }
 
@@ -895,6 +968,71 @@ fn lower_invariants(parsed: &ParsedSpec) -> Vec<InvariantMir> {
                     source_span: None,
                 })
             }),
+        })
+        .collect()
+}
+
+fn lower_covers(parsed: &ParsedSpec) -> Vec<CoverMir> {
+    parsed
+        .covers
+        .iter()
+        .map(|c| CoverMir {
+            name: c.name.clone(),
+            traces: c.traces.clone(),
+            reachable: c
+                .reachable
+                .iter()
+                .map(|(op, when)| {
+                    let pred = when.as_ref().map(|expr| {
+                        Predicate(Expr {
+                            lean: expr.clone(),
+                            ..Default::default()
+                        })
+                    });
+                    (op.clone(), pred)
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+fn lower_liveness(parsed: &ParsedSpec) -> Vec<LivenessMir> {
+    parsed
+        .liveness_props
+        .iter()
+        .map(|l| LivenessMir {
+            name: l.name.clone(),
+            from_state: l.from_state.clone(),
+            leads_to_state: l.leads_to_state.clone(),
+            via_ops: l.via_ops.clone(),
+            within_steps: l.within_steps,
+        })
+        .collect()
+}
+
+fn lower_environments(parsed: &ParsedSpec) -> Vec<EnvironmentMir> {
+    parsed
+        .environments
+        .iter()
+        .map(|env| EnvironmentMir {
+            name: env.name.clone(),
+            mutates: env
+                .mutates
+                .iter()
+                .map(|(name, ty)| (name.clone(), parse_ty(ty)))
+                .collect(),
+            constraints: env
+                .constraints
+                .iter()
+                .enumerate()
+                .map(|(i, lean)| {
+                    Predicate(Expr {
+                        lean: lean.clone(),
+                        rust: env.constraints_rust.get(i).cloned().unwrap_or_default(),
+                        ..Default::default()
+                    })
+                })
+                .collect(),
         })
         .collect()
 }
@@ -1259,6 +1397,9 @@ mod tests {
             uninterpreted_helpers: vec![],
             ref_impls: vec![],
             properties: vec![],
+            covers: vec![],
+            liveness_props: vec![],
+            environments: vec![],
         };
         assert_eq!(mir.name, "Test");
         assert!(mir.handlers.is_empty());

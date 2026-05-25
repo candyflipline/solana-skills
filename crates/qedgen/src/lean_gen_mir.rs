@@ -164,11 +164,13 @@ fn render_single_account(mir: &Mir) -> String {
     emit_aborts_if(&mut out, mir);
     emit_ensures(&mut out, mir);
     emit_frame_conditions(&mut out, mir);
+    emit_covers(&mut out, mir);
+    emit_liveness(&mut out, mir);
+    emit_environments(&mut out, mir);
+    emit_overflow(&mut out, mir);
 
-    // TODO Phase 1c (subsequent slices): CPI theorems, cover,
-    // liveness, environments, overflow.
+    // TODO Phase 1c (subsequent slices): CPI theorems.
     out.push_str("-- TODO(mir-phase-1c-later): CPI theorems\n\n");
-    out.push_str("-- TODO(mir-phase-1c-later): cover / liveness / environments / overflow\n\n");
 
     emit_namespace_close(&mut out, mir);
     out
@@ -1031,6 +1033,445 @@ fn emit_state_struct(out: &mut String, mir: &Mir) {
     out.push_str("  deriving DecidableEq, Repr\n\n");
 }
 
+/// Emit `cover` reachability theorems. Mirrors
+/// `lean_gen::render_covers` for the pilot scope (flat single-account
+/// state). Each `cover <name> [op_1, ..., op_n]` lowers to a nested
+/// existential theorem asserting the trace runs to completion; each
+/// `reachable when <expr>` entry lowers to one theorem per `(op, when)`.
+///
+/// **Proof bodies emit `:= sorry`** rather than discharging via
+/// witness construction. The legacy `cover_trace_proof` helper drives
+/// state-field defaults + lifecycle-aware witnesses to auto-prove
+/// some traces; porting it is a separately-tracked deferred item (see
+/// the §15 / preservation-script entries in the MIR sketch).
+fn emit_covers(out: &mut String, mir: &Mir) {
+    if mir.covers.is_empty() {
+        return;
+    }
+    out.push_str(
+        "-- ============================================================================\n",
+    );
+    out.push_str("-- Cover properties \u{2014} reachability (existential proofs)\n");
+    out.push_str(
+        "-- ============================================================================\n\n",
+    );
+
+    for cover in &mir.covers {
+        for (trace_idx, trace) in cover.traces.iter().enumerate() {
+            let suffix = if cover.traces.len() > 1 {
+                format!("_{}", trace_idx)
+            } else {
+                String::new()
+            };
+
+            out.push_str(&format!(
+                "/-- {} \u{2014} trace [{}] is reachable. -/\n",
+                cover.name,
+                trace.join(", ")
+            ));
+            out.push_str(&format!(
+                "theorem cover_{}{} : \u{2203} (s0 : State) (signer : Pubkey),\n",
+                cover.name, suffix
+            ));
+
+            // Build the nested `∃ s_{j+1}, <trans> s_j signer args =
+            // some s_{j+1} ∧ ...` chain. The terminal step uses
+            // `≠ none` to keep with the legacy emission shape.
+            let mut indent = "    ".to_string();
+            for (j, op_name) in trace.iter().enumerate() {
+                let handler = mir.handlers.iter().find(|h| h.name == *op_name);
+                let trans = safe_name(&format!("{}Transition", op_name));
+                let param_args = handler
+                    .map(|h| param_args_str(&h.params))
+                    .unwrap_or_default();
+                let extra_exists = handler
+                    .map(|h| {
+                        h.params
+                            .iter()
+                            .enumerate()
+                            .map(|(k, (_, t))| format!("(v{}_{} : {})", j, k, render_ty(t)))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+                    .unwrap_or_default();
+
+                // Rename param refs in the call site to the existentially-
+                // bound `v{j}_{k}` form. We keep `param_args` as the
+                // declared names because the legacy emits raw names too,
+                // and the binders match by position once `extra_exists`
+                // shadows them in the inner scope. For the MIR pilot we
+                // simply reuse the declared names without renaming —
+                // mirrors `render_covers` line ~3699.
+                let _ = param_args;
+                let positional_args = handler
+                    .map(|h| {
+                        h.params
+                            .iter()
+                            .enumerate()
+                            .map(|(k, _)| format!("v{}_{}", j, k))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+                    .unwrap_or_default();
+
+                let s_var = if j == 0 {
+                    "s0".to_string()
+                } else {
+                    format!("s{}", j)
+                };
+
+                if !extra_exists.is_empty() {
+                    out.push_str(&format!("{}\u{2203} {}, ", indent, extra_exists));
+                }
+
+                if j < trace.len() - 1 {
+                    let s_next = format!("s{}", j + 1);
+                    let arg_str = if positional_args.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" {}", positional_args)
+                    };
+                    out.push_str(&format!(
+                        "\u{2203} ({} : State), {} {} signer{} = some {} \u{2227}\n",
+                        s_next, trans, s_var, arg_str, s_next
+                    ));
+                    indent.push_str("  ");
+                } else {
+                    let arg_str = if positional_args.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" {}", positional_args)
+                    };
+                    out.push_str(&format!(
+                        "{} {} signer{} \u{2260} none := sorry\n\n",
+                        trans, s_var, arg_str
+                    ));
+                }
+            }
+        }
+
+        for (op_name, when_pred) in &cover.reachable {
+            let handler = mir.handlers.iter().find(|h| h.name == *op_name);
+            let trans = safe_name(&format!("{}Transition", op_name));
+            let param_exists = handler
+                .map(|h| {
+                    h.params
+                        .iter()
+                        .map(|(n, t)| format!("({} : {})", n, render_ty(t)))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .unwrap_or_default();
+            let param_args = handler
+                .map(|h| param_args_str(&h.params))
+                .unwrap_or_default();
+
+            out.push_str(&format!(
+                "/-- {} \u{2014} {} is reachable",
+                cover.name, op_name
+            ));
+            if let Some(p) = when_pred {
+                out.push_str(&format!(" when {}. -/\n", p.0.lean));
+            } else {
+                out.push_str(". -/\n");
+            }
+            out.push_str(&format!(
+                "theorem cover_{}_{} : \u{2203} (s : State) (signer : Pubkey),\n",
+                cover.name,
+                safe_name(op_name)
+            ));
+            if let Some(p) = when_pred {
+                out.push_str(&format!("    {} \u{2227} ", p.0.lean));
+            } else {
+                out.push_str("    ");
+            }
+            if !param_exists.is_empty() {
+                out.push_str(&format!("\u{2203} {}, ", param_exists));
+            }
+            out.push_str(&format!(
+                "{} s signer{} \u{2260} none := sorry\n\n",
+                trans, param_args
+            ));
+        }
+    }
+}
+
+/// Emit `liveness` (bounded leads-to) theorems. Mirrors
+/// `lean_gen::render_liveness` in shape but always emits the
+/// existential `∃ ops s', ... := by sorry` form. The legacy emits
+/// a stronger universal-form theorem when the lifecycle-graph walk
+/// auto-discovers a path; porting `find_liveness_path` +
+/// `liveness_proof_script` is a separately-tracked deferred item.
+fn emit_liveness(out: &mut String, mir: &Mir) {
+    if mir.liveness_props.is_empty() {
+        return;
+    }
+    out.push_str(
+        "-- ============================================================================\n",
+    );
+    out.push_str("-- Liveness properties \u{2014} bounded reachability (leads-to)\n");
+    out.push_str(
+        "-- ============================================================================\n\n",
+    );
+
+    // Emit one shared `applyOps` helper (matches the legacy single-
+    // account / single-operation-type pilot scope). Indexed and
+    // multi-account variants are deferred.
+    let needs_helper = mir.handlers.iter().any(|_| true);
+    if needs_helper {
+        out.push_str(
+            "def applyOps (s : State) (signer : Pubkey) : List Operation \u{2192} Option State\n",
+        );
+        out.push_str("  | [] => some s\n");
+        out.push_str("  | op :: ops => match applyOp s signer op with\n");
+        out.push_str("    | some s' => applyOps s' signer ops\n");
+        out.push_str("    | none => none\n\n");
+    }
+
+    for liveness in &mir.liveness_props {
+        let bound = liveness.within_steps.unwrap_or(10);
+        out.push_str(&format!(
+            "/-- {} \u{2014} from {} leads to {} within {} steps via [{}]. -/\n",
+            liveness.name,
+            liveness.from_state,
+            liveness.leads_to_state,
+            bound,
+            liveness.via_ops.join(", ")
+        ));
+        out.push_str(&format!(
+            "theorem liveness_{} (s : State) (signer : Pubkey)\n",
+            liveness.name
+        ));
+        out.push_str(&format!(
+            "    (h : s.status = .{}) :\n",
+            liveness.from_state
+        ));
+        out.push_str(&format!(
+            "    \u{2203} ops s', ops.length \u{2264} {} \u{2227} applyOps s signer ops = some s' \u{2227} s'.status = .{} := by sorry\n\n",
+            bound, liveness.leads_to_state
+        ));
+    }
+}
+
+/// Emit `environment` preservation theorems. Mirrors
+/// `lean_gen::render_environments` for the pilot scope. For each
+/// (property × environment) pair, emit
+/// `theorem <prop>_under_<env> (s : State) <new-field params>
+///     <constraint hyps> (h_inv : <prop> s) :
+///     <prop> { s with <field := new_field>... } := <proof>`.
+///
+/// Proof body auto-discharges with `unfold <prop> at h_inv ⊢; dsimp;
+/// exact h_inv` when the mutated fields don't appear in the property
+/// expression (legacy trivial-preservation shortcut). Otherwise
+/// emits `:= sorry`.
+fn emit_environments(out: &mut String, mir: &Mir) {
+    if mir.environments.is_empty() {
+        return;
+    }
+    out.push_str(
+        "-- ============================================================================\n",
+    );
+    out.push_str("-- Environment \u{2014} properties hold under external state changes\n");
+    out.push_str(
+        "-- ============================================================================\n\n",
+    );
+
+    for env in &mir.environments {
+        for prop in &mir.properties {
+            let prop_expr = match &prop.expression {
+                Some(e) => e,
+                None => continue,
+            };
+
+            // Build new_<field> param signature.
+            let param_sig: String = env
+                .mutates
+                .iter()
+                .map(|(name, ty)| format!(" (new_{} : {})", name, render_ty(ty)))
+                .collect();
+
+            // Rewrite `s.<field>` / `state.<field>` in each constraint
+            // to refer to the new value. Mirrors legacy field-by-field
+            // substitution at lean_gen.rs:4296.
+            let constraint_hyps: String = env
+                .constraints
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    let mut expr = c.0.lean.clone();
+                    for (field, _) in &env.mutates {
+                        expr = expr
+                            .replace(&format!("s.{}", field), &format!("new_{}", field))
+                            .replace(&format!("state.{}", field), &format!("new_{}", field));
+                    }
+                    format!("\n    (h_c{} : {})", i, expr)
+                })
+                .collect();
+
+            let with_parts: String = env
+                .mutates
+                .iter()
+                .map(|(name, _)| format!("{} := new_{}", safe_name(name), name))
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            out.push_str(&format!(
+                "theorem {}_under_{} (s : State){}{}\n",
+                prop.name, env.name, param_sig, constraint_hyps
+            ));
+            out.push_str(&format!("    (h_inv : {} s) :\n", prop.name));
+
+            // Trivial-preservation shortcut: if no mutated field
+            // appears in the property's lean expression, the property
+            // holds by reflexivity after the struct update.
+            let mutated_overlap = env.mutates.iter().any(|(field, _)| {
+                prop_expr.lean.contains(&format!("s.{}", safe_name(field)))
+                    || prop_expr.lean.contains(&format!("state.{}", field))
+            });
+
+            if !mutated_overlap {
+                out.push_str(&format!(
+                    "    {} {{ s with {} }} := by\n  unfold {} at h_inv \u{22A2}; dsimp; exact h_inv\n\n",
+                    prop.name, with_parts, prop.name
+                ));
+            } else {
+                out.push_str(&format!(
+                    "    {} {{ s with {} }} := sorry\n\n",
+                    prop.name, with_parts
+                ));
+            }
+        }
+    }
+}
+
+/// Emit overflow-safety obligations. Mirrors
+/// `lean_gen::render_overflow_obligations` for the pilot scope.
+///
+/// For every handler whose body issues `CheckedAdd` (an `add` effect
+/// in the legacy spec model), emit a theorem stating that all numeric
+/// state fields stay within their declared type bounds across the
+/// transition. The pre-condition asserts inbound `valid_<T>` on each
+/// numeric field; the post-condition asserts the same after.
+///
+/// **Proof bodies emit `:= sorry`.** The legacy `overflow_proof_script`
+/// auto-discharges via `unfold + split + omega`; porting it is a
+/// separately-tracked deferred item.
+fn emit_overflow(out: &mut String, mir: &Mir) {
+    use crate::mir::{Stmt, Ty};
+
+    let has_add = |h: &crate::mir::HandlerMir| -> bool {
+        h.body
+            .stmts
+            .iter()
+            .any(|s| matches!(s, Stmt::CheckedAdd { .. } | Stmt::WrapAdd { .. }))
+    };
+    let add_handlers: Vec<&crate::mir::HandlerMir> =
+        mir.handlers.iter().filter(|h| has_add(h)).collect();
+    if add_handlers.is_empty() {
+        return;
+    }
+
+    // Collect numeric state-field names + their MIR Ty, unioned across
+    // every variant in declaration order. Mirrors the union pass in
+    // `emit_state_struct`.
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut numeric_fields: Vec<(String, Ty)> = Vec::new();
+    for v in &mir.state.variants {
+        for f in &v.fields {
+            if !matches!(
+                f.ty,
+                Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64 | Ty::U128 | Ty::I64 | Ty::I128
+            ) {
+                continue;
+            }
+            if seen.insert(f.name.clone()) {
+                numeric_fields.push((f.name.clone(), f.ty.clone()));
+            }
+        }
+    }
+    if numeric_fields.is_empty() {
+        return;
+    }
+
+    let valid_fn = |ty: &Ty| -> &'static str {
+        match ty {
+            Ty::U8 => "valid_u8",
+            Ty::U16 => "valid_u16",
+            Ty::U32 => "valid_u32",
+            Ty::U64 => "valid_u64",
+            Ty::U128 => "valid_u128",
+            Ty::I64 => "valid_i64",
+            Ty::I128 => "valid_i128",
+            _ => "valid_u64",
+        }
+    };
+
+    out.push_str(
+        "-- ============================================================================\n",
+    );
+    out.push_str(
+        "-- Overflow safety obligations (auto-generated for operations with add effects)\n",
+    );
+    out.push_str(
+        "-- ============================================================================\n\n",
+    );
+
+    for h in add_handlers {
+        let trans_name = safe_name(&format!("{}Transition", h.name));
+        let param_sig = param_sig_str(&h.params);
+        let param_args = param_args_str(&h.params);
+
+        let pre_parts: Vec<String> = numeric_fields
+            .iter()
+            .map(|(n, t)| format!("{} s.{}", valid_fn(t), safe_name(n)))
+            .collect();
+        let post_parts: Vec<String> = numeric_fields
+            .iter()
+            .map(|(n, t)| format!("{} s'.{}", valid_fn(t), safe_name(n)))
+            .collect();
+
+        // Unary invariant hypotheses: properties this handler is
+        // declared to preserve. Binary properties carry an `s s'`
+        // shape and don't fit as single-state hypotheses; the MIR
+        // lift doesn't yet carry the binary/unary tag (it lives on
+        // `ParsedProperty.class`), so we conservatively include every
+        // preserved-by entry whose expression exists. Pilot fixtures
+        // don't tickle the binary case in their overflow theorems
+        // today; revisit when that distinction lands on PropertyMir.
+        let inv_hyps: Vec<&str> = mir
+            .properties
+            .iter()
+            .filter(|p| p.expression.is_some() && p.preserved_by.contains(&h.name))
+            .map(|p| p.name.as_str())
+            .collect();
+
+        out.push_str(&format!(
+            "theorem {}_overflow_safe (s s' : State) (signer : Pubkey){}\n",
+            safe_name(&h.name),
+            param_sig
+        ));
+        let pre_joined = pre_parts
+            .iter()
+            .map(|p| paren_low_prec(p))
+            .collect::<Vec<_>>()
+            .join(" \u{2227} ");
+        out.push_str(&format!("    (h_valid : {})\n", pre_joined));
+        for inv in &inv_hyps {
+            out.push_str(&format!("    (h_inv_{} : {} s)\n", safe_name(inv), inv));
+        }
+        out.push_str(&format!(
+            "    (h : {} s signer{} = some s') :\n",
+            trans_name, param_args
+        ));
+        let post_joined = post_parts
+            .iter()
+            .map(|p| paren_low_prec(p))
+            .collect::<Vec<_>>()
+            .join(" \u{2227} ");
+        out.push_str(&format!("    {} := sorry\n\n", post_joined));
+    }
+}
+
 // ----------------------------------------------------------------------
 // Helpers
 // ----------------------------------------------------------------------
@@ -1342,6 +1783,9 @@ mod tests {
             }],
             ref_impls: vec![],
             properties: vec![],
+            covers: vec![],
+            liveness_props: vec![],
+            environments: vec![],
         };
         let out = render(&mir);
         assert!(
@@ -1377,6 +1821,9 @@ mod tests {
                 rust_body: "a * b".to_string(),
             }],
             properties: vec![],
+            covers: vec![],
+            liveness_props: vec![],
+            environments: vec![],
         };
         let out = render(&mir);
         assert!(
@@ -1445,6 +1892,127 @@ mod tests {
         // word.
         let out = prefix_state_fields("taker_amount > 0", &fields);
         assert_eq!(out, "taker_amount > 0");
+    }
+
+    #[test]
+    fn render_emits_cover_theorems() {
+        // Lending declares two cover blocks:
+        //   cover borrow_repay_cycle [init_pool, deposit, borrow, repay]
+        //   cover liquidation_path   [init_pool, deposit, borrow, liquidate]
+        let mir = lower_fixture("examples/rust/lending/lending.qedspec");
+        let out = render(&mir);
+        assert!(
+            out.contains("-- Cover properties"),
+            "expected cover section header"
+        );
+        assert!(
+            out.contains("theorem cover_borrow_repay_cycle"),
+            "expected cover_borrow_repay_cycle theorem"
+        );
+        assert!(
+            out.contains("theorem cover_liquidation_path"),
+            "expected cover_liquidation_path theorem"
+        );
+        // Trace witnesses must use `Transition` calls per handler
+        // and end with `\u{2260} none := sorry`.
+        assert!(
+            out.contains("init_poolTransition"),
+            "trace should call init_poolTransition"
+        );
+        assert!(
+            out.contains("\u{2260} none := sorry"),
+            "terminal trace step should emit `\u{2260} none := sorry`"
+        );
+    }
+
+    #[test]
+    fn render_emits_liveness_theorems() {
+        // Lending: `liveness loan_settles : Loan.Active ~> Loan.Empty
+        // via [repay] within 1`. MIR pilot strips the State.` prefix
+        // and uses the flat-State form (multi-account ADT path is a
+        // separately tracked deferred item).
+        let mir = lower_fixture("examples/rust/lending/lending.qedspec");
+        let out = render(&mir);
+        assert!(
+            out.contains("-- Liveness properties"),
+            "expected liveness section header"
+        );
+        assert!(
+            out.contains("def applyOps (s : State)"),
+            "expected applyOps helper"
+        );
+        assert!(
+            out.contains("theorem liveness_loan_settles"),
+            "expected liveness_loan_settles theorem"
+        );
+        // Step bound from `within 1` should appear in the existential.
+        assert!(
+            out.contains("ops.length \u{2264} 1"),
+            "expected within-step bound of 1"
+        );
+        assert!(
+            out.contains(":= by sorry"),
+            "liveness body should be `:= by sorry` until proof script ports"
+        );
+    }
+
+    #[test]
+    fn render_emits_environment_theorems() {
+        // Lending declares
+        //   environment interest_rate_change { mutates interest_rate :
+        //   U64; constraint interest_rate > 0 }
+        // and `property pool_solvency` — cross product emits one
+        // `pool_solvency_under_interest_rate_change` theorem.
+        let mir = lower_fixture("examples/rust/lending/lending.qedspec");
+        let out = render(&mir);
+        assert!(
+            out.contains("-- Environment"),
+            "expected environment section header"
+        );
+        assert!(
+            out.contains("theorem pool_solvency_under_interest_rate_change"),
+            "expected pool_solvency_under_interest_rate_change theorem"
+        );
+        assert!(
+            out.contains("new_interest_rate : Nat"),
+            "expected new_<field> param of MIR-rendered type"
+        );
+        assert!(
+            out.contains("(h_inv : pool_solvency s)"),
+            "expected (h_inv : <prop> s) hypothesis"
+        );
+        assert!(
+            out.contains("{ s with interest_rate := new_interest_rate }"),
+            "expected struct-update with mutated field"
+        );
+    }
+
+    #[test]
+    fn render_emits_overflow_theorems() {
+        // Lending: `deposit` issues a `+=` effect against numeric
+        // pool fields, which MIR lowers to `CheckedAdd` (the default
+        // arithmetic mode post-v2.7 G3). The overflow emitter picks
+        // it up and produces a `deposit_overflow_safe` theorem.
+        let mir = lower_fixture("examples/rust/lending/lending.qedspec");
+        let out = render(&mir);
+        assert!(
+            out.contains("-- Overflow safety obligations"),
+            "expected overflow section header"
+        );
+        assert!(
+            out.contains("theorem deposit_overflow_safe"),
+            "expected deposit_overflow_safe theorem"
+        );
+        // Pre-condition asserts `valid_<T>` on each numeric field.
+        assert!(out.contains("valid_u64"), "expected valid_u64 in pre/post");
+        assert!(
+            out.contains("= some s'"),
+            "expected `= some s'` hypothesis on transition"
+        );
+        assert!(
+            out.contains(":= sorry"),
+            "overflow body should be `:= sorry` until proof script ports"
+        );
     }
 
     #[test]

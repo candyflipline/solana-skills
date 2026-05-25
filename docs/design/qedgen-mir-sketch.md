@@ -1,6 +1,6 @@
 # qedgen MIR — design sketch
 
-**Status:** Phase 1c closed for this session (14/16 emit sections shipped), on the `mir` branch. Phase 1d (snapshot equivalence) + the deferred Phase 1c items (§8 CPI theorems, §15 cover/liveness/etc, multi-variant ADT path) pick up in a dedicated next session — handoff notes in §"Next-session handoff" below.
+**Status:** Phase 1c-6 landed (§15 cover / liveness / environments / overflow emit statements; proof scripts deferred). 15/16 emit sections shipped on the `mir` branch. Remaining: §8 CPI theorems, the §15 auto-proof scripts, the multi-variant ADT path, and Phase 1d (snapshot equivalence). Handoff notes in §"Next-session handoff" below.
 
 **Last revised:** 2026-05-25 (Phase 1c close-out).
 
@@ -339,10 +339,10 @@ Sub-slices shipped:
 | 12 | `emit_aborts_if` (legacy + requires-else) | 1c-2 | ✅ |
 | 13 | `emit_ensures` | 1c-2 | ✅ |
 | 14 | `emit_frame_conditions` | 1c-3 | ✅ |
-| 15 | cover / liveness / environments / overflow | — | **deferred** |
+| 15 | `emit_covers` + `emit_liveness` + `emit_environments` + `emit_overflow` | 1c-6 | ✅ (statements only — proof scripts deferred) |
 | 16 | namespace close | 1b | ✅ |
 
-**14 of 16 sections emit content.** End-to-end smoke-confirmed on `examples/rust/{escrow,lending,multisig,bundled-stdlib-demo,percolator}/*.qedspec` with `QEDGEN_USE_MIR=1`. 11 lean_gen_mir tests + 10 mir tests pass. Full suite 962 + 21 = 983 passing.
+**15 of 16 sections emit content.** End-to-end smoke-confirmed on `examples/rust/{escrow,lending,multisig,bundled-stdlib-demo,percolator}/*.qedspec` with `QEDGEN_USE_MIR=1`. 15 lean_gen_mir tests + 10 mir tests pass. Full bin suite at 970 passing.
 
 Commit trail on `mir` branch:
 - `ab4bdbe` Phase 0 — typed IR + lowering
@@ -353,11 +353,12 @@ Commit trail on `mir` branch:
 - `c403089` docs — sketch progress catchup
 - `42bdb06` Phase 1c-4 — constants + helpers + ref_impls
 - `040a8b4` Phase 1c-5 — properties + preservation
+- (next commit) Phase 1c-6 — cover / liveness / environments / overflow
 
 ### Deferred — return in a dedicated Phase 1d session
 
 - **§8 CPI theorems** — `render_cpi_theorems` in legacy lean_gen.rs:`grep -n "^fn render_cpi_theorems"`. Requires populating `Mir.interfaces` from `ParsedSpec.imported_namespaces` + the bundled stdlib registry (SPL Token / System Program / Metaplex). Intersects with Phase 3's `cpi_substitute` MIR→MIR pass. ~1–2 days.
-- **§15 cover / liveness / environments / overflow** — four small emit fns. `render_covers`, `render_liveness`, `render_environments`, `render_overflow_obligations` in legacy. Each touches `ParsedSpec` fields not yet lifted into MIR (`covers`, `liveness_props`, `environments`, plus per-handler overflow analysis). ~1–2 days total.
+- **§15 proof scripts** — Phase 1c-6 emits cover / liveness / overflow theorems with `:= sorry` / `:= by sorry` bodies. Legacy lean_gen.rs has three auto-proof helpers — `cover_trace_proof` (witness construction over state-field defaults), `liveness_proof_script` (lifecycle-graph walk via `find_liveness_path` + `subst h_apply; rfl`), `overflow_proof_script` (`unfold + split + omega`) — that close many trivial cases. Environment theorems already auto-discharge via `unfold + dsimp + exact h_inv` when mutated fields don't appear in the property body. ~half to one day total when needed.
 - **Multi-variant ADT path (`render_single_account_adt`)** — currently lean_gen.rs takes this branch for `escrow` (Uninitialized | Open | Closed); the MIR path emits the flat-state form, which diverges from legacy. Byte-equivalence for escrow requires implementing the inductive-State emission. ~2–3 days. Largest single deferred item.
 - **Preservation proof scripts** — Phase 1c-5 emits property preservation theorems as `:= sorry`. legacy lean_gen.rs has a `preservation_proof_script` helper that discharges via `if_neg` / `dsimp + omega` projection. ~half day.
 - **`rewrite_subscripts_lean` pass for ref_impls** — Phase 1c-4 emits ref_impl bodies verbatim; legacy applies a `m[i]` → `(m i)` rewrite for Map-typed params. Triggers when a fixture uses ref_impls with Map subscripts — no pilot fixture does today. ~half day when needed.
@@ -379,10 +380,10 @@ For the next session picking up this work:
 - Local: `.cargo/config.toml` carries `rustflags = ["-C", "symbol-mangling-version=v0"]` for the macOS linker workaround. See [[reference-macos-linker-workaround]].
 
 **Smoke commands:**
-- `cargo test -p qedgen-solana-skills lean_gen_mir::tests` — 11 MIR-codegen tests.
-- `cargo test -p qedgen-solana-skills mir::tests` — 10 MIR lowering tests.
+- `cargo test -p qedgen-solana-skills --bins lean_gen_mir::tests` — 15 MIR-codegen tests (run via `--bins` since the package has no lib target).
+- `cargo test -p qedgen-solana-skills --bins mir::tests` — 10 MIR lowering tests.
 - `cargo fmt --check` + `cargo clippy -p qedgen-solana-skills -- -D warnings` — CI gates.
-- `QEDGEN_USE_MIR=1 qedgen codegen --spec examples/rust/lending/lending.qedspec --lean` — run the new path end-to-end on a fixture. Inspect `formal_verification/Spec.lean`.
+- `QEDGEN_USE_MIR=1 qedgen codegen --spec examples/rust/lending/lending.qedspec --lean` — run the new path end-to-end on a fixture. Inspect `formal_verification/Spec.lean`. The lending fixture exercises every Phase 1c-6 emitter (covers, liveness, environments, overflow); restore with `git checkout -- examples/rust/lending/` after eyeballing — codegen rewrites `programs/` too.
 
 **Where the pieces live:**
 - `crates/qedgen/src/mir.rs` — typed IR + lowering. Section dividers (`// ---- ----`) split the file. Search anchors: `pub struct Mir`, `pub enum Stmt`, `pub fn lower`.
@@ -390,10 +391,10 @@ For the next session picking up this work:
 - `crates/qedgen/src/main.rs:3194` — dispatch gate (`if QEDGEN_USE_MIR { mir::lower → lean_gen_mir } else { lean_gen }`).
 
 **Suggested first move in the next session:**
-1. Pick the simplest deferred item — §15 cover/liveness/environments/overflow — and implement it as four small `emit_*` fns + four small MIR field additions. Mechanical work that warms the pattern back up.
-2. Then tackle the multi-variant ADT path (`render_single_account_adt`) since byte-equivalence for `escrow` depends on it.
-3. Last: §8 CPI theorems (the biggest lift; intersects with Phase 3 work).
-4. Then Phase 1d snapshot tests.
+1. Multi-variant ADT path (`render_single_account_adt`) — biggest single deferred item. Byte-equivalence for `escrow` depends on it; MIR currently emits the flat-state form for sum-typed accounts. ~2–3 days.
+2. §8 CPI theorems — populate `Mir.interfaces` from `ParsedSpec.imported_namespaces`, then port `render_cpi_theorems`. Intersects with Phase 3's `cpi_substitute` MIR→MIR pass — design the lift first (see "What NOT to do" below). ~1–2 days.
+3. §15 + §11 auto-proof scripts — port `cover_trace_proof`, `liveness_proof_script`, `overflow_proof_script`, `preservation_proof_script` from legacy. Each replaces a `:= sorry` body with a real auto-discharge that closes trivial cases. ~1 day.
+4. Phase 1d snapshot tests — once the above lands, both codegens against every pilot fixture, byte-identical or cosmetic-diff-only.
 
 **What NOT to do without revisiting:**
 - Don't try to byte-match `lean_gen.rs` output verbatim before all sections emit. Cosmetic diffs (ordering, whitespace) are expected; locking them into snapshots is Phase 1d's job, not earlier.
