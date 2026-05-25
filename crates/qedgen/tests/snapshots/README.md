@@ -25,24 +25,24 @@ two diverge today:
 | `bundled-stdlib-demo` | ADT | **byte-identical** |
 | `cross-program-vault` | ADT | **byte-identical** |
 | `escrow-split` | ADT | byte-identical (vs fresh-legacy regen) after §15 `cover_trace_proof` port |
-| `escrow` | flat | substantial pre-existing divergence — `inductive Status` deriving order, transition body shape (no signer-equality / lifecycle gate), cover proof witnesses |
-| `lending` | flat | same as escrow |
-| `multisig` | flat | same as escrow |
+| `escrow` | flat | **byte-identical** (vs fresh-legacy regen) after Phase 1c-10 flat-path alignment |
+| `lending` | flat | divergent — multi-account codegen (`PoolState` + `LoanState` vs single `State`); Phase 2 |
+| `multisig` | flat | divergent — indexed-state imports + `Map[N] T` compound-type lowering; separate work |
 
-ADT-path byte-equivalence is the v2.30 Phase 1c-8 deliverable; the
-flat-path differences predate Phase 1d and are tracked as follow-on
-work. See `docs/design/qedgen-mir-sketch.md` §"Deferred — return in
-a dedicated Phase 1d session" for the open items, notably:
+ADT-path byte-equivalence was the v2.30 Phase 1c-8 deliverable;
+escrow flat-path byte-equivalence was the v2.30 Phase 1c-10
+deliverable (Status/State deriving order, signer-equality + lifecycle
+gate conjuncts in transition bodies, requires-based abort
+auto-proof, liveness path-finding + auto-proof script). Lending and
+multisig still diverge for unrelated structural reasons
+(multi-account split; indexed-state lowering) tracked separately.
 
-- §15 `cover_trace_proof` auto-discharge — ported and unlocked
-  `escrow-split` byte-equivalence on 2026-05-25. The companion
-  `liveness_proof_script` / `overflow_proof_script` /
-  `preservation_proof_script` ports remain deferred: they
-  pattern-match on the legacy transition body's `split`/`cases`
-  structure, so they're gated on the flat-path alignment below.
-- Flat-state transition body / `inductive Status` / abort proof shape
-  alignment — closes the bulk of the flat-path diff and unlocks the
-  remaining auto-proof scripts above.
+Remaining `qedgen-mir-sketch.md` deferred items:
 
-Tracked in `MEMORY.md` as
-[[project-v230-mir-byte-equivalence]] when it lands as a follow-up.
+- §11 `overflow_proof_script` / §15 `preservation_proof_script`
+  ports — pattern-match on the flat transition body's `split` /
+  `cases` structure that Phase 1c-10 unblocked. Next-session scope.
+- Multi-account `render_multi_account` (Phase 2) — required to close
+  the lending diff.
+- Indexed-state `Map[N] T` + `IndexedState` import emission —
+  required to close the multisig diff.

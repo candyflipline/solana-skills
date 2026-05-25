@@ -797,15 +797,21 @@ fn emit_lifecycle_marker(out: &mut String, mir: &Mir) {
     // ≥ 2 states. Issue #43: a single-state lifecycle is no
     // discriminator; emitting Status for it collides with user-declared
     // `status` fields.
+    //
+    // Flat-path shape: bare variant tags (no `: Status` annotation) and
+    // `deriving Repr, DecidableEq, BEq` to match `lean_gen::render_single_account`.
+    // Distinct from the multi-variant ADT path's `emit_status_inductive_adt`
+    // — same shape (deriving order) but the flat path doesn't need to share
+    // the helper since the State block itself differs.
     let states = &mir.state.lifecycle_states;
     if states.len() < 2 {
         return;
     }
     out.push_str("inductive Status where\n");
     for s in states {
-        out.push_str(&format!("  | {} : Status\n", safe_name(s)));
+        out.push_str(&format!("  | {}\n", safe_name(s)));
     }
-    out.push_str("  deriving DecidableEq, Repr\n\n");
+    out.push_str("  deriving Repr, DecidableEq, BEq\n\n");
 }
 
 /// Emit one transition function per handler. Mirrors
@@ -831,7 +837,7 @@ fn emit_transitions(out: &mut String, mir: &Mir) {
     }
 }
 
-fn emit_handler_transition(out: &mut String, _mir: &Mir, h: &crate::mir::HandlerMir) {
+fn emit_handler_transition(out: &mut String, mir: &Mir, h: &crate::mir::HandlerMir) {
     use crate::mir::Stmt;
 
     let trans_name = safe_name(&format!("{}Transition", h.name));
@@ -843,29 +849,18 @@ fn emit_handler_transition(out: &mut String, _mir: &Mir, h: &crate::mir::Handler
         trans_name, param_sig
     ));
 
-    // Auth alias: when `auth <who>` is not a state field, bind `who` to
-    // `signer` so user-written predicates referencing it resolve.
-    if let Some(auth_name) = handler_auth_name(h) {
-        // Phase 1c approximation: emit the alias whenever `auth` is set.
-        // Determining whether `who` is a state field requires walking
-        // the State variants — we have that info, but the legacy code's
-        // gate is more nuanced (it checks if `who` collides with a
-        // field name OR a Pubkey-typed state field). Erring on the
-        // side of always emitting the alias matches the most-common
-        // case in the pilot fixtures.
-        out.push_str(&format!("  let {} := signer\n", safe_name(&auth_name)));
-    }
+    let conds = build_guard_cond_parts(mir, h);
 
-    // RequireOrAbort clauses → if-condition.
-    let conds: Vec<String> = h
-        .body
-        .stmts
-        .iter()
-        .filter_map(|s| match s {
-            Stmt::RequireOrAbort { pred, .. } => Some(pred.0.lean.clone()),
-            _ => None,
-        })
-        .collect();
+    // Auth alias: `let <who> := signer` only when `who` is NOT a state
+    // field (legacy behavior; otherwise the conjunct above already
+    // pins the relationship and an alias would shadow the field name).
+    if let Some(who) = handler_auth_name(h) {
+        let state_fields = flat_state_fields(mir);
+        let who_is_state_field = state_fields.iter().any(|(n, _)| n == &who);
+        if !who_is_state_field {
+            out.push_str(&format!("  let {} := signer\n", safe_name(&who)));
+        }
+    }
 
     // Assign / Add / Sub family → record-update parts.
     let mut with_parts: Vec<String> = Vec::new();
@@ -908,7 +903,7 @@ fn emit_handler_transition(out: &mut String, _mir: &Mir, h: &crate::mir::Handler
         // Only emit the `status :=` part when lifecycle is real
         // (≥2 states); single-lifecycle specs skip the marker per
         // issue #43.
-        if _mir.state.lifecycle_states.len() >= 2 {
+        if mir.state.lifecycle_states.len() >= 2 {
             with_parts.push(format!("status := .{}", safe_name(post)));
         }
     }
@@ -929,9 +924,124 @@ fn emit_handler_transition(out: &mut String, _mir: &Mir, h: &crate::mir::Handler
             .join(" \u{2227} ");
         out.push_str(&format!("  if {} then\n", joined));
         out.push_str(&format!("    {}\n", then_body));
-        out.push_str("  else\n");
-        out.push_str("    none\n\n");
+        out.push_str("  else none\n\n");
     }
+}
+
+/// Build the if-condition conjuncts for a handler's flat-state
+/// transition function. Mirrors `lean_gen::build_guard_cond_parts`
+/// exactly; emit-site users (transition body, aborts theorem proof
+/// indexing) share the same conjunct list.
+///
+/// Order (and content) matches legacy so the resulting `if` line,
+/// `cond_parts.iter().position(...)` lookups, and conjunction-
+/// projection paths are byte-equivalent:
+///   1. `signer = s.<who>`  (only if `who` names a state field)
+///   2. `s.status = .<pre>` (lifecycle gate)
+///   3. sub-effect underflow guards (`<delta> ≤ s.<field>`, unsigned only)
+///   4. RequireOrAbort predicates (filtered: skip handler-account pubkey refs)
+///   5. add-effect overflow guards (`s.<field> + <delta> ≤ <max>`, unsigned only)
+fn build_guard_cond_parts(mir: &Mir, h: &crate::mir::HandlerMir) -> Vec<String> {
+    use crate::mir::Stmt;
+    let mut conds: Vec<String> = Vec::new();
+
+    let state_fields = flat_state_fields(mir);
+
+    let auth_name = handler_auth_name(h);
+    let who_is_state_field = auth_name
+        .as_deref()
+        .map(|w| state_fields.iter().any(|(n, _)| n == w))
+        .unwrap_or(false);
+    if let Some(who) = &auth_name {
+        if who_is_state_field {
+            conds.push(format!("signer = s.{}", safe_name(who)));
+        }
+    }
+
+    if let Some((pre, _)) = &h.transition {
+        if mir.state.lifecycle_states.len() >= 2 {
+            conds.push(format!("s.status = .{}", safe_name(pre)));
+        }
+    }
+
+    for stmt in &h.body.stmts {
+        let (path, delta) = match stmt {
+            Stmt::CheckedSub { path, delta, .. }
+            | Stmt::WrapSub { path, delta }
+            | Stmt::SatSub { path, delta } => (path, delta),
+            _ => continue,
+        };
+        let field = path_field_name(path);
+        if let Some(ty) = state_fields
+            .iter()
+            .find(|(n, _)| n == &field)
+            .map(|(_, t)| t.clone())
+        {
+            if ty_max_const(&ty).is_some() {
+                conds.push(format!("{} \u{2264} s.{}", delta.lean, safe_name(&field)));
+            }
+        }
+    }
+
+    for stmt in &h.body.stmts {
+        if let Stmt::RequireOrAbort { pred, .. } = stmt {
+            if mentions_handler_account_pubkey(&pred.0.lean, &h.accounts) {
+                continue;
+            }
+            conds.push(pred.0.lean.clone());
+        }
+    }
+
+    for stmt in &h.body.stmts {
+        let (path, delta) = match stmt {
+            Stmt::CheckedAdd { path, delta, .. }
+            | Stmt::WrapAdd { path, delta }
+            | Stmt::SatAdd { path, delta } => (path, delta),
+            _ => continue,
+        };
+        let field = path_field_name(path);
+        let ty = match state_fields
+            .iter()
+            .find(|(n, _)| n == &field)
+            .map(|(_, t)| t.clone())
+        {
+            Some(t) => t,
+            None => continue,
+        };
+        let max = match ty_max_const(&ty) {
+            Some(m) => m,
+            None => continue,
+        };
+        let sf = safe_name(&field);
+        let needle_a = format!("s.{} + {}", sf, delta.lean);
+        let needle_b = format!("{} + s.{}", delta.lean, sf);
+        let already = conds
+            .iter()
+            .any(|c| c.contains(&needle_a) || c.contains(&needle_b));
+        if already {
+            continue;
+        }
+        conds.push(format!("s.{} + {} \u{2264} {}", sf, delta.lean, max));
+    }
+
+    conds
+}
+
+/// Union of (field-name, type) pairs across every state variant —
+/// matches the flat-state `emit_state_struct` projection. Used by
+/// `emit_handler_transition` to look up field types for the auth
+/// gate and the auto overflow/underflow guards.
+fn flat_state_fields(mir: &Mir) -> Vec<(String, crate::mir::Ty)> {
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut out: Vec<(String, crate::mir::Ty)> = Vec::new();
+    for v in &mir.state.variants {
+        for f in &v.fields {
+            if seen.insert(f.name.clone()) {
+                out.push((f.name.clone(), f.ty.clone()));
+            }
+        }
+    }
+    out
 }
 
 /// Emit CPI theorems — Phase 1c-7 port of
@@ -1707,6 +1817,72 @@ fn emit_aborts_if(out: &mut String, mir: &Mir) {
     emit_aborts_if_with_sorry(out, mir, "sorry");
 }
 
+/// Count top-level `∧` conjuncts in a Lean expression. Respects
+/// parenthesis nesting (`(a ∧ b) ∧ c` returns 2, not 3). Mirrors
+/// `lean_gen::count_top_level_conjuncts`.
+fn count_top_level_conjuncts(expr: &str) -> usize {
+    let mut depth: i32 = 0;
+    let mut count = 0usize;
+    for ch in expr.chars() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            '\u{2227}' if depth == 0 => count += 1, // ∧
+            _ => {}
+        }
+    }
+    count + 1
+}
+
+/// Projection path into a right-associative `∧` chain. Mirrors
+/// `lean_gen::conjunction_projection`.
+fn conjunction_projection(flat_index: usize, total_atoms: usize) -> String {
+    let mut path = String::from("hg");
+    for _ in 0..flat_index {
+        path.push_str(".2");
+    }
+    if flat_index < total_atoms - 1 {
+        path.push_str(".1");
+    }
+    path
+}
+
+/// Build the tactic body for a flat-path requires-based abort theorem.
+/// Mirrors `lean_gen::abort_requires_proof`: the hypothesis
+/// `h : ¬(req_lean_expr)` contradicts the matching conjuncts in the
+/// transition's guard, so the proof closes by `if_neg` projection.
+fn abort_requires_proof(
+    trans_name: &str,
+    cond_parts: &[String],
+    req_index_in_cond_parts: usize,
+) -> String {
+    let atoms_per: Vec<usize> = cond_parts
+        .iter()
+        .map(|p| count_top_level_conjuncts(p))
+        .collect();
+    let total_atoms: usize = atoms_per.iter().sum();
+    let flat_start: usize = atoms_per[..req_index_in_cond_parts].iter().sum();
+    let target_atoms = atoms_per[req_index_in_cond_parts];
+
+    if total_atoms == 1 {
+        return format!(" := by\n  unfold {}\n  rw [if_neg h]\n", trans_name);
+    }
+
+    let projections: Vec<String> = (0..target_atoms)
+        .map(|i| conjunction_projection(flat_start + i, total_atoms))
+        .collect();
+    let extraction = if projections.len() == 1 {
+        projections[0].clone()
+    } else {
+        format!("\u{27E8}{}\u{27E9}", projections.join(", "))
+    };
+
+    format!(
+        " := by\n  unfold {}\n  rw [if_neg (fun hg => h {})]\n",
+        trans_name, extraction
+    )
+}
+
 /// ADT-shape variant — emits `:= by sorry` for every clause, matching
 /// `lean_gen::render_aborts_if_adt`. The structural difference is
 /// confined to the proof body's tactic / term form; the theorem
@@ -1815,6 +1991,15 @@ fn emit_aborts_if_with_sorry(out: &mut String, mir: &Mir, sorry_form: &str) {
         // theorem would mention free variables. Mirrors
         // lean_gen.rs:4467. Skipping here keeps the Lean compilable;
         // the runtime-side check still fires in Rust.
+        //
+        // For the flat path (`sorry_form == "sorry"`), the proof
+        // mechanically closes via `if_neg`-with-projection — mirror
+        // `lean_gen::abort_requires_proof`. The ADT path
+        // (`"by sorry"`) keeps the sorry placeholder; per-variant
+        // pattern matching makes the same script ill-formed and the
+        // legacy ADT renderer is itself sorry-bodied today.
+        let cond_parts = build_guard_cond_parts(mir, h);
+        let flat_path = sorry_form == "sorry";
         for r in &h.requires_or_abort {
             if mentions_handler_account_pubkey(&r.pred.0.lean, &h.accounts) {
                 continue;
@@ -1824,6 +2009,17 @@ fn emit_aborts_if_with_sorry(out: &mut String, mir: &Mir, sorry_form: &str) {
                 "theorem {} (s : State) (signer : Pubkey){}\n",
                 theorem_name, param_sig
             ));
+            let req_pos = cond_parts.iter().position(|c| c == &r.pred.0.lean);
+            if flat_path {
+                if let Some(pos) = req_pos {
+                    let proof = abort_requires_proof(&trans_name, &cond_parts, pos);
+                    out.push_str(&format!(
+                        "    (h : \u{00AC}({})) : {} s signer{} = none{}\n",
+                        r.pred.0.lean, trans_name, param_args, proof
+                    ));
+                    continue;
+                }
+            }
             out.push_str(&format!(
                 "    (h : \u{00AC}({})) : {} s signer{} = none := {}\n\n",
                 r.pred.0.lean, trans_name, param_args, sorry_form
@@ -1990,7 +2186,7 @@ fn emit_state_struct(out: &mut String, mir: &Mir) {
     if has_lifecycle {
         out.push_str("  status : Status\n");
     }
-    out.push_str("  deriving DecidableEq, Repr\n\n");
+    out.push_str("  deriving Repr, DecidableEq, BEq\n\n");
 }
 
 // ----------------------------------------------------------------------
@@ -2527,9 +2723,35 @@ fn emit_liveness_inner(out: &mut String, mir: &Mir, adt_form: bool) {
             liveness.from_state
         ));
         if adt_form {
+            // ADT-shape liveness: keep the universal-implication form
+            // with `by sorry`; the auto-discharge script pattern-matches
+            // on flat-state if-guards and isn't valid against the
+            // per-variant pattern-match transitions.
             out.push_str(&format!(
                 "    \u{2203} ops, ops.length \u{2264} {} \u{2227} \u{2200} s', applyOps s signer ops = some s' \u{2192} s'.status = .{} := by sorry\n\n",
                 bound, liveness.leads_to_state
+            ));
+            continue;
+        }
+
+        // Flat-state path: try to find a concrete via-op path through
+        // the lifecycle. When one exists, emit the universal-
+        // implication form + auto-proof script (legacy
+        // `render_liveness` ~line 3994). Otherwise fall back to the
+        // existential form with sorry (non-vacuous obligation, issue
+        // #38).
+        let path = find_liveness_path(
+            &liveness.from_state,
+            &liveness.leads_to_state,
+            &liveness.via_ops,
+            &mir.handlers,
+        );
+
+        if let Some(ref ops_path) = path {
+            let proof = liveness_proof_script(ops_path, &mir.handlers);
+            out.push_str(&format!(
+                "    \u{2203} ops, ops.length \u{2264} {} \u{2227} \u{2200} s', applyOps s signer ops = some s' \u{2192} s'.status = .{}{}\n",
+                bound, liveness.leads_to_state, proof
             ));
         } else {
             out.push_str(&format!(
@@ -2537,6 +2759,216 @@ fn emit_liveness_inner(out: &mut String, mir: &Mir, adt_form: bool) {
                 bound, liveness.leads_to_state
             ));
         }
+    }
+}
+
+/// BFS through the lifecycle graph defined by `via_ops`'
+/// `(pre_status, post_status)` arrows, returning the first sequence
+/// that gets from `from_state` to `to_state`. Mirrors
+/// `lean_gen::find_liveness_path` byte-for-byte (single-step shortcut
+/// + bounded BFS by `via_ops.len()`).
+fn find_liveness_path(
+    from_state: &str,
+    to_state: &str,
+    via_ops: &[String],
+    handlers: &[crate::mir::HandlerMir],
+) -> Option<Vec<String>> {
+    for op_name in via_ops {
+        if let Some(h) = handlers.iter().find(|h| h.name == *op_name) {
+            if let Some((pre, post)) = &h.transition {
+                if pre == from_state && post == to_state {
+                    return Some(vec![op_name.clone()]);
+                }
+            }
+        }
+    }
+
+    let mut queue: Vec<(String, Vec<String>)> = vec![(from_state.to_string(), Vec::new())];
+    let max_depth = via_ops.len();
+
+    while let Some((current, path)) = queue.first().cloned() {
+        queue.remove(0);
+        if path.len() >= max_depth {
+            continue;
+        }
+        for op_name in via_ops {
+            if let Some(h) = handlers.iter().find(|h| h.name == *op_name) {
+                if let Some((pre, post)) = &h.transition {
+                    if pre == &current && !post.is_empty() {
+                        let mut new_path = path.clone();
+                        new_path.push(op_name.clone());
+                        if post == to_state {
+                            return Some(new_path);
+                        }
+                        queue.push((post.clone(), new_path));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Generate the Lean tactic body for a liveness theorem along an
+/// already-found `ops_path`. Mirrors `lean_gen::liveness_proof_script`;
+/// shape:
+///   1. Optional `let pk : Pubkey := ⟨0,0,0,0⟩` when any constructor
+///      takes a Pubkey witness.
+///   2. `refine ⟨[<ops>], by decide, fun s' h_apply => ?_⟩`
+///   3. `simp only [applyOps, applyOp, …]` then `split at h_apply` /
+///      `subst` / `rfl` mechanics (one nest per step, single-step is
+///      special-cased).
+///
+/// `needs_split[i]` is true when handler i's if-guard is non-trivial
+/// (has a `who`, a requires clause, or a lifecycle gate). MIR's
+/// proxy: `build_guard_cond_parts` produces a non-empty conjunct list.
+fn liveness_proof_script(ops_path: &[String], handlers: &[crate::mir::HandlerMir]) -> String {
+    let n = ops_path.len();
+
+    // Build the ops list literal: `[.op1 arg1, .op2, ...]`. Each
+    // constructor needs a witness arg per `params`; bare `.op` would
+    // mistype handlers whose Operation constructor takes parameters.
+    let mut needs_pk_binding = false;
+    let ops_list: Vec<String> = ops_path
+        .iter()
+        .map(|name| {
+            let handler = handlers.iter().find(|h| &h.name == name);
+            let args: Vec<String> = match handler {
+                Some(h) => h
+                    .params
+                    .iter()
+                    .map(|(_, ty)| match ty {
+                        crate::mir::Ty::Pubkey => {
+                            needs_pk_binding = true;
+                            "pk".to_string()
+                        }
+                        crate::mir::Ty::Bool => "false".to_string(),
+                        _ => "0".to_string(),
+                    })
+                    .collect(),
+                None => Vec::new(),
+            };
+            if args.is_empty() {
+                format!(".{}", safe_name(name))
+            } else {
+                format!(".{} {}", safe_name(name), args.join(" "))
+            }
+        })
+        .collect();
+    let ops_literal = format!("[{}]", ops_list.join(", "));
+
+    // Per-step "guard is non-trivial" flag. Mirrors legacy
+    // `h.who.is_some() || h.guard_str.is_some() || !h.requires.is_empty()`.
+    // For MIR pilot scope: `auth.is_some() || any RequireOrAbort ||
+    // transition lifecycle gate present`.
+    let needs_split: Vec<bool> = ops_path
+        .iter()
+        .map(|name| {
+            handlers
+                .iter()
+                .find(|h| &h.name == name)
+                .map(|h| {
+                    handler_auth_name(h).is_some()
+                        || !h.requires_or_abort.is_empty()
+                        || h.transition.is_some()
+                        || !h.pre.is_empty()
+                })
+                .unwrap_or(false)
+        })
+        .collect();
+
+    let trans_names: Vec<String> = ops_path
+        .iter()
+        .map(|name| safe_name(&format!("{}Transition", name)))
+        .collect();
+
+    let mut proof = String::new();
+    proof.push_str(" := by\n");
+    if needs_pk_binding {
+        proof.push_str("  let pk : Pubkey := \u{27E8}0, 0, 0, 0\u{27E9}\n");
+    }
+    proof.push_str(&format!(
+        "  refine \u{27E8}{}, by decide, fun s' h_apply => ?\u{5F}\u{27E9}\n",
+        ops_literal
+    ));
+
+    if n == 1 {
+        let trans = &trans_names[0];
+        if needs_split[0] {
+            proof.push_str(&format!(
+                "  simp only [applyOps, applyOp, {}] at h_apply\n",
+                trans
+            ));
+            proof.push_str("  split at h_apply\n");
+            proof.push_str("  \u{B7} next heq =>\n");
+            proof.push_str("    split at heq\n");
+            proof.push_str(
+                "    \u{B7} next hg => simp at heq h_apply; subst heq; subst h_apply; rfl\n",
+            );
+            proof.push_str("    \u{B7} simp at heq\n");
+            proof.push_str("  \u{B7} simp at h_apply\n");
+        } else {
+            proof.push_str(&format!(
+                "  simp only [applyOps, applyOp, {}, h, \u{2193}reduceIte] at h_apply\n",
+                trans
+            ));
+            proof.push_str("  cases h_apply; rfl\n");
+        }
+    } else {
+        proof.push_str("  simp only [applyOps, applyOp] at h_apply\n");
+        liveness_multi_step_proof(&mut proof, &trans_names, &needs_split, 0, "  ");
+    }
+
+    proof
+}
+
+/// Recursive nested-split builder for multi-step liveness. Mirrors
+/// `lean_gen::liveness_multi_step_proof`. Indentation grows by two
+/// spaces per nesting depth so the emitted Lean is readable.
+#[allow(clippy::only_used_in_recursion)]
+fn liveness_multi_step_proof(
+    proof: &mut String,
+    trans_names: &[String],
+    needs_split: &[bool],
+    step: usize,
+    indent: &str,
+) {
+    if step >= trans_names.len() {
+        return;
+    }
+    let trans = &trans_names[step];
+    let is_last = step == trans_names.len() - 1;
+
+    proof.push_str(&format!("{}simp only [{}] at h_apply\n", indent, trans));
+    proof.push_str(&format!("{}split at h_apply\n", indent));
+
+    if is_last {
+        if needs_split[step] {
+            proof.push_str(&format!("{}\u{B7} next heq =>\n", indent));
+            let inner = format!("{}  ", indent);
+            proof.push_str(&format!("{}split at heq\n", inner));
+            proof.push_str(&format!(
+                "{}\u{B7} next hg => simp at heq h_apply; subst heq; subst h_apply; rfl\n",
+                inner
+            ));
+            proof.push_str(&format!("{}\u{B7} simp at heq\n", inner));
+        } else {
+            proof.push_str(&format!("{}\u{B7} cases h_apply; rfl\n", indent));
+        }
+    } else if needs_split[step] {
+        proof.push_str(&format!("{}\u{B7} next heq =>\n", indent));
+        let inner = format!("{}  ", indent);
+        proof.push_str(&format!("{}split at heq\n", inner));
+        proof.push_str(&format!("{}\u{B7} next hg =>\n", inner));
+        let inner2 = format!("{}  ", inner);
+        proof.push_str(&format!("{}simp at heq\n", inner2));
+        proof.push_str(&format!("{}subst heq\n", inner2));
+        liveness_multi_step_proof(proof, trans_names, needs_split, step + 1, &inner2);
+        proof.push_str(&format!("{}\u{B7} simp at heq\n", inner));
+    } else {
+        proof.push_str(&format!("{}\u{B7}\n", indent));
+        let next_indent = format!("{}  ", indent);
+        liveness_multi_step_proof(proof, trans_names, needs_split, step + 1, &next_indent);
     }
 }
 

@@ -8,10 +8,10 @@ namespace Lending
 open QEDGen.Solana
 
 inductive Status where
-  | Uninitialized : Status
-  | Active : Status
-  | Paused : Status
-  deriving DecidableEq, Repr
+  | Uninitialized
+  | Active
+  | Paused
+  deriving Repr, DecidableEq, BEq
 
 structure State where
   authority : Pubkey
@@ -19,37 +19,34 @@ structure State where
   total_borrows : Nat
   interest_rate : Nat
   status : Status
-  deriving DecidableEq, Repr
+  deriving Repr, DecidableEq, BEq
 
 def init_poolTransition (s : State) (signer : Pubkey) (rate : Nat) : Option State :=
-  let authority := signer
-  if rate > 0 then
+  if signer = s.authority ∧ s.status = .Uninitialized ∧ rate > 0 then
     some { s with interest_rate := rate, total_deposits := 0, total_borrows := 0, status := .Active }
-  else
-    none
+  else none
 
 def depositTransition (s : State) (signer : Pubkey) (amount : Nat) : Option State :=
-  if amount > 0 then
+  if s.status = .Active ∧ amount > 0 ∧ s.total_deposits + amount ≤ 18446744073709551615 then
     some { s with total_deposits := s.total_deposits + amount, status := .Active }
-  else
-    none
+  else none
 
 def borrowTransition (s : State) (signer : Pubkey) (amount : Nat) (collateral : Nat) : Option State :=
   let borrower := signer
-  if amount > 0 ∧ collateral > 0 then
+  if s.status = .Empty ∧ amount > 0 ∧ collateral > 0 then
     some { s with amount := amount, collateral := collateral, status := .Active }
-  else
-    none
+  else none
 
 def repayTransition (s : State) (signer : Pubkey) : Option State :=
   let borrower := signer
-  some { s with amount := 0, collateral := 0, status := .Empty }
+  if s.status = .Active then
+    some { s with amount := 0, collateral := 0, status := .Empty }
+  else none
 
 def liquidateTransition (s : State) (signer : Pubkey) : Option State :=
-  if s.amount > s.collateral then
+  if s.status = .Active ∧ s.amount > s.collateral then
     some { s with amount := 0, status := .Liquidated }
-  else
-    none
+  else none
 
 /-- deposit transfer envelope: depositor_ta → pool_vault amount amount authority depositor.
     Verifies CPI shape (program ID, account list, discriminator).
@@ -193,16 +190,24 @@ theorem pool_solvency_invariant (s s' : State) (signer : Pubkey) (op : Operation
 -- ============================================================================
 
 theorem init_pool_aborts_if_InvalidAmount (s : State) (signer : Pubkey) (rate : Nat)
-    (h : ¬(rate > 0)) : init_poolTransition s signer rate = none := sorry
+    (h : ¬(rate > 0)) : init_poolTransition s signer rate = none := by
+  unfold init_poolTransition
+  rw [if_neg (fun hg => h hg.2.2)]
 
 theorem deposit_aborts_if_InvalidAmount (s : State) (signer : Pubkey) (amount : Nat)
-    (h : ¬(amount > 0)) : depositTransition s signer amount = none := sorry
+    (h : ¬(amount > 0)) : depositTransition s signer amount = none := by
+  unfold depositTransition
+  rw [if_neg (fun hg => h hg.2.1)]
 
 theorem borrow_aborts_if_InvalidAmount (s : State) (signer : Pubkey) (amount : Nat) (collateral : Nat)
-    (h : ¬(amount > 0 ∧ collateral > 0)) : borrowTransition s signer amount collateral = none := sorry
+    (h : ¬(amount > 0 ∧ collateral > 0)) : borrowTransition s signer amount collateral = none := by
+  unfold borrowTransition
+  rw [if_neg (fun hg => h ⟨hg.2.1, hg.2.2⟩)]
 
 theorem liquidate_aborts_if_AccountHealthy (s : State) (signer : Pubkey)
-    (h : ¬(s.amount > s.collateral)) : liquidateTransition s signer = none := sorry
+    (h : ¬(s.amount > s.collateral)) : liquidateTransition s signer = none := by
+  unfold liquidateTransition
+  rw [if_neg (fun hg => h hg.2)]
 
 -- ============================================================================
 -- Cover properties — reachability (existential proofs)
@@ -247,7 +252,15 @@ def applyOps (s : State) (signer : Pubkey) : List Operation → Option State
 /-- loan_settles — from Active leads to Empty within 1 steps via [repay]. -/
 theorem liveness_loan_settles (s : State) (signer : Pubkey)
     (h : s.status = .Active) :
-    ∃ ops s', ops.length ≤ 1 ∧ applyOps s signer ops = some s' ∧ s'.status = .Empty := by sorry
+    ∃ ops, ops.length ≤ 1 ∧ ∀ s', applyOps s signer ops = some s' → s'.status = .Empty := by
+  refine ⟨[.repay], by decide, fun s' h_apply => ?_⟩
+  simp only [applyOps, applyOp, repayTransition] at h_apply
+  split at h_apply
+  · next heq =>
+    split at heq
+    · next hg => simp at heq h_apply; subst heq; subst h_apply; rfl
+    · simp at heq
+  · simp at h_apply
 
 -- ============================================================================
 -- Environment — properties hold under external state changes

@@ -10,10 +10,10 @@ open QEDGen.Solana
 abbrev MAX_MEMBERS : Nat := 32
 
 inductive Status where
-  | Uninitialized : Status
-  | Active : Status
-  | HasProposal : Status
-  deriving DecidableEq, Repr
+  | Uninitialized
+  | Active
+  | HasProposal
+  deriving Repr, DecidableEq, BEq
 
 structure State where
   creator : Pubkey
@@ -24,56 +24,50 @@ structure State where
   approval_count : Nat
   rejection_count : Nat
   status : Status
-  deriving DecidableEq, Repr
+  deriving Repr, DecidableEq, BEq
 
 def create_vaultTransition (s : State) (signer : Pubkey) (threshold : Nat) (member_count : Nat) : Option State :=
-  let creator := signer
-  if threshold > 0 ∧ threshold ≤ member_count ∧ member_count ≤ 32 then
+  if signer = s.creator ∧ s.status = .Uninitialized ∧ threshold > 0 ∧ threshold ≤ member_count ∧ member_count ≤ 32 then
     some { s with threshold := threshold, member_count := member_count, approval_count := 0, rejection_count := 0, status := .Active }
-  else
-    none
+  else none
 
 def proposeTransition (s : State) (signer : Pubkey) : Option State :=
-  let creator := signer
-  some { s with approval_count := 0, rejection_count := 0, status := .HasProposal }
+  if signer = s.creator ∧ s.status = .Active then
+    some { s with approval_count := 0, rejection_count := 0, status := .HasProposal }
+  else none
 
 def approveTransition (s : State) (signer : Pubkey) (member_index : Nat) : Option State :=
   let approver := signer
-  if member_index < s.member_count ∧ s.members[member_index] = approver ∧ s.voted[member_index] = 0 then
+  if s.status = .HasProposal ∧ member_index < s.member_count ∧ s.members[member_index] = approver ∧ s.voted[member_index] = 0 ∧ s.approval_count + 1 ≤ 255 then
     some { s with approval_count := s.approval_count + 1, voted[member_index] := 1, status := .HasProposal }
-  else
-    none
+  else none
 
 def rejectTransition (s : State) (signer : Pubkey) (member_index : Nat) : Option State :=
   let rejecter := signer
-  if member_index < s.member_count ∧ s.members[member_index] = rejecter ∧ s.voted[member_index] = 0 then
+  if s.status = .HasProposal ∧ member_index < s.member_count ∧ s.members[member_index] = rejecter ∧ s.voted[member_index] = 0 ∧ s.rejection_count + 1 ≤ 255 then
     some { s with rejection_count := s.rejection_count + 1, voted[member_index] := 1, status := .HasProposal }
-  else
-    none
+  else none
 
 def executeTransition (s : State) (signer : Pubkey) (member_index : Nat) : Option State :=
   let executor := signer
-  if member_index < s.member_count ∧ s.members[member_index] = executor ∧ s.approval_count ≥ s.threshold then
+  if s.status = .HasProposal ∧ member_index < s.member_count ∧ s.members[member_index] = executor ∧ s.approval_count ≥ s.threshold then
     some { s with approval_count := 0, rejection_count := 0, status := .Active }
-  else
-    none
+  else none
 
 def cancel_proposalTransition (s : State) (signer : Pubkey) : Option State :=
-  if s.member_count - s.rejection_count < s.threshold then
+  if s.status = .HasProposal ∧ s.member_count - s.rejection_count < s.threshold then
     some { s with approval_count := 0, rejection_count := 0, status := .Active }
-  else
-    none
+  else none
 
 def add_memberTransition (s : State) (signer : Pubkey) (member_index : Nat) (member_pubkey : Pubkey) : Option State :=
-  let creator := signer
-  if member_index < s.member_count then
+  if signer = s.creator ∧ s.status = .Active ∧ member_index < s.member_count then
     some { s with members[member_index] := member_pubkey, status := .Active }
-  else
-    none
+  else none
 
 def remove_memberTransition (s : State) (signer : Pubkey) : Option State :=
-  let creator := signer
-  some { s with member_count := s.member_count - 1, status := .Active }
+  if signer = s.creator ∧ s.status = .Active ∧ 1 ≤ s.member_count then
+    some { s with member_count := s.member_count - 1, status := .Active }
+  else none
 
 inductive Operation where
   | create_vault (threshold : Nat) (member_count : Nat)
@@ -167,43 +161,69 @@ theorem votes_bounded_invariant (s s' : State) (signer : Pubkey) (op : Operation
 -- ============================================================================
 
 theorem create_vault_aborts_if_InvalidThreshold (s : State) (signer : Pubkey) (threshold : Nat) (member_count : Nat)
-    (h : ¬(threshold > 0 ∧ threshold ≤ member_count)) : create_vaultTransition s signer threshold member_count = none := sorry
+    (h : ¬(threshold > 0 ∧ threshold ≤ member_count)) : create_vaultTransition s signer threshold member_count = none := by
+  unfold create_vaultTransition
+  rw [if_neg (fun hg => h ⟨hg.2.2.1, hg.2.2.2.1⟩)]
 
 theorem create_vault_aborts_if_TooManyMembers (s : State) (signer : Pubkey) (threshold : Nat) (member_count : Nat)
-    (h : ¬(member_count ≤ 32)) : create_vaultTransition s signer threshold member_count = none := sorry
+    (h : ¬(member_count ≤ 32)) : create_vaultTransition s signer threshold member_count = none := by
+  unfold create_vaultTransition
+  rw [if_neg (fun hg => h hg.2.2.2.2)]
 
 theorem approve_aborts_if_NotAMember_0 (s : State) (signer : Pubkey) (member_index : Nat)
-    (h : ¬(member_index < s.member_count)) : approveTransition s signer member_index = none := sorry
+    (h : ¬(member_index < s.member_count)) : approveTransition s signer member_index = none := by
+  unfold approveTransition
+  rw [if_neg (fun hg => h hg.2.1)]
 
 theorem approve_aborts_if_NotAMember_1 (s : State) (signer : Pubkey) (member_index : Nat)
-    (h : ¬(s.members[member_index] = approver)) : approveTransition s signer member_index = none := sorry
+    (h : ¬(s.members[member_index] = approver)) : approveTransition s signer member_index = none := by
+  unfold approveTransition
+  rw [if_neg (fun hg => h hg.2.2.1)]
 
 theorem approve_aborts_if_AlreadyVoted (s : State) (signer : Pubkey) (member_index : Nat)
-    (h : ¬(s.voted[member_index] = 0)) : approveTransition s signer member_index = none := sorry
+    (h : ¬(s.voted[member_index] = 0)) : approveTransition s signer member_index = none := by
+  unfold approveTransition
+  rw [if_neg (fun hg => h hg.2.2.2.1)]
 
 theorem reject_aborts_if_NotAMember_0 (s : State) (signer : Pubkey) (member_index : Nat)
-    (h : ¬(member_index < s.member_count)) : rejectTransition s signer member_index = none := sorry
+    (h : ¬(member_index < s.member_count)) : rejectTransition s signer member_index = none := by
+  unfold rejectTransition
+  rw [if_neg (fun hg => h hg.2.1)]
 
 theorem reject_aborts_if_NotAMember_1 (s : State) (signer : Pubkey) (member_index : Nat)
-    (h : ¬(s.members[member_index] = rejecter)) : rejectTransition s signer member_index = none := sorry
+    (h : ¬(s.members[member_index] = rejecter)) : rejectTransition s signer member_index = none := by
+  unfold rejectTransition
+  rw [if_neg (fun hg => h hg.2.2.1)]
 
 theorem reject_aborts_if_AlreadyVoted (s : State) (signer : Pubkey) (member_index : Nat)
-    (h : ¬(s.voted[member_index] = 0)) : rejectTransition s signer member_index = none := sorry
+    (h : ¬(s.voted[member_index] = 0)) : rejectTransition s signer member_index = none := by
+  unfold rejectTransition
+  rw [if_neg (fun hg => h hg.2.2.2.1)]
 
 theorem execute_aborts_if_NotAMember_0 (s : State) (signer : Pubkey) (member_index : Nat)
-    (h : ¬(member_index < s.member_count)) : executeTransition s signer member_index = none := sorry
+    (h : ¬(member_index < s.member_count)) : executeTransition s signer member_index = none := by
+  unfold executeTransition
+  rw [if_neg (fun hg => h hg.2.1)]
 
 theorem execute_aborts_if_NotAMember_1 (s : State) (signer : Pubkey) (member_index : Nat)
-    (h : ¬(s.members[member_index] = executor)) : executeTransition s signer member_index = none := sorry
+    (h : ¬(s.members[member_index] = executor)) : executeTransition s signer member_index = none := by
+  unfold executeTransition
+  rw [if_neg (fun hg => h hg.2.2.1)]
 
 theorem execute_aborts_if_ThresholdNotMet (s : State) (signer : Pubkey) (member_index : Nat)
-    (h : ¬(s.approval_count ≥ s.threshold)) : executeTransition s signer member_index = none := sorry
+    (h : ¬(s.approval_count ≥ s.threshold)) : executeTransition s signer member_index = none := by
+  unfold executeTransition
+  rw [if_neg (fun hg => h hg.2.2.2)]
 
 theorem cancel_proposal_aborts_if_ThresholdUnreachable (s : State) (signer : Pubkey)
-    (h : ¬(s.member_count - s.rejection_count < s.threshold)) : cancel_proposalTransition s signer = none := sorry
+    (h : ¬(s.member_count - s.rejection_count < s.threshold)) : cancel_proposalTransition s signer = none := by
+  unfold cancel_proposalTransition
+  rw [if_neg (fun hg => h hg.2)]
 
 theorem add_member_aborts_if_NotAMember (s : State) (signer : Pubkey) (member_index : Nat) (member_pubkey : Pubkey)
-    (h : ¬(member_index < s.member_count)) : add_memberTransition s signer member_index member_pubkey = none := sorry
+    (h : ¬(member_index < s.member_count)) : add_memberTransition s signer member_index member_pubkey = none := by
+  unfold add_memberTransition
+  rw [if_neg (fun hg => h hg.2.2)]
 
 -- ============================================================================
 -- Cover properties — reachability (existential proofs)
@@ -248,7 +268,15 @@ def applyOps (s : State) (signer : Pubkey) : List Operation → Option State
 /-- proposal_resolves — from HasProposal leads to Active within 1 steps via [execute, cancel_proposal]. -/
 theorem liveness_proposal_resolves (s : State) (signer : Pubkey)
     (h : s.status = .HasProposal) :
-    ∃ ops s', ops.length ≤ 1 ∧ applyOps s signer ops = some s' ∧ s'.status = .Active := by sorry
+    ∃ ops, ops.length ≤ 1 ∧ ∀ s', applyOps s signer ops = some s' → s'.status = .Active := by
+  refine ⟨[.execute 0], by decide, fun s' h_apply => ?_⟩
+  simp only [applyOps, applyOp, executeTransition] at h_apply
+  split at h_apply
+  · next heq =>
+    split at heq
+    · next hg => simp at heq h_apply; subst heq; subst h_apply; rfl
+    · simp at heq
+  · simp at h_apply
 
 -- ============================================================================
 -- Overflow safety obligations (auto-generated for operations with add effects)

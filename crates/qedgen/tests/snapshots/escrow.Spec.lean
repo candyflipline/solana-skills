@@ -8,10 +8,10 @@ namespace Escrow
 open QEDGen.Solana
 
 inductive Status where
-  | Uninitialized : Status
-  | Open : Status
-  | Closed : Status
-  deriving DecidableEq, Repr
+  | Uninitialized
+  | Open
+  | Closed
+  deriving Repr, DecidableEq, BEq
 
 structure State where
   initializer : Pubkey
@@ -21,28 +21,22 @@ structure State where
   taker_amount : Nat
   escrow_token_account : Pubkey
   status : Status
-  deriving DecidableEq, Repr
+  deriving Repr, DecidableEq, BEq
 
 def initializeTransition (s : State) (signer : Pubkey) (deposit_amount : Nat) (receive_amount : Nat) : Option State :=
-  let initializer := signer
-  if deposit_amount > 0 ∧ receive_amount > 0 then
+  if signer = s.initializer ∧ s.status = .Uninitialized ∧ deposit_amount > 0 ∧ receive_amount > 0 then
     some { s with initializer_amount := deposit_amount, taker_amount := receive_amount, status := .Open }
-  else
-    none
+  else none
 
 def exchangeTransition (s : State) (signer : Pubkey) : Option State :=
-  let taker := signer
-  if initializer_ta.pubkey = s.initializer_token_account then
+  if signer = s.taker ∧ s.status = .Open then
     some { s with status := .Closed }
-  else
-    none
+  else none
 
 def cancelTransition (s : State) (signer : Pubkey) : Option State :=
-  let initializer := signer
-  if initializer_ta.pubkey = s.initializer_token_account then
+  if signer = s.initializer ∧ s.status = .Open then
     some { s with status := .Closed }
-  else
-    none
+  else none
 
 /-- initialize transfer envelope: initializer_ta → escrow_ta amount deposit_amount authority initializer.
     Verifies CPI shape (program ID, account list, discriminator).
@@ -160,7 +154,9 @@ def applyOp (s : State) (signer : Pubkey) : Operation → Option State
 -- ============================================================================
 
 theorem initialize_aborts_if_InvalidAmount (s : State) (signer : Pubkey) (deposit_amount : Nat) (receive_amount : Nat)
-    (h : ¬(deposit_amount > 0 ∧ receive_amount > 0)) : initializeTransition s signer deposit_amount receive_amount = none := sorry
+    (h : ¬(deposit_amount > 0 ∧ receive_amount > 0)) : initializeTransition s signer deposit_amount receive_amount = none := by
+  unfold initializeTransition
+  rw [if_neg (fun hg => h ⟨hg.2.2.1, hg.2.2.2⟩)]
 
 -- ============================================================================
 -- Cover properties — reachability (existential proofs)
@@ -197,6 +193,14 @@ def applyOps (s : State) (signer : Pubkey) : List Operation → Option State
 /-- escrow_settles — from Open leads to Closed within 1 steps via [exchange, cancel]. -/
 theorem liveness_escrow_settles (s : State) (signer : Pubkey)
     (h : s.status = .Open) :
-    ∃ ops s', ops.length ≤ 1 ∧ applyOps s signer ops = some s' ∧ s'.status = .Closed := by sorry
+    ∃ ops, ops.length ≤ 1 ∧ ∀ s', applyOps s signer ops = some s' → s'.status = .Closed := by
+  refine ⟨[.exchange], by decide, fun s' h_apply => ?_⟩
+  simp only [applyOps, applyOp, exchangeTransition] at h_apply
+  split at h_apply
+  · next heq =>
+    split at heq
+    · next hg => simp at heq h_apply; subst heq; subst h_apply; rfl
+    · simp at heq
+  · simp at h_apply
 
 end Escrow
