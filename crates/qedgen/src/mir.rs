@@ -100,7 +100,17 @@ pub struct Mir {
     pub name: Symbol,
     /// State ADT — variants and their fields. For single-variant specs,
     /// this is a single `StateVariant` with all fields and `tag = Symbol::default()`.
+    ///
+    /// For multi-account specs this carries the *primary* account so the
+    /// single-account renderers stay byte-stable; `account_states[0]`
+    /// reflects the same data. Multi-account renderers walk
+    /// `account_states` instead.
     pub state: StateAdt,
+    /// Per-account state lifts. Always populated; `len() == 1` for
+    /// single-account specs (back-compat path), `> 1` for multi-account.
+    /// Lending is the canonical multi-account fixture (Pool + Loan).
+    /// v2.30 Phase 2.
+    pub account_states: Vec<AccountStateMir>,
     /// Account-block surface — PDAs, owners, writability, init, authority,
     /// token-type annotations. Foundational per
     /// `docs/design/qedgen-mir-sketch.md` §"AccountTable is foundational"
@@ -173,6 +183,28 @@ pub struct StateAdt {
 pub struct StateVariant {
     pub tag: VariantTag,
     pub fields: Vec<FieldDecl>,
+}
+
+/// Per-account state lift. v2.30 Phase 2 multi-account scaffolding:
+/// `Mir.state` collapses to the primary account for back-compat, while
+/// `Mir.account_states` carries the full list so the multi-account
+/// renderer can emit per-account `<Name>State` structs, per-group
+/// `apply<Name>Op` dispatchers, and per-group preservation theorems.
+/// Single-account specs surface as `account_states.len() == 1`.
+#[derive(Debug, Clone)]
+pub struct AccountStateMir {
+    /// Account-type name from the `type <Name>` block (e.g., "Pool",
+    /// "Loan"). Drives Lean type naming: `<Name>State`, `<Name>Status`,
+    /// `<Name>Operation`, `apply<Name>Op`.
+    pub name: Symbol,
+    /// Variant declarations when the account is an ADT (`type Pool |
+    /// Uninitialized | Active of {…}`). Empty for flat-record accounts.
+    pub variants: Vec<StateVariant>,
+    /// Flat record fields when the account is `type Pool { … }`. Empty
+    /// for ADT accounts (fields live on each `StateVariant`).
+    pub fields: Vec<FieldDecl>,
+    /// Lifecycle-only variant labels (no payload).
+    pub lifecycle_states: Vec<Symbol>,
 }
 
 #[derive(Debug, Clone)]
@@ -278,6 +310,13 @@ pub struct HandlerMir {
     /// preserve the user-level intent and let some codegens emit
     /// alternative shapes if needed.
     pub transition: Option<(VariantTag, VariantTag)>,
+    /// Multi-account routing — when the handler signature qualifies the
+    /// pre-state with an account name (e.g. `: Loan.Empty -> Loan.Active`),
+    /// `on_account` records `"Loan"`. `None` means the handler defaults
+    /// to the primary account. Mirrors `ParsedHandler.on_account`.
+    /// v2.30 Phase 2 multi-account codegen reads this to group handlers
+    /// per account.
+    pub on_account: Option<Symbol>,
     /// Pre-conditions. Schema-includes are already expanded in
     /// `chumsky_adapter.rs:3125+`; what arrives here is the flat list.
     pub pre: Vec<Predicate>,
@@ -957,6 +996,7 @@ pub fn lower(parsed: &ParsedSpec) -> Mir {
     Mir {
         name: parsed.program_name.clone(),
         state: lower_state(parsed),
+        account_states: lower_account_states(parsed),
         accounts: lower_account_table(parsed),
         errors: lower_errors(parsed),
         imports: lower_imports(parsed),
@@ -1004,6 +1044,47 @@ pub fn lower(parsed: &ParsedSpec) -> Mir {
         liveness_props: lower_liveness(parsed),
         environments: lower_environments(parsed),
     }
+}
+
+/// Lift every `type <Account>` declaration into a parallel
+/// `AccountStateMir`. The primary account is the first entry;
+/// multi-account codegen walks the full list. v2.30 Phase 2.
+fn lower_account_states(parsed: &ParsedSpec) -> Vec<AccountStateMir> {
+    parsed
+        .account_types
+        .iter()
+        .map(|at| {
+            let variants = at
+                .variants
+                .iter()
+                .map(|v| StateVariant {
+                    tag: v.name.clone(),
+                    fields: v
+                        .fields
+                        .iter()
+                        .map(|(n, t)| FieldDecl {
+                            name: n.clone(),
+                            ty: parse_ty(t),
+                        })
+                        .collect(),
+                })
+                .collect();
+            let fields = at
+                .fields
+                .iter()
+                .map(|(n, t)| FieldDecl {
+                    name: n.clone(),
+                    ty: parse_ty(t),
+                })
+                .collect();
+            AccountStateMir {
+                name: at.name.clone(),
+                variants,
+                fields,
+                lifecycle_states: at.lifecycle.clone(),
+            }
+        })
+        .collect()
 }
 
 fn lower_state(parsed: &ParsedSpec) -> StateAdt {
@@ -1333,6 +1414,7 @@ fn lower_handler(h: &crate::check::ParsedHandler) -> HandlerMir {
         auth: lower_auth(h),
         permissionless: h.permissionless,
         transition,
+        on_account: h.on_account.clone(),
         pre,
         requires_or_abort,
         aborts_if,
@@ -1611,6 +1693,7 @@ mod tests {
         let mir = Mir {
             name: "Test".to_string(),
             state: StateAdt::default(),
+            account_states: vec![],
             accounts: AccountTable::default(),
             errors: ErrorEnum::default(),
             imports: BTreeMap::new(),

@@ -1,8 +1,8 @@
 # qedgen MIR — design sketch
 
-**Status:** Phase 1c-7 (unified imports), Phase 1c-8 (multi-variant ADT path), Phase 1d (snapshot equivalence), §15 `cover_trace_proof` auto-discharge, Phase 1c-11 (§11 overflow + §15 preservation auto-proof scripts + master theorem rename `_invariant → _inductive`), and Phase 1e (indexed-state lowering — `multisig` byte-equivalent to legacy) shipped on the `mir` branch. All 16 emit sections + ADT path emit content; snapshot tests gate every pilot fixture. ADT-path byte-equivalence achieved on `bundled-stdlib-demo`, `cross-program-vault`, AND `escrow-split`. Flat-path proof bodies for overflow + per-handler preservation + master `_inductive` match legacy verbatim. Indexed-state path (`multisig`) is byte-equivalent to legacy. The remaining gap is `lending` — its legacy renderer takes the multi-account path (separate `PoolState`/`LoanState` per account group), which is Phase 2.
+**Status:** Phase 1c-7 (unified imports), Phase 1c-8 (multi-variant ADT path), Phase 1d (snapshot equivalence), §15 `cover_trace_proof` auto-discharge, Phase 1c-11 (§11 overflow + §15 preservation auto-proof scripts + master theorem rename `_invariant → _inductive`), Phase 1e (indexed-state lowering — `multisig` byte-equivalent to legacy), and **Phase 2 (multi-account codegen — `lending` byte-equivalent to legacy)** shipped on the `mir` branch. All six pilot fixtures now render byte-identical between MIR and legacy. Snapshot tests gate every pilot fixture.
 
-**Last revised:** 2026-05-25 (Phase 1e indexed-state lowering close-out).
+**Last revised:** 2026-05-25 (Phase 2 multi-account renderer close-out).
 
 **Companion docs** (read these first if you want measured evidence behind the claims here):
 
@@ -383,17 +383,22 @@ parity per fixture is documented in
 | `cross-program-vault` | ADT | byte-identical |
 | `escrow-split` | ADT | byte-identical (vs fresh-legacy regen) after §15 `cover_trace_proof` port |
 | `escrow` | flat | byte-identical (vs fresh-legacy regen) after Phase 1c-10 flat-path alignment |
-| `lending` | flat | divergent — multi-account codegen (Phase 2) |
-| `multisig` | flat | divergent — indexed-state lowering + `Map[N] T` |
+| `lending` | multi-account | byte-identical (vs fresh-legacy regen) after Phase 2 multi-account renderer |
+| `multisig` | indexed | byte-identical after Phase 1e indexed-state lowering |
 
 ADT-path byte-equivalence is the Phase 1c-8 deliverable; escrow flat-
-path byte-equivalence is the Phase 1c-10 deliverable. Lending and
-multisig still diverge for unrelated structural reasons tracked
-separately under "Deferred" below.
+path byte-equivalence is the Phase 1c-10 deliverable; multisig
+indexed-state is the Phase 1e deliverable; lending multi-account is
+the Phase 2 deliverable. **Every pilot fixture is now byte-equivalent
+to the legacy renderer**, gated by `cargo test --test mir_snapshot`.
 
 ### Honest scoping
 
-Phase 1 to byte-equivalence is ~4–7 more focused days. The pattern is locked in — each remaining gap is mechanical translation from a known `lean_gen.rs` section. Multi-variant ADT path is the biggest single item.
+Byte-equivalence reached for all six pilot fixtures across all four
+state shapes (ADT, flat single-account, indexed, multi-account). The
+remaining MIR work is non-Lean codegen carry-through (Kani / proptest
+/ Anchor still consume `ParsedSpec` directly) and flipping the
+dispatch default to MIR-on, legacy-off.
 
 ## Next-session handoff
 
@@ -416,30 +421,73 @@ For the next session picking up this work:
 - `crates/qedgen/src/main.rs:3194` — dispatch gate (`if QEDGEN_USE_MIR { mir::lower → lean_gen_mir } else { lean_gen }`).
 
 **Suggested first move in the next session:**
-1. **Phase 2 — multi-account codegen** (`render_multi_account`
-   stub today). Closes the `lending` diff. Legacy detects multi-
-   account specs (`>= 2` `type Account` blocks, where one shape
-   is *not* `Map`-keyed) and emits per-account `<Account>State`
-   structs + per-group `applyOp` dispatchers (`applyPoolOp`,
-   `applyLoanOp`) instead of a single flat `State`. MIR currently
-   collapses multi-account into a single `StateAdt` at lowering
-   time (`fn lower` in `mir.rs:~1300`); Phase 2 needs MIR to
-   carry per-account grouping AND a `render_multi_account`
-   function that walks the group set. Largest remaining piece;
-   budgeted at ~1 week in §"Phase ordering implication".
-2. **Examples drift sweep** — after Phase 2 + Phase 1e, all six
-   pilot fixtures emit byte-equivalent (or intentionally
-   different — `lending` still diverges until Phase 2) Lean
-   between MIR and legacy. Time to flip the default: change
-   `main.rs:3199`'s `if QEDGEN_USE_MIR { … }` from opt-in to
+1. **Examples drift sweep — flip the default.** All six pilot
+   fixtures now emit byte-equivalent Lean between MIR and legacy.
+   Change `main.rs:3199`'s `if QEDGEN_USE_MIR { … }` from opt-in to
    opt-out (`QEDGEN_LEGACY_LEAN=1` for the escape hatch), refresh
-   every bundled example's `.qed.lock`, and update
-   `references/cli.md` / `SKILL.md` to drop the env-var mention.
-3. **MIR carry-through for the non-Lean codegens** — Anchor /
+   every bundled example's `.qed.lock`, run
+   `bash scripts/check-lake-build.sh --strict` to confirm Lean
+   builds, and update `references/cli.md` / `SKILL.md` to drop the
+   env-var mention.
+2. **MIR carry-through for the non-Lean codegens** — Anchor /
    Kani / proptest still consume `ParsedSpec` directly. Phase 1
    pilot was Lean-only by design. Picking the next codegen is a
    scope call: Kani impact (auto-CPI substitution) > Anchor
    impact (handler shape) > proptest impact (per-slot lowering).
+3. **Retire `render_single_account_adt` ↔ `render_multi_account`
+   split where possible.** Phase 2's per-account scoped-Mir +
+   token-rename approach (`scope_mir_to_account` + `rename_state_idents`
+   in `lean_gen_mir.rs`) is the proven pattern; the ADT path could
+   eventually pivot the same way to share emitters with the flat
+   path. Low-priority cleanup — defer to v3.0.
+
+**What Phase 2 closed** (this session, 2026-05-25):
+- `Mir.account_states: Vec<AccountStateMir>` carries every
+  declared `type <Account>` block as a parallel state lift.
+  Single-account specs keep `account_states.len() == 1`;
+  `Mir.state` still points at the primary so the existing single-
+  account renderers (`render_single_account`,
+  `render_single_account_adt`, `render_indexed_state`) keep
+  emitting the same output. `HandlerMir.on_account: Option<Symbol>`
+  records the qualified pre-state account name (e.g. `Loan` from
+  `: Loan.Empty -> Loan.Active`).
+- `lean_gen_mir::render_multi_account` mirrors
+  `lean_gen::render_multi_account` byte-for-byte for the lending
+  fixture. Implementation strategy: per-account *scoped Mir*
+  (`scope_mir_to_account`) reuses the existing single-account
+  section emitters; `rename_state_idents` rewrites bare
+  `State` / `Status` / `Operation` / `applyOp` / `applyOps`
+  identifiers to their per-account form (`PoolState`,
+  `LoanOperation`, `applyLoanOp`, …) before the block lands in
+  the main buffer.
+- Multi-account specifics handled in dedicated helpers:
+  - `emit_invariants_as_comments` — variant-typed binder
+    invariants emit structured `-- INVARIANT OBLIGATION` comments
+    (lowering deferred to v3.0; mirrors
+    `lean_gen::render_invariants_as_comments`).
+  - `emit_properties_multi` + `group_properties_by_account` —
+    properties group by which account's fields they touch; pass-2
+    overflow theorems thread the right `h_inv_<prop>` hypothesis.
+  - `emit_covers_multi` — section header always written when any
+    covers exist; cross-account traces become skip-comments.
+  - `emit_liveness_multi` — resolves the per-liveness account from
+    `via_ops[0].on_account` so `liveness_loan_settles` correctly
+    binds to `LoanState` + `applyLoanOps` + the legacy auto-
+    discharge script.
+  - `emit_environments_multi` + `emit_environments_no_header` —
+    per-property-group binding + bare-field-name rewrite
+    (`constraint interest_rate > 0` →
+    `(h_c0 : new_interest_rate > 0)`).
+- Unit tests `render_emits_invariant_theorems`,
+  `render_emits_cover_theorems`, `render_emits_liveness_theorems`,
+  `render_emits_properties_with_preservation` updated to assert
+  the correct multi-account shape (they previously asserted on
+  the pre-Phase-2 broken single-account collapse output).
+
+Result: `cargo test --test mir_snapshot snapshot_lending` passes
+with the snapshot byte-identical to a fresh legacy regen (cksum
+match). Every pilot fixture now byte-equivalent across MIR ↔
+legacy.
 
 **What Phase 1e closed** (this session, 2026-05-25):
 - `Ty::Map { capacity, value }` capacity field is now `Symbol`

@@ -105,7 +105,7 @@ pub fn render(mir: &Mir) -> String {
         return render_indexed_state(mir);
     }
     if is_multi_account(mir) {
-        return render_multi_account_stub(mir);
+        return render_multi_account(mir);
     }
     if is_multi_variant_adt(mir) {
         return render_single_account_adt(mir);
@@ -135,13 +135,14 @@ fn is_indexed(mir: &Mir) -> bool {
 }
 
 fn is_multi_account(mir: &Mir) -> bool {
-    // Multi-account specs declare > 1 `type Account` block. MIR
-    // collapses to a single `StateAdt` today; multi-account support
-    // requires Phase 2's MIR extension. For pilot, single-account only.
-    // Detection placeholder — returns false until MIR carries
-    // multi-account info.
-    let _ = mir;
-    false
+    // v2.30 Phase 2: multi-account specs declare > 1 `type Account`
+    // block. MIR carries the full list in `account_states`;
+    // `render_multi_account` walks them and emits per-account
+    // `<Name>State`, `<Name>Status`, `<Name>Operation`, `apply<Name>Op`.
+    // Single-account specs route through `render_single_account` /
+    // `render_single_account_adt` as before. Indexed-state specs are
+    // dispatched earlier in `render` and skip this gate.
+    mir.account_states.len() > 1
 }
 
 /// v2.24 §S5 — true iff the single-account spec uses the
@@ -1303,8 +1304,637 @@ fn emit_indexed_operation_inductive(
     out.push('\n');
 }
 
-fn render_multi_account_stub(_mir: &Mir) -> String {
-    "-- MIR-TODO(phase-2): multi-account codegen not yet ported\n".to_string()
+/// v2.30 Phase 2 — multi-account renderer. Mirrors
+/// `lean_gen::render_multi_account` (`crates/qedgen/src/lean_gen.rs`).
+///
+/// For each `type <Account>` declared in the spec, emits a separate
+/// `<Account>State` structure, `<Account>Status` lifecycle inductive,
+/// per-account transition functions, a per-account `<Account>Operation`
+/// inductive + `apply<Account>Op` dispatcher. CPI theorems for handlers
+/// owned by the account are interleaved with that account's block (same
+/// ordering as the legacy renderer). Invariants are lowered as
+/// structured comments (multi-account variant-typed binders need a
+/// richer lowering — v3.0). Properties group by which account's fields
+/// they touch; aborts / ensures / overflow emit per account. Covers /
+/// liveness / environments bind to the primary account (covers whose
+/// traces span accounts emit skip-comments).
+///
+/// Implementation strategy: build a per-account *scoped Mir* whose
+/// `state` and `handlers` are filtered to that account, call the
+/// existing single-account section emitters, then rewrite the bare
+/// type/function identifiers (`State`, `Status`, `Operation`,
+/// `applyOp`, `applyOps`) to their per-account form via
+/// `rename_state_idents`. This keeps the multi-account port small
+/// without duplicating every emitter.
+fn render_multi_account(mir: &Mir) -> String {
+    let mut out = String::new();
+    emit_header(&mut out, mir);
+    emit_namespace_open(&mut out, mir);
+    emit_uninterpreted_helpers(&mut out, mir);
+    emit_ref_impls(&mut out, mir);
+    emit_constants(&mut out, mir);
+
+    // Pass 1 — per-account: Status, State, Transitions, CPI theorems,
+    // Operation + applyOp. Mirrors the first `for acct in &spec.account_types`
+    // loop in `lean_gen::render_multi_account` lines 1334–1387.
+    for acct in &mir.account_states {
+        let scoped = scope_mir_to_account(mir, acct);
+        if scoped.handlers.is_empty() {
+            continue;
+        }
+        let mut block = String::new();
+        emit_lifecycle_marker(&mut block, &scoped);
+        emit_state_struct(&mut block, &scoped);
+        emit_transitions(&mut block, &scoped);
+        let _pinned = emit_cpi_theorems(&mut block, &scoped);
+        emit_operation_inductive(&mut block, &scoped);
+        out.push_str(&rename_state_idents(&block, &acct.name));
+    }
+
+    // Invariants — multi-account translation deferred. Emit as
+    // structured comments to match `lean_gen::render_invariants_as_comments`
+    // (lines 2390–2406).
+    emit_invariants_as_comments(&mut out, mir);
+
+    // Properties grouped by account ownership. Mirrors
+    // `lean_gen::render_properties_multi` lines 2521–2601.
+    emit_properties_multi(&mut out, mir);
+
+    // Pass 2 — per-account: aborts_if, ensures, frame, overflow.
+    // Mirrors `lean_gen::render_multi_account` lines 1405–1428.
+    // Overflow needs each account's properties on the scoped Mir so the
+    // `h_inv_<prop>` hypothesis threads correctly.
+    let prop_groups = group_properties_by_account(mir);
+    for acct in &mir.account_states {
+        let mut scoped = scope_mir_to_account(mir, acct);
+        if scoped.handlers.is_empty() {
+            continue;
+        }
+        if let Some(props) = prop_groups.get(&acct.name) {
+            scoped.properties = props.clone();
+        }
+        let mut block = String::new();
+        emit_aborts_if(&mut block, &scoped);
+        emit_ensures(&mut block, &scoped);
+        emit_frame_conditions(&mut block, &scoped);
+        emit_overflow(&mut block, &scoped);
+        out.push_str(&rename_state_idents(&block, &acct.name));
+    }
+
+    // Spec-level covers: emit the section header when any covers
+    // exist (matches legacy). Cross-account traces become skip-comments;
+    // single-account traces emit through the regular cover-witness
+    // machinery scoped to the primary account.
+    let primary = &mir.account_states[0];
+    let primary_scoped = scope_mir_to_account(mir, primary);
+    {
+        let mut tail = String::new();
+        emit_covers_multi(&mut tail, mir, &primary_scoped);
+        out.push_str(&rename_state_idents(&tail, &primary.name));
+    }
+
+    // Liveness — each `liveness <name> : <from> ~> <to> via [op1, ...]`
+    // binds to the account that owns the via-ops (resolved via
+    // `via_ops[0].on_account`). Matches `lean_gen::render_liveness`
+    // line ~3910.
+    emit_liveness_multi(&mut out, mir);
+
+    // Environments — each property × environment cross emits its
+    // preservation theorem against the account-scoped state type.
+    emit_environments_multi(&mut out, mir);
+
+    emit_namespace_close(&mut out, mir);
+    out
+}
+
+/// Group properties by the account whose fields they touch. Same
+/// heuristic as `emit_properties_multi` but returned as a map so the
+/// pass-2 overflow theorems can re-use it.
+fn group_properties_by_account(
+    mir: &Mir,
+) -> std::collections::BTreeMap<String, Vec<crate::mir::PropertyMir>> {
+    use std::collections::BTreeMap;
+    let mut groups: BTreeMap<String, Vec<crate::mir::PropertyMir>> = BTreeMap::new();
+    if mir.account_states.is_empty() {
+        return groups;
+    }
+    let primary_name = mir.account_states[0].name.clone();
+    for prop in &mir.properties {
+        let target = if let Some(expr) = &prop.expression {
+            mir.account_states
+                .iter()
+                .find(|a| {
+                    a.fields
+                        .iter()
+                        .any(|f| expr.lean.contains(&format!("s.{}", f.name)))
+                })
+                .map(|a| a.name.clone())
+                .unwrap_or_else(|| primary_name.clone())
+        } else {
+            primary_name.clone()
+        };
+        groups.entry(target).or_default().push(prop.clone());
+    }
+    groups
+}
+
+/// Per-liveness account resolution + section emit. The header is
+/// emitted once at the top; each liveness then runs through the
+/// existing single-account `emit_liveness` against a Mir scoped to its
+/// owning account, with token renames applied to the per-liveness
+/// block.
+fn emit_liveness_multi(out: &mut String, mir: &Mir) {
+    if mir.liveness_props.is_empty() || mir.account_states.is_empty() {
+        return;
+    }
+
+    let by_handler: std::collections::HashMap<String, Option<String>> = mir
+        .handlers
+        .iter()
+        .map(|h| (h.name.clone(), h.on_account.clone()))
+        .collect();
+    let primary_name = mir.account_states[0].name.clone();
+
+    let resolve = |via_ops: &[String]| -> String {
+        if let Some(first) = via_ops.first() {
+            if let Some(Some(acct)) = by_handler.get(first) {
+                return acct.clone();
+            }
+        }
+        primary_name.clone()
+    };
+
+    out.push_str(
+        "-- ============================================================================\n",
+    );
+    out.push_str("-- Liveness properties \u{2014} bounded reachability (leads-to)\n");
+    out.push_str(
+        "-- ============================================================================\n\n",
+    );
+
+    let mut emitted_helpers: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+    for liveness in &mir.liveness_props {
+        let acct_name = resolve(&liveness.via_ops);
+        let acct = match mir.account_states.iter().find(|a| a.name == acct_name) {
+            Some(a) => a,
+            None => continue,
+        };
+        let mut scoped = scope_mir_to_account(mir, acct);
+        scoped.liveness_props = vec![liveness.clone()];
+
+        let mut block = String::new();
+        emit_liveness_inner_body(&mut block, &scoped, &mut emitted_helpers, &acct.name);
+        out.push_str(&block);
+    }
+}
+
+/// Emit the body of one liveness theorem against a scoped Mir,
+/// tracking which `apply<Account>Ops` helpers we've already emitted so
+/// we don't repeat them. The helper itself + the theorem are written
+/// with bare `State` / `Operation` / `applyOp` identifiers, then
+/// renamed in one pass at the end.
+fn emit_liveness_inner_body(
+    out: &mut String,
+    scoped: &Mir,
+    emitted_helpers: &mut std::collections::BTreeSet<String>,
+    account_name: &str,
+) {
+    // Buffer raw output (still using bare identifiers) so we can rename
+    // before pushing into the caller's `out`. The applyOps helper is
+    // emitted at most once per account.
+    let mut buf = String::new();
+    let helper_key = format!("apply{}Ops", account_name);
+    if !emitted_helpers.contains(&helper_key) {
+        buf.push_str(
+            "def applyOps (s : State) (signer : Pubkey) : List Operation \u{2192} Option State\n",
+        );
+        buf.push_str("  | [] => some s\n");
+        buf.push_str("  | op :: ops => match applyOp s signer op with\n");
+        buf.push_str("    | some s' => applyOps s' signer ops\n");
+        buf.push_str("    | none => none\n\n");
+        emitted_helpers.insert(helper_key);
+    }
+
+    // Reuse the existing liveness theorem emitter via a temporary
+    // header-stripped wrapper. emit_liveness_inner emits its own
+    // section header which we've already written, so we render to a
+    // throwaway buffer and slice off the header lines.
+    let mut tmp = String::new();
+    emit_liveness_inner_no_header(&mut tmp, scoped, /* adt_form */ false);
+    // emit_liveness_inner_no_header skips both the section header AND
+    // the always-emitted applyOps helper; we manage the helper above.
+    buf.push_str(&tmp);
+
+    out.push_str(&rename_state_idents(&buf, account_name));
+}
+
+/// Body of `emit_liveness_inner` minus the section header and the
+/// helper-emit (those are handled by `emit_liveness_multi` /
+/// `emit_liveness_inner_body`). Inline copy of the per-theorem block
+/// from `emit_liveness_inner` (line ~3844). When the legacy auto-
+/// discharge script lands, this stays in sync.
+fn emit_liveness_inner_no_header(out: &mut String, mir: &Mir, adt_form: bool) {
+    for liveness in &mir.liveness_props {
+        let bound = liveness.within_steps.unwrap_or(10);
+        out.push_str(&format!(
+            "/-- {} \u{2014} from {} leads to {} within {} steps via [{}]. -/\n",
+            liveness.name,
+            liveness.from_state,
+            liveness.leads_to_state,
+            bound,
+            liveness.via_ops.join(", ")
+        ));
+        out.push_str(&format!(
+            "theorem liveness_{} (s : State) (signer : Pubkey)\n",
+            liveness.name
+        ));
+        out.push_str(&format!(
+            "    (h : s.status = .{}) :\n",
+            liveness.from_state
+        ));
+        if adt_form {
+            out.push_str(&format!(
+                "    \u{2203} ops, ops.length \u{2264} {} \u{2227} \u{2200} s', applyOps s signer ops = some s' \u{2192} s'.status = .{} := by sorry\n\n",
+                bound, liveness.leads_to_state
+            ));
+            continue;
+        }
+        let path = find_liveness_path(
+            &liveness.from_state,
+            &liveness.leads_to_state,
+            &liveness.via_ops,
+            &mir.handlers,
+        );
+        if let Some(ref ops_path) = path {
+            let proof = liveness_proof_script(ops_path, &mir.handlers);
+            out.push_str(&format!(
+                "    \u{2203} ops, ops.length \u{2264} {} \u{2227} \u{2200} s', applyOps s signer ops = some s' \u{2192} s'.status = .{}{}\n",
+                bound, liveness.leads_to_state, proof
+            ));
+        } else {
+            out.push_str(&format!(
+                "    \u{2203} ops s', ops.length \u{2264} {} \u{2227} applyOps s signer ops = some s' \u{2227} s'.status = .{} := by sorry\n\n",
+                bound, liveness.leads_to_state
+            ));
+        }
+    }
+}
+
+/// Multi-account environment emit. Each property × environment cross
+/// emits a preservation theorem against the property's owning account.
+/// Mirrors the structure of `emit_environments` but groups by the
+/// account whose fields the property touches; the legacy single-call
+/// `render_environments(out, spec, primary)` works for lending only
+/// because `pool_solvency` happens to bind to the primary, but the
+/// shape generalizes.
+fn emit_environments_multi(out: &mut String, mir: &Mir) {
+    if mir.environments.is_empty() || mir.properties.is_empty() {
+        return;
+    }
+
+    out.push_str(
+        "-- ============================================================================\n",
+    );
+    out.push_str("-- Environment \u{2014} properties hold under external state changes\n");
+    out.push_str(
+        "-- ============================================================================\n\n",
+    );
+
+    let groups = group_properties_by_account(mir);
+    for acct in &mir.account_states {
+        let props = match groups.get(&acct.name) {
+            Some(p) => p,
+            None => continue,
+        };
+        let mut scoped = scope_mir_to_account(mir, acct);
+        scoped.properties = props.clone();
+        scoped.environments = mir.environments.clone();
+        let mut block = String::new();
+        emit_environments_no_header(&mut block, &scoped);
+        out.push_str(&rename_state_idents(&block, &acct.name));
+    }
+}
+
+/// Body of `emit_environments` minus the section header (already
+/// written by `emit_environments_multi`). Keeps the rest of the
+/// per-theorem rendering in lockstep with the single-account path,
+/// including the bare-field-name rewrite that the spec's `constraint
+/// <field> > 0` form needs.
+fn emit_environments_no_header(out: &mut String, mir: &Mir) {
+    for env in &mir.environments {
+        for prop in &mir.properties {
+            let prop_expr = match &prop.expression {
+                Some(e) => e,
+                None => continue,
+            };
+            let param_sig: String = env
+                .mutates
+                .iter()
+                .map(|(name, ty)| format!(" (new_{} : {})", name, render_ty(ty)))
+                .collect();
+
+            let constraint_hyps: String = env
+                .constraints
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    let mut expr = c.0.lean.clone();
+                    for (field, _) in &env.mutates {
+                        expr = expr
+                            .replace(&format!("s.{}", field), &format!("new_{}", field))
+                            .replace(&format!("state.{}", field), &format!("new_{}", field));
+                        // Bare field-name reference (e.g.
+                        // `constraint interest_rate > 0`). Use word
+                        // boundary so `interest_rate_pct` isn't
+                        // captured by `interest_rate`.
+                        let pat = format!(r"\b{}\b", regex::escape(field));
+                        let re = regex::Regex::new(&pat).expect("static regex");
+                        expr = re
+                            .replace_all(&expr, regex::NoExpand(&format!("new_{}", field)))
+                            .into_owned();
+                    }
+                    format!("\n    (h_c{} : {})", i, expr)
+                })
+                .collect();
+
+            let with_parts: String = env
+                .mutates
+                .iter()
+                .map(|(name, _)| format!("{} := new_{}", safe_name(name), name))
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            out.push_str(&format!(
+                "theorem {}_under_{} (s : State){}{}\n",
+                prop.name, env.name, param_sig, constraint_hyps
+            ));
+            out.push_str(&format!("    (h_inv : {} s) :\n", prop.name));
+
+            let mutated_overlap = env.mutates.iter().any(|(field, _)| {
+                prop_expr.lean.contains(&format!("s.{}", safe_name(field)))
+                    || prop_expr.lean.contains(&format!("state.{}", field))
+            });
+
+            if !mutated_overlap {
+                out.push_str(&format!(
+                    "    {} {{ s with {} }} := by\n  unfold {} at h_inv \u{22A2}; dsimp; exact h_inv\n\n",
+                    prop.name, with_parts, prop.name
+                ));
+            } else {
+                out.push_str(&format!(
+                    "    {} {{ s with {} }} := sorry\n\n",
+                    prop.name, with_parts
+                ));
+            }
+        }
+    }
+}
+
+/// Build a Mir whose `state` is a single `StateAdt` derived from the
+/// given account, whose `handlers` are filtered to those targeting
+/// this account (per-handler `on_account` match, with the primary
+/// account also collecting handlers that didn't qualify). Used by
+/// `render_multi_account` to drive the existing single-account
+/// emitters per-account.
+fn scope_mir_to_account(mir: &Mir, acct: &crate::mir::AccountStateMir) -> Mir {
+    let is_primary = mir
+        .account_states
+        .first()
+        .map(|a| a.name == acct.name)
+        .unwrap_or(false);
+
+    let handlers: Vec<crate::mir::HandlerMir> = mir
+        .handlers
+        .iter()
+        .filter(|h| match &h.on_account {
+            Some(name) => name == &acct.name,
+            None => is_primary,
+        })
+        .cloned()
+        .collect();
+
+    // Build a StateAdt for this account: variants from the ADT decl
+    // (when present), else a synthetic single-variant carrying the
+    // flat-record fields. lifecycle_states drives the `Status` emit.
+    let state = if !acct.variants.is_empty() {
+        crate::mir::StateAdt {
+            variants: acct.variants.clone(),
+            lifecycle_states: acct.lifecycle_states.clone(),
+        }
+    } else {
+        crate::mir::StateAdt {
+            variants: vec![crate::mir::StateVariant {
+                tag: acct.name.clone(),
+                fields: acct.fields.clone(),
+            }],
+            lifecycle_states: acct.lifecycle_states.clone(),
+        }
+    };
+
+    Mir {
+        name: mir.name.clone(),
+        state,
+        // Single-account view — scoped emitters that re-enter the
+        // dispatch (none do today, but keep is_multi_account honest).
+        account_states: vec![acct.clone()],
+        accounts: mir.accounts.clone(),
+        errors: mir.errors.clone(),
+        imports: mir.imports.clone(),
+        handlers,
+        invariants: Vec::new(), // emit_invariants_as_comments handles
+        events: mir.events.clone(),
+        constants: Vec::new(),             // already emitted at top
+        uninterpreted_helpers: Vec::new(), // already emitted
+        ref_impls: Vec::new(),             // already emitted
+        properties: Vec::new(),            // emit_properties_multi handles
+        covers: Vec::new(),                // emit_covers_multi handles
+        liveness_props: mir.liveness_props.clone(),
+        environments: mir.environments.clone(),
+    }
+}
+
+/// Rewrite bare type / function identifiers (`State`, `Status`,
+/// `Operation`, `applyOp`, `applyOps`) to their per-account form
+/// (`PoolState`, `PoolStatus`, `PoolOperation`, `applyPoolOp`,
+/// `applyPoolOps`). Word-boundary regex protects field names that
+/// happen to share a prefix.
+///
+/// Safe because the renamed identifiers are emitter-internal type and
+/// function names: spec field names are lowercase by convention, and
+/// the type names (`State`, `Status`, `Operation`) never appear as
+/// values inside Lean expressions emitted by these helpers.
+fn rename_state_idents(text: &str, account_name: &str) -> String {
+    let renames: [(&str, String); 5] = [
+        (r"\bapplyOps\b", format!("apply{}Ops", account_name)),
+        (r"\bapplyOp\b", format!("apply{}Op", account_name)),
+        (r"\bOperation\b", format!("{}Operation", account_name)),
+        (r"\bStatus\b", format!("{}Status", account_name)),
+        (r"\bState\b", format!("{}State", account_name)),
+    ];
+
+    let mut out = text.to_string();
+    for (pat, replacement) in &renames {
+        let re = regex::Regex::new(pat).expect("static regex");
+        out = re
+            .replace_all(&out, regex::NoExpand(replacement))
+            .into_owned();
+    }
+    out
+}
+
+/// Emit declared invariants as structured comments — matches
+/// `lean_gen::render_invariants_as_comments`. Multi-account variant-
+/// typed invariant bodies (e.g. `forall l : Loan.Active, …`) need a
+/// richer lowering pass (v3.0); comments preserve the declared name +
+/// body for visibility.
+fn emit_invariants_as_comments(out: &mut String, mir: &Mir) {
+    for inv in &mir.invariants {
+        out.push_str(&format!(
+            "-- INVARIANT OBLIGATION (declared, multi-account translation deferred): {}\n",
+            inv.name
+        ));
+        if let Some(body) = &inv.body {
+            out.push_str(&format!("--   predicate body: {}\n", body.0.lean));
+        }
+        if !inv.doc.is_empty() {
+            out.push_str(&format!("--   description: {}\n", inv.doc));
+        }
+        out.push_str("-- v2.14 emits this as a comment; multi-account invariant\n");
+        out.push_str("-- bodies (e.g. `forall l : Loan.Active, ...`) need lowering\n");
+        out.push_str("-- to typed-state-with-status-filter form. v2.15 picks it up.\n\n");
+    }
+}
+
+/// Group properties by which account's fields they reference, then
+/// emit each group through the per-account scoped path. Mirrors
+/// `lean_gen::render_properties_multi`.
+fn emit_properties_multi(out: &mut String, mir: &Mir) {
+    use std::collections::BTreeMap;
+
+    if mir.properties.is_empty() || mir.account_states.is_empty() {
+        return;
+    }
+
+    let mut groups: BTreeMap<String, Vec<crate::mir::PropertyMir>> = BTreeMap::new();
+    let primary_name = mir.account_states[0].name.clone();
+
+    for prop in &mir.properties {
+        let target = if let Some(expr) = &prop.expression {
+            mir.account_states
+                .iter()
+                .find(|a| {
+                    a.fields
+                        .iter()
+                        .any(|f| expr.lean.contains(&format!("s.{}", f.name)))
+                })
+                .map(|a| a.name.clone())
+                .unwrap_or_else(|| primary_name.clone())
+        } else {
+            primary_name.clone()
+        };
+        groups.entry(target).or_default().push(prop.clone());
+    }
+
+    for (acct_name, props) in groups {
+        let acct = mir
+            .account_states
+            .iter()
+            .find(|a| a.name == acct_name)
+            .expect("account_states contains group key");
+        let mut scoped = scope_mir_to_account(mir, acct);
+        scoped.properties = props;
+        let mut block = String::new();
+        emit_properties(&mut block, &scoped);
+        out.push_str(&rename_state_idents(&block, &acct.name));
+    }
+}
+
+/// Emit cover trace theorems, skipping any whose handler sequence
+/// targets more than one account. The skipped traces emit a structured
+/// comment so the spec author can see the obligation was dropped.
+/// Matches the multi-account skip behavior of
+/// `lean_gen::render_covers` (which sees `state_type = primary` and
+/// the legacy multi-account skip-comment).
+fn emit_covers_multi(out: &mut String, mir: &Mir, primary_scoped: &Mir) {
+    if mir.covers.is_empty() {
+        return;
+    }
+
+    let by_handler: std::collections::HashMap<String, Option<String>> = mir
+        .handlers
+        .iter()
+        .map(|h| (h.name.clone(), h.on_account.clone()))
+        .collect();
+    let primary_name = mir.account_states.first().map(|a| a.name.clone());
+
+    // Section header always written when any covers exist (legacy emits
+    // the same header even if every trace ends up as a skip-comment).
+    out.push_str(
+        "-- ============================================================================\n",
+    );
+    out.push_str("-- Cover properties \u{2014} reachability (existential proofs)\n");
+    out.push_str(
+        "-- ============================================================================\n\n",
+    );
+
+    let mut kept = Vec::new();
+    for c in &mir.covers {
+        let mut spans_multi = false;
+        'outer: for trace in &c.traces {
+            let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            for op in trace {
+                let acct = by_handler.get(op).and_then(|o| o.clone()).or_else(|| {
+                    if by_handler.contains_key(op) {
+                        primary_name.clone()
+                    } else {
+                        None
+                    }
+                });
+                if let Some(a) = acct {
+                    seen.insert(a);
+                }
+            }
+            if seen.len() > 1 {
+                spans_multi = true;
+                break 'outer;
+            }
+        }
+        if spans_multi {
+            let label: String = c
+                .traces
+                .first()
+                .map(|t| format!("[{}]", t.join(", ")))
+                .unwrap_or_else(|| "[]".to_string());
+            out.push_str(&format!(
+                "-- cover_{}: trace {} spans multiple account types, skipped\n\n",
+                c.name, label
+            ));
+        } else {
+            kept.push(c.clone());
+        }
+    }
+
+    if !kept.is_empty() {
+        let mut scoped = primary_scoped.clone();
+        scoped.covers = kept;
+        // emit_covers writes its own section header; we've already
+        // emitted it. Render to a buffer and strip the duplicate
+        // header block (3 lines).
+        let mut buf = String::new();
+        emit_covers(&mut buf, &scoped);
+        let stripped: String = buf
+            .lines()
+            .skip_while(|l| {
+                l.starts_with("-- ===") || l.contains("Cover properties") || l.is_empty()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !stripped.is_empty() {
+            out.push_str(&stripped);
+            out.push('\n');
+        }
+    }
 }
 
 // ----------------------------------------------------------------------
@@ -4475,6 +5105,7 @@ mod tests {
         let mir = Mir {
             name: "T".to_string(),
             state: crate::mir::StateAdt::default(),
+            account_states: vec![],
             accounts: crate::mir::AccountTable::default(),
             errors: crate::mir::ErrorEnum::default(),
             imports: std::collections::BTreeMap::new(),
@@ -4507,6 +5138,7 @@ mod tests {
         let mir = Mir {
             name: "T".to_string(),
             state: crate::mir::StateAdt::default(),
+            account_states: vec![],
             accounts: crate::mir::AccountTable::default(),
             errors: crate::mir::ErrorEnum::default(),
             imports: std::collections::BTreeMap::new(),
@@ -4541,44 +5173,42 @@ mod tests {
 
     #[test]
     fn render_emits_properties_with_preservation() {
-        // Lending declares `property pool_solvency : ...` and
-        // names handlers it's preserved by. Confirm the predicate
-        // def, per-handler preservation sub-lemmas, and master
-        // theorem all emit.
+        // Lending declares `property pool_solvency : ...` and names
+        // handlers it's preserved by. v2.30 Phase 2: lending is
+        // multi-account (Pool + Loan), so the property predicate and
+        // master theorem both bind to `PoolState` / `PoolOperation`
+        // (the property's fields live on the Pool account).
         let mir = lower_fixture("examples/rust/lending/lending.qedspec");
         let out = render(&mir);
 
-        // Must have a Lean def for the property.
         assert!(
-            out.contains("def pool_solvency (s : State) : Prop :="),
-            "expected pool_solvency predicate def:\n{}",
+            out.contains("def pool_solvency (s : PoolState) : Prop :="),
+            "expected pool_solvency predicate def on PoolState:\n{}",
             &out[..out.len().min(3000)]
         );
 
-        // Master preservation theorem with applyOp.
         assert!(
             out.contains("theorem pool_solvency_inductive"),
             "expected pool_solvency_inductive master theorem"
         );
-        assert!(out.contains("(op : Operation)"));
+        assert!(out.contains("(op : PoolOperation)"));
     }
 
     #[test]
     fn render_emits_invariant_theorems() {
-        // Lending declares `invariant collateral_backing`.
+        // Lending declares `invariant collateral_backing`. v2.30
+        // Phase 2: multi-account specs emit invariants as structured
+        // comments (matches legacy `render_invariants_as_comments`);
+        // variant-typed binder lowering is a v3.0 item.
         let mir = lower_fixture("examples/rust/lending/lending.qedspec");
         let out = render(&mir);
         assert!(
-            out.contains("/-- Invariant: collateral_backing"),
+            out.contains("-- INVARIANT OBLIGATION (declared, multi-account translation deferred): collateral_backing"),
             "expected collateral_backing invariant comment"
         );
         assert!(
-            out.contains("theorem collateral_backing (s : State)"),
-            "expected collateral_backing theorem"
-        );
-        assert!(
-            out.contains(":= by sorry"),
-            "expected `by sorry` body on invariants"
+            out.contains("--   predicate body:"),
+            "expected predicate body line in invariant comment"
         );
     }
 
@@ -4602,52 +5232,44 @@ mod tests {
 
     #[test]
     fn render_emits_cover_theorems() {
-        // Lending declares two cover blocks:
-        //   cover borrow_repay_cycle [init_pool, deposit, borrow, repay]
-        //   cover liquidation_path   [init_pool, deposit, borrow, liquidate]
+        // Lending declares two cover blocks whose traces span both
+        // accounts (Pool init_pool/deposit + Loan borrow/repay or
+        // borrow/liquidate). v2.30 Phase 2 emits skip-comments for
+        // cross-account traces and still writes the cover section
+        // header (matches legacy multi-account behavior). Cover-
+        // theorem auto-discharge for single-account traces is
+        // covered by the escrow snapshot.
         let mir = lower_fixture("examples/rust/lending/lending.qedspec");
         let out = render(&mir);
         assert!(
             out.contains("-- Cover properties"),
-            "expected cover section header"
+            "expected cover section header even when all skipped"
         );
         assert!(
-            out.contains("theorem cover_borrow_repay_cycle"),
-            "expected cover_borrow_repay_cycle theorem"
+            out.contains(
+                "-- cover_borrow_repay_cycle: trace [init_pool, deposit, borrow, repay] spans multiple account types, skipped"
+            ),
+            "expected borrow_repay_cycle skip-comment"
         );
         assert!(
-            out.contains("theorem cover_liquidation_path"),
-            "expected cover_liquidation_path theorem"
-        );
-        // Trace witnesses use `Transition` calls per handler.
-        assert!(
-            out.contains("init_poolTransition"),
-            "trace should call init_poolTransition"
-        );
-        // §15 auto-proof: terminal trace steps close via
-        // `cover_trace_proof` (witness construction + `by decide`)
-        // when the MIR can synthesize a witness. The pilot lending
-        // fixture's two cover traces both succeed, so the output
-        // should NOT contain a bare `:= sorry` at the trace
-        // terminal — every cover theorem ends with `exact ⟨…⟩`.
-        assert!(
-            out.contains("exact \u{27E8}"),
-            "expected exact-witness term from cover_trace_proof; got:\n{}",
-            out
-        );
-        assert!(
-            out.contains("by decide"),
-            "expected `by decide` discharge in cover trace proof; got:\n{}",
-            out
+            out.contains(
+                "-- cover_liquidation_path: trace [init_pool, deposit, borrow, liquidate] spans multiple account types, skipped"
+            ),
+            "expected liquidation_path skip-comment"
         );
     }
 
     #[test]
     fn render_emits_liveness_theorems() {
         // Lending: `liveness loan_settles : Loan.Active ~> Loan.Empty
-        // via [repay] within 1`. MIR pilot strips the State.` prefix
-        // and uses the flat-State form (multi-account ADT path is a
-        // separately tracked deferred item).
+        // via [repay] within 1`. v2.30 Phase 2 resolves the per-
+        // liveness state type from `via_ops[0].on_account` → the
+        // `repay` handler is qualified `Loan.Active -> Loan.Empty` so
+        // the theorem binds to `LoanState` + `applyLoanOps` /
+        // `applyLoanOp` / `LoanOperation`. The legacy auto-discharge
+        // script fires when `find_liveness_path` succeeds, yielding
+        // the universal-implication form with a closed proof — no
+        // trailing `sorry` for the lending pilot.
         let mir = lower_fixture("examples/rust/lending/lending.qedspec");
         let out = render(&mir);
         assert!(
@@ -4655,21 +5277,20 @@ mod tests {
             "expected liveness section header"
         );
         assert!(
-            out.contains("def applyOps (s : State)"),
-            "expected applyOps helper"
+            out.contains("def applyLoanOps (s : LoanState)"),
+            "expected applyLoanOps helper bound to LoanState"
         );
         assert!(
-            out.contains("theorem liveness_loan_settles"),
-            "expected liveness_loan_settles theorem"
+            out.contains("theorem liveness_loan_settles (s : LoanState)"),
+            "expected liveness_loan_settles theorem on LoanState"
         );
-        // Step bound from `within 1` should appear in the existential.
         assert!(
             out.contains("ops.length \u{2264} 1"),
             "expected within-step bound of 1"
         );
         assert!(
-            out.contains(":= by sorry"),
-            "liveness body should be `:= by sorry` until proof script ports"
+            out.contains("\u{2200} s', applyLoanOps s signer ops = some s'"),
+            "expected auto-discharged universal-implication form"
         );
     }
 

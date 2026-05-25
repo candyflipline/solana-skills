@@ -18,12 +18,17 @@
 //! commit-message level:
 //!   * ADT path (bundled-stdlib-demo, cross-program-vault):
 //!     byte-identical to legacy.
-//!   * escrow-split: identical modulo deferred §15
-//!     `cover_trace_proof` auto-discharge witnesses.
-//!   * Flat path (escrow, lending, multisig): pre-existing
-//!     divergence in transition body shape + `inductive Status`
-//!     deriving order + cover/aborts proof bodies. Tracked for
-//!     follow-up phases.
+//!   * escrow-split: byte-identical post Phase 1c-9 §15
+//!     `cover_trace_proof` auto-discharge.
+//!   * Flat path (escrow): byte-identical post Phase 1c-10
+//!     flat-path emitter alignment.
+//!   * Indexed path (multisig): byte-identical post Phase 1e
+//!     indexed-state lowering (Mathlib + IndexedState imports,
+//!     `Map[N] T` capacity, `Function.update` collapse).
+//!   * Multi-account path (lending): byte-identical post Phase 2
+//!     multi-account renderer (per-account `<Name>State` structures,
+//!     per-group `apply<Name>Op` dispatchers, per-property
+//!     environment scoping, per-via-op liveness scoping).
 
 use std::fs;
 use std::path::{Path, PathBuf};
