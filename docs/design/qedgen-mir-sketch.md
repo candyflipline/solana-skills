@@ -418,23 +418,27 @@ For the next session picking up this work:
 **Where the pieces live:**
 - `crates/qedgen/src/mir.rs` — typed IR + lowering. Section dividers (`// ---- ----`) split the file. Search anchors: `pub struct Mir`, `pub enum Stmt`, `pub fn lower`.
 - `crates/qedgen/src/lean_gen_mir.rs` — Lean emission. Section emitters are `emit_*` fns; the order in `render_single_account` mirrors `lean_gen.rs::render_single_account` (line 1177).
-- `crates/qedgen/src/main.rs:3194` — dispatch gate (`if QEDGEN_LEGACY_LEAN { lean_gen } else { mir::lower → lean_gen_mir }`).
+- `crates/qedgen/src/main.rs:3194` — dispatch gate. Pilot-scope
+  guard sends sBPF (`pragma sbpf`) and record-bearing specs
+  (`type T { … }`) to legacy unconditionally; pilot specs route
+  through `mir::lower → lean_gen_mir`; `QEDGEN_LEGACY_LEAN=1`
+  forces legacy regardless of shape.
 
 **Suggested first move in the next session:**
-1. **Bundled-example regen sweep.** Now that MIR is the default,
-   regenerate every committed `examples/rust/*/formal_verification/Spec.lean`
-   so the in-repo Lean stays in lock-step with the renderer. Pre-flip
-   spot-check showed `escrow`'s committed Spec.lean had drifted from
-   BOTH MIR and legacy (older v2.24 §S5 ADT shape rather than the
-   current flat shape). Run `bash scripts/check-lake-build.sh --strict`
-   afterwards to confirm every example still builds. Separate commit
-   from the dispatch flip so the renderer-output churn is clearly
-   attributable.
-2. **MIR carry-through for the non-Lean codegens** — Anchor /
+1. **MIR carry-through for the non-Lean codegens** — Anchor /
    Kani / proptest still consume `ParsedSpec` directly. Phase 1
    pilot was Lean-only by design. Picking the next codegen is a
    scope call: Kani impact (auto-CPI substitution) > Anchor
    impact (handler shape) > proptest impact (per-slot lowering).
+2. **Close the MIR pilot-scope carve-outs.** The dispatch guard
+   currently sends two shape classes to legacy: (a) sBPF — needs
+   `pragmas` lifted into MIR and `is_sbpf` un-stubbed (then a
+   `render_sbpf` MIR port); (b) record-bearing specs (percolator
+   class) — needs `Mir.records` lift + per-field `structure T` +
+   `instance : Inhabited T` emission + bare-field assign wrapping
+   (`{ acct with active := 1 }` instead of MIR's current bare
+   `(1)`). The legacy fallback covers correctness; closing the
+   carve-outs lets the guard be removed.
 3. **Retire `render_single_account_adt` ↔ `render_multi_account`
    split where possible.** Phase 2's per-account scoped-Mir +
    token-rename approach (`scope_mir_to_account` + `rename_state_idents`

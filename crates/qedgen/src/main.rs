@@ -3197,11 +3197,24 @@ async fn dispatch(cmd: Commands) -> Result<()> {
                 // (lending). `QEDGEN_LEGACY_LEAN=1` opts back into the
                 // ParsedSpec-direct renderer as an escape hatch while
                 // the non-Lean codegens (Kani / proptest / Anchor)
-                // finish their MIR carry-through. The legacy path
-                // remains reachable for any spec where MIR diverges
-                // unexpectedly — file an issue so the snapshot test
-                // can catch it next regen.
-                if std::env::var("QEDGEN_LEGACY_LEAN").is_ok() {
+                // finish their MIR carry-through.
+                //
+                // Pilot-scope guard: shapes the MIR pilot doesn't
+                // cover route to legacy unconditionally so the flip
+                // doesn't introduce silent miscodegen.
+                //   * sBPF (`pragma sbpf`) — MIR's `is_sbpf` is a
+                //     Phase-0 stub (pragmas aren't lifted into MIR);
+                //     forcing MIR would emit the Anchor-shaped header.
+                //   * Record-bearing specs (`type T { … }`) — Phase 1e
+                //     lifted `Map[N] T` indexed lowering but did not
+                //     port the per-field record `structure T` + `instance
+                //     Inhabited T` emission, nor the bare-field assign
+                //     wrapping (`{ acct with active := 1 }`). Affects
+                //     percolator-class fixtures; tracked as a v3.0
+                //     item.
+                let mir_out_of_scope = parsed.is_assembly_target() || !parsed.records.is_empty();
+                let use_legacy = std::env::var("QEDGEN_LEGACY_LEAN").is_ok() || mir_out_of_scope;
+                if use_legacy {
                     lean_gen::generate(&parsed, &lean_output)?;
                 } else {
                     let mir = mir::lower(&parsed);
