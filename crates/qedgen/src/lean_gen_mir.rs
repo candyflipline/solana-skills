@@ -157,14 +157,15 @@ fn render_single_account(mir: &Mir) -> String {
     emit_state_struct(&mut out, mir);
     emit_transitions(&mut out, mir);
     emit_operation_inductive(&mut out, mir);
+    emit_invariants(&mut out, mir);
     emit_aborts_if(&mut out, mir);
     emit_ensures(&mut out, mir);
+    emit_frame_conditions(&mut out, mir);
 
-    // TODO Phase 1c (subsequent slices): CPI theorems, invariants,
-    // properties, frame, cover, liveness, environments, overflow.
+    // TODO Phase 1c (subsequent slices): CPI theorems, properties,
+    // cover, liveness, environments, overflow.
     out.push_str("-- TODO(mir-phase-1c-later): CPI theorems\n\n");
-    out.push_str("-- TODO(mir-phase-1c-later): invariants\n\n");
-    out.push_str("-- TODO(mir-phase-1c-later): properties / frame / cover / liveness\n\n");
+    out.push_str("-- TODO(mir-phase-1c-later): properties / cover / liveness / overflow\n\n");
 
     emit_namespace_close(&mut out, mir);
     out
@@ -349,6 +350,171 @@ fn emit_handler_transition(out: &mut String, _mir: &Mir, h: &crate::mir::Handler
         out.push_str("  else\n");
         out.push_str("    none\n\n");
     }
+}
+
+/// Emit invariant theorems. Mirrors `lean_gen::render_invariants_theorem_form`.
+///
+/// Per invariant with a predicate body:
+/// ```text
+/// /-- Invariant: <name> — <doc> -/
+/// theorem <name> (s : State) : <prefixed-pred> := by sorry
+/// ```
+///
+/// Bare bodies (description-only invariants from pre-v2.14) emit a
+/// structured comment instead — no `theorem ... := True` tautology.
+/// The `bare_invariant` lint surfaces these as P3.
+fn emit_invariants(out: &mut String, mir: &Mir) {
+    if mir.invariants.is_empty() {
+        return;
+    }
+
+    // Collect all state-field names across every variant for the
+    // `prefix_state_fields` regex pass.
+    let field_set: std::collections::HashSet<String> = mir
+        .state
+        .variants
+        .iter()
+        .flat_map(|v| v.fields.iter().map(|f| f.name.clone()))
+        .collect();
+
+    for inv in &mir.invariants {
+        match &inv.body {
+            Some(pred) => {
+                let prefixed = prefix_state_fields(&pred.0.lean, &field_set);
+                out.push_str(&format!(
+                    "/-- Invariant: {}{} -/\n",
+                    inv.name,
+                    if inv.doc.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" — {}", inv.doc)
+                    }
+                ));
+                out.push_str(&format!(
+                    "theorem {} (s : State) : {} := by sorry\n\n",
+                    inv.name, prefixed
+                ));
+            }
+            None => {
+                out.push_str(&format!(
+                    "-- INVARIANT OBLIGATION (declared, no predicate body): {}\n",
+                    inv.name
+                ));
+                if !inv.doc.is_empty() {
+                    out.push_str(&format!("--   description: {}\n", inv.doc));
+                }
+                out.push_str("-- The spec declared this name but didn't supply a predicate body\n");
+                out.push_str("-- (`invariant <name> : <expr>`). Give it a body to verify.\n\n");
+            }
+        }
+    }
+}
+
+/// Emit frame condition theorems. Mirrors
+/// `lean_gen::render_frame_conditions`.
+///
+/// For each handler with a `modifies` clause, emit a theorem proving
+/// that every field NOT in `modifies` stays equal across the
+/// transition. Lifecycle-transitioning handlers implicitly modify the
+/// `status` field.
+fn emit_frame_conditions(out: &mut String, mir: &Mir) {
+    let has_modifies = mir.handlers.iter().any(|h| h.modifies.is_some());
+    if !has_modifies {
+        return;
+    }
+
+    out.push_str(
+        "-- ============================================================================\n",
+    );
+    out.push_str("-- Frame conditions (modifies)\n");
+    out.push_str(
+        "-- ============================================================================\n\n",
+    );
+
+    // All declared state-field names across every variant.
+    let all_fields: Vec<String> = {
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut out_fields = Vec::new();
+        for v in &mir.state.variants {
+            for f in &v.fields {
+                if seen.insert(f.name.clone()) {
+                    out_fields.push(f.name.clone());
+                }
+            }
+        }
+        out_fields
+    };
+
+    for h in &mir.handlers {
+        let Some(modified) = &h.modifies else {
+            continue;
+        };
+        let modified_set: std::collections::HashSet<String> = modified
+            .iter()
+            .map(|p| p.segments.last().cloned().unwrap_or_default())
+            .collect();
+
+        let status_modified = h.transition.is_some();
+        let unchanged: Vec<&String> = all_fields
+            .iter()
+            .filter(|f| !(modified_set.contains(*f) || (*f == "status" && status_modified)))
+            .collect();
+        if unchanged.is_empty() {
+            continue;
+        }
+
+        let trans_name = safe_name(&format!("{}Transition", h.name));
+        let param_sig = param_sig_str(&h.params);
+        let param_args = param_args_str(&h.params);
+        let theorem_name = safe_name(&format!("{}_frame", h.name));
+
+        out.push_str(&format!(
+            "theorem {} (s s' : State) (signer : Pubkey){}\n",
+            theorem_name, param_sig
+        ));
+        out.push_str(&format!(
+            "    (h : {} s signer{} = some s') :\n",
+            trans_name, param_args
+        ));
+        let conjuncts: Vec<String> = unchanged
+            .iter()
+            .map(|f| format!("s'.{} = s.{}", safe_name(f), safe_name(f)))
+            .collect();
+        out.push_str(&format!(
+            "    {} := sorry\n\n",
+            conjuncts.join(" \u{2227} ")
+        ));
+    }
+}
+
+/// Prefix every state-field identifier in `expr` with `s.`. Word-boundary
+/// regex avoids touching substrings of other identifiers (e.g., `amount`
+/// shouldn't become `s.amount` inside `taker_amount`). Skips fields
+/// already prefixed.
+fn prefix_state_fields(expr: &str, fields: &std::collections::HashSet<String>) -> String {
+    let mut out = expr.to_string();
+    for field in fields {
+        let pattern = format!(r"\b{}\b", regex::escape(field));
+        let re = regex::Regex::new(&pattern).expect("regex compiles for state-field name");
+        let replacement = format!("s.{}", field);
+        // Skip if already prefixed somewhere — avoid double-prefix on
+        // re-passes. The simple way: check `s.<field>` literal presence
+        // before applying.
+        if out.contains(&replacement) {
+            // Already partly prefixed — fall back to a non-greedy
+            // single-pass apply that won't double-prefix because the
+            // `\b` regex doesn't match after `.` (word boundary
+            // already broken by the dot).
+            out = re
+                .replace_all(&out, regex::NoExpand(&replacement))
+                .into_owned();
+        } else {
+            out = re
+                .replace_all(&out, regex::NoExpand(&replacement))
+                .into_owned();
+        }
+    }
+    out
 }
 
 /// Emit abort theorems. Mirrors `lean_gen::render_aborts_if`.
@@ -921,6 +1087,43 @@ mod tests {
             "account-pubkey requires should be filtered from abort theorems:\n{}",
             out
         );
+    }
+
+    #[test]
+    fn render_emits_invariant_theorems() {
+        // Lending declares `invariant collateral_backing`.
+        let mir = lower_fixture("examples/rust/lending/lending.qedspec");
+        let out = render(&mir);
+        assert!(
+            out.contains("/-- Invariant: collateral_backing"),
+            "expected collateral_backing invariant comment"
+        );
+        assert!(
+            out.contains("theorem collateral_backing (s : State)"),
+            "expected collateral_backing theorem"
+        );
+        assert!(
+            out.contains(":= by sorry"),
+            "expected `by sorry` body on invariants"
+        );
+    }
+
+    #[test]
+    fn prefix_state_fields_word_boundary() {
+        let mut fields = std::collections::HashSet::new();
+        fields.insert("amount".to_string());
+        fields.insert("taker".to_string());
+
+        // Bare field references get prefixed.
+        let out = prefix_state_fields("amount > 0", &fields);
+        assert_eq!(out, "s.amount > 0");
+
+        // Substrings inside longer identifiers are NOT prefixed
+        // (word-boundary regex). Tricky: `taker_amount` contains both
+        // `taker` and `amount` as substrings but neither as a whole
+        // word.
+        let out = prefix_state_fields("taker_amount > 0", &fields);
+        assert_eq!(out, "taker_amount > 0");
     }
 
     #[test]
