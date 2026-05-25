@@ -108,8 +108,13 @@ pub struct Mir {
     pub accounts: AccountTable,
     /// Declared error variants (from `type Error | InvalidAmount | …` blocks).
     pub errors: ErrorEnum,
-    /// Imported interface namespaces (v2.29 Slice F unified imports).
-    pub interfaces: InterfaceRegistry,
+    /// Cross-program references — the sole lifted structure for
+    /// everything an `import` resolves to AND every inline
+    /// `interface { … }` block. v2.30 unified imports collapses the
+    /// parallel `ParsedSpec.interfaces` + `ParsedSpec.imported_namespaces`
+    /// surfaces into one canonical view keyed by local namespace
+    /// alias. See `docs/design/mir-unified-imports.md`.
+    pub imports: BTreeMap<Symbol, ImportedSpecMir>,
     /// Per-handler IR.
     pub handlers: Vec<HandlerMir>,
     /// Top-level invariants (whole-state predicates, not method-level).
@@ -356,7 +361,11 @@ pub enum Stmt {
         from: AccountRef,
         to: AccountRef,
         amount: Expr,
-        authority: AccountRef,
+        /// `None` when the `transfers` block declared no `authority`
+        /// clause. The CPI envelope theorem needs a 3-account shape,
+        /// so authorityless transfers skip the theorem emission with
+        /// an obligation comment — preserving the v2.29 behavior.
+        authority: Option<AccountRef>,
     },
 
     /// Lifecycle promotion to a new variant, carrying payload.
@@ -422,12 +431,20 @@ pub enum Stmt {
     Abort(ErrorRef),
 
     // ---- Escape hatches ----
-    /// Generic CPI to a non-Token interface. Reserved for forward
-    /// compatibility; 1 fixture occurrence today.
+    /// Generic CPI to a non-Token interface.
     Cpi {
+        /// References the alias in `Mir.imports`.
         target: InterfaceRef,
+        /// Which handler within the targeted interface.
         method: MethodRef,
         args: Vec<CallArg>,
+        /// v2.27 Track A — caller-supplied projections from the
+        /// callee's abstract state vocabulary onto the caller's
+        /// concrete State fields. Empty when the caller declared no
+        /// `state_binders { ... }` block on the call site (preserves
+        /// the v2.26 callee-frame, param-only axiom shape).
+        state_binders: Vec<StateBinder>,
+        /// `let X = call ...` binder; `None` for terminal calls.
         result_binding: Option<Symbol>,
     },
 
@@ -658,18 +675,13 @@ pub struct RefImpl {
     pub rust_body: String,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct InterfaceRegistry {
-    /// Interface lookup by name (e.g., `Token` → `Token.transfer`'s
-    /// ensures clauses live here, sourced from
-    /// `ParsedSpec.imported_namespaces[..].interfaces`).
-    pub by_name: BTreeMap<Symbol, InterfaceDecl>,
-}
-
 #[derive(Debug, Clone)]
 pub struct InterfaceDecl {
     pub name: Symbol,
-    pub program_id: String,
+    /// Declared program ID for the callee. `None` for inline
+    /// `interface { … }` blocks that omit the field; the legacy
+    /// `lean_gen` lowering renders `"<unknown>"` in that case.
+    pub program_id: Option<Symbol>,
     pub methods: BTreeMap<Symbol, InterfaceMethod>,
 }
 
@@ -680,6 +692,126 @@ pub struct InterfaceMethod {
     /// Pre-rendered callee ensures clauses — fed into per-callsite
     /// substitution by the `cpi_substitute` MIR→MIR pass.
     pub ensures: Vec<Predicate>,
+    /// v2.27 Track A — typed abstract-state vocabulary declared by
+    /// the optional interface-level `state { name : Type, ... }` block.
+    /// Empty when the interface declares no state. Used by the CPI
+    /// theorem emitter to pick the right Lean codomain in the bundled
+    /// axiom signature (`State → T`).
+    pub state_fields: Vec<(Symbol, Ty)>,
+    /// v2.26 Track K — when the source declared
+    /// `-> <ident> : <Type>`, the identifier names the return value
+    /// inside the callee's ensures. Substitution rewrites this name to
+    /// the caller's `let X = ...` binder; `None` falls back to the
+    /// literal `"result"` for back-compat.
+    pub result_binder: Option<Symbol>,
+    /// v2.24 #11 declared handler return type, in source DSL form
+    /// (e.g. `U64`). `None` for terminal handlers.
+    pub return_type: Option<Symbol>,
+}
+
+// ----------------------------------------------------------------------
+// Cross-program references — unified imports (v2.30 / Phase 1c-7)
+// ----------------------------------------------------------------------
+//
+// One canonical lifted structure for everything an `import` resolves
+// to AND every inline `interface { … }` block. See
+// `docs/design/mir-unified-imports.md` for the design rationale —
+// notably the collapse of the parallel `ParsedSpec.interfaces` +
+// `ParsedSpec.imported_namespaces` surfaces into a single MIR view.
+//
+// Tier classification under unification is derivable, not declared:
+//   * Tier 0 — `ImportOrigin::Inline` OR an external import with
+//     every interface declaring no `ensures`. No call-site warrant.
+//   * Tier 1 — external import with non-empty `ensures` AND
+//     `Some(upstream)` carrying a `binary_hash` pin. Caller theorems
+//     apply the bundled axiom; runtime CPI is warranted by the pin.
+//   * Tier 2 — same as Tier 1 plus a bundled proof package under
+//     `crates/qedgen/data/proofs/`. The lakefile `require`s pull the
+//     callee's verified theorems in directly (Stance 2 in
+//     [[project-stance3-qedsvm-discharge]]).
+
+/// One imported source — both types and call contracts come from the
+/// same artifact, warranted by the same `binary_hash` pin (when the
+/// import is external).
+#[derive(Debug, Clone)]
+pub struct ImportedSpecMir {
+    /// Local alias used by `call <alias>.handler(...)` and
+    /// `<alias>.<Type>` references. Falls back to the bound name when
+    /// no `as` clause is declared. For `ImportOrigin::Inline`, the
+    /// alias IS the interface name itself (see
+    /// `mir-unified-imports.md` §"Open questions" #2).
+    pub alias: Symbol,
+    /// Where the imported source came from — built-in stdlib key,
+    /// user-supplied file path, or the `Inline` marker for inline
+    /// `interface` blocks (no source, no warrant).
+    pub origin: ImportOrigin,
+    /// Account-type declarations exported by the imported spec.
+    /// Re-emitted as Rust mirrors at `src/imported/<alias>.rs` when
+    /// non-empty. Empty for Tier-0 interface-only stubs (SPL Token /
+    /// System Program / Metaplex bundled stubs) and inline blocks.
+    pub account_types: Vec<crate::check::ParsedAccountType>,
+    /// Record types referenced by the imported account types.
+    /// Re-emitted alongside `account_types` so the mirror is
+    /// self-contained.
+    pub records: Vec<crate::check::ParsedRecordType>,
+    /// Interface (call-contract) declarations the imported spec
+    /// exports. Each carries handlers + ensures + requires + the
+    /// abstract state-field vocabulary (v2.27 Phase 0). For inline
+    /// `interface Foo { ... }` blocks, this map has a single entry
+    /// keyed by `Foo`.
+    pub interfaces: BTreeMap<Symbol, InterfaceDecl>,
+    /// `upstream { binary_hash = ... }` pin warranting the entire
+    /// imported artifact. The pin justifies trusting both
+    /// `interfaces` ensures AND `account_types` layouts — they're
+    /// the same artifact, not two contracts. `None` for
+    /// `ImportOrigin::Inline` (Tier 0 by construction).
+    pub upstream: Option<crate::check::ParsedUpstream>,
+    /// v2.27 Track B / Stance 2 — set to `Some(pkg_root)` when the
+    /// imported source ships a bundled proof package whose theorems
+    /// will discharge this import's per-handler ensures. `None` keeps
+    /// the Stance-1 axiom path active (consumer emits its own
+    /// sibling axiom module). The package root informs the lakefile
+    /// `require` directive that pulls in the provider's proofs.
+    pub verified_pkg_root: Option<std::path::PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub enum ImportOrigin {
+    /// Built-in stdlib key resolved through the bundled qedspec at
+    /// `crates/qedgen/data/interfaces/<key>.qedspec` (e.g. `"spl"`,
+    /// `"system"`, `"metaplex"`).
+    Builtin(Symbol),
+    /// File-path import from the consumer's `qed.toml`. The path
+    /// stored is the manifest dep key (the value after `from "..."`).
+    File(Symbol),
+    /// Inline `interface Foo { ... }` block declared in the
+    /// consumer's own spec. No source, no `upstream` pin — Tier 0
+    /// by construction. The interface name doubles as the namespace
+    /// alias (`Mir.imports["Foo"]` and `Mir.imports["Foo"]
+    /// .interfaces["Foo"]`).
+    Inline,
+}
+
+/// v2.27 Track A — caller-supplied projection from a callee's
+/// abstract state field onto a caller's concrete State field.
+///
+/// At today's surface, the RHS must be a single dotted path
+/// (`state.<ident>`). The MIR type tightens that to a `Path`,
+/// trading the free-string shape for structure. Richer RHS
+/// expressions are reserved for a future spec evolution.
+#[derive(Debug, Clone)]
+pub struct StateBinder {
+    /// LHS — callee abstract field name (from the imported
+    /// interface's `state { ... }` block). Word-boundary substitution
+    /// catches every occurrence in the callee's ensures.
+    pub callee_field: Symbol,
+    /// RHS — caller-side projection. Typically a single bare state
+    /// field (`Path { segments: ["caller_field"] }`) lifted from
+    /// `state.<ident>` at the surface; carrying the full `Path`
+    /// shape leaves room for `state.X.Y` projections to land
+    /// alongside [[project-stance3-qedsvm-discharge]] without
+    /// reshaping the IR.
+    pub caller_projection: Path,
 }
 
 // ----------------------------------------------------------------------
@@ -823,7 +955,7 @@ pub fn lower(parsed: &ParsedSpec) -> Mir {
         state: lower_state(parsed),
         accounts: lower_account_table(parsed),
         errors: lower_errors(parsed),
-        interfaces: lower_interfaces(parsed),
+        imports: lower_imports(parsed),
         handlers: parsed.handlers.iter().map(lower_handler).collect(),
         invariants: lower_invariants(parsed),
         events: lower_events(parsed),
@@ -944,12 +1076,119 @@ fn lower_errors(parsed: &ParsedSpec) -> ErrorEnum {
     }
 }
 
-fn lower_interfaces(_parsed: &ParsedSpec) -> InterfaceRegistry {
-    // v2.29 Slice F populates `ParsedSpec.imported_namespaces`; reading
-    // it into MIR requires walking the namespace tree and pulling
-    // interface ensures. Phase 0 stubs as empty — Phase 3's
-    // `cpi_substitute` pass populates this from `ParsedSpec.imported_namespaces`.
-    InterfaceRegistry::default()
+/// Lower `ParsedSpec` import sources (both `import` resolutions in
+/// `imported_namespaces` and inline `interface { ... }` blocks in
+/// `interfaces`) to the unified `BTreeMap<Symbol, ImportedSpecMir>`
+/// shape. Implements step 4 of
+/// `docs/design/mir-unified-imports.md`.
+///
+/// Discrimination rule: external imports register in both
+/// `parsed.imported_namespaces` (keyed by local alias) and
+/// `parsed.interfaces` (one entry per alias, name post-rename).
+/// Inline `interface { … }` blocks register only in
+/// `parsed.interfaces`. So the algorithm:
+///   1. Walk `imported_namespaces` → external import entries
+///      (`ImportOrigin::Builtin` if `dep_key` resolves through
+///      `import_resolver::builtin_source`, else
+///      `ImportOrigin::File`).
+///   2. Walk `parsed.interfaces`; any entry whose name is NOT a key
+///      in `imported_namespaces` is an inline block →
+///      `ImportOrigin::Inline`.
+fn lower_imports(parsed: &ParsedSpec) -> BTreeMap<Symbol, ImportedSpecMir> {
+    let mut imports = BTreeMap::new();
+
+    // Step 1 — external imports.
+    for (local_name, ns) in &parsed.imported_namespaces {
+        let iface = parsed.interfaces.iter().find(|i| &i.name == local_name);
+        let mut interfaces_map = BTreeMap::new();
+        if let Some(i) = iface {
+            interfaces_map.insert(i.name.clone(), lift_interface(i));
+        }
+        let origin = if crate::import_resolver::builtin_source(&ns.dep_key).is_some() {
+            ImportOrigin::Builtin(ns.dep_key.clone())
+        } else {
+            ImportOrigin::File(ns.dep_key.clone())
+        };
+        imports.insert(
+            local_name.clone(),
+            ImportedSpecMir {
+                alias: local_name.clone(),
+                origin,
+                account_types: ns.account_types.clone(),
+                records: ns.records.clone(),
+                interfaces: interfaces_map,
+                upstream: iface.and_then(|i| i.upstream.clone()),
+                verified_pkg_root: parsed.verified_callees.get(local_name).cloned(),
+            },
+        );
+    }
+
+    // Step 2 — inline interface blocks.
+    for iface in &parsed.interfaces {
+        if parsed.imported_namespaces.contains_key(&iface.name) {
+            continue;
+        }
+        let mut interfaces_map = BTreeMap::new();
+        interfaces_map.insert(iface.name.clone(), lift_interface(iface));
+        imports.insert(
+            iface.name.clone(),
+            ImportedSpecMir {
+                alias: iface.name.clone(),
+                origin: ImportOrigin::Inline,
+                account_types: Vec::new(),
+                records: Vec::new(),
+                interfaces: interfaces_map,
+                upstream: None,
+                verified_pkg_root: None,
+            },
+        );
+    }
+
+    imports
+}
+
+/// Lift a single `ParsedInterface` to the MIR `InterfaceDecl` shape.
+///
+/// Preserves the legacy semantics: `program_id` flows through as
+/// `Option<Symbol>` (the CPI emitter renders `"<unknown>"` for the
+/// `None` case to match the v2.x output exactly), and every handler's
+/// `ensures` clauses become `Predicate`s carrying their pre-rendered
+/// Lean / Rust forms — Phase 3's `cpi_substitute` MIR→MIR pass will
+/// rewrite them per call site.
+fn lift_interface(iface: &crate::check::ParsedInterface) -> InterfaceDecl {
+    let mut methods = BTreeMap::new();
+    for h in &iface.handlers {
+        let params: Vec<(Symbol, Ty)> = h
+            .params
+            .iter()
+            .map(|(n, t)| (n.clone(), parse_ty(t)))
+            .collect();
+        let ensures: Vec<Predicate> = h
+            .ensures
+            .iter()
+            .map(|e| Predicate(Expr::from_ensures(e)))
+            .collect();
+        methods.insert(
+            h.name.clone(),
+            InterfaceMethod {
+                name: h.name.clone(),
+                params,
+                ensures,
+                state_fields: iface
+                    .state_fields
+                    .iter()
+                    .map(|(n, t)| (n.clone(), parse_ty(t)))
+                    .collect(),
+                result_binder: h.result_binder.clone(),
+                return_type: h.return_type.clone(),
+            },
+        );
+    }
+    InterfaceDecl {
+        name: iface.name.clone(),
+        program_id: iface.program_id.clone(),
+        methods,
+    }
 }
 
 fn lower_invariants(parsed: &ParsedSpec) -> Vec<InvariantMir> {
@@ -1247,29 +1486,18 @@ fn lower_body(h: &crate::check::ParsedHandler) -> Block {
             authority: tr
                 .authority
                 .as_ref()
-                .map(|a| AccountRef::ByBinding(a.clone()))
-                .unwrap_or(AccountRef::ByBinding(tr.from.clone())),
+                .map(|a| AccountRef::ByBinding(a.clone())),
         });
     }
 
-    // 5. Explicit CPI calls — Token.transfer → TokenTransfer;
-    //    everything else → generic Cpi.
+    // 5. Explicit CPI calls — all lower to `Stmt::Cpi`. The legacy
+    //    `lean_gen::render_cpi_theorems` deliberately routes
+    //    `call Token.transfer(...)` through the call-site ensures-as-
+    //    axiom half (and reserves the transfer-envelope half for
+    //    `transfers { ... }` blocks). Collapsing them at lowering
+    //    time would erase that intent.
     for call in &h.calls {
-        let stmt = if call.target_interface == "Token" && call.target_handler == "transfer" {
-            let from = call_arg_account(&call.args, "from")
-                .unwrap_or_else(|| AccountRef::ByBinding("UNKNOWN_FROM".to_string()));
-            let to = call_arg_account(&call.args, "to")
-                .unwrap_or_else(|| AccountRef::ByBinding("UNKNOWN_TO".to_string()));
-            let amount = call_arg_expr(&call.args, "amount").unwrap_or_default();
-            let authority = call_arg_account(&call.args, "authority")
-                .unwrap_or_else(|| AccountRef::ByBinding("UNKNOWN_AUTH".to_string()));
-            Stmt::TokenTransfer {
-                from,
-                to,
-                amount,
-                authority,
-            }
-        } else {
+        let stmt = {
             Stmt::Cpi {
                 target: InterfaceRef(call.target_interface.clone()),
                 method: MethodRef(call.target_handler.clone()),
@@ -1285,6 +1513,14 @@ fn lower_body(h: &crate::check::ParsedHandler) -> Block {
                             rust_binary: String::new(),
                             source_span: None,
                         },
+                    })
+                    .collect(),
+                state_binders: call
+                    .state_binders
+                    .iter()
+                    .map(|b| StateBinder {
+                        callee_field: b.callee_field.clone(),
+                        caller_projection: Path::single(b.caller_field.clone()),
                     })
                     .collect(),
                 result_binding: call.result_binding.clone(),
@@ -1309,26 +1545,6 @@ fn lower_body(h: &crate::check::ParsedHandler) -> Block {
     }
 
     Block { stmts }
-}
-
-/// Find a call argument by name and return it as an AccountRef.
-/// Accepts raw account-name strings (the qedspec `from = taker_ta`
-/// shape — `rust_expr` is `"taker_ta"`).
-fn call_arg_account(args: &[crate::check::ParsedCallArg], name: &str) -> Option<AccountRef> {
-    args.iter()
-        .find(|a| a.name == name)
-        .map(|a| AccountRef::ByBinding(a.rust_expr.trim().to_string()))
-}
-
-/// Find a call argument by name and return it as an Expr.
-fn call_arg_expr(args: &[crate::check::ParsedCallArg], name: &str) -> Option<Expr> {
-    args.iter().find(|a| a.name == name).map(|a| Expr {
-        lean: a.lean_expr.clone(),
-        rust: a.rust_expr.clone(),
-        rust_pod: a.rust_expr_pod.clone(),
-        rust_binary: String::new(),
-        source_span: None,
-    })
 }
 
 /// Parse a dotted field path like `state.admin` or `accounts.escrow_ta.amount`
@@ -1389,7 +1605,7 @@ mod tests {
             state: StateAdt::default(),
             accounts: AccountTable::default(),
             errors: ErrorEnum::default(),
-            interfaces: InterfaceRegistry::default(),
+            imports: BTreeMap::new(),
             handlers: vec![],
             invariants: vec![],
             events: vec![],
@@ -1424,7 +1640,7 @@ mod tests {
             from: AccountRef::ByBinding("src".to_string()),
             to: AccountRef::ByBinding("dst".to_string()),
             amount: Expr::default(),
-            authority: AccountRef::ByBinding("auth".to_string()),
+            authority: Some(AccountRef::ByBinding("auth".to_string())),
         };
         let _ = Stmt::Assign {
             path: Path::single("counter"),
@@ -1695,5 +1911,82 @@ mod tests {
                 fixture
             );
         }
+    }
+
+    // ---- Phase 1c-7 (unified imports) — lower_imports tests ----
+
+    #[test]
+    fn lower_imports_builtin_spl_token() {
+        // bundled-stdlib-demo/pool.qedspec is the only pilot fixture
+        // with an explicit `import Token from "spl"` line. The lifted
+        // import should land as `Mir.imports["Token"]` tagged
+        // `ImportOrigin::Builtin("spl")` with the SPL Token interface
+        // (carrying `transfer`, `mint_to`, etc.) lifted into
+        // `.interfaces["Token"]`. v2.30 unified-imports step 0
+        // guarantees the entry exists even though the bundled stub
+        // declares no `type`s.
+        let mir = lower_fixture("examples/rust/bundled-stdlib-demo/pool.qedspec");
+        let token = mir
+            .imports
+            .get("Token")
+            .expect("bundled-stdlib-demo should import Token namespace");
+        assert_eq!(token.alias, "Token");
+        match &token.origin {
+            ImportOrigin::Builtin(k) => assert_eq!(k, "spl"),
+            other => panic!("expected ImportOrigin::Builtin(\"spl\"), got {:?}", other),
+        }
+        // Tier-0 shape for SPL Token (interface stub, no `type` decls).
+        assert!(token.account_types.is_empty());
+        // Interface lifted under same local name.
+        assert!(token.interfaces.contains_key("Token"));
+        let token_iface = &token.interfaces["Token"];
+        assert!(
+            token_iface.methods.contains_key("transfer"),
+            "SPL Token bundled stub should declare transfer; got methods: {:?}",
+            token_iface.methods.keys().collect::<Vec<_>>()
+        );
+        // SPL Token ships an `upstream { binary_hash = ... }` pin in
+        // the bundled stub.
+        assert!(
+            token.upstream.is_some(),
+            "SPL Token bundled stub should carry an upstream pin"
+        );
+    }
+
+    #[test]
+    fn lower_imports_inline_interface() {
+        // issue-8 pool.qedspec declares an inline `interface MockEncrypt
+        // { ... }` block — it should lower as
+        // `Mir.imports["MockEncrypt"]` tagged `ImportOrigin::Inline`
+        // with no upstream pin (Tier 0 by construction).
+        let mir = lower_fixture("examples/regressions/issue-8/pool.qedspec");
+        let mock = mir
+            .imports
+            .get("MockEncrypt")
+            .expect("issue-8 pool should declare MockEncrypt namespace");
+        assert!(matches!(mock.origin, ImportOrigin::Inline));
+        assert!(mock.upstream.is_none(), "inline blocks have no upstream");
+        assert!(
+            mock.account_types.is_empty(),
+            "inline blocks declare no types"
+        );
+        // The interface name doubles as the namespace alias.
+        assert_eq!(mock.alias, "MockEncrypt");
+        assert!(mock.interfaces.contains_key("MockEncrypt"));
+    }
+
+    #[test]
+    fn lower_imports_no_imports_is_empty() {
+        // Specs that initiate CPIs only through the `transfers { }`
+        // sugar (no explicit `import` line, no inline `interface`
+        // block) should produce an empty `Mir.imports`. The escrow
+        // pilot is the canonical case — three `transfers` blocks but
+        // no top-level import.
+        let mir = lower_fixture("examples/rust/escrow/escrow.qedspec");
+        assert!(
+            mir.imports.is_empty(),
+            "escrow should have no lifted imports; got: {:?}",
+            mir.imports.keys().collect::<Vec<_>>()
+        );
     }
 }

@@ -3198,7 +3198,7 @@ async fn dispatch(cmd: Commands) -> Result<()> {
                 // path across every pilot fixture (Phase 1d).
                 if std::env::var("QEDGEN_USE_MIR").is_ok() {
                     let mir = mir::lower(&parsed);
-                    lean_gen_mir::generate(&mir, &lean_output)?;
+                    lean_gen_mir::generate(&mir, &parsed, &lean_output)?;
                 } else {
                     lean_gen::generate(&parsed, &lean_output)?;
                 }
