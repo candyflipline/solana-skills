@@ -155,17 +155,16 @@ fn render_single_account(mir: &Mir) -> String {
     emit_constants(&mut out, mir);
     emit_lifecycle_marker(&mut out, mir);
     emit_state_struct(&mut out, mir);
+    emit_transitions(&mut out, mir);
+    emit_operation_inductive(&mut out, mir);
 
-    // TODO Phase 1c: transitions, CPI theorems, invariants,
-    // operation inductive + applyOp, properties, aborts, ensures,
-    // frame, cover, liveness, environments, overflow obligations.
-    // Sections below are placeholders so the generated file has a
-    // clear shape during incremental wiring.
-    out.push_str("-- TODO(mir-phase-1c): transitions\n\n");
-    out.push_str("-- TODO(mir-phase-1c): CPI theorems\n\n");
-    out.push_str("-- TODO(mir-phase-1c): invariants\n\n");
-    out.push_str("-- TODO(mir-phase-1c): Operation + applyOp\n\n");
-    out.push_str("-- TODO(mir-phase-1c): properties / aborts / ensures / frame\n\n");
+    // TODO Phase 1c (subsequent slices): CPI theorems, invariants,
+    // properties, aborts, ensures, frame, cover, liveness, environments,
+    // overflow obligations. Sections below are placeholders so the
+    // generated file has a clear shape during incremental wiring.
+    out.push_str("-- TODO(mir-phase-1c-later): CPI theorems\n\n");
+    out.push_str("-- TODO(mir-phase-1c-later): invariants\n\n");
+    out.push_str("-- TODO(mir-phase-1c-later): properties / aborts / ensures / frame\n\n");
 
     emit_namespace_close(&mut out, mir);
     out
@@ -226,20 +225,207 @@ fn emit_lifecycle_marker(out: &mut String, mir: &Mir) {
     out.push_str("  deriving DecidableEq, Repr\n\n");
 }
 
-fn emit_state_struct(out: &mut String, mir: &Mir) {
-    // For single-account multi-variant specs, render the canonical
-    // flat-state form (Phase 1 pilot scope). Multi-variant ADT
-    // emission (the inductive-State form for ≥2 variants) is a
-    // Phase 1c task.
-    let primary = match mir.state.variants.first() {
-        Some(v) => v,
-        None => return,
+/// Emit one transition function per handler. Mirrors
+/// `lean_gen::render_transitions` for the pilot scope:
+///
+/// ```text
+/// def <name>Transition (s : State) (signer : Pubkey) <params> : Option State :=
+///   let <auth_alias> := signer  -- when `auth <who>` isn't a state field
+///   if <require-or-abort-conjunction> then
+///     some { s with <assigns>... }
+///   else
+///     none
+/// ```
+///
+/// Pilot scope: lowers `Stmt::RequireOrAbort` into the if-condition;
+/// `Stmt::Assign` / `CheckedAdd` / `CheckedSub` / `WrapAdd` / etc. into
+/// the `{ s with ... }` record update. `TokenTransfer` and `Cpi`
+/// don't affect local state — they're discharged by separate CPI
+/// theorems (Phase 1c-later slice).
+fn emit_transitions(out: &mut String, mir: &Mir) {
+    for h in &mir.handlers {
+        emit_handler_transition(out, mir, h);
+    }
+}
+
+fn emit_handler_transition(out: &mut String, _mir: &Mir, h: &crate::mir::HandlerMir) {
+    use crate::mir::Stmt;
+
+    let trans_name = safe_name(&format!("{}Transition", h.name));
+    let param_sig = param_sig_str(&h.params);
+
+    // Signature.
+    out.push_str(&format!(
+        "def {} (s : State) (signer : Pubkey){} : Option State :=\n",
+        trans_name, param_sig
+    ));
+
+    // Auth alias: when `auth <who>` is not a state field, bind `who` to
+    // `signer` so user-written predicates referencing it resolve.
+    if let Some(auth_name) = handler_auth_name(h) {
+        // Phase 1c approximation: emit the alias whenever `auth` is set.
+        // Determining whether `who` is a state field requires walking
+        // the State variants — we have that info, but the legacy code's
+        // gate is more nuanced (it checks if `who` collides with a
+        // field name OR a Pubkey-typed state field). Erring on the
+        // side of always emitting the alias matches the most-common
+        // case in the pilot fixtures.
+        out.push_str(&format!("  let {} := signer\n", safe_name(&auth_name)));
+    }
+
+    // RequireOrAbort clauses → if-condition.
+    let conds: Vec<String> = h
+        .body
+        .stmts
+        .iter()
+        .filter_map(|s| match s {
+            Stmt::RequireOrAbort { pred, .. } => Some(pred.0.lean.clone()),
+            _ => None,
+        })
+        .collect();
+
+    // Assign / Add / Sub family → record-update parts.
+    let mut with_parts: Vec<String> = Vec::new();
+    for stmt in &h.body.stmts {
+        match stmt {
+            Stmt::Assign { path, rhs } => {
+                // Drop `<field> := <account_binding>.pubkey` — the
+                // mirror behavior from lean_gen.rs:1839; account-binding
+                // pubkey refs have no Lean scope.
+                if is_account_pubkey_ref(&rhs.rust) {
+                    continue;
+                }
+                with_parts.push(format!(
+                    "{} := {}",
+                    safe_name(&path_field_name(path)),
+                    rhs.lean
+                ));
+            }
+            Stmt::CheckedAdd { path, delta, .. }
+            | Stmt::WrapAdd { path, delta }
+            | Stmt::SatAdd { path, delta } => {
+                let f = safe_name(&path_field_name(path));
+                with_parts.push(format!("{} := s.{} + {}", f, f, delta.lean));
+            }
+            Stmt::CheckedSub { path, delta, .. }
+            | Stmt::WrapSub { path, delta }
+            | Stmt::SatSub { path, delta } => {
+                let f = safe_name(&path_field_name(path));
+                with_parts.push(format!("{} := s.{} - {}", f, f, delta.lean));
+            }
+            _ => {}
+        }
+    }
+
+    // Lifecycle promotion: `state := .NextVariant` lowers as
+    // `status := .NextVariant` on the lifecycle marker field. For
+    // pilot fixtures, the transition arrow on HandlerMir.transition
+    // captures this; emit the post-status set when present.
+    if let Some((_, post)) = &h.transition {
+        // Only emit the `status :=` part when lifecycle is real
+        // (≥2 states); single-lifecycle specs skip the marker per
+        // issue #43.
+        if _mir.state.lifecycle_states.len() >= 2 {
+            with_parts.push(format!("status := .{}", safe_name(post)));
+        }
+    }
+
+    let then_body = if with_parts.is_empty() {
+        "some s".to_string()
+    } else {
+        format!("some {{ s with {} }}", with_parts.join(", "))
     };
+
+    if conds.is_empty() {
+        out.push_str(&format!("  {}\n\n", then_body));
+    } else {
+        let joined = conds
+            .iter()
+            .map(|c| paren_low_prec(c))
+            .collect::<Vec<_>>()
+            .join(" \u{2227} ");
+        out.push_str(&format!("  if {} then\n", joined));
+        out.push_str(&format!("    {}\n", then_body));
+        out.push_str("  else\n");
+        out.push_str("    none\n\n");
+    }
+}
+
+/// Emit the `inductive Operation` enum + `def applyOp` dispatcher.
+/// Mirrors `lean_gen::render_operation_inductive`.
+fn emit_operation_inductive(out: &mut String, mir: &Mir) {
+    if mir.handlers.is_empty() {
+        return;
+    }
+
+    out.push_str("inductive Operation where\n");
+    for h in &mir.handlers {
+        let ctor = safe_name(&h.name);
+        if h.params.is_empty() {
+            out.push_str(&format!("  | {}\n", ctor));
+        } else {
+            let params: Vec<String> = h
+                .params
+                .iter()
+                .map(|(n, t)| format!("({} : {})", n, render_ty(t)))
+                .collect();
+            out.push_str(&format!("  | {} {}\n", ctor, params.join(" ")));
+        }
+    }
+    out.push_str("  deriving Repr, DecidableEq, BEq\n\n");
+
+    // applyOp dispatcher.
+    out.push_str("def applyOp (s : State) (signer : Pubkey) : Operation \u{2192} Option State\n");
+    for h in &mir.handlers {
+        let ctor = safe_name(&h.name);
+        let trans = safe_name(&format!("{}Transition", h.name));
+        let names: Vec<String> = h.params.iter().map(|(n, _)| n.clone()).collect();
+        let pattern_args = if names.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", names.join(" "))
+        };
+        let call_args = if names.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", names.join(" "))
+        };
+        out.push_str(&format!(
+            "  | .{}{} => {} s signer{}\n",
+            ctor, pattern_args, trans, call_args
+        ));
+    }
+    out.push('\n');
+}
+
+fn emit_state_struct(out: &mut String, mir: &Mir) {
+    // For multi-variant ADTs (e.g., State | Uninitialized | Open of
+    // {...} | Closed), the flat-state form unions every variant's
+    // fields into one struct, keyed by name. The status field carries
+    // the lifecycle discriminator. Mirrors lean_gen.rs's flat-state
+    // shape — variants don't get separate constructors here; that's
+    // the `render_single_account_adt` (multi-variant ADT) path landing
+    // later in Phase 1c.
+    if mir.state.variants.is_empty() {
+        return;
+    }
 
     let has_lifecycle = mir.state.lifecycle_states.len() >= 2;
 
+    // Union fields across all variants, preserving declaration order
+    // and de-duping by name.
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut unique_fields: Vec<&crate::mir::FieldDecl> = Vec::new();
+    for v in &mir.state.variants {
+        for f in &v.fields {
+            if seen.insert(f.name.clone()) {
+                unique_fields.push(f);
+            }
+        }
+    }
+
     out.push_str("structure State where\n");
-    for field in &primary.fields {
+    for field in &unique_fields {
         out.push_str(&format!(
             "  {} : {}\n",
             safe_name(&field.name),
@@ -274,6 +460,113 @@ fn render_ty(ty: &crate::mir::Ty) -> String {
             format!("Map /* {} */", render_ty(value))
         }
     }
+}
+
+/// Build a parameter signature string for transition function
+/// declarations: `" (p1 : T1) (p2 : T2) ..."`. Empty string when
+/// `params` is empty. Mirrors `lean_gen::param_sig_str` for the
+/// MIR-typed parameter list.
+fn param_sig_str(params: &[(crate::mir::Symbol, crate::mir::Ty)]) -> String {
+    if params.is_empty() {
+        return String::new();
+    }
+    params
+        .iter()
+        .map(|(n, t)| format!(" ({} : {})", n, render_ty(t)))
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+/// Extract the auth-account name for the alias-let, if any. For the
+/// pilot scope, `auth <name>` lowers to `Some(AccountOrField::Account(ByBinding(name)))`.
+/// Returns `None` for permissionless handlers and dotted-auth shapes
+/// (which were desugared into a synthetic `requires` clause upstream
+/// and don't need a separate alias).
+fn handler_auth_name(h: &crate::mir::HandlerMir) -> Option<crate::mir::Symbol> {
+    use crate::mir::{AccountOrField, AccountRef};
+    match &h.auth {
+        Some(AccountOrField::Account(AccountRef::ByBinding(name))) => Some(name.clone()),
+        _ => None,
+    }
+}
+
+/// Extract the field name from a Path. For Phase 1c we accept dotted
+/// paths but emit only the trailing segment (matches lean_gen.rs's
+/// `strip_variant_prefix_for_flat_state` behavior on the flat-state
+/// path).
+fn path_field_name(path: &crate::mir::Path) -> String {
+    path.segments
+        .last()
+        .cloned()
+        .unwrap_or_else(|| "?".to_string())
+}
+
+/// Detect whether the RHS string references an account-binding's
+/// `.pubkey` field — `lean_gen.rs:1839` drops these from the record
+/// update since they have no Lean scope.
+fn is_account_pubkey_ref(rust: &str) -> bool {
+    // Heuristic matching lean_gen.rs::is_account_binding_pubkey_ref:
+    // the RHS is exactly `<identifier>.pubkey`.
+    let trimmed = rust.trim();
+    trimmed
+        .strip_suffix(".pubkey")
+        .map(|head| !head.is_empty() && head.chars().all(|c| c.is_alphanumeric() || c == '_'))
+        .unwrap_or(false)
+}
+
+/// Wrap an expression in parens if it contains low-precedence operators
+/// that would re-group when joined under `∧`. Mirrors
+/// `lean_gen::paren_if_low_prec` — defensive parens at concat sites
+/// (the mitigation for divergence class C3 in
+/// `docs/design/codegen-divergence.md`).
+fn paren_low_prec(expr: &str) -> String {
+    let trimmed = expr.trim();
+    // Already-parenthesized at the top level: leave alone.
+    if trimmed.starts_with('(') && trimmed.ends_with(')') {
+        // Check the parens actually match (could be `(a) ∧ (b)`).
+        let mut depth = 0i32;
+        let mut top_level_seen = false;
+        for c in trimmed.chars() {
+            match c {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ => {
+                    if depth == 0 {
+                        top_level_seen = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if !top_level_seen {
+            return trimmed.to_string();
+        }
+    }
+    // Look for low-precedence ops (or / and) at the top level.
+    if has_top_level_op(trimmed, &[" or ", " ∨ ", " || "]) {
+        format!("({})", trimmed)
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn has_top_level_op(expr: &str, ops: &[&str]) -> bool {
+    let mut depth = 0i32;
+    for (i, c) in expr.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            _ if depth == 0 => {
+                for op in ops {
+                    if expr[i..].starts_with(op) {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Quote Lean reserved names. Today minimal — extend as fixtures
