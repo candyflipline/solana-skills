@@ -1,8 +1,8 @@
 # qedgen MIR — design sketch
 
-**Status:** Phase 1 + Phase 2 complete — every pilot fixture renders byte-identical Lean between MIR and legacy across all four state shapes (ADT, flat, indexed, multi-account). MIR is the default Lean codegen path (`QEDGEN_LEGACY_LEAN=1` for the escape hatch). **Phase 3a-3c2 (Kani MIR carry-through)** shipped: `crates/qedgen/src/kani_mir.rs` emits structural prefix (3a), per-account structural body (3b), guard-enforcement harnesses (3c1) + state-init helper promotion to `rust_codegen_util`, and abort-condition harnesses (3c2 — structurally complete but no current pilot uses the direct `aborts_if` DSL form, so emits no visible output). Byte-equivalent to legacy on 5 of 6 pilots; lending diverges as expected (multi-account → Phase 3e). `QEDGEN_USE_MIR_KANI=1` opt-in; default stays on legacy `kani::generate` until remaining slices (3c3+ for property/invariant/effect/overflow harnesses + 3d for file-level features + 3e for multi-account) land.
+**Status:** Phase 1 + Phase 2 complete — every pilot fixture renders byte-identical Lean between MIR and legacy across all four state shapes (ADT, flat, indexed, multi-account). MIR is the default Lean codegen path (`QEDGEN_LEGACY_LEAN=1` for the escape hatch). **Phase 3a-3c3 (Kani MIR carry-through)** shipped: structural prefix (3a), per-account structural body (3b), guard-enforcement harnesses + state-init helper promotion (3c1), abort-condition harnesses (3c2 — structural-only, no pilot exercises it), property-preservation harnesses (3c3 — substantial coverage gains: multisig 323→655, percolator 608→1515 lines byte-identical). Byte-equivalent to legacy on 5 of 6 pilots; lending diverges (multi-account → Phase 3e). `QEDGEN_USE_MIR_KANI=1` opt-in; default stays on legacy. Remaining: 3c4+ (invariant-preservation / effect / overflow / ensures harnesses) + 3d (file-level features: covers / liveness / environment) + 3e (multi-account).
 
-**Last revised:** 2026-05-25 (Phase 3c2 abort-condition harnesses).
+**Last revised:** 2026-05-25 (Phase 3c3 property-preservation harnesses).
 
 **Companion docs** (read these first if you want measured evidence behind the claims here):
 
@@ -398,20 +398,17 @@ to the legacy renderer**, gated by `cargo test --test mir_snapshot`.
 all four state shapes (ADT, flat single-account, indexed, multi-
 account). MIR is the default Lean codegen path post v2.30 Phase 2.
 
-**Kani.** Phase 3a (scaffold + structural prefix) + Phase 3b (per-
-account structural body) + Phase 3c1 (guard-enforcement harnesses
-+ state-init helper promotion) + Phase 3c2 (abort-condition
-harnesses) shipped. Byte-equivalent to legacy on 5 of 6 pilots
-through Phase 3c2 emit-scope; lending diverges on multi-account
-wrapping (Phase 3e). Phase 3c2 is structurally complete but emits
-no output for current pilots — `op.aborts_if` is populated only by
-the direct `aborts_if Pred Error` DSL form, which no pilot uses
-(they use `requires X else Err`, which lowers via a different
-field). `QEDGEN_USE_MIR_KANI=1` opt-in; default stays on legacy.
-Remaining harness sections (property-preservation / invariant-
-preservation / effect conformance / overflow detection / file-
-level features: covers / liveness / environment) are Phase 3c3+
-slices.
+**Kani.** Phase 3a–3c3 shipped: scaffold + structural prefix (3a),
+per-account structural body (3b), guard-enforcement + state-init
+helper promotion (3c1), abort-condition (3c2 — structural-only),
+property-preservation (3c3 — substantial coverage gain: multisig
+323→655, percolator 608→1515 lines byte-identical). Byte-equivalent
+to legacy on 5 of 6 pilots; lending diverges on multi-account
+wrapping (Phase 3e). `QEDGEN_USE_MIR_KANI=1` opt-in; default stays
+on legacy. Remaining harness sections (invariant-preservation /
+effect conformance / overflow detection / ensures preservation /
+file-level features: covers / liveness / environment) are Phase
+3c4+ slices.
 
 **Anchor / proptest.** Untouched — still consume `ParsedSpec`
 directly. Same Phase-3-style port shape applies when picked up.

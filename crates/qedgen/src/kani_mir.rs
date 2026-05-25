@@ -163,13 +163,20 @@ pub fn render(mir: &Mir, parsed: &ParsedSpec) -> String {
         ));
     }
 
-    // Phase 3c3+ stub. Remaining harness sections (property
-    // preservation, invariant preservation, effect conformance,
-    // overflow detection) + file-level features (covers / liveness /
-    // environment) emit here in subsequent slices.
+    if let Err(e) = emit_property_preservation_harnesses(&mut out, parsed) {
+        out.push_str(&format!(
+            "// MIR-ERROR: property-preservation emit failed: {}\n",
+            e
+        ));
+    }
+
+    // Phase 3c4+ stub. Remaining harness sections (invariant
+    // preservation, effect conformance, overflow detection,
+    // ensures preservation) + file-level features (covers /
+    // liveness / environment) emit here in subsequent slices.
     out.push_str(
-        "// MIR-TODO(phase-3c3+): property-preservation / invariant-preservation / \
-         effect / overflow harnesses + file-level features (covers / liveness / environment) \
+        "// MIR-TODO(phase-3c4+): invariant-preservation / effect / overflow / \
+         ensures harnesses + file-level features (covers / liveness / environment) \
          not ported yet — fall back to legacy `kani.rs` for production output.\n",
     );
 
@@ -642,6 +649,260 @@ fn emit_abort_condition_harnesses(out: &mut String, parsed: &ParsedSpec) -> Resu
 }
 
 // ----------------------------------------------------------------------
+// Section emitters — Phase 3c3 property-preservation harnesses
+// ----------------------------------------------------------------------
+
+/// Emit `#[kani::proof] fn verify_<handler>_preserves_<property>()`
+/// for every `(property, handler)` pair where `handler` is named in
+/// the property's `preserved_by` list. Mirrors
+/// `kani::emit_kani_account_section` lines ~567–802.
+///
+/// Per-pair harness shape:
+///   * Pre-state: zeroed for init handlers (`pre_status ==
+///     Uninitialized`), symbolic for non-init; `let mut post = pre;`
+///   * Non-init: lifecycle pre-status assume, optional per-slot
+///     binder bind, pre-property assumes (unary only — Binary
+///     properties skip), MAX_MEMBERS-derived bound assume
+///   * Symbolic params + abstract binders
+///   * `emit_add_strict_bounds` for add-effect overflow gating
+///   * `if <handler>(&mut post, args) { assert!(<prop>...); }`
+///     dispatched on prop class (Binary → `prop(&pre, &post)`,
+///     per-slot Unary → `prop_at(&post, binder)`, plain Unary →
+///     `prop(&post)`)
+fn emit_property_preservation_harnesses(out: &mut String, parsed: &ParsedSpec) -> Result<()> {
+    use crate::codegen::map_type;
+    use crate::rust_codegen_util as util;
+
+    if parsed.properties.is_empty() {
+        return Ok(());
+    }
+
+    // Resolve view — same logic as `emit_account_section_structural`.
+    let (state_fields, lifecycle): (&[(String, String)], &[String]) =
+        if parsed.account_types.len() == 1 {
+            (
+                &parsed.account_types[0].fields,
+                parsed.account_types[0].lifecycle.as_slice(),
+            )
+        } else if parsed.account_types.is_empty() {
+            (
+                util::resolve_state_fields(parsed),
+                parsed.lifecycle_states.as_slice(),
+            )
+        } else {
+            (
+                &parsed.account_types[0].fields,
+                parsed.account_types[0].lifecycle.as_slice(),
+            )
+        };
+    let mutable = util::mutable_fields(state_fields);
+
+    out.push_str(
+        "// ============================================================================\n",
+    );
+    out.push_str("// Property preservation — invariants hold through all transitions\n");
+    out.push_str(
+        "// ============================================================================\n\n",
+    );
+
+    let handlers: Vec<&crate::check::ParsedHandler> = parsed.handlers.iter().collect();
+    let properties: Vec<&crate::check::ParsedProperty> = parsed.properties.iter().collect();
+
+    for prop in &properties {
+        if prop.expression.is_none() {
+            continue;
+        }
+
+        for op_name in &prop.preserved_by {
+            // Filter to handlers in this section (single-account
+            // mode → all of them; multi-account → only those tied
+            // to the primary account, which Phase 3e closes).
+            let Some(op) = handlers.iter().copied().find(|o| &o.name == op_name) else {
+                continue;
+            };
+
+            out.push_str("#[kani::proof]\n");
+            out.push_str("#[kani::unwind(2)]\n");
+            out.push_str("#[kani::solver(cadical)]\n");
+            out.push_str(&format!(
+                "fn verify_{}_preserves_{}() {{\n",
+                op_name, prop.name
+            ));
+
+            let is_init = op.pre_status.as_deref() == Some("Uninitialized");
+
+            // v2.20 §S1.1: per-slot binder handling — skip the
+            // local binding when the handler param shadows it
+            // (same binder pre & post unifies the value).
+            let handler_takes_binder = match &prop.per_slot {
+                Some(slot) => op
+                    .takes_params
+                    .iter()
+                    .any(|(n, t)| n == &slot.binder_name && t == &slot.binder_type),
+                _ => false,
+            };
+            let needs_local_binder = prop.per_slot.is_some() && !handler_takes_binder;
+
+            if is_init {
+                // Init handler — pre-state is zeroed.
+                out.push_str("    let pre = ");
+                out.push_str("State {\n");
+                for (fname, ftype) in &mutable {
+                    if let Some(default) =
+                        crate::proptest_gen::default_value_for_field(ftype, parsed)
+                    {
+                        out.push_str(&format!("        {}: {},\n", fname, default));
+                    }
+                }
+                if let Some(initial) = lifecycle.first() {
+                    if lifecycle.len() >= 2 {
+                        out.push_str(&format!("        status: Status::{},\n", initial));
+                    }
+                }
+                out.push_str("    };\n");
+                out.push_str("    let mut post = pre;\n");
+            } else {
+                // Non-init — pre is symbolic.
+                out.push_str("    let pre = State {\n");
+                for (fname, _) in &mutable {
+                    out.push_str(&format!("        {}: kani::any(),\n", fname));
+                }
+                if lifecycle.len() >= 2 {
+                    out.push_str("        status: kani::any(),\n");
+                }
+                out.push_str("    };\n");
+                if lifecycle.len() >= 2 {
+                    if let Some(ref pre_status) = op.pre_status {
+                        out.push_str(&format!(
+                            "    kani::assume(pre.status == Status::{});\n",
+                            pre_status
+                        ));
+                    }
+                }
+
+                if needs_local_binder {
+                    if let Some(slot) = &prop.per_slot {
+                        let rust_ty = map_type(&slot.binder_type, parsed)?;
+                        out.push_str(&format!(
+                            "    let {}: {} = kani::any();\n",
+                            slot.binder_name, rust_ty
+                        ));
+                    }
+                }
+
+                // v2.23 Slice 4: assume unary pre-properties hold;
+                // skip Binary (those have a `(pre, post)` shape
+                // that asserts trivially against `(pre, pre)`).
+                for pre_prop in &properties {
+                    if pre_prop.expression.is_none() {
+                        continue;
+                    }
+                    if pre_prop.class == crate::check::PropertyClass::Binary {
+                        continue;
+                    }
+                    match &pre_prop.per_slot {
+                        Some(slot) if pre_prop.name == prop.name => {
+                            out.push_str(&format!(
+                                "    kani::assume({}_at(&pre, {}));\n",
+                                pre_prop.name, slot.binder_name
+                            ));
+                        }
+                        _ => {
+                            out.push_str(&format!("    kani::assume({}(&pre));\n", pre_prop.name));
+                        }
+                    }
+                }
+
+                // MAX_MEMBERS-derived bound assume — derived from
+                // create_vault guard; same shape as legacy
+                // kani.rs:715–728.
+                if !parsed.constants.is_empty() {
+                    for (cname, _cval) in &parsed.constants {
+                        let upper = cname.to_uppercase();
+                        if upper.contains("MAX") || upper.contains("MEMBER") {
+                            if mutable.iter().any(|(f, _)| f == "member_count") {
+                                out.push_str(&format!(
+                                    "    kani::assume(pre.member_count <= {});\n",
+                                    upper
+                                ));
+                            }
+                            break;
+                        }
+                    }
+                }
+
+                out.push_str("    let mut post = pre;\n");
+            }
+
+            // Symbolic params.
+            for (pname, ptype) in &op.takes_params {
+                out.push_str(&format!(
+                    "    let {}: {} = kani::any();\n",
+                    pname,
+                    map_type(ptype, parsed)?
+                ));
+            }
+            // v2.29 Slice A (#8) — abstract binders. Single call
+            // here (NOT the double-emit bug of guard/abort
+            // sections) — legacy kani.rs:742–745 calls it once.
+            util::emit_abstract_binders(out, op, "    ", "kani::any()", |t| map_type(t, parsed))?;
+
+            // `emit_add_strict_bounds` against pre-state — same
+            // owned-Vec workaround as legacy kani.rs:750–752.
+            let owned_props: Vec<crate::check::ParsedProperty> =
+                properties.iter().map(|p| (*p).clone()).collect();
+            util::emit_add_strict_bounds(
+                out,
+                op,
+                &owned_props,
+                "    kani::assume(pre.{field} < pre.{bound}); // strict bound: {field} increments\n",
+            );
+
+            // Transition call + dispatch on prop class.
+            let args: String = op
+                .takes_params
+                .iter()
+                .chain(op.abstract_binders.iter())
+                .map(|(n, _)| format!(", {}", n))
+                .collect();
+            out.push_str(&format!("    if {}(&mut post{}) {{\n", op_name, args));
+            let is_binary_prop = prop.class == crate::check::PropertyClass::Binary;
+            if is_binary_prop {
+                out.push_str(&format!("        assert!({}(&pre, &post),\n", prop.name));
+                out.push_str(&format!(
+                    "            \"{} must hold after {} (binary: pre/post)\");\n",
+                    prop.name, op_name
+                ));
+            } else {
+                match &prop.per_slot {
+                    Some(slot) => {
+                        out.push_str(&format!(
+                            "        assert!({}_at(&post, {}),\n",
+                            prop.name, slot.binder_name
+                        ));
+                        out.push_str(&format!(
+                            "            \"{} must hold after {} (forall {} : {})\");\n",
+                            prop.name, op_name, slot.binder_name, slot.binder_type
+                        ));
+                    }
+                    None => {
+                        out.push_str(&format!("        assert!({}(&post),\n", prop.name));
+                        out.push_str(&format!(
+                            "            \"{} must hold after {}\");\n",
+                            prop.name, op_name
+                        ));
+                    }
+                }
+            }
+            out.push_str("    }\n");
+            out.push_str("}\n\n");
+        }
+    }
+
+    Ok(())
+}
+
+// ----------------------------------------------------------------------
 // Tests
 // ----------------------------------------------------------------------
 
@@ -714,17 +975,35 @@ mod tests {
     }
 
     #[test]
-    fn render_emits_phase_3c3_todo_marker() {
+    fn render_emits_phase_3c4_todo_marker() {
         // Until subsequent slices port the remaining harness-emit
-        // sections (property-preservation / invariant-preservation /
-        // effect / overflow / file-level features), every rendered
-        // file carries the structured TODO marker so users know
-        // what's missing.
+        // sections (invariant-preservation / effect / overflow /
+        // ensures / file-level features), every rendered file carries
+        // the structured TODO marker so users know what's missing.
         let (mir, parsed) = lower_fixture("examples/rust/escrow/escrow.qedspec");
         let out = render(&mir, &parsed);
         assert!(
-            out.contains("MIR-TODO(phase-3c3+)"),
-            "expected phase-3c3+ TODO marker"
+            out.contains("MIR-TODO(phase-3c4+)"),
+            "expected phase-3c4+ TODO marker"
+        );
+    }
+
+    #[test]
+    fn render_emits_property_preservation_harnesses() {
+        // Multisig declares `property votes_bounded` with
+        // `preserved_by`. The Phase 3c3 emitter fires one
+        // `verify_<handler>_preserves_votes_bounded()` per matched
+        // handler. Section header is constant; the per-pair body is
+        // covered by the byte-equivalence sweep against legacy.
+        let (mir, parsed) = lower_fixture("examples/rust/multisig/multisig.qedspec");
+        let out = render(&mir, &parsed);
+        assert!(
+            out.contains("// Property preservation —"),
+            "expected property-preservation section header"
+        );
+        assert!(
+            out.contains("_preserves_"),
+            "expected at least one preserves_<prop> harness"
         );
     }
 
