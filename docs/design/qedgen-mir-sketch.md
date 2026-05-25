@@ -391,14 +391,14 @@ For the next session picking up this work:
 - `crates/qedgen/src/main.rs:3194` — dispatch gate (`if QEDGEN_USE_MIR { mir::lower → lean_gen_mir } else { lean_gen }`).
 
 **Suggested first move in the next session:**
-1. Multi-variant ADT path (`render_single_account_adt`) — biggest single deferred item. Byte-equivalence for `escrow` depends on it; MIR currently emits the flat-state form for sum-typed accounts. ~2–3 days.
-2. §8 CPI theorems — populate `Mir.interfaces` from `ParsedSpec.imported_namespaces`, then port `render_cpi_theorems`. Intersects with Phase 3's `cpi_substitute` MIR→MIR pass — design the lift first (see "What NOT to do" below). ~1–2 days.
+1. **§8 CPI theorems (Phase 1c-7)** — design call resolved 2026-05-25; spec lives in [`mir-unified-imports.md`](mir-unified-imports.md). `Mir.imports` (canonical) collapses the parallel `ParsedSpec.interfaces` + `ParsedSpec.imported_namespaces` surfaces. Sequence: add types → `lower_imports` → port `render_cpi_theorems`. ~2–3 days.
+2. Multi-variant ADT path (`render_single_account_adt`) — biggest remaining MIR-shape item after §8. Byte-equivalence for `escrow` depends on it; MIR currently emits the flat-state form for sum-typed accounts. ~2–3 days.
 3. §15 + §11 auto-proof scripts — port `cover_trace_proof`, `liveness_proof_script`, `overflow_proof_script`, `preservation_proof_script` from legacy. Each replaces a `:= sorry` body with a real auto-discharge that closes trivial cases. ~1 day.
 4. Phase 1d snapshot tests — once the above lands, both codegens against every pilot fixture, byte-identical or cosmetic-diff-only.
 
 **What NOT to do without revisiting:**
 - Don't try to byte-match `lean_gen.rs` output verbatim before all sections emit. Cosmetic diffs (ordering, whitespace) are expected; locking them into snapshots is Phase 1d's job, not earlier.
-- Don't lift `ParsedSpec.imported_namespaces` into `Mir.interfaces` without a design pass — that field intersects v2.29 Slice F's unified-imports work and the bundled-stdlib registry. Cross-reference [[feedback-unified-imports-semantics]] before designing the MIR shape.
+- Don't add a parallel `Mir.interfaces` lift alongside `Mir.imports` — the unified shape resolved in [`mir-unified-imports.md`](mir-unified-imports.md) makes `Mir.imports` canonical. Re-introducing the split would re-create the exact debt this MIR exercise pays down.
 
 ## What the companion docs validate
 
@@ -417,7 +417,8 @@ For the next session picking up this work:
 
 ## Cross-references
 
-- `docs/design/spec-composition.md` — Tier 1/2/3 interface composition (relates to `Mir.interfaces`).
+- `docs/design/mir-unified-imports.md` — Phase 1c-7 design note. `Mir.imports` collapses the parallel `ParsedSpec.interfaces` + `ParsedSpec.imported_namespaces` surfaces into one canonical lifted structure; sequencing + open questions + validation plan.
+- `docs/design/spec-composition.md` — Tier 1/2/3 interface composition (relates to `Mir.imports[*].interfaces`).
 - `docs/design/pre-post-property-lowering.md` — current pre/post handling at the ParsedSpec level; lowering moves into parser→MIR.
 - `crates/qedgen/src/lean_gen.rs` — current Lean codegen; Phase 1 rewrites this on top of MIR.
 - `crates/qedgen/src/codegen.rs` — current Anchor/Quasar codegen; Phase 2 rewrites.
