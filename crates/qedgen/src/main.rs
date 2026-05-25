@@ -33,6 +33,7 @@ mod integration_test;
 mod interface_gen;
 mod kani;
 mod kani_impl;
+mod kani_mir;
 mod lean_gen;
 mod lean_gen_mir;
 mod lifecycle_probe;
@@ -3138,7 +3139,23 @@ async fn dispatch(cmd: Commands) -> Result<()> {
                 if let Err(e) = deps::require_kani() {
                     eprintln!("warning: {e}");
                 }
-                kani::generate(&spec, &kani_output)?;
+                // v2.30 Phase 3a — `QEDGEN_USE_MIR_KANI=1` routes the
+                // Kani harness emit through the MIR-consuming path.
+                // Default stays on legacy `kani::generate` until the
+                // full section walk lands + snapshot equivalence
+                // ratifies every pilot fixture (mirrors Lean's
+                // Phase 1 sequencing). The MIR scaffold currently
+                // emits only the structural prefix (banner / math
+                // helpers / state-model header / constants) and a
+                // `MIR-TODO(phase-3b)` marker where the next slice
+                // picks up.
+                if std::env::var("QEDGEN_USE_MIR_KANI").is_ok() {
+                    let parsed = check::parse_spec_file(&spec)?;
+                    let mir = mir::lower(&parsed);
+                    kani_mir::generate(&mir, &parsed, &kani_output)?;
+                } else {
+                    kani::generate(&spec, &kani_output)?;
+                }
             }
 
             // v2.26 Batch 2 Track H — impl-targeted Kani harness. Emits

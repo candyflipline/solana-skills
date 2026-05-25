@@ -1,8 +1,8 @@
 # qedgen MIR — design sketch
 
-**Status:** Phase 1c-7 (unified imports), Phase 1c-8 (multi-variant ADT path), Phase 1d (snapshot equivalence), §15 `cover_trace_proof` auto-discharge, Phase 1c-11 (§11 overflow + §15 preservation auto-proof scripts + master theorem rename `_invariant → _inductive`), Phase 1e (indexed-state lowering — `multisig` byte-equivalent to legacy), and **Phase 2 (multi-account codegen — `lending` byte-equivalent to legacy)** shipped on the `mir` branch. All six pilot fixtures now render byte-identical between MIR and legacy. Snapshot tests gate every pilot fixture.
+**Status:** Phase 1 + Phase 2 complete — every pilot fixture renders byte-identical Lean between MIR and legacy across all four state shapes (ADT, flat, indexed, multi-account). MIR is the default Lean codegen path (`QEDGEN_LEGACY_LEAN=1` for the escape hatch). **Phase 3a (Kani MIR carry-through scaffold)** shipped: `crates/qedgen/src/kani_mir.rs` mirrors `lean_gen_mir.rs`'s entry shape and emits the four deterministic structural sections (header / math helpers / state-model header / constants); `QEDGEN_USE_MIR_KANI=1` opt-in, default stays on legacy `kani::generate` until subsequent Phase 3 slices complete the section walk.
 
-**Last revised:** 2026-05-25 (Phase 2 multi-account renderer close-out).
+**Last revised:** 2026-05-25 (Phase 3a Kani scaffold).
 
 **Companion docs** (read these first if you want measured evidence behind the claims here):
 
@@ -394,11 +394,19 @@ to the legacy renderer**, gated by `cargo test --test mir_snapshot`.
 
 ### Honest scoping
 
-Byte-equivalence reached for all six pilot fixtures across all four
-state shapes (ADT, flat single-account, indexed, multi-account). The
-remaining MIR work is non-Lean codegen carry-through (Kani / proptest
-/ Anchor still consume `ParsedSpec` directly) and flipping the
-dispatch default to MIR-on, legacy-off.
+**Lean.** Byte-equivalence reached for all six pilot fixtures across
+all four state shapes (ADT, flat single-account, indexed, multi-
+account). MIR is the default Lean codegen path post v2.30 Phase 2.
+
+**Kani.** Phase 3a shipped the scaffold (`crates/qedgen/src/kani_mir.rs`)
++ four structural sections (header, math helpers, state-model header,
+constants). `QEDGEN_USE_MIR_KANI=1` opt-in; default stays on legacy.
+The harness-emit sections (records, enums, `Status`, `State`,
+transitions, guard / effect / overflow / abort / property / invariant /
+file-level features) are subsequent Phase 3 slices.
+
+**Anchor / proptest.** Untouched — still consume `ParsedSpec`
+directly. Same Phase-3-style port shape applies when picked up.
 
 ## Next-session handoff
 
@@ -425,11 +433,16 @@ For the next session picking up this work:
   forces legacy regardless of shape.
 
 **Suggested first move in the next session:**
-1. **MIR carry-through for the non-Lean codegens** — Anchor /
-   Kani / proptest still consume `ParsedSpec` directly. Phase 1
-   pilot was Lean-only by design. Picking the next codegen is a
-   scope call: Kani impact (auto-CPI substitution) > Anchor
-   impact (handler shape) > proptest impact (per-slot lowering).
+1. **MIR carry-through for the non-Lean codegens — Kani Phase 3
+   continues.** Phase 3a shipped the scaffold + four structural
+   sections (header, math helpers, state-model header, constants).
+   `QEDGEN_USE_MIR_KANI=1` opt-in; default stays on legacy
+   `kani::generate`. Next slice (Phase 3b) ports records / enums /
+   `Status` / `State` / transitions — the per-account section
+   structural body. `crates/qedgen/src/kani_mir.rs` mirrors
+   `lean_gen_mir.rs`'s shape; the kani.rs section walk lives in the
+   module-header doc. After Kani: Anchor (handler shape impact);
+   then proptest (per-slot lowering impact).
 2. **Close the MIR pilot-scope carve-outs.** The dispatch guard
    currently sends two shape classes to legacy: (a) sBPF — needs
    `pragmas` lifted into MIR and `is_sbpf` un-stubbed (then a
