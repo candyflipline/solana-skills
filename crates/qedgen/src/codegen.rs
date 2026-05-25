@@ -26,42 +26,42 @@ const BODY_HASH_PLACEHOLDER: &str = "QEDGEN_FIXUP_BODY_HASH";
 /// the accounts-method forwarder idiom that the rest of the emitter
 /// produces.
 #[derive(Clone, Copy)]
-struct FrameworkSurface {
-    target: Target,
+pub(crate) struct FrameworkSurface {
+    pub(crate) target: Target,
     /// Crate-root attributes line, e.g. `"#![no_std]\n\n"`. Empty for
     /// targets that build against std.
-    crate_attrs: &'static str,
+    pub(crate) crate_attrs: &'static str,
     /// `"use anchor_lang::prelude::*;\n"` or
     /// `"use quasar_lang::prelude::*;\n"`. Caller appends the trailing
     /// blank line (some generators add additional imports first).
-    prelude_import: &'static str,
+    pub(crate) prelude_import: &'static str,
     /// Type written as `<context_type>::<X>` in handler signatures —
     /// `"Context"` (Anchor) or `"Ctx"` (Quasar).
-    context_type: &'static str,
+    pub(crate) context_type: &'static str,
     /// Handler return type — `"Result<()>"` (Anchor; the `Result`
     /// alias from `anchor_lang::prelude` defaults the error to
     /// `anchor_lang::error::Error`) or `"Result<(), ProgramError>"`
     /// (Quasar).
-    handler_result_type: &'static str,
+    pub(crate) handler_result_type: &'static str,
     /// Lifetime threaded into `#[derive(Accounts)]` structs and impl
     /// blocks. Anchor uses `"'info"`; Quasar's `Account<()>` doesn't
     /// need one and uses `""`.
-    accounts_lifetime: &'static str,
+    pub(crate) accounts_lifetime: &'static str,
     /// Visibility keyword for the `#[program]` mod — Anchor convention
     /// is `pub mod`, Quasar is bare `mod`.
-    program_mod_vis: &'static str,
+    pub(crate) program_mod_vis: &'static str,
     /// True when each handler in the `#[program]` mod needs an
     /// `#[instruction(discriminator = N)]` attribute. Quasar requires
     /// it; Anchor auto-derives.
-    explicit_handler_discriminator: bool,
+    pub(crate) explicit_handler_discriminator: bool,
     /// True when each `#[account]` struct in `state.rs` needs an
     /// explicit `discriminator = N` parameter (Quasar) vs Anchor's
     /// auto-derived form.
-    explicit_account_discriminator: bool,
+    pub(crate) explicit_account_discriminator: bool,
 }
 
 impl FrameworkSurface {
-    fn for_target(target: Target) -> Self {
+    pub(crate) fn for_target(target: Target) -> Self {
         match target {
             Target::Anchor => FrameworkSurface {
                 target,
@@ -121,7 +121,7 @@ impl FrameworkSurface {
     /// Render the lifetime parameter list for a `#[derive(Accounts)]`
     /// struct or impl block — e.g. `"<'info>"` (Anchor) or `""`
     /// (Quasar).
-    fn lifetime_params(&self) -> String {
+    pub(crate) fn lifetime_params(&self) -> String {
         if self.accounts_lifetime.is_empty() {
             String::new()
         } else {
@@ -129,7 +129,7 @@ impl FrameworkSurface {
         }
     }
 
-    fn is_quasar(&self) -> bool {
+    pub(crate) fn is_quasar(&self) -> bool {
         matches!(self.target, Target::Quasar)
     }
 
@@ -144,7 +144,7 @@ impl FrameworkSurface {
     ///
     /// Returns `String` rather than `&'static str` because the import
     /// list is composed at call time. Empty when neither flag is set.
-    fn token_imports(&self, has_token: bool, has_mint: bool) -> String {
+    pub(crate) fn token_imports(&self, has_token: bool, has_mint: bool) -> String {
         if !has_token && !has_mint {
             return String::new();
         }
@@ -3528,7 +3528,7 @@ fn emit_variant_auth_guard(handler: &ParsedHandler, spec: &ParsedSpec, target: T
 /// structs live at crate root so `#[program]` can find them) and by
 /// `render_handler_scaffold` (Quasar target — struct + impl together
 /// in `instructions/<name>.rs`).
-fn render_handler_accounts_struct(
+pub(crate) fn render_handler_accounts_struct(
     handler: &ParsedHandler,
     spec: &ParsedSpec,
     is_multi: bool,

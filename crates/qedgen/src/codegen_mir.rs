@@ -119,7 +119,8 @@ pub fn generate(
     // Sub-generator dispatch — same order as `codegen::generate`
     // (lines 5261–5280). Each delegated call gets its MIR-direct
     // port in a later Phase 4 slice.
-    crate::codegen::generate_lib(parsed, &fp, output_dir, target)?;
+    // Phase 4e — MIR-direct port.
+    emit_lib(mir, parsed, &fp, output_dir, target)?;
     crate::codegen::generate_state(parsed, &fp, output_dir, target)?;
     // Phase 4b/3 — MIR-direct port.
     emit_events(mir, parsed, &fp, output_dir, target)?;
@@ -248,6 +249,234 @@ fn render_cargo_toml(
     out.push_str("\n[workspace]\n");
 
     out
+}
+
+/// Emit `src/lib.rs` — the `#[program] pub mod` entry with one
+/// `pub fn` per handler dispatching to `ctx.accounts.handler(...)`.
+/// Idempotent: if `src/lib.rs` already exists, the call is a no-op
+/// (matches legacy line 714–722) so user-stamped imports / extra
+/// modules survive regeneration. MIR-direct port of
+/// `codegen::generate_lib`.
+///
+/// Reads from MIR:
+///   * `Mir.name` → program mod name (lowercased) + crate root.
+///   * `mir.handlers[*].name` / `.doc` → per-handler fn emission.
+///   * `mir.events.is_empty()` / `mir.errors.variants.is_empty()` /
+///     `mir.ref_impls.is_empty()` → mod re-export gating.
+///   * `mir.imports.values().any(...)` → `pub mod imported;` gate.
+///
+/// Falls back to `parsed` for:
+///   * `program_id` (top-level `Option<String>` not in MIR).
+///   * `type_aliases` (for Fin alias resolution on Quasar param
+///     types).
+///   * `ParsedHandler.has_bumps()` / `.takes_params` / `.accounts`
+///     (the per-handler dispatch + Anchor token/mint detection
+///     walk ParsedHandler fields directly).
+///   * `render_handler_accounts_struct` (600+ LoC Anchor helper
+///     that owns the `#[derive(Accounts)]` struct emission;
+///     promoted to `pub(crate)`, still consumes `ParsedSpec` /
+///     `ParsedHandler` directly).
+fn emit_lib(
+    mir: &Mir,
+    parsed: &ParsedSpec,
+    fp: &crate::fingerprint::SpecFingerprint,
+    output_dir: &Path,
+    target: Target,
+) -> Result<()> {
+    use crate::codegen::{to_pascal_case, FrameworkSurface};
+
+    let surface = FrameworkSurface::for_target(target);
+    let src_dir = output_dir.join("src");
+    std::fs::create_dir_all(&src_dir)?;
+
+    let lib_path = src_dir.join("lib.rs");
+    if lib_path.exists() {
+        eprintln!(
+            "programs/{}/src/lib.rs already exists — skipping (user-owned). guards.rs regenerated.",
+            output_dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("<program>")
+        );
+        return Ok(());
+    }
+
+    let program_name = mir.name.to_lowercase();
+    let program_id = parsed
+        .program_id
+        .as_deref()
+        .unwrap_or("11111111111111111111111111111111");
+
+    let mut out = String::new();
+    out.push_str(&crate::codegen::marker("DO NOT EDIT", fp, "src/lib.rs"));
+    out.push_str(surface.crate_attrs);
+    out.push_str(surface.prelude_import);
+    out.push('\n');
+    out.push_str("mod instructions;\n");
+    if matches!(target, Target::Quasar) {
+        out.push_str("use instructions::*;\n");
+    }
+
+    if !mir.events.is_empty() {
+        out.push_str("pub mod events;\n");
+    }
+    if !mir.errors.variants.is_empty() {
+        out.push_str("pub mod errors;\n");
+    }
+    out.push_str("pub mod state;\n");
+    out.push_str("pub mod guards;\n");
+    if crate::codegen::guards_use_math_helpers(parsed) {
+        out.push_str("pub mod math;\n");
+    }
+    if !mir.ref_impls.is_empty() {
+        out.push_str("pub mod ref_impls;\n");
+    }
+    if mir
+        .imports
+        .values()
+        .any(|imp| !imp.account_types.is_empty())
+    {
+        out.push_str("pub mod imported;\n");
+    }
+    out.push('\n');
+
+    out.push_str(&format!("declare_id!(\"{}\");\n\n", program_id));
+
+    out.push_str("#[program]\n");
+    out.push_str(&format!(
+        "{} {} {{\n",
+        surface.program_mod_vis, program_name
+    ));
+    out.push_str("    use super::*;\n\n");
+
+    // Per-handler fn emission. Iterates `mir.handlers` (typed
+    // structure) but reads `parsed.handlers` by index for the
+    // `has_bumps()` / `takes_params` / `type_aliases` Fin-resolution
+    // details that consume ParsedHandler directly.
+    for (i, handler) in mir.handlers.iter().enumerate() {
+        let parsed_handler = parsed
+            .handlers
+            .iter()
+            .find(|h| h.name == handler.name)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "MIR handler '{}' has no matching ParsedHandler (parser/lowering mismatch)",
+                    handler.name
+                )
+            })?;
+        let pascal = to_pascal_case(&handler.name);
+
+        if let Some(ref doc) = handler.doc {
+            out.push_str(&format!("    /// {}\n", doc));
+        }
+        if surface.explicit_handler_discriminator {
+            out.push_str(&format!("    #[instruction(discriminator = {})]\n", i));
+        }
+
+        let mut params = format!("ctx: {}<{}>", surface.context_type, pascal);
+
+        let needs_fin_cast = |ptype: &str| -> bool {
+            if !matches!(target, Target::Quasar) {
+                return false;
+            }
+            let mut resolved = ptype.trim().to_string();
+            while let Some((_, rhs)) = parsed.type_aliases.iter().find(|(n, _)| n == &resolved) {
+                resolved = rhs.trim().to_string();
+            }
+            resolved.starts_with("Fin")
+        };
+
+        for (pname, ptype) in &parsed_handler.takes_params {
+            let rust_ty = if needs_fin_cast(ptype) {
+                "u32".to_string()
+            } else {
+                crate::codegen::map_type_for_target(ptype, parsed, target)?
+            };
+            params.push_str(&format!(", {}: {}", pname, rust_ty));
+        }
+
+        out.push_str(&format!(
+            "    pub fn {}({}) -> {} {{\n",
+            handler.name, params, surface.handler_result_type
+        ));
+
+        let cast_arg = |pname: &str, ptype: &str| -> String {
+            if needs_fin_cast(ptype) {
+                format!("{} as usize", pname)
+            } else {
+                pname.to_string()
+            }
+        };
+
+        if parsed_handler.has_bumps() {
+            out.push_str(&format!(
+                "        ctx.accounts.handler({}&ctx.bumps)\n",
+                parsed_handler
+                    .takes_params
+                    .iter()
+                    .map(|(n, t)| format!("{}, ", cast_arg(n, t)))
+                    .collect::<String>()
+            ));
+        } else {
+            out.push_str(&format!(
+                "        ctx.accounts.handler({})\n",
+                parsed_handler
+                    .takes_params
+                    .iter()
+                    .map(|(n, t)| cast_arg(n, t))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        out.push_str("    }\n\n");
+    }
+
+    out.push_str("}\n");
+
+    // Anchor: emit `#[derive(Accounts)]` structs at crate root via
+    // legacy `render_handler_accounts_struct` (600+ LoC helper that
+    // consumes ParsedSpec / ParsedHandler extensively — porting it
+    // is a separately-trackable cleanup).
+    if matches!(target, Target::Anchor) {
+        let is_multi = parsed.account_types.len() > 1;
+        let default_state_name = format!("{}Account", to_pascal_case(&mir.name));
+        out.push('\n');
+        out.push_str("// `#[derive(Accounts)]` structs live at the crate root so the\n");
+        out.push_str("// Anchor `#[program]` macro can resolve them via `crate::*`.\n");
+        out.push_str("// The handler impl blocks live next to the (always-regenerated)\n");
+        out.push_str("// guard module in `instructions/<name>.rs`.\n");
+        out.push_str("use crate::state::*;\n");
+        let has_token = parsed.handlers.iter().any(|h| {
+            h.accounts
+                .iter()
+                .any(|a| a.account_type.as_deref() == Some("token") || a.name == "token_program")
+        });
+        let has_mint = parsed.handlers.iter().any(|h| {
+            h.accounts
+                .iter()
+                .any(|a| a.account_type.as_deref() == Some("mint"))
+        });
+        let imports = surface.token_imports(has_token, has_mint);
+        if !imports.is_empty() {
+            out.push_str(&imports);
+        }
+        for handler in &parsed.handlers {
+            out.push('\n');
+            out.push_str(&crate::codegen::render_handler_accounts_struct(
+                handler,
+                parsed,
+                is_multi,
+                &default_state_name,
+                &surface,
+                target,
+            ));
+        }
+    }
+
+    out.push_str("// ---- END GENERATED ----\n");
+
+    std::fs::write(src_dir.join("lib.rs"), &out)?;
+    Ok(())
 }
 
 /// Emit `src/imported/<ns>.rs` mirror files + `src/imported/mod.rs`
