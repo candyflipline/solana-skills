@@ -121,7 +121,8 @@ pub fn generate(
     // port in a later Phase 4 slice.
     // Phase 4e — MIR-direct port.
     emit_lib(mir, parsed, &fp, output_dir, target)?;
-    crate::codegen::generate_state(parsed, &fp, output_dir, target)?;
+    // Phase 4f — MIR-direct port.
+    emit_state(mir, parsed, &fp, output_dir, target)?;
     // Phase 4b/3 — MIR-direct port.
     emit_events(mir, parsed, &fp, output_dir, target)?;
     // Phase 4c/1 — MIR-direct port.
@@ -476,6 +477,266 @@ fn emit_lib(
     out.push_str("// ---- END GENERATED ----\n");
 
     std::fs::write(src_dir.join("lib.rs"), &out)?;
+    Ok(())
+}
+
+/// Emit `src/state.rs` — `#[account]` data structures for the
+/// program's persisted state. MIR-direct port of
+/// `codegen::generate_state` (328L).
+///
+/// Dispatches three shapes:
+///   1. **Multi-account** (`mir.account_states.len() > 1`): one
+///      `<Name>Account` `#[account]` struct per account_type, with
+///      optional `<Name>Status` enum.
+///   2. **Multi-variant ADT (Anchor only, WrongState-gated)**:
+///      wrapper-struct + inner-enum pair, with Slice B accessor
+///      methods for fields shared across variants.
+///   3. **Flat single-account**: `<Name>Account` struct from
+///      `spec.state_fields` with optional bump / status fields +
+///      lifecycle `Status` enum.
+///
+/// Reads from MIR for structure (`mir.name`, `mir.account_states`),
+/// from `parsed` for compound shapes not yet lifted into MIR
+/// (`records`, `state_fields`, `lifecycle_states`, `pdas`, per-
+/// account `pda_ref`).
+fn emit_state(
+    mir: &Mir,
+    parsed: &ParsedSpec,
+    fp: &crate::fingerprint::SpecFingerprint,
+    output_dir: &Path,
+    target: Target,
+) -> Result<()> {
+    use crate::codegen::{
+        is_multi_variant_adt_state_pub, map_type_for_target, map_type_pod, to_pascal_case,
+        FrameworkSurface,
+    };
+
+    let surface = FrameworkSurface::for_target(target);
+    let src_dir = output_dir.join("src");
+    std::fs::create_dir_all(&src_dir)?;
+
+    let is_multi = mir.account_states.len() > 1;
+
+    let mut out = String::new();
+    out.push_str(&crate::codegen::marker("DO NOT EDIT", fp, "src/state.rs"));
+    out.push_str(surface.prelude_import);
+    out.push('\n');
+
+    // Records first — emitted as `#[repr(C)]` structs with target-
+    // specific derives. Anchor needs Borsh + InitSpace for the
+    // `#[account]` outer struct's space calculation; Quasar needs
+    // Pod-companion type mapping for zero-copy alignment.
+    for record in &parsed.records {
+        out.push_str("#[repr(C)]\n");
+        let derives = match target {
+            Target::Anchor => "#[derive(AnchorSerialize, AnchorDeserialize, InitSpace, Clone, Copy, Debug, PartialEq)]\n",
+            _ => "#[derive(Clone, Copy)]\n",
+        };
+        out.push_str(derives);
+        out.push_str(&format!("pub struct {} {{\n", record.name));
+        for (fname, ftype) in &record.fields {
+            let rust_ty = match target {
+                Target::Quasar => map_type_pod(ftype, parsed)?,
+                _ => map_type_for_target(ftype, parsed, target)?,
+            };
+            out.push_str(&format!("    pub {}: {},\n", fname, rust_ty));
+        }
+        out.push_str("}\n\n");
+    }
+
+    if is_multi {
+        // Multi-account: iterate `mir.account_states` for structure;
+        // pda_ref is on ParsedAccountType so look up the matching
+        // parsed entry by name.
+        for (idx, acct_mir) in mir.account_states.iter().enumerate() {
+            let acct = parsed
+                .account_types
+                .iter()
+                .find(|a| a.name == acct_mir.name)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "MIR account_state '{}' has no matching ParsedAccountType",
+                        acct_mir.name
+                    )
+                })?;
+            let struct_name = format!("{}Account", acct.name);
+
+            let account_attr = if surface.explicit_account_discriminator {
+                format!("#[account(discriminator = {})]\n", idx + 1)
+            } else {
+                "#[account]\n".to_string()
+            };
+            out.push_str(&account_attr);
+            if matches!(target, Target::Anchor) {
+                out.push_str("#[derive(InitSpace)]\n");
+            }
+            out.push_str(&format!("pub struct {} {{\n", struct_name));
+
+            for (fname, ftype) in &acct.fields {
+                out.push_str(&format!(
+                    "    pub {}: {},\n",
+                    fname,
+                    map_type_for_target(ftype, parsed, target)?
+                ));
+            }
+
+            if acct.pda_ref.is_some() && !acct.fields.iter().any(|(n, _)| n == "bump") {
+                out.push_str("    pub bump: u8,\n");
+            }
+
+            if !acct.lifecycle.is_empty() && !acct.fields.iter().any(|(n, _)| n == "status") {
+                out.push_str("    pub status: u8,\n");
+            }
+
+            out.push_str("}\n\n");
+
+            if !acct.lifecycle.is_empty() {
+                out.push_str(&format!("/// {} lifecycle states.\n", acct.name));
+                out.push_str("#[derive(Clone, Copy, PartialEq, Eq)]\n");
+                out.push_str("#[repr(u8)]\n");
+                out.push_str(&format!("pub enum {}Status {{\n", acct.name));
+                for (i, state) in acct.lifecycle.iter().enumerate() {
+                    out.push_str(&format!("    {} = {},\n", state, i));
+                }
+                out.push_str("}\n\n");
+            }
+        }
+    } else if is_multi_variant_adt_state_pub(parsed) && matches!(target, Target::Anchor) {
+        // Multi-variant ADT (Anchor only, WrongState-gated):
+        // wrapper struct + inner enum + Slice B accessors.
+        let state_name = format!("{}Account", to_pascal_case(&mir.name));
+        let inner_name = format!("{}Inner", state_name);
+        let acct = &parsed.account_types[0];
+
+        out.push_str("#[account]\n");
+        out.push_str("#[derive(InitSpace)]\n");
+        out.push_str(&format!("pub struct {} {{\n", state_name));
+        out.push_str(&format!("    pub inner: {},\n", inner_name));
+        if !parsed.pdas.is_empty() && !parsed.state_fields.iter().any(|(n, _)| n == "bump") {
+            out.push_str("    pub bump: u8,\n");
+        }
+        out.push_str("}\n\n");
+
+        out.push_str(&format!(
+            "/// Variant-payload state for {0}. The Anchor wrapper above\n\
+             /// carries the account discriminator; this enum carries the\n\
+             /// state-machine variant + per-variant payload fields.\n",
+            state_name
+        ));
+        out.push_str(
+            "#[derive(AnchorSerialize, AnchorDeserialize, InitSpace, Clone, Debug, PartialEq)]\n",
+        );
+        out.push_str(&format!("pub enum {} {{\n", inner_name));
+        for variant in &acct.variants {
+            if variant.fields.is_empty() {
+                out.push_str(&format!("    {},\n", variant.name));
+            } else {
+                out.push_str(&format!("    {} {{\n", variant.name));
+                for (fname, ftype) in &variant.fields {
+                    out.push_str(&format!(
+                        "        {}: {},\n",
+                        fname,
+                        map_type_for_target(ftype, parsed, target)?
+                    ));
+                }
+                out.push_str("    },\n");
+            }
+        }
+        out.push_str("}\n\n");
+
+        // Slice B accessors for fields shared across variants.
+        let mut field_index: std::collections::BTreeMap<String, Vec<(String, String)>> =
+            std::collections::BTreeMap::new();
+        for variant in &acct.variants {
+            for (fname, ftype) in &variant.fields {
+                field_index
+                    .entry(fname.clone())
+                    .or_default()
+                    .push((variant.name.clone(), ftype.clone()));
+            }
+        }
+        if !field_index.is_empty() {
+            out.push_str(&format!("impl {} {{\n", inner_name));
+            for (fname, occurrences) in &field_index {
+                let first_ty = &occurrences[0].1;
+                if occurrences.iter().any(|(_, t)| t != first_ty) {
+                    continue;
+                }
+                let rust_ty = map_type_for_target(first_ty, parsed, target)?;
+                out.push_str(&format!(
+                    "    /// v2.29 Slice B accessor for `{0}`. Panics on variants\n\
+                     /// that don't carry the field — guarded against by the\n\
+                     /// per-handler lifecycle check that fires before any\n\
+                     /// `requires` emission in `crate::guards`.\n",
+                    fname
+                ));
+                out.push_str(&format!(
+                    "    pub fn {}(&self) -> &{} {{\n        match self {{\n",
+                    fname, rust_ty
+                ));
+                for (variant_name, _) in occurrences {
+                    out.push_str(&format!(
+                        "            Self::{} {{ {}, .. }} => {},\n",
+                        variant_name, fname, fname
+                    ));
+                }
+                let all_variants = acct.variants.len();
+                if occurrences.len() < all_variants {
+                    out.push_str(&format!(
+                        "            _ => panic!(\"{}::{}() called on a variant without `{}`\"),\n",
+                        inner_name, fname, fname
+                    ));
+                }
+                out.push_str("        }\n    }\n");
+            }
+            out.push_str("}\n");
+        }
+    } else {
+        // Flat single-account fallback.
+        let state_name = format!("{}Account", to_pascal_case(&mir.name));
+
+        let account_attr = if surface.explicit_account_discriminator {
+            "#[account(discriminator = 1)]\n"
+        } else {
+            "#[account]\n"
+        };
+        out.push_str(&format!("{}pub struct {} {{\n", account_attr, state_name));
+
+        for (fname, ftype) in &parsed.state_fields {
+            out.push_str(&format!(
+                "    pub {}: {},\n",
+                fname,
+                map_type_for_target(ftype, parsed, target)?
+            ));
+        }
+
+        if !parsed.pdas.is_empty() && !parsed.state_fields.iter().any(|(n, _)| n == "bump") {
+            out.push_str("    pub bump: u8,\n");
+        }
+
+        if !parsed.lifecycle_states.is_empty()
+            && !parsed.state_fields.iter().any(|(n, _)| n == "status")
+        {
+            out.push_str("    pub status: u8,\n");
+        }
+
+        out.push_str("}\n");
+
+        if !parsed.lifecycle_states.is_empty() {
+            out.push_str("\n/// Program lifecycle states.\n");
+            out.push_str("#[derive(Clone, Copy, PartialEq, Eq)]\n");
+            out.push_str("#[repr(u8)]\n");
+            out.push_str("pub enum Status {\n");
+            for (i, state) in parsed.lifecycle_states.iter().enumerate() {
+                out.push_str(&format!("    {} = {},\n", state, i));
+            }
+            out.push_str("}\n");
+        }
+    }
+
+    out.push_str("// ---- END GENERATED ----\n");
+
+    std::fs::write(src_dir.join("state.rs"), &out)?;
     Ok(())
 }
 
