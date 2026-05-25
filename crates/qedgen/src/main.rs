@@ -35,6 +35,7 @@ mod kani;
 mod kani_impl;
 mod lean_gen;
 mod lifecycle_probe;
+mod mir;
 mod miri_verify;
 mod native_extractor;
 mod paired_validator_probe;

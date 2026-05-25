@@ -1,0 +1,13 @@
+# Local Cargo config.
+#
+# `v0` symbol mangling works around a macOS linker bug
+# (`ld: Assertion failed: (name.size() <= maxLength)` in
+# `SymbolString.cpp`) that fires when `cargo test` on the qedgen binary
+# emits Rust symbols past the legacy mangler's byte limit. Affects local
+# macOS builds only — CI runs on `ubuntu-latest` and is unaffected.
+#
+# v0 mangling is also the recommended scheme for newer toolchains
+# (rust-lang/rust#60705); adopting it has no runtime cost and avoids
+# the class of bug.
+[build]
+rustflags = ["-C", "symbol-mangling-version=v0"]

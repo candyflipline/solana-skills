@@ -1,0 +1,1423 @@
+// Dead-code warnings expected during Phase 0 — types are defined ahead of
+// the codegens that consume them. Re-enable once Phase 0c lowering wires
+// these into a `lower()` body that codegen tests can exercise.
+#![allow(dead_code)]
+
+//! qedgen MIR — typed Solana-native intermediate representation between
+//! the `.qedspec` parser and the codegens.
+//!
+//! Phase 0 of the v2.30 refactor. See `docs/design/qedgen-mir-sketch.md` for
+//! the design rationale, `docs/design/codegen-divergence.md` for the measured
+//! cross-codegen divergence classes this IR closes, and
+//! `docs/design/intrinsic-fixture-map.md` for the fixture evidence behind
+//! the chosen `Stmt` set.
+//!
+//! ## What this is
+//!
+//! A typed IR that sits between `crate::check::ParsedSpec` and the four
+//! primary codegens (`lean_gen.rs`, `codegen.rs`, `kani.rs` + `kani_impl.rs`,
+//! `proptest_gen.rs`). Every codegen will eventually consume `Mir` instead
+//! of pattern-matching on `ParsedSpec` directly.
+//!
+//! ## Key design constraints
+//!
+//! 1. **Structurally typed at the statement level, opaque at the expression
+//!    level.** `Expr` carries pre-rendered target strings (`lean`, `rust`,
+//!    `rust_pod`, `rust_binary`) — the parser already lowers expressions
+//!    per target via `ParsedRequires` / `ParsedEnsures` etc. Re-modelling
+//!    expressions as a typed tree would duplicate that work and reach back
+//!    into `crate::ast::Node<crate::ast::Expr>`, which only `ParsedRequires`
+//!    preserves. So MIR's value comes from desugaring *structure*, not
+//!    expressions.
+//!
+//! 2. **MIR is desugared, not optimized.** Surface sugar (`+=!`, `else Err`,
+//!    schema-includes, dotted-auth, `transfers {…}` blocks) lowers to
+//!    explicit primitive nodes during parser→MIR. Optimizations
+//!    (const fold, dead-handler elimination) are out of scope for v2.30.
+//!
+//! 3. **Bug-reduction is the goal**, not LoC purity. A `Stmt` kind earns
+//!    inclusion by closing a divergence class from
+//!    `docs/design/codegen-divergence.md`, not by reaching a codegen-count
+//!    quorum. See [[feedback-mir-is-bug-reduction]] for the framing.
+//!
+//! 4. **qedgen-local scope.** No `runMir` Lean-side operational semantics
+//!    (parked). No `applyOp ≡ runMir` equivalence lemma. No cross-repo
+//!    qedsvm migration. qedsvm stays vendored at
+//!    `lean_solana/QEDGen/Solana/SBPF/` until it tags stable.
+//!
+//! ## Lowering source — ParsedSpec types we read from
+//!
+//! Phase 0a survey notes (cross-reference `crates/qedgen/src/check.rs`):
+//!
+//! - `ParsedSpec.handlers: Vec<ParsedHandler>` — main input.
+//! - `ParsedSpec.account_types: Vec<ParsedAccountType>` — state ADT;
+//!   carries `variants: Vec<ParsedVariant>` for multi-variant lifecycle.
+//! - `ParsedSpec.records: Vec<ParsedRecordType>` — plain record types.
+//! - `ParsedSpec.pdas: Vec<ParsedPda>` — top-level PDA declarations.
+//! - `ParsedSpec.error_codes: Vec<String>` — declared error variants.
+//! - `ParsedSpec.events: Vec<ParsedEvent>` — event declarations.
+//! - `ParsedSpec.imported_namespaces` — v2.29 Slice F unified imports.
+//!
+//! Per-handler shapes consumed:
+//!
+//! - `ParsedHandler.who: Option<String>` + `permissionless: bool` — auth.
+//! - `ParsedHandler.pre_status` / `post_status: Option<String>` — lifecycle.
+//! - `ParsedHandler.requires: Vec<ParsedRequires>` — pre-conditions (with
+//!   optional `error_name` for `requires X else Err`).
+//! - `ParsedHandler.ensures: Vec<ParsedEnsures>` — post-conditions; carries
+//!   `lean_expr`, `rust_expr`, `rust_expr_pod`, `rust_expr_binary`.
+//! - `ParsedHandler.effects: Vec<(String, String, String)>` — `(field, op_kind, value)`.
+//!   op_kind ∈ {"set", "add", "add_sat", "add_wrap", "sub", "sub_sat", "sub_wrap"}.
+//! - `ParsedHandler.effect_on_error: Vec<Option<String>>` — v2.24 per-site error
+//!   overrides parallel to `effects`.
+//! - `ParsedHandler.effect_branches: Option<ParsedEffectBranches>` — issue #42
+//!   conditional effects (only consumed by Lean today; MIR makes it first-class).
+//! - `ParsedHandler.transfers: Vec<ParsedTransfer>` — declarative
+//!   `transfers { from A to B amount X authority W }`. Lowers to
+//!   `Stmt::TokenTransfer`.
+//! - `ParsedHandler.calls: Vec<ParsedCall>` — explicit
+//!   `call Interface.method(arg = expr, ...)`. `Token.transfer` calls lower
+//!   to `Stmt::TokenTransfer`; everything else lowers to `Stmt::Cpi`.
+//! - `ParsedHandler.accounts: Vec<ParsedHandlerAccount>` — per-handler
+//!   account bindings (writable / signer / pda / authority / type).
+//! - `ParsedHandler.emits: Vec<String>` — event emission (auxiliary).
+//!
+//! Predicate-carrier structs all share the same shape: each carries
+//! `lean_expr: String` plus one or more Rust forms. MIR's `Expr` mirrors
+//! this — see the `Expr` struct below.
+
+use crate::check::ParsedSpec;
+use std::collections::BTreeMap;
+
+// ----------------------------------------------------------------------
+// Top-level
+// ----------------------------------------------------------------------
+
+/// Root MIR object for a single `.qedspec` program.
+#[derive(Debug, Clone)]
+pub struct Mir {
+    /// Spec name (typically `spec <Name>` line).
+    pub name: Symbol,
+    /// State ADT — variants and their fields. For single-variant specs,
+    /// this is a single `StateVariant` with all fields and `tag = Symbol::default()`.
+    pub state: StateAdt,
+    /// Account-block surface — PDAs, owners, writability, init, authority,
+    /// token-type annotations. Foundational per
+    /// `docs/design/qedgen-mir-sketch.md` §"AccountTable is foundational"
+    /// (339 fixture references across account-block features).
+    pub accounts: AccountTable,
+    /// Declared error variants (from `type Error | InvalidAmount | …` blocks).
+    pub errors: ErrorEnum,
+    /// Imported interface namespaces (v2.29 Slice F unified imports).
+    pub interfaces: InterfaceRegistry,
+    /// Per-handler IR.
+    pub handlers: Vec<HandlerMir>,
+    /// Top-level invariants (whole-state predicates, not method-level).
+    pub invariants: Vec<InvariantMir>,
+    /// Declared events. Auxiliary — codegen reads them when lowering
+    /// `HandlerMir.emits`; they're not body statements.
+    pub events: Vec<EventDecl>,
+}
+
+// ----------------------------------------------------------------------
+// State
+// ----------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default)]
+pub struct StateAdt {
+    /// One or more variants. Single-record specs lower to a single
+    /// unnamed variant carrying all the fields.
+    pub variants: Vec<StateVariant>,
+    /// Lifecycle-only variant labels (no payload) for back-compat with
+    /// pre-v2.24 lifecycle-only state declarations.
+    pub lifecycle_states: Vec<Symbol>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StateVariant {
+    pub tag: VariantTag,
+    pub fields: Vec<FieldDecl>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FieldDecl {
+    pub name: Symbol,
+    pub ty: Ty,
+}
+
+// ----------------------------------------------------------------------
+// AccountTable
+// ----------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default)]
+pub struct AccountTable {
+    /// Top-level `pda <name> [seeds]` declarations. Per-account inline PDAs
+    /// (`acct : writable, pda [seeds]`) live in `AccountBindingShape.pda_ref`.
+    pub pdas: BTreeMap<Symbol, PdaDeclaration>,
+    /// Handler-scoped bindings are stored on each `HandlerMir.accounts`;
+    /// this map holds spec-level account shapes shared across handlers
+    /// when the surface DSL eventually supports them (today every
+    /// account binding is handler-scoped, so this is reserved for v3.0
+    /// — kept here to fix the shape).
+    #[allow(dead_code)]
+    pub spec_level_bindings: BTreeMap<Symbol, AccountBindingShape>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PdaDeclaration {
+    pub name: Symbol,
+    /// Seeds as pre-rendered target strings; same opaque-string discipline
+    /// as `Expr`. Each seed maps to its own multi-target rendering since
+    /// seeds can be literals, account refs, or param refs.
+    pub seeds: Vec<Expr>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AccountBindingShape {
+    pub name: Symbol,
+    pub writable: bool,
+    pub is_signer: bool,
+    pub init: bool,
+    pub is_program: bool,
+    pub kind: AccountKind,
+    /// `authority <other_account>` annotation. None for accounts without
+    /// declared authority (signer accounts, programs).
+    pub authority: Option<AccountRef>,
+    /// Refers to a `PdaDeclaration` in `Mir.accounts.pdas` when the
+    /// account is PDA-derived.
+    pub pda_ref: Option<Symbol>,
+    /// v2.29 Slice G — when the account's type comes from an imported
+    /// spec, this carries the namespace alias.
+    pub imported_namespace: Option<Symbol>,
+    /// v2.29 brownfield — hard-coded base58 pubkey when this account is
+    /// a well-known default (system_program, the program itself, event
+    /// authority, etc.). Codegen lowers to `solana_pubkey::pubkey!("…")`.
+    pub default_pubkey: Option<String>,
+    /// `account_type` annotation (e.g., `type token` → AccountKind::Token,
+    /// or a user-declared type name → AccountKind::TypedAccount).
+    pub account_type: Option<Symbol>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountKind {
+    /// `account : signer` — must sign the transaction.
+    Signer,
+    /// `account : type token` — SPL Token account.
+    Token,
+    /// `account : type mint` — SPL Mint account.
+    Mint,
+    /// `account : program` — a program ID account, not data.
+    Program,
+    /// PDA-derived data account (`pda [seeds]`).
+    Pda,
+    /// `account_type` resolves to a user-declared `type T` block.
+    TypedAccount,
+    /// Account with no specific kind annotation. Treated as a plain
+    /// data account whose schema is declared elsewhere.
+    Plain,
+}
+
+// ----------------------------------------------------------------------
+// Handler
+// ----------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct HandlerMir {
+    pub name: Symbol,
+    pub doc: Option<String>,
+    /// Anchor instruction discriminator if the handler declared one.
+    pub discriminant: Option<Vec<u8>>,
+    pub params: Vec<(Symbol, Ty)>,
+    /// Per-handler account bindings — the `accounts { … }` block.
+    pub accounts: Vec<AccountBindingShape>,
+    /// Authorization requirement (`auth <account>` or
+    /// `auth <account>.<field>` dotted form, post-v2.29.1 desugaring).
+    /// `None` means handler is either permissionless or had no auth
+    /// requirement declared.
+    pub auth: Option<AccountOrField>,
+    pub permissionless: bool,
+    /// Lifecycle transition (`: State.V1 -> State.V2` in handler signature).
+    /// Lowered into a synthetic entry-`RequireOrAbort` by Phase 3's
+    /// `lifecycle_lower` MIR→MIR pass; carried separately here to
+    /// preserve the user-level intent and let some codegens emit
+    /// alternative shapes if needed.
+    pub transition: Option<(VariantTag, VariantTag)>,
+    /// Pre-conditions. Schema-includes are already expanded in
+    /// `chumsky_adapter.rs:3125+`; what arrives here is the flat list.
+    pub pre: Vec<Predicate>,
+    /// Pre-conditions with `else <ErrorName>` markers — these lower to
+    /// `Stmt::RequireOrAbort` rather than collected `pre`.
+    /// Empty after Phase 3 lowering (passes synthesize them into `body`);
+    /// populated during parser→MIR before the pass runs.
+    pub requires_or_abort: Vec<RequireOrAbortClause>,
+    pub body: Block,
+    /// Post-conditions (`ensures`).
+    pub post: Vec<Predicate>,
+    /// Frame condition — fields that may be modified. None means
+    /// "everything modifiable per the effects list."
+    pub modifies: Option<Vec<Path>>,
+    /// Event names emitted by this handler. Codegen pulls event schema
+    /// from `Mir.events`.
+    pub emits: Vec<Symbol>,
+    /// Per-handler invariant references (names of invariants this handler
+    /// must preserve).
+    pub invariants: Vec<Symbol>,
+    /// v2.17 — invariants this handler *establishes* at post-state without
+    /// requiring at pre-state (init / one-shot handlers).
+    pub establishes: Vec<Symbol>,
+    /// v2.29 Slice A — `abstract <name> : <Type>` declarations. Each
+    /// codegen lowers to its own existential / fuzz-input / agent-fill
+    /// shape. Pair: (name, dsl-type-string).
+    pub abstract_binders: Vec<(Symbol, String)>,
+    /// `aborts_total` — every abort branch is exhaustive; codegen emits
+    /// a ↔ theorem instead of per-abort.
+    pub aborts_total: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct RequireOrAbortClause {
+    pub pred: Predicate,
+    pub err: ErrorRef,
+}
+
+// ----------------------------------------------------------------------
+// Statements
+// ----------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default)]
+pub struct Block {
+    pub stmts: Vec<Stmt>,
+}
+
+/// Statement kinds. Total: 12 — 4 primary intrinsics + 7 effect/control +
+/// 1 escape hatch CPI. See `docs/design/intrinsic-fixture-map.md` for
+/// the fixture evidence per kind.
+#[derive(Debug, Clone)]
+pub enum Stmt {
+    // ---- Primary intrinsics (fixture-evidence anchored) ----
+    /// Authorization-or-abort. Canonical `requires X else Err` shape;
+    /// 96 uses across 15 of 21 main fixtures. Closes divergence A3.
+    RequireOrAbort {
+        pred: Predicate,
+        err: ErrorRef,
+    },
+
+    /// SPL Token Transfer (`call Token.transfer` or `transfers {}` block).
+    /// 7 fixtures, 15 total uses. Closes divergence A2 (Kani/proptest CPI
+    /// gap) and A4 (CPI ensures coordination).
+    TokenTransfer {
+        from: AccountRef,
+        to: AccountRef,
+        amount: Expr,
+        authority: AccountRef,
+    },
+
+    /// Lifecycle promotion to a new variant, carrying payload.
+    /// 1 main fixture + regression coverage. Closes A2 (Kani/proptest
+    /// variant-promotion gap).
+    VariantPromote {
+        from_tag: VariantTag,
+        to_tag: VariantTag,
+        payload: Vec<(Symbol, Expr)>,
+    },
+
+    // ---- Effect-op kinds (closes B1: effect-op string-literal dispatch) ----
+    /// `field := value`. Escape hatch for arbitrary effect RHS.
+    Assign {
+        path: Path,
+        rhs: Expr,
+    },
+
+    /// `field +=` with checked overflow → ErrorRef. Default arithmetic
+    /// shape post-v2.7 G3 / v2.24.
+    CheckedAdd {
+        path: Path,
+        delta: Expr,
+        err: ErrorRef,
+    },
+    CheckedSub {
+        path: Path,
+        delta: Expr,
+        err: ErrorRef,
+    },
+
+    /// `field +=!` — wrapping arithmetic, no error. v2.24 explicit marker.
+    WrapAdd {
+        path: Path,
+        delta: Expr,
+    },
+    WrapSub {
+        path: Path,
+        delta: Expr,
+    },
+
+    /// `field +=?` — saturating arithmetic, no error. v2.24 explicit marker.
+    SatAdd {
+        path: Path,
+        delta: Expr,
+    },
+    SatSub {
+        path: Path,
+        delta: Expr,
+    },
+
+    // ---- Control flow (closes A1: ParsedEffectBranches divergence) ----
+    /// Conditional effect block. Lowered from
+    /// `ParsedHandler.effect_branches` (issue #42).
+    Branch {
+        scrutinee: BranchScrutinee,
+        arms: Vec<BranchArm>,
+        default: Option<Block>,
+    },
+
+    /// Terminal abort. Used as the canonical post-`Branch` exit for
+    /// fail paths and standalone abort clauses.
+    Abort(ErrorRef),
+
+    // ---- Escape hatches ----
+    /// Generic CPI to a non-Token interface. Reserved for forward
+    /// compatibility; 1 fixture occurrence today.
+    Cpi {
+        target: InterfaceRef,
+        method: MethodRef,
+        args: Vec<CallArg>,
+        result_binding: Option<Symbol>,
+    },
+
+    /// Event emission — auxiliary, not a state mutation. Most codegens
+    /// emit nothing or a `emit!(EventName { ... })` macro call.
+    Emit {
+        event: Symbol,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum BranchScrutinee {
+    /// Boolean test (e.g., `if pred then …`).
+    Predicate(Predicate),
+    /// Match on a value scrutinee — `effect_branches.scrutinee_rust`.
+    /// Stored opaquely per the opaque-expression discipline; arms
+    /// pattern-match on the rendered form.
+    Match(Expr),
+}
+
+#[derive(Debug, Clone)]
+pub struct BranchArm {
+    /// For `Predicate` scrutinees, this is empty (the predicate IS the
+    /// guard). For `Match` scrutinees, this is the pattern as a
+    /// pre-rendered string (per the opaque-expression discipline).
+    pub pattern: Option<Expr>,
+    pub block: Block,
+}
+
+#[derive(Debug, Clone)]
+pub struct CallArg {
+    pub name: Symbol,
+    pub value: Expr,
+}
+
+// ----------------------------------------------------------------------
+// Predicates and expressions (opaque carriers per design)
+// ----------------------------------------------------------------------
+
+/// Opaque expression carrier. The parser already lowers expressions to
+/// per-target string forms; MIR mirrors them without re-modelling.
+///
+/// One of the fields will be non-empty depending on the source. For
+/// `ParsedRequires`-derived expressions, `lean`, `rust`, and `rust_pod`
+/// are all populated. For `ParsedEnsures`-derived expressions, the
+/// `rust_binary` form is additionally populated. Each codegen picks the
+/// field it needs.
+#[derive(Debug, Clone, Default)]
+pub struct Expr {
+    pub lean: String,
+    pub rust: String,
+    pub rust_pod: String,
+    /// v2.25 — binary-mode rendering for ensures clauses
+    /// (`state.x` → `post.x`, `old(state.x)` → `pre.x`). Empty for
+    /// expressions sourced from pre-conditions or effect RHS where the
+    /// distinction doesn't apply.
+    pub rust_binary: String,
+    /// Source AST retained when available (today only `ParsedRequires`
+    /// preserves it). Lints and AST-level checks can read this; codegens
+    /// shouldn't.
+    pub source_span: Option<SourceSpan>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Predicate(pub Expr);
+
+/// Source-span placeholder. Today qedgen's parsing doesn't surface
+/// spans up to ParsedSpec uniformly; the v3.0 refactor will. Kept as
+/// an opaque carrier so adding real spans later is non-breaking.
+#[derive(Debug, Clone, Default)]
+pub struct SourceSpan {
+    pub start: usize,
+    pub end: usize,
+}
+
+// ----------------------------------------------------------------------
+// Invariants
+// ----------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct InvariantMir {
+    pub name: Symbol,
+    pub doc: String,
+    /// `None` for description-only invariants (pre-v2.14 stubs flagged
+    /// by the `bare_invariant` lint).
+    pub body: Option<Predicate>,
+}
+
+// ----------------------------------------------------------------------
+// Types
+// ----------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ty {
+    U8,
+    U16,
+    U32,
+    U64,
+    U128,
+    I64,
+    I128,
+    Bool,
+    Pubkey,
+    /// User-declared type name (a record, sum type, or imported type).
+    Custom(Symbol),
+    /// Bounded map keyed by `Pubkey` with value type `Custom(_)` and
+    /// capacity `N`. e.g., `Map[N] TokenAccount`.
+    Map {
+        capacity: u32,
+        value: Box<Ty>,
+    },
+}
+
+// ----------------------------------------------------------------------
+// Errors / events / interfaces
+// ----------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default)]
+pub struct ErrorEnum {
+    pub variants: Vec<Symbol>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EventDecl {
+    pub name: Symbol,
+    pub fields: Vec<FieldDecl>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct InterfaceRegistry {
+    /// Interface lookup by name (e.g., `Token` → `Token.transfer`'s
+    /// ensures clauses live here, sourced from
+    /// `ParsedSpec.imported_namespaces[..].interfaces`).
+    pub by_name: BTreeMap<Symbol, InterfaceDecl>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InterfaceDecl {
+    pub name: Symbol,
+    pub program_id: String,
+    pub methods: BTreeMap<Symbol, InterfaceMethod>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InterfaceMethod {
+    pub name: Symbol,
+    pub params: Vec<(Symbol, Ty)>,
+    /// Pre-rendered callee ensures clauses — fed into per-callsite
+    /// substitution by the `cpi_substitute` MIR→MIR pass.
+    pub ensures: Vec<Predicate>,
+}
+
+// ----------------------------------------------------------------------
+// Reference types
+// ----------------------------------------------------------------------
+
+/// Interned symbol — today just a String for simplicity, will become
+/// a hash-interned id when the corpus grows large enough to warrant it.
+pub type Symbol = String;
+
+pub type VariantTag = Symbol;
+pub type ErrorRef = Symbol;
+pub type EventRef = Symbol;
+
+#[derive(Debug, Clone)]
+pub struct InterfaceRef(pub Symbol);
+
+#[derive(Debug, Clone)]
+pub struct MethodRef(pub Symbol);
+
+#[derive(Debug, Clone)]
+pub struct Path {
+    /// Dotted path, e.g., `state.admin` parses as `["state", "admin"]`.
+    /// First segment indicates the namespace (`state`, an account
+    /// binding name, a handler param).
+    pub segments: Vec<Symbol>,
+}
+
+impl Path {
+    pub fn single(name: impl Into<Symbol>) -> Self {
+        Path {
+            segments: vec![name.into()],
+        }
+    }
+
+    pub fn dotted(parts: &[&str]) -> Self {
+        Path {
+            segments: parts.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum AccountRef {
+    /// Refers to an entry in the handler's `accounts` block by name.
+    ByBinding(Symbol),
+    /// Refers to the handler's primary state account (used when
+    /// `auth self` or implicit self-references appear).
+    SelfState,
+}
+
+#[derive(Debug, Clone)]
+pub enum AccountOrField {
+    /// Bare `auth <account_name>`.
+    Account(AccountRef),
+    /// Dotted-auth v2.29.1 — `auth <account>.<field>`. Already desugared
+    /// to a synthetic `requires` clause in `chumsky_adapter.rs:3144`, but
+    /// the structured form is retained here so codegens that want the
+    /// original shape (e.g., the lint that detects auth patterns) can
+    /// reach it.
+    AccountField { account: AccountRef, field: Symbol },
+}
+
+// ----------------------------------------------------------------------
+// Lowering entry point — implemented in Phase 0c
+// ----------------------------------------------------------------------
+
+// ----------------------------------------------------------------------
+// Expr constructors
+// ----------------------------------------------------------------------
+
+impl Expr {
+    /// Build an `Expr` from a `ParsedRequires` — uses all three render
+    /// forms (`lean_expr` / `rust_expr` / `rust_expr_pod`). `rust_binary`
+    /// stays empty since requires runs in single-state context.
+    pub fn from_requires(req: &crate::check::ParsedRequires) -> Self {
+        Expr {
+            lean: req.lean_expr.clone(),
+            rust: req.rust_expr.clone(),
+            rust_pod: req.rust_expr_pod.clone(),
+            rust_binary: String::new(),
+            source_span: None,
+        }
+    }
+
+    /// Build an `Expr` from a `ParsedEnsures` — uses all four render
+    /// forms including `rust_expr_binary` for the pre/post split.
+    pub fn from_ensures(ens: &crate::check::ParsedEnsures) -> Self {
+        Expr {
+            lean: ens.lean_expr.clone(),
+            rust: ens.rust_expr.clone(),
+            rust_pod: ens.rust_expr_pod.clone(),
+            rust_binary: ens.rust_expr_binary.clone(),
+            source_span: None,
+        }
+    }
+
+    /// Build an `Expr` from a raw single-form string (e.g., an effect
+    /// value, a transfer amount, a seed). Stores in `rust` only;
+    /// codegens that need other forms must render on the fly from this.
+    /// This is the Phase 0 compromise — proper multi-form rendering at
+    /// lowering time requires touching the parser, deferred to v3.0.
+    pub fn from_raw(s: impl Into<String>) -> Self {
+        let s = s.into();
+        Expr {
+            lean: s.clone(),
+            rust: s.clone(),
+            rust_pod: s.clone(),
+            rust_binary: String::new(),
+            source_span: None,
+        }
+    }
+}
+
+// ----------------------------------------------------------------------
+// Lowering — ParsedSpec → MIR
+// ----------------------------------------------------------------------
+
+/// Lower a fully-parsed and checked `ParsedSpec` to MIR.
+///
+/// The lowering is **lossless w.r.t. semantics** but not w.r.t. source
+/// syntax — surface sugar (schema-includes, `transfers` blocks,
+/// dotted-auth) is desugared into the explicit `Stmt` shapes during
+/// lowering. Schema-include expansion and dotted-auth desugaring have
+/// already run upstream in `chumsky_adapter.rs:3125+`; lowering reads
+/// the expanded form.
+///
+/// Pre-conditions: `parsed` must have passed `check::check_spec` so
+/// post-pass expansions have run. The lowering assumes these are
+/// already done and does not re-validate.
+///
+/// Phase 0c scope: lowers TokenTransfer, RequireOrAbort, Assign,
+/// CheckedAdd / CheckedSub, WrapAdd / WrapSub, SatAdd / SatSub,
+/// lifecycle gating via `HandlerMir.transition`, and the AccountTable.
+/// `Stmt::Branch` (conditional effects) and `Stmt::VariantPromote`
+/// recognize their parsed source but emit a structured TODO `Stmt::Abort`
+/// stub today; Phase 5 fills them in.
+pub fn lower(parsed: &ParsedSpec) -> Mir {
+    Mir {
+        name: parsed.program_name.clone(),
+        state: lower_state(parsed),
+        accounts: lower_account_table(parsed),
+        errors: lower_errors(parsed),
+        interfaces: lower_interfaces(parsed),
+        handlers: parsed.handlers.iter().map(lower_handler).collect(),
+        invariants: lower_invariants(parsed),
+        events: lower_events(parsed),
+    }
+}
+
+fn lower_state(parsed: &ParsedSpec) -> StateAdt {
+    // Primary account type drives the state ADT. Multi-account specs
+    // surface only the primary here; per-account state lives on each
+    // handler's `accounts` binding. v3.0 may revisit.
+    let primary = parsed.account_types.first();
+
+    let variants = match primary {
+        Some(at) if !at.variants.is_empty() => at
+            .variants
+            .iter()
+            .map(|v| StateVariant {
+                tag: v.name.clone(),
+                fields: v
+                    .fields
+                    .iter()
+                    .map(|(n, t)| FieldDecl {
+                        name: n.clone(),
+                        ty: parse_ty(t),
+                    })
+                    .collect(),
+            })
+            .collect(),
+        Some(at) => {
+            // Single-record account type — one synthetic variant
+            // carrying all fields. tag = the account-type name for
+            // back-compat with codegens that key on the name.
+            vec![StateVariant {
+                tag: at.name.clone(),
+                fields: at
+                    .fields
+                    .iter()
+                    .map(|(n, t)| FieldDecl {
+                        name: n.clone(),
+                        ty: parse_ty(t),
+                    })
+                    .collect(),
+            }]
+        }
+        None => vec![],
+    };
+
+    StateAdt {
+        variants,
+        lifecycle_states: primary.map(|at| at.lifecycle.clone()).unwrap_or_default(),
+    }
+}
+
+fn lower_account_table(parsed: &ParsedSpec) -> AccountTable {
+    let mut pdas = BTreeMap::new();
+    for pda in &parsed.pdas {
+        pdas.insert(
+            pda.name.clone(),
+            PdaDeclaration {
+                name: pda.name.clone(),
+                seeds: pda
+                    .seeds
+                    .iter()
+                    .map(|s| Expr::from_raw(s.clone()))
+                    .collect(),
+            },
+        );
+    }
+    AccountTable {
+        pdas,
+        spec_level_bindings: BTreeMap::new(),
+    }
+}
+
+fn lower_errors(parsed: &ParsedSpec) -> ErrorEnum {
+    ErrorEnum {
+        variants: parsed.error_codes.clone(),
+    }
+}
+
+fn lower_interfaces(_parsed: &ParsedSpec) -> InterfaceRegistry {
+    // v2.29 Slice F populates `ParsedSpec.imported_namespaces`; reading
+    // it into MIR requires walking the namespace tree and pulling
+    // interface ensures. Phase 0 stubs as empty — Phase 3's
+    // `cpi_substitute` pass populates this from `ParsedSpec.imported_namespaces`.
+    InterfaceRegistry::default()
+}
+
+fn lower_invariants(parsed: &ParsedSpec) -> Vec<InvariantMir> {
+    parsed
+        .invariants
+        .iter()
+        .map(|inv| InvariantMir {
+            name: inv.name.clone(),
+            doc: inv.doc.clone(),
+            body: inv.lean_expr.as_ref().map(|lean| {
+                Predicate(Expr {
+                    lean: lean.clone(),
+                    rust: inv.rust_expr.clone().unwrap_or_default(),
+                    rust_pod: String::new(),
+                    rust_binary: String::new(),
+                    source_span: None,
+                })
+            }),
+        })
+        .collect()
+}
+
+fn lower_events(parsed: &ParsedSpec) -> Vec<EventDecl> {
+    parsed
+        .events
+        .iter()
+        .map(|ev| EventDecl {
+            name: ev.name.clone(),
+            fields: ev
+                .fields
+                .iter()
+                .map(|(n, t)| FieldDecl {
+                    name: n.clone(),
+                    ty: parse_ty(t),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+fn lower_handler(h: &crate::check::ParsedHandler) -> HandlerMir {
+    let transition = match (&h.pre_status, &h.post_status) {
+        (Some(pre), Some(post)) => Some((pre.clone(), post.clone())),
+        _ => None,
+    };
+
+    let (pre, requires_or_abort) = split_requires(&h.requires);
+
+    HandlerMir {
+        name: h.name.clone(),
+        doc: h.doc.clone(),
+        discriminant: None, // Anchor IDL extractor populates this elsewhere; Phase 0 stub
+        params: h
+            .takes_params
+            .iter()
+            .map(|(n, t)| (n.clone(), parse_ty(t)))
+            .collect(),
+        accounts: h.accounts.iter().map(lower_account_binding).collect(),
+        auth: lower_auth(h),
+        permissionless: h.permissionless,
+        transition,
+        pre,
+        requires_or_abort,
+        body: lower_body(h),
+        post: h
+            .ensures
+            .iter()
+            .map(|e| Predicate(Expr::from_ensures(e)))
+            .collect(),
+        modifies: h
+            .modifies
+            .as_ref()
+            .map(|m| m.iter().map(|s| Path::single(s.clone())).collect()),
+        emits: h.emits.clone(),
+        invariants: h.invariants.clone(),
+        establishes: h.establishes.clone(),
+        abstract_binders: h.abstract_binders.clone(),
+        aborts_total: h.aborts_total,
+    }
+}
+
+/// Split `ParsedRequires` into (pure pre-conditions, requires-or-abort).
+/// Clauses with `error_name = Some(...)` go to the requires-or-abort
+/// list (lowered to `Stmt::RequireOrAbort` in the body); clauses
+/// without go to `pre` (silent pre-conditions used in theorem
+/// hypotheses but not enforced via abort).
+fn split_requires(
+    requires: &[crate::check::ParsedRequires],
+) -> (Vec<Predicate>, Vec<RequireOrAbortClause>) {
+    let mut pre = Vec::new();
+    let mut roa = Vec::new();
+    for r in requires {
+        let expr = Expr::from_requires(r);
+        match &r.error_name {
+            Some(err) => roa.push(RequireOrAbortClause {
+                pred: Predicate(expr),
+                err: err.clone(),
+            }),
+            None => pre.push(Predicate(expr)),
+        }
+    }
+    (pre, roa)
+}
+
+fn lower_auth(h: &crate::check::ParsedHandler) -> Option<AccountOrField> {
+    h.who.as_ref().map(|who| {
+        // Dotted form was desugared in chumsky_adapter.rs:3144 — by the
+        // time we see it, `who` is the bare signer-account name (the
+        // dotted clause was synthesized into requires). But keep the
+        // structured form here so future passes can recover the original
+        // shape from a paired ParsedRequires lookup if needed.
+        AccountOrField::Account(AccountRef::ByBinding(who.clone()))
+    })
+}
+
+fn lower_account_binding(a: &crate::check::ParsedHandlerAccount) -> AccountBindingShape {
+    let kind = match a.account_type.as_deref() {
+        Some("token") => AccountKind::Token,
+        Some("mint") => AccountKind::Mint,
+        _ if a.is_program => AccountKind::Program,
+        _ if a.is_signer => AccountKind::Signer,
+        _ if a.pda_seeds.is_some() => AccountKind::Pda,
+        Some(_other) => AccountKind::TypedAccount,
+        None => AccountKind::Plain,
+    };
+
+    AccountBindingShape {
+        name: a.name.clone(),
+        writable: a.is_writable,
+        is_signer: a.is_signer,
+        init: false, // ParsedHandlerAccount doesn't carry `init` today;
+        // Anchor's #[account(init)] comes from account_attr —
+        // pre-v3.0 lives in a separate parser surface. v3.0
+        // unifies.
+        is_program: a.is_program,
+        kind,
+        authority: a
+            .authority
+            .as_ref()
+            .map(|name| AccountRef::ByBinding(name.clone())),
+        pda_ref: None, // inline `pda [seeds]` is captured on
+        // `ParsedHandlerAccount.pda_seeds`; top-level
+        // pdas live in AccountTable. v3.0 unifies.
+        imported_namespace: a.imported_namespace.clone(),
+        default_pubkey: a.default_pubkey.clone(),
+        account_type: a.account_type.clone(),
+    }
+}
+
+fn lower_body(h: &crate::check::ParsedHandler) -> Block {
+    let mut stmts = Vec::new();
+
+    // 1. RequireOrAbort clauses from `requires X else Err`.
+    for r in &h.requires {
+        if let Some(err) = &r.error_name {
+            stmts.push(Stmt::RequireOrAbort {
+                pred: Predicate(Expr::from_requires(r)),
+                err: err.clone(),
+            });
+        }
+    }
+
+    // 2. Aborts-if (legacy form, still appears in some specs).
+    for ab in &h.aborts_if {
+        stmts.push(Stmt::Abort(ab.error_name.clone()));
+    }
+
+    // 3. Effects → typed Stmt kinds per op_kind.
+    //    effect_on_error[i] (when present) supplies the per-site error name
+    //    for checked variants.
+    for (i, (field, op_kind, value)) in h.effects.iter().enumerate() {
+        let err_override = h.effect_on_error.get(i).and_then(|o| o.clone());
+        let path = parse_field_path(field);
+        let rhs = Expr::from_raw(value.clone());
+        let stmt = match op_kind.as_str() {
+            "set" => Stmt::Assign { path, rhs },
+            "add" => Stmt::CheckedAdd {
+                path,
+                delta: rhs,
+                err: err_override.unwrap_or_else(|| "Overflow".to_string()),
+            },
+            "sub" => Stmt::CheckedSub {
+                path,
+                delta: rhs,
+                err: err_override.unwrap_or_else(|| "Underflow".to_string()),
+            },
+            "add_wrap" => Stmt::WrapAdd { path, delta: rhs },
+            "sub_wrap" => Stmt::WrapSub { path, delta: rhs },
+            "add_sat" => Stmt::SatAdd { path, delta: rhs },
+            "sub_sat" => Stmt::SatSub { path, delta: rhs },
+            other => {
+                // Unknown op_kind — synthesize an Assign with a structured
+                // comment marker so codegens can surface it as a bug.
+                Stmt::Assign {
+                    path,
+                    rhs: Expr::from_raw(format!(
+                        "/* MIR-TODO: unknown op_kind `{other}` */ {value}"
+                    )),
+                }
+            }
+        };
+        stmts.push(stmt);
+    }
+
+    // 4. Transfers — desugar each into a TokenTransfer Stmt.
+    for tr in &h.transfers {
+        stmts.push(Stmt::TokenTransfer {
+            from: AccountRef::ByBinding(tr.from.clone()),
+            to: AccountRef::ByBinding(tr.to.clone()),
+            amount: tr
+                .amount
+                .as_ref()
+                .map(|a| Expr::from_raw(a.clone()))
+                .unwrap_or_default(),
+            authority: tr
+                .authority
+                .as_ref()
+                .map(|a| AccountRef::ByBinding(a.clone()))
+                .unwrap_or(AccountRef::ByBinding(tr.from.clone())),
+        });
+    }
+
+    // 5. Explicit CPI calls — Token.transfer → TokenTransfer;
+    //    everything else → generic Cpi.
+    for call in &h.calls {
+        let stmt = if call.target_interface == "Token" && call.target_handler == "transfer" {
+            let from = call_arg_account(&call.args, "from")
+                .unwrap_or_else(|| AccountRef::ByBinding("UNKNOWN_FROM".to_string()));
+            let to = call_arg_account(&call.args, "to")
+                .unwrap_or_else(|| AccountRef::ByBinding("UNKNOWN_TO".to_string()));
+            let amount = call_arg_expr(&call.args, "amount").unwrap_or_default();
+            let authority = call_arg_account(&call.args, "authority")
+                .unwrap_or_else(|| AccountRef::ByBinding("UNKNOWN_AUTH".to_string()));
+            Stmt::TokenTransfer {
+                from,
+                to,
+                amount,
+                authority,
+            }
+        } else {
+            Stmt::Cpi {
+                target: InterfaceRef(call.target_interface.clone()),
+                method: MethodRef(call.target_handler.clone()),
+                args: call
+                    .args
+                    .iter()
+                    .map(|a| CallArg {
+                        name: a.name.clone(),
+                        value: Expr {
+                            lean: a.lean_expr.clone(),
+                            rust: a.rust_expr.clone(),
+                            rust_pod: a.rust_expr_pod.clone(),
+                            rust_binary: String::new(),
+                            source_span: None,
+                        },
+                    })
+                    .collect(),
+                result_binding: call.result_binding.clone(),
+            }
+        };
+        stmts.push(stmt);
+    }
+
+    // 6. Event emissions.
+    for ev in &h.emits {
+        stmts.push(Stmt::Emit { event: ev.clone() });
+    }
+
+    // 7. ParsedEffectBranches: Phase 0c stub — emit a placeholder Abort
+    //    with a marker error name. Phase 5 fills in proper Branch
+    //    lowering. The TokenTransfer-using pilot fixtures don't trip
+    //    this path; this is purely a forward-compatibility hook.
+    if h.effect_branches.is_some() {
+        stmts.push(Stmt::Abort(
+            "__MIR_TODO_PHASE_5_BRANCH_LOWERING__".to_string(),
+        ));
+    }
+
+    Block { stmts }
+}
+
+/// Find a call argument by name and return it as an AccountRef.
+/// Accepts raw account-name strings (the qedspec `from = taker_ta`
+/// shape — `rust_expr` is `"taker_ta"`).
+fn call_arg_account(args: &[crate::check::ParsedCallArg], name: &str) -> Option<AccountRef> {
+    args.iter()
+        .find(|a| a.name == name)
+        .map(|a| AccountRef::ByBinding(a.rust_expr.trim().to_string()))
+}
+
+/// Find a call argument by name and return it as an Expr.
+fn call_arg_expr(args: &[crate::check::ParsedCallArg], name: &str) -> Option<Expr> {
+    args.iter().find(|a| a.name == name).map(|a| Expr {
+        lean: a.lean_expr.clone(),
+        rust: a.rust_expr.clone(),
+        rust_pod: a.rust_expr_pod.clone(),
+        rust_binary: String::new(),
+        source_span: None,
+    })
+}
+
+/// Parse a dotted field path like `state.admin` or `accounts.escrow_ta.amount`
+/// into a `Path`. For Phase 0, just splits on `.`.
+fn parse_field_path(s: &str) -> Path {
+    Path {
+        segments: s.split('.').map(|seg| seg.to_string()).collect(),
+    }
+}
+
+/// Parse a DSL type string into a `Ty`. Best-effort — unknown forms
+/// become `Ty::Custom(name)`. v3.0 will type-check this rigorously.
+fn parse_ty(s: &str) -> Ty {
+    match s.trim() {
+        "U8" => Ty::U8,
+        "U16" => Ty::U16,
+        "U32" => Ty::U32,
+        "U64" => Ty::U64,
+        "U128" => Ty::U128,
+        "I64" => Ty::I64,
+        "I128" => Ty::I128,
+        "Bool" => Ty::Bool,
+        "Pubkey" => Ty::Pubkey,
+        other => {
+            // Crude `Map[N] T` matcher — `Map[10] TokenAccount` etc.
+            if let Some(rest) = other.strip_prefix("Map[") {
+                if let Some(close) = rest.find(']') {
+                    let cap_str = &rest[..close];
+                    let inner = rest[close + 1..].trim();
+                    if let Ok(cap) = cap_str.parse::<u32>() {
+                        return Ty::Map {
+                            capacity: cap,
+                            value: Box::new(parse_ty(inner)),
+                        };
+                    }
+                }
+            }
+            Ty::Custom(other.to_string())
+        }
+    }
+}
+
+// ----------------------------------------------------------------------
+// Tests
+// ----------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path as FsPath;
+
+    // ---- Phase 0b: type-composition smoke tests ----
+
+    #[test]
+    fn mir_types_construct() {
+        let mir = Mir {
+            name: "Test".to_string(),
+            state: StateAdt::default(),
+            accounts: AccountTable::default(),
+            errors: ErrorEnum::default(),
+            interfaces: InterfaceRegistry::default(),
+            handlers: vec![],
+            invariants: vec![],
+            events: vec![],
+        };
+        assert_eq!(mir.name, "Test");
+        assert!(mir.handlers.is_empty());
+    }
+
+    #[test]
+    fn path_helpers() {
+        let p = Path::single("state");
+        assert_eq!(p.segments, vec!["state"]);
+
+        let p2 = Path::dotted(&["state", "admin"]);
+        assert_eq!(p2.segments, vec!["state", "admin"]);
+    }
+
+    #[test]
+    fn stmt_variants_compose() {
+        let _ = Stmt::RequireOrAbort {
+            pred: Predicate(Expr::default()),
+            err: "Unauthorized".to_string(),
+        };
+        let _ = Stmt::TokenTransfer {
+            from: AccountRef::ByBinding("src".to_string()),
+            to: AccountRef::ByBinding("dst".to_string()),
+            amount: Expr::default(),
+            authority: AccountRef::ByBinding("auth".to_string()),
+        };
+        let _ = Stmt::Assign {
+            path: Path::single("counter"),
+            rhs: Expr::default(),
+        };
+        let _ = Stmt::CheckedAdd {
+            path: Path::single("balance"),
+            delta: Expr::default(),
+            err: "Overflow".to_string(),
+        };
+        let _ = Stmt::Abort("InvalidState".to_string());
+        let _ = Stmt::Branch {
+            scrutinee: BranchScrutinee::Predicate(Predicate(Expr::default())),
+            arms: vec![],
+            default: None,
+        };
+    }
+
+    #[test]
+    fn parse_ty_known_forms() {
+        assert_eq!(parse_ty("U64"), Ty::U64);
+        assert_eq!(parse_ty("Pubkey"), Ty::Pubkey);
+        assert_eq!(parse_ty(" Bool "), Ty::Bool);
+        // Custom and Map forms parse to expected variants.
+        assert!(matches!(parse_ty("Snapshot"), Ty::Custom(s) if s == "Snapshot"));
+        let m = parse_ty("Map[10] TokenAccount");
+        match m {
+            Ty::Map { capacity, value } => {
+                assert_eq!(capacity, 10);
+                assert!(matches!(*value, Ty::Custom(s) if s == "TokenAccount"));
+            }
+            other => panic!("expected Map, got {:?}", other),
+        }
+    }
+
+    // ---- Phase 0d: fixture-based lowering tests ----
+    //
+    // Each test parses a real .qedspec from `examples/` and lowers it to
+    // MIR, asserting structural properties. Pass = lowering succeeds
+    // without panic and key features survive the round-trip.
+    //
+    // These tests use `parse_spec_file` which exercises the full
+    // chumsky parser + chumsky_adapter post-pass pipeline. Schema-include
+    // expansion and dotted-auth desugaring run before lowering sees the
+    // ParsedSpec, matching production usage.
+
+    fn lower_fixture(rel_path: &str) -> Mir {
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+        let workspace_root = FsPath::new(&manifest_dir)
+            .ancestors()
+            .nth(2)
+            .expect("workspace root above crates/qedgen");
+        let spec_path = workspace_root.join(rel_path);
+        assert!(
+            spec_path.exists(),
+            "fixture not found: {}",
+            spec_path.display()
+        );
+        // `parse_spec_file` handles both single-file and multi-file
+        // (directory) specs — escrow-split distributes its handlers
+        // across `handlers/*.qedspec` and needs the directory as input.
+        let parsed = crate::check::parse_spec_file(&spec_path)
+            .unwrap_or_else(|e| panic!("parse {}: {e}", spec_path.display()));
+        lower(&parsed)
+    }
+
+    #[test]
+    fn lower_escrow_pilot() {
+        let mir = lower_fixture("examples/rust/escrow/escrow.qedspec");
+
+        // Three handlers: initialize, exchange, cancel.
+        assert_eq!(mir.handlers.len(), 3, "expected 3 handlers");
+        let names: Vec<&str> = mir.handlers.iter().map(|h| h.name.as_str()).collect();
+        assert!(names.contains(&"initialize"));
+        assert!(names.contains(&"exchange"));
+        assert!(names.contains(&"cancel"));
+
+        // All three handlers carry lifecycle transitions.
+        for h in &mir.handlers {
+            assert!(
+                h.transition.is_some(),
+                "handler {} should have a transition",
+                h.name
+            );
+        }
+
+        // Each non-init handler emits ≥1 TokenTransfer in its body.
+        for h in &mir.handlers {
+            if h.name == "initialize" {
+                // initialize has 1 transfer (deposit)
+                let xfers = h
+                    .body
+                    .stmts
+                    .iter()
+                    .filter(|s| matches!(s, Stmt::TokenTransfer { .. }))
+                    .count();
+                assert_eq!(xfers, 1, "initialize should have 1 TokenTransfer");
+            } else if h.name == "exchange" {
+                let xfers = h
+                    .body
+                    .stmts
+                    .iter()
+                    .filter(|s| matches!(s, Stmt::TokenTransfer { .. }))
+                    .count();
+                assert_eq!(xfers, 2, "exchange should have 2 TokenTransfers");
+            } else if h.name == "cancel" {
+                let xfers = h
+                    .body
+                    .stmts
+                    .iter()
+                    .filter(|s| matches!(s, Stmt::TokenTransfer { .. }))
+                    .count();
+                assert_eq!(xfers, 1, "cancel should have 1 TokenTransfer");
+            }
+        }
+
+        // exchange and cancel both have `requires X else Unauthorized`
+        // → RequireOrAbort in body.
+        for name in ["exchange", "cancel"] {
+            let h = mir.handlers.iter().find(|h| h.name == name).unwrap();
+            let roa_count = h
+                .body
+                .stmts
+                .iter()
+                .filter(|s| matches!(s, Stmt::RequireOrAbort { .. }))
+                .count();
+            assert!(
+                roa_count >= 1,
+                "{} should have ≥1 RequireOrAbort, found {}",
+                name,
+                roa_count
+            );
+        }
+
+        // initialize has `requires deposit_amount > 0 and receive_amount > 0 else InvalidAmount`.
+        let init = mir
+            .handlers
+            .iter()
+            .find(|h| h.name == "initialize")
+            .unwrap();
+        let roa = init
+            .body
+            .stmts
+            .iter()
+            .filter(|s| matches!(s, Stmt::RequireOrAbort { .. }))
+            .count();
+        assert!(roa >= 1, "initialize should have ≥1 RequireOrAbort");
+
+        // Three error variants declared.
+        assert!(mir.errors.variants.contains(&"InvalidAmount".to_string()));
+        assert!(mir.errors.variants.contains(&"Unauthorized".to_string()));
+        assert!(mir.errors.variants.contains(&"AlreadyClosed".to_string()));
+
+        // State is a multi-variant ADT (Uninitialized | Open | Closed).
+        assert!(mir.state.variants.len() >= 2);
+
+        // PDA `escrow` declared.
+        assert!(
+            mir.accounts.pdas.contains_key("escrow"),
+            "PDA 'escrow' should be in AccountTable.pdas, found: {:?}",
+            mir.accounts.pdas.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn lower_lending_pilot() {
+        let mir = lower_fixture("examples/rust/lending/lending.qedspec");
+        assert!(!mir.handlers.is_empty(), "lending has handlers");
+        // Lending uses TokenTransfer for deposit/withdraw flows.
+        let total_xfers: usize = mir
+            .handlers
+            .iter()
+            .map(|h| {
+                h.body
+                    .stmts
+                    .iter()
+                    .filter(|s| matches!(s, Stmt::TokenTransfer { .. }))
+                    .count()
+            })
+            .sum();
+        assert!(total_xfers > 0, "lending should lower TokenTransfers");
+
+        // Every handler should have well-formed account bindings.
+        for h in &mir.handlers {
+            assert!(
+                !h.accounts.is_empty(),
+                "handler {} should have account bindings",
+                h.name
+            );
+        }
+    }
+
+    #[test]
+    fn lower_multisig_pilot() {
+        let mir = lower_fixture("examples/rust/multisig/multisig.qedspec");
+        assert!(!mir.handlers.is_empty());
+
+        // Multisig has RequireOrAbort dominance — most clauses carry
+        // `else Err`.
+        let total_roa: usize = mir
+            .handlers
+            .iter()
+            .map(|h| {
+                h.body
+                    .stmts
+                    .iter()
+                    .filter(|s| matches!(s, Stmt::RequireOrAbort { .. }))
+                    .count()
+            })
+            .sum();
+        assert!(
+            total_roa > 0,
+            "multisig should lower RequireOrAbort clauses"
+        );
+    }
+
+    #[test]
+    fn lower_bundled_stdlib_demo() {
+        let mir = lower_fixture("examples/rust/bundled-stdlib-demo/pool.qedspec");
+        assert!(!mir.handlers.is_empty());
+    }
+
+    #[test]
+    fn lower_effects_to_typed_stmt() {
+        // Walk every handler in every pilot fixture and confirm each
+        // effect op_kind lowers to its typed Stmt kind (not the
+        // unknown-op fallback marker).
+        for fixture in &[
+            "examples/rust/escrow/escrow.qedspec",
+            "examples/rust/lending/lending.qedspec",
+            "examples/rust/multisig/multisig.qedspec",
+            "examples/rust/bundled-stdlib-demo/pool.qedspec",
+        ] {
+            let mir = lower_fixture(fixture);
+            for h in &mir.handlers {
+                for s in &h.body.stmts {
+                    if let Stmt::Assign { rhs, .. } = s {
+                        // Unknown op_kind path tags the RHS with a TODO comment.
+                        // If any Assign carries that, our op-kind switch missed something.
+                        assert!(
+                            !rhs.rust.starts_with("/* MIR-TODO: unknown op_kind"),
+                            "fixture {} has unknown-op_kind effect: {}",
+                            fixture,
+                            rhs.rust
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lower_preserves_handler_count_across_pilot() {
+        // Smoke: every pilot fixture parses + lowers without panic and
+        // yields ≥1 handler. Catches future parser regressions or
+        // lowering-side panics.
+        for fixture in &[
+            "examples/rust/escrow/escrow.qedspec",
+            "examples/rust/escrow-split",
+            "examples/rust/lending/lending.qedspec",
+            "examples/rust/multisig/multisig.qedspec",
+            "examples/rust/bundled-stdlib-demo/pool.qedspec",
+        ] {
+            let mir = lower_fixture(fixture);
+            assert!(
+                !mir.handlers.is_empty(),
+                "{} should have ≥1 handler in MIR",
+                fixture
+            );
+        }
+    }
+}
