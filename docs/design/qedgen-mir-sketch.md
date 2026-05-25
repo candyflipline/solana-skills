@@ -1,8 +1,8 @@
 # qedgen MIR — design sketch
 
-**Status:** Phase 1 + 2 complete (Lean MIR-default). Phase 3 complete (Kani MIR-default, `QEDGEN_LEGACY_KANI=1` escape hatch). **Phase 4a in progress (Anchor/Quasar codegen)**: `codegen_mir.rs` scaffold shipped with pure-delegation `generate` body — `QEDGEN_USE_MIR_CODEGEN=1` opt-in routes through MIR, which calls each promoted-pub(crate) `codegen::generate_<X>` sub-generator in legacy's order. Byte-identical to default across the entire `programs/` tree on every pilot (90 files total). Phase 4b+ migrates sub-generators one at a time, smallest-first. Remaining: proptest (2,110 LoC).
+**Status:** Phase 1 + 2 complete (Lean MIR-default). Phase 3 complete (Kani MIR-default). **Phase 4 complete (Anchor/Quasar codegen MIR-default)**: 9 of 10 sub-generators MIR-direct (cargo_toml / math / events / errors / ref_impls / imported_mirror / lib / state / instructions); `guards` (636L) stays delegated to legacy pending a typed-Stmt MIR refactor (v3.0). `QEDGEN_LEGACY_CODEGEN=1` escape hatch. Snapshot tests in `tests/codegen_snapshot.rs` gate every pilot via concatenated `programs/` tree dumps (6 pilots — cross-program-vault skipped due to sibling-import resolution). All 7 fixtures (incl. cross-program-vault) byte-identical default-vs-forced-legacy. Remaining: proptest (2,110 LoC).
 
-**Last revised:** 2026-05-25 (Phase 4a Anchor codegen scaffold).
+**Last revised:** 2026-05-25 (Phase 4i Anchor codegen dispatch flip — Phase 4 complete).
 
 **Companion docs** (read these first if you want measured evidence behind the claims here):
 
@@ -410,14 +410,19 @@ unconditionally — MIR's `is_sbpf` is still a Phase-0 stub; records
 `rust_codegen_util::emit_record_structs`, so no records carve-out
 needed (unlike the Lean side).
 
-**Anchor.** Phase 4a shipped: `codegen_mir.rs` scaffold with
-pure-delegation `generate` that calls each promoted-pub(crate)
-`codegen::generate_<X>` sub-generator. Byte-identical across the
-entire `programs/` tree on every pilot. Future slices migrate the
-sub-generators one at a time, smallest-first (4b: cargo_toml +
-math + events; 4c: errors + ref_impls; 4d: imported_mirror;
-4e: lib; 4f: state; 4g: guards — largest; 4h: instructions;
-4i: snapshot tests + dispatch flip).
+**Anchor.** Phase 4a–4i shipped. **MIR is the default
+Anchor/Quasar codegen path** post Phase 4i flip
+(`QEDGEN_LEGACY_CODEGEN=1` escape hatch). 9 of 10 sub-generators
+MIR-direct: 4b cargo_toml + math + events, 4c errors +
+ref_impls, 4d imported_mirror, 4e lib, 4f state, 4h instructions.
+4g `generate_guards` (636L) intentionally stays delegated to
+legacy — its per-handler `requires` / `effects` / `auth` / `status`
+emission is deeply coupled to `ParsedHandler` fields with no
+clean structural seam; a meaningful MIR port requires lifting
+requires + effects into typed `Stmt` nodes first (a separate
+v3.0-class refactor). Snapshot tests in `tests/codegen_snapshot.rs`
+gate every pilot via concatenated `programs/` tree dumps with
+`--- <relpath> ---` headers between files.
 
 **Proptest.** Untouched — `proptest_gen.rs` (2,110 LoC) still
 consumes `ParsedSpec` directly. Same Phase-3-style port shape

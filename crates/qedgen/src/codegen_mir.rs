@@ -155,11 +155,7 @@ pub fn generate(
         + usize::from(!parsed.events.is_empty())
         + usize::from(!parsed.error_codes.is_empty());
 
-    eprintln!(
-        "[MIR-pilot] Generated {} files in {}",
-        file_count,
-        output_dir.display()
-    );
+    eprintln!("Generated {} files in {}", file_count, output_dir.display());
 
     Ok(())
 }
