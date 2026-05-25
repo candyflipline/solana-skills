@@ -156,12 +156,19 @@ pub fn render(mir: &Mir, parsed: &ParsedSpec) -> String {
         ));
     }
 
-    // Phase 3c2+ stub. Remaining harness sections (abort, property
+    if let Err(e) = emit_abort_condition_harnesses(&mut out, parsed) {
+        out.push_str(&format!(
+            "// MIR-ERROR: abort-condition emit failed: {}\n",
+            e
+        ));
+    }
+
+    // Phase 3c3+ stub. Remaining harness sections (property
     // preservation, invariant preservation, effect conformance,
     // overflow detection) + file-level features (covers / liveness /
     // environment) emit here in subsequent slices.
     out.push_str(
-        "// MIR-TODO(phase-3c2+): abort / property-preservation / invariant-preservation / \
+        "// MIR-TODO(phase-3c3+): property-preservation / invariant-preservation / \
          effect / overflow harnesses + file-level features (covers / liveness / environment) \
          not ported yet — fall back to legacy `kani.rs` for production output.\n",
     );
@@ -534,6 +541,107 @@ fn emit_guard_enforcement_harnesses(out: &mut String, parsed: &ParsedSpec) -> Re
 }
 
 // ----------------------------------------------------------------------
+// Section emitters — Phase 3c2 abort-condition harnesses
+// ----------------------------------------------------------------------
+
+/// Emit `#[kani::proof] fn verify_<handler>_aborts_if_<error>()` for
+/// every `requires X else Error` clause across every handler.
+/// Mirrors `kani::emit_kani_account_section` lines ~501–565.
+///
+/// One harness per (handler, abort clause):
+///   * Symbolic state + pre-status assume + symbolic params +
+///     (double-emit) abstract binders (bug-for-bug parity)
+///   * `kani::assume(<abort.rust_expr>)` — the condition that
+///     should trigger abortion
+///   * `assert!(!<handler>(...))` — handler must reject
+fn emit_abort_condition_harnesses(out: &mut String, parsed: &ParsedSpec) -> Result<()> {
+    use crate::codegen::map_type;
+    use crate::rust_codegen_util as util;
+
+    // Resolve view — same logic as `emit_account_section_structural`.
+    let (state_fields, lifecycle): (&[(String, String)], &[String]) =
+        if parsed.account_types.len() == 1 {
+            (
+                &parsed.account_types[0].fields,
+                parsed.account_types[0].lifecycle.as_slice(),
+            )
+        } else if parsed.account_types.is_empty() {
+            (
+                util::resolve_state_fields(parsed),
+                parsed.lifecycle_states.as_slice(),
+            )
+        } else {
+            (
+                &parsed.account_types[0].fields,
+                parsed.account_types[0].lifecycle.as_slice(),
+            )
+        };
+    let mutable = util::mutable_fields(state_fields);
+
+    let abort_ops: Vec<&crate::check::ParsedHandler> = parsed
+        .handlers
+        .iter()
+        .filter(|op| !op.aborts_if.is_empty())
+        .collect();
+
+    if abort_ops.is_empty() {
+        return Ok(());
+    }
+
+    out.push_str(
+        "// ============================================================================\n",
+    );
+    out.push_str("// Abort conditions — operations must reject under specified conditions\n");
+    out.push_str(
+        "// ============================================================================\n\n",
+    );
+
+    for op in &abort_ops {
+        for abort in &op.aborts_if {
+            out.push_str("#[kani::proof]\n");
+            out.push_str("#[kani::unwind(2)]\n");
+            out.push_str("#[kani::solver(cadical)]\n");
+            out.push_str(&format!(
+                "fn verify_{}_aborts_if_{}() {{\n",
+                op.name, abort.error_name
+            ));
+
+            util::emit_state_init_symbolic(out, &mutable, lifecycle);
+            util::emit_pre_status_assume(out, op, lifecycle);
+
+            for (pname, ptype) in &op.takes_params {
+                out.push_str(&format!(
+                    "    let {}: {} = kani::any();\n",
+                    pname,
+                    map_type(ptype, parsed)?
+                ));
+            }
+            // Bug-for-bug parity: legacy double-calls
+            // `emit_abstract_binders`. See guard-enforcement comment.
+            util::emit_abstract_binders(out, op, "    ", "kani::any()", |t| map_type(t, parsed))?;
+            util::emit_abstract_binders(out, op, "    ", "kani::any()", |t| map_type(t, parsed))?;
+
+            out.push_str(&format!("    kani::assume({});\n", abort.rust_expr));
+
+            let args: String = op
+                .takes_params
+                .iter()
+                .chain(op.abstract_binders.iter())
+                .map(|(n, _)| format!(", {}", n))
+                .collect();
+            out.push_str(&format!("    assert!(!{}(&mut s{}),\n", op.name, args));
+            out.push_str(&format!(
+                "        \"{} must abort with {}\");\n",
+                op.name, abort.error_name
+            ));
+            out.push_str("}\n\n");
+        }
+    }
+
+    Ok(())
+}
+
+// ----------------------------------------------------------------------
 // Tests
 // ----------------------------------------------------------------------
 
@@ -606,16 +714,33 @@ mod tests {
     }
 
     #[test]
-    fn render_emits_phase_3c2_todo_marker() {
+    fn render_emits_phase_3c3_todo_marker() {
         // Until subsequent slices port the remaining harness-emit
-        // sections (abort / property / invariant / effect / overflow
-        // / file-level features), every rendered file carries the
-        // structured TODO marker so users know what's missing.
+        // sections (property-preservation / invariant-preservation /
+        // effect / overflow / file-level features), every rendered
+        // file carries the structured TODO marker so users know
+        // what's missing.
         let (mir, parsed) = lower_fixture("examples/rust/escrow/escrow.qedspec");
         let out = render(&mir, &parsed);
         assert!(
-            out.contains("MIR-TODO(phase-3c2+)"),
-            "expected phase-3c2+ TODO marker"
+            out.contains("MIR-TODO(phase-3c3+)"),
+            "expected phase-3c3+ TODO marker"
+        );
+    }
+
+    #[test]
+    fn render_emits_no_abort_section_when_no_aborts_if() {
+        // Phase 3c2 — `emit_abort_condition_harnesses` only fires when
+        // `op.aborts_if` is non-empty, which is the direct
+        // `aborts_if Pred Error` DSL form. Current pilots use
+        // `requires X else Err` which lowers to a different field
+        // (`requires_or_abort`), so the section header doesn't emit.
+        // This asserts the no-op behavior matches legacy.
+        let (mir, parsed) = lower_fixture("examples/rust/escrow/escrow.qedspec");
+        let out = render(&mir, &parsed);
+        assert!(
+            !out.contains("// Abort conditions —"),
+            "expected no abort-conditions section for pilots without `aborts_if`"
         );
     }
 
