@@ -1895,28 +1895,27 @@ fn resolve_and_merge_imports(
         let local_ns_name = merged.name.clone();
         parsed.interfaces.push(merged);
 
-        // v2.29 Slice F — capture full-spec import bookkeeping.
-        // Whenever the imported source carries account types beyond
-        // what an interface stub would (the bundled SPL Token /
-        // System Program / Metaplex stubs declare none), record
-        // them under the local namespace name so Slice H can emit
-        // a Rust mirror at `src/imported/<ns>.rs` and Slice G's
-        // type-ref resolver can recognize `<ns>.<Type>` in
-        // account-binding positions.
+        // v2.30 (mir / unified imports) — every imported source
+        // registers here, including the bundled SPL Token / System
+        // Program / Metaplex stubs whose `account_types` is empty.
+        // `parsed.imported_namespaces` is the single canonical
+        // parse-layer truth for "every imported source"; the empty
+        // case is meaningful (Tier-0 interface stubs), not a
+        // suppression signal. The "is there anything to mirror?"
+        // decision moves to codegen.rs (see `generate_imported_mirror`).
         //
         // The local name follows the same alias-or-bound-name rule
         // as the interface merge so the consumer-side type ref
-        // matches the consumer-side call name. Bundled stubs flow
-        // through the same loop but leave the map empty — their
-        // `imported.account_types` is empty by construction.
-        if !imported.account_types.is_empty() {
-            let ns = ImportedNamespace {
-                dep_key: r.dep_key.clone(),
-                account_types: imported.account_types.clone(),
-                records: imported.records.clone(),
-            };
-            parsed.imported_namespaces.insert(local_ns_name, ns);
-        }
+        // matches the consumer-side call name.
+        //
+        // See docs/design/mir-unified-imports.md §"Migration sequence"
+        // step 0 for the rationale.
+        let ns = ImportedNamespace {
+            dep_key: r.dep_key.clone(),
+            account_types: imported.account_types.clone(),
+            records: imported.records.clone(),
+        };
+        parsed.imported_namespaces.insert(local_ns_name, ns);
     }
     // Dedup while preserving first-seen DFS order — handles diamond
     // dep shapes where the same provider is reached via two import

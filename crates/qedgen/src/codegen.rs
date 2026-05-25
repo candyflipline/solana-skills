@@ -760,7 +760,17 @@ fn generate_lib(
     // namespace) by `generate_imported_mirror`. Empty for specs that
     // import only interface stubs (the bundled SPL Token / System
     // Program / Metaplex stubs declare no `type`s; nothing to mirror).
-    if !spec.imported_namespaces.is_empty() {
+    //
+    // v2.30 (mir / unified imports): every imported source now
+    // registers in `imported_namespaces` (bundled stubs included),
+    // so the "anything to mirror?" decision moves here — we emit
+    // `pub mod imported;` only when at least one entry carries
+    // non-empty `account_types`.
+    if spec
+        .imported_namespaces
+        .values()
+        .any(|ns| !ns.account_types.is_empty())
+    {
         out.push_str("pub mod imported;\n");
     }
     out.push('\n');
@@ -1274,7 +1284,16 @@ fn generate_imported_mirror(
     output_dir: &Path,
     target: Target,
 ) -> Result<()> {
-    if spec.imported_namespaces.is_empty() {
+    // v2.30 (mir / unified imports): every imported source registers
+    // in `imported_namespaces`, but only those with non-empty
+    // `account_types` produce a mirror file. Tier-0 interface stubs
+    // (SPL Token / System Program / Metaplex) carry no `type`
+    // declarations — skip them.
+    if !spec
+        .imported_namespaces
+        .values()
+        .any(|ns| !ns.account_types.is_empty())
+    {
         return Ok(());
     }
     let surface = FrameworkSurface::for_target(target);
@@ -1286,6 +1305,11 @@ fn generate_imported_mirror(
     // sorted by local name so the generated mod.rs re-exports stay
     // deterministic across runs.
     for (local_name, ns) in &spec.imported_namespaces {
+        // Skip Tier-0 stubs whose `account_types` is empty —
+        // no Rust mirror to emit.
+        if ns.account_types.is_empty() {
+            continue;
+        }
         let mut out = String::new();
         let file_rel = format!("src/imported/{}.rs", local_name);
         out.push_str(&marker("DO NOT EDIT", fp, &file_rel));
@@ -1470,7 +1494,13 @@ fn generate_imported_mirror(
     mod_out.push_str(&marker("DO NOT EDIT", fp, "src/imported/mod.rs"));
     mod_out.push_str("//! v2.29 Slice H — re-exports for imported namespace mirrors.\n\n");
     mod_out.push_str("#![allow(non_snake_case)]\n\n");
-    for local_name in spec.imported_namespaces.keys() {
+    // v2.30: only re-export namespaces that actually produced a
+    // mirror file (account_types non-empty). Tier-0 stubs registered
+    // in `imported_namespaces` are silent on the codegen side.
+    for (local_name, ns) in &spec.imported_namespaces {
+        if ns.account_types.is_empty() {
+            continue;
+        }
         mod_out.push_str(&format!("pub mod {};\n", local_name));
     }
     mod_out.push_str("\n// ---- END GENERATED ----\n");
@@ -5240,14 +5270,13 @@ pub fn generate(spec_path: &Path, output_dir: &Path, target: crate::Target) -> R
     // v2.26 Slice 3: emit ref_impls module so program code can call
     // declared `ref_impl` fns from guards / handlers / properties.
     generate_ref_impls(&spec, &fp, output_dir, target)?;
-    // v2.29 Slice H: emit `src/imported/<ns>.rs` mirrors so handler
-    // accounts blocks can name `<ns>::<Type>` without depending on
-    // the foreign crate. No-op for specs that import only interface
-    // stubs (bundled SPL Token / System Program / Metaplex carry no
-    // `type` declarations).
-    if !spec.imported_namespaces.is_empty() {
-        generate_imported_mirror(&spec, &fp, output_dir, target)?;
-    }
+    // v2.29 Slice H / v2.30 unified imports: emit `src/imported/<ns>.rs`
+    // mirrors so handler accounts blocks can name `<ns>::<Type>` without
+    // depending on the foreign crate. The inner generator no-ops when
+    // no entry carries `account_types` (bundled SPL Token / System
+    // Program / Metaplex stubs); the early-exit logic lives there
+    // rather than at this call site.
+    generate_imported_mirror(&spec, &fp, output_dir, target)?;
     generate_cargo_toml(&spec, &fp, output_dir, target)?;
 
     let file_count = 4
