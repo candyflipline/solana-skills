@@ -136,7 +136,8 @@ pub fn generate(
     }
     // Phase 4c/2 — MIR-direct port.
     emit_ref_impls(mir, parsed, &fp, output_dir, target)?;
-    crate::codegen::generate_imported_mirror(parsed, &fp, output_dir, target)?;
+    // Phase 4d — MIR-direct port.
+    emit_imported_mirror(mir, parsed, &fp, output_dir, target)?;
     // Phase 4b/1 — MIR-direct port.
     emit_cargo_toml(mir, &fp, output_dir, target)?;
 
@@ -247,6 +248,240 @@ fn render_cargo_toml(
     out.push_str("\n[workspace]\n");
 
     out
+}
+
+/// Emit `src/imported/<ns>.rs` mirror files + `src/imported/mod.rs`
+/// re-export aggregator. MIR-direct port of
+/// `codegen::generate_imported_mirror`.
+///
+/// Iteration source is `mir.imports: BTreeMap<Symbol,
+/// ImportedSpecMir>` (Phase 1c-7 unified imports). Each
+/// `ImportedSpecMir.account_types` / `.records` is
+/// `Vec<ParsedAccountType>` / `Vec<ParsedRecordType>` directly —
+/// MIR mirrors the parsed shapes verbatim, so iteration is a 1:1
+/// translation. `dep_key` extraction goes through the
+/// `ImportOrigin` enum (`Builtin(k)` / `File(k)` both wrap a key;
+/// `Inline` has no source artifact and never produces a mirror).
+///
+/// Tier-0 stubs (SPL Token, System Program, Metaplex bundled) have
+/// `account_types.is_empty()` and skip both the per-namespace file
+/// and the mod.rs re-export (matches legacy line ~1296–1302 +
+/// 1505–1509 gating).
+fn emit_imported_mirror(
+    mir: &Mir,
+    parsed: &ParsedSpec,
+    fp: &crate::fingerprint::SpecFingerprint,
+    output_dir: &Path,
+    target: Target,
+) -> Result<()> {
+    // Early exit when no imported namespace carries account_types.
+    if !mir
+        .imports
+        .values()
+        .any(|imp| !imp.account_types.is_empty())
+    {
+        return Ok(());
+    }
+
+    let (prelude_import, explicit_account_discriminator): (&str, bool) = match target {
+        Target::Anchor => ("use anchor_lang::prelude::*;\n", false),
+        Target::Quasar => ("use quasar_lang::prelude::*;\n", true),
+        Target::Pinocchio => unreachable!("Pinocchio is rejected at the init dispatcher"),
+    };
+
+    let src_dir = output_dir.join("src");
+    let imported_dir = src_dir.join("imported");
+    std::fs::create_dir_all(&imported_dir)?;
+
+    // Per-namespace file emission. BTreeMap order is sorted by
+    // alias for deterministic output.
+    for (local_name, imp) in &mir.imports {
+        if imp.account_types.is_empty() {
+            continue;
+        }
+        let dep_key = match &imp.origin {
+            crate::mir::ImportOrigin::Builtin(k) | crate::mir::ImportOrigin::File(k) => k.clone(),
+            crate::mir::ImportOrigin::Inline => {
+                // Inline interface — no source artifact + already
+                // gated out by `account_types.is_empty()` above
+                // (inline blocks never declare account_types). Skip
+                // defensively.
+                continue;
+            }
+        };
+
+        let mut out = String::new();
+        let file_rel = format!("src/imported/{}.rs", local_name);
+        out.push_str(&crate::codegen::marker("DO NOT EDIT", fp, &file_rel));
+        out.push_str(&format!(
+            "//! v2.29 Slice H mirror of `{0}`'s account types\n\
+             //! (sourced from dep `{1}`).\n\
+             //!\n\
+             //! Hand-editing is unsafe: every `qedgen codegen` regenerates\n\
+             //! this file from the imported `.qedspec`'s `type` declarations.\n\
+             //! To change a field, change the imported spec and re-resolve.\n\n",
+            local_name, dep_key,
+        ));
+        out.push_str(prelude_import);
+        out.push('\n');
+
+        // Records — declared first so account_types can reference them.
+        for record in &imp.records {
+            out.push_str("#[repr(C)]\n");
+            let derives = match target {
+                Target::Anchor => "#[derive(AnchorSerialize, AnchorDeserialize, InitSpace, Clone, Copy, Debug, PartialEq)]\n",
+                _ => "#[derive(Clone, Copy)]\n",
+            };
+            out.push_str(derives);
+            out.push_str(&format!("pub struct {} {{\n", record.name));
+            for (fname, ftype) in &record.fields {
+                let rust_ty = crate::codegen::map_type_for_target(ftype, parsed, target)?;
+                out.push_str(&format!("    pub {}: {},\n", fname, rust_ty));
+            }
+            out.push_str("}\n\n");
+        }
+
+        // Account types — single-variant flat struct or multi-
+        // variant wrapper+inner enum, mirroring `generate_state`'s
+        // dispatch shape.
+        for (idx, acct) in imp.account_types.iter().enumerate() {
+            let is_multi_variant = acct.variants.len() > 1;
+            let account_attr = if explicit_account_discriminator {
+                format!("#[account(discriminator = {})]\n", idx + 1)
+            } else {
+                "#[account]\n".to_string()
+            };
+
+            if !is_multi_variant {
+                out.push_str(&format!("{}pub struct {} {{\n", account_attr, acct.name));
+                for (fname, ftype) in &acct.fields {
+                    let rust_ty = crate::codegen::map_type_for_target(ftype, parsed, target)?;
+                    out.push_str(&format!("    pub {}: {},\n", fname, rust_ty));
+                }
+                if !acct.lifecycle.is_empty() && !acct.fields.iter().any(|(n, _)| n == "status") {
+                    out.push_str("    pub status: u8,\n");
+                }
+                out.push_str("}\n\n");
+
+                if !acct.lifecycle.is_empty() {
+                    out.push_str(&format!(
+                        "/// {} lifecycle states (mirrored from `{}`).\n",
+                        acct.name, dep_key
+                    ));
+                    out.push_str("#[derive(Clone, Copy, PartialEq, Eq)]\n");
+                    out.push_str("#[repr(u8)]\n");
+                    out.push_str(&format!("pub enum {}Status {{\n", acct.name));
+                    for (i, state) in acct.lifecycle.iter().enumerate() {
+                        out.push_str(&format!("    {} = {},\n", state, i));
+                    }
+                    out.push_str("}\n\n");
+                }
+                continue;
+            }
+
+            // Multi-variant ADT: wrapper struct + inner enum.
+            let inner_name = format!("{}Inner", acct.name);
+            out.push_str(&format!("{}pub struct {} {{\n", account_attr, acct.name));
+            out.push_str(&format!("    pub inner: {},\n", inner_name));
+            out.push_str("}\n\n");
+
+            out.push_str(&format!(
+                "/// Variant-payload state for `{0}` (mirrored from `{1}`).\n",
+                acct.name, dep_key
+            ));
+            out.push_str(
+                "#[derive(AnchorSerialize, AnchorDeserialize, InitSpace, Clone, Debug, PartialEq)]\n",
+            );
+            out.push_str(&format!("pub enum {} {{\n", inner_name));
+            for variant in &acct.variants {
+                if variant.fields.is_empty() {
+                    out.push_str(&format!("    {},\n", variant.name));
+                } else {
+                    out.push_str(&format!("    {} {{\n", variant.name));
+                    for (fname, ftype) in &variant.fields {
+                        out.push_str(&format!(
+                            "        {}: {},\n",
+                            fname,
+                            crate::codegen::map_type_for_target(ftype, parsed, target)?
+                        ));
+                    }
+                    out.push_str("    },\n");
+                }
+            }
+            out.push_str("}\n\n");
+
+            // Slice B accessor pattern — fields that appear with
+            // consistent type across variants get an accessor.
+            let mut field_index: std::collections::BTreeMap<String, Vec<(String, String)>> =
+                std::collections::BTreeMap::new();
+            for variant in &acct.variants {
+                for (fname, ftype) in &variant.fields {
+                    field_index
+                        .entry(fname.clone())
+                        .or_default()
+                        .push((variant.name.clone(), ftype.clone()));
+                }
+            }
+            if !field_index.is_empty() {
+                out.push_str(&format!("impl {} {{\n", inner_name));
+                for (fname, occurrences) in &field_index {
+                    let first_ty = &occurrences[0].1;
+                    if occurrences.iter().any(|(_, t)| t != first_ty) {
+                        continue;
+                    }
+                    let rust_ty = crate::codegen::map_type_for_target(first_ty, parsed, target)?;
+                    out.push_str(&format!(
+                        "    /// v2.29 Slice H accessor for `{0}`. Panics on variants\n\
+                         /// that don't carry the field — the per-handler lifecycle\n\
+                         /// check at the top of each `crate::guards::*` fn prevents\n\
+                         /// the panic arm from being reached at runtime.\n",
+                        fname
+                    ));
+                    out.push_str(&format!(
+                        "    pub fn {}(&self) -> &{} {{\n        match self {{\n",
+                        fname, rust_ty
+                    ));
+                    for (variant_name, _) in occurrences {
+                        out.push_str(&format!(
+                            "            Self::{} {{ {}, .. }} => {},\n",
+                            variant_name, fname, fname
+                        ));
+                    }
+                    if occurrences.len() < acct.variants.len() {
+                        out.push_str(&format!(
+                            "            _ => panic!(\"{}::{}() called on a variant without `{}`\"),\n",
+                            inner_name, fname, fname
+                        ));
+                    }
+                    out.push_str("        }\n    }\n");
+                }
+                out.push_str("}\n\n");
+            }
+        }
+
+        out.push_str("// ---- END GENERATED ----\n");
+        std::fs::write(imported_dir.join(format!("{}.rs", local_name)), &out)?;
+    }
+
+    // mod.rs re-export aggregator. Mirrors legacy line ~1497–1511.
+    let mut mod_out = String::new();
+    mod_out.push_str(&crate::codegen::marker(
+        "DO NOT EDIT",
+        fp,
+        "src/imported/mod.rs",
+    ));
+    mod_out.push_str("//! v2.29 Slice H — re-exports for imported namespace mirrors.\n\n");
+    mod_out.push_str("#![allow(non_snake_case)]\n\n");
+    for (local_name, imp) in &mir.imports {
+        if imp.account_types.is_empty() {
+            continue;
+        }
+        mod_out.push_str(&format!("pub mod {};\n", local_name));
+    }
+    mod_out.push_str("\n// ---- END GENERATED ----\n");
+    std::fs::write(imported_dir.join("mod.rs"), mod_out)?;
+
+    Ok(())
 }
 
 /// Emit `src/errors.rs` — `#[error_code] pub enum <Name>Error { ... }`
