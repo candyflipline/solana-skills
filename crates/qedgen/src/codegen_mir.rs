@@ -127,7 +127,14 @@ pub fn generate(
     emit_events(mir, parsed, &fp, output_dir, target)?;
     // Phase 4c/1 — MIR-direct port.
     emit_errors(mir, parsed, &fp, output_dir, target)?;
-    crate::codegen::generate_instructions(parsed, &fp, spec_path, output_dir, target)?;
+    // Phase 4h — MIR-direct port.
+    emit_instructions(mir, parsed, &fp, spec_path, output_dir, target)?;
+    // Phase 4g — deferred. `generate_guards` is 636L of per-handler
+    // `requires` / `effects` / `auth` / `status` emission deeply
+    // coupled to `ParsedHandler` fields with no clean structural
+    // seam. A meaningful MIR port requires lifting requires +
+    // effects into typed `Stmt` nodes first — that's a separate
+    // v3.0-class refactor. Until then, delegate to legacy.
     crate::codegen::generate_guards(parsed, &fp, output_dir, target)?;
     // Phase 4b/2 — MIR-direct port. `generate_math` body is
     // fully deterministic (no spec read at all), so the gate is
@@ -477,6 +484,107 @@ fn emit_lib(
     out.push_str("// ---- END GENERATED ----\n");
 
     std::fs::write(src_dir.join("lib.rs"), &out)?;
+    Ok(())
+}
+
+/// Emit `src/instructions/mod.rs` + per-handler
+/// `src/instructions/<name>.rs` scaffold files. MIR-direct port of
+/// `codegen::generate_instructions` (77L entry — the per-handler
+/// emit body lives in `render_handler_scaffold`, a 600+ LoC helper
+/// promoted to `pub(crate)` and called unchanged).
+///
+/// Per-handler `<name>.rs` files are USER-OWNED — emitted only when
+/// missing. The `mod.rs` re-exporter is always regenerated.
+///
+/// Reads from MIR for iteration (`mir.handlers[*].name`); falls back
+/// to `parsed` for the per-handler scaffold body
+/// (`ParsedHandler` carries the accounts / effects / auth /
+/// transition / takes_params data the scaffold renders).
+fn emit_instructions(
+    mir: &Mir,
+    parsed: &ParsedSpec,
+    fp: &crate::fingerprint::SpecFingerprint,
+    spec_path: &Path,
+    output_dir: &Path,
+    target: Target,
+) -> Result<()> {
+    use crate::codegen::to_pascal_case;
+
+    let instr_dir = output_dir.join("src").join("instructions");
+    std::fs::create_dir_all(&instr_dir)?;
+
+    let is_multi = parsed.account_types.len() > 1;
+    let default_state_name = format!("{}Account", to_pascal_case(&mir.name));
+
+    // mod.rs — always regenerated, pure scaffold.
+    let mut mod_out = String::new();
+    mod_out.push_str(&crate::codegen::marker(
+        "DO NOT EDIT",
+        fp,
+        "src/instructions/mod.rs",
+    ));
+    for handler in &mir.handlers {
+        mod_out.push_str(&format!("pub mod {};\n", handler.name));
+    }
+    // Quasar re-exports `Accounts` structs from each
+    // `instructions/<name>.rs`; Anchor keeps them in lib.rs at
+    // crate root.
+    if matches!(target, Target::Quasar) {
+        mod_out.push('\n');
+        for handler in &mir.handlers {
+            let pascal = to_pascal_case(&handler.name);
+            mod_out.push_str(&format!("pub use {}::{};\n", handler.name, pascal));
+        }
+    }
+    mod_out.push_str("// ---- END GENERATED ----\n");
+    std::fs::write(instr_dir.join("mod.rs"), &mod_out)?;
+
+    // Read spec source once for spec_hash attributes (handles both
+    // single-file and multi-file specs).
+    let spec_src = crate::check::read_spec_source(spec_path).unwrap_or_default();
+    let spec_attr = crate::codegen::relative_spec_path(spec_path, output_dir);
+
+    // Per-handler scaffold files (user-owned — skipped if existing).
+    // Iteration source is `mir.handlers` for the name; the matching
+    // `ParsedHandler` is what `render_handler_scaffold` actually
+    // consumes (per-handler accounts / effects / requires walk).
+    for handler_mir in &mir.handlers {
+        let handler = parsed
+            .handlers
+            .iter()
+            .find(|h| h.name == handler_mir.name)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "MIR handler '{}' has no matching ParsedHandler",
+                    handler_mir.name
+                )
+            })?;
+
+        let handler_path = instr_dir.join(format!("{}.rs", handler.name));
+        if handler_path.exists() {
+            eprintln!(
+                "programs/{}/src/instructions/{}.rs already exists — skipping (user-owned). guards.rs regenerated.",
+                output_dir
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("<program>"),
+                handler.name
+            );
+            continue;
+        }
+
+        let out = crate::codegen::render_handler_scaffold(
+            handler,
+            parsed,
+            is_multi,
+            &default_state_name,
+            &spec_src,
+            &spec_attr,
+            target,
+        )?;
+        std::fs::write(&handler_path, &out)?;
+    }
+
     Ok(())
 }
 

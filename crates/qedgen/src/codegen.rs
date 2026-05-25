@@ -374,7 +374,7 @@ fn render_account_field_type(
 ///
 /// Best-effort: if the spec isn't under a path we can express relatively,
 /// fall back to the absolute path (works as long as the repo doesn't move).
-fn relative_spec_path(spec_path: &Path, manifest_dir: &Path) -> String {
+pub(crate) fn relative_spec_path(spec_path: &Path, manifest_dir: &Path) -> String {
     // Canonicalize both; fall back to the raw paths on failure.
     let spec = spec_path
         .canonicalize()
@@ -3595,7 +3595,7 @@ pub(crate) fn render_handler_accounts_struct(
     out
 }
 
-fn render_handler_scaffold(
+pub(crate) fn render_handler_scaffold(
     handler: &ParsedHandler,
     spec: &ParsedSpec,
     is_multi: bool,
