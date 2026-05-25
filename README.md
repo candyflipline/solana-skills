@@ -492,7 +492,19 @@ bash scripts/check-version-consistency.sh
 bash scripts/check-readme-drift.sh
 bash scripts/check-lake-build.sh --strict
 qedgen check --regen-drift
+cargo audit --deny warnings --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2024-0388
+cargo deny check
 ```
+
+`cargo audit` and `cargo deny check` enforce the supply-chain gate
+defined in `deny.toml`: zero unignored RustSec vulnerabilities, only
+permissive licenses (MIT / Apache-2.0 / BSD / ISC / etc.), and only
+`crates.io` as a dep source (no git-branch pins). The two ignored
+RUSTSEC IDs are `paste 1.0.15` and `derivative 2.2.0` — both
+informational "unmaintained" tags on transitive deps the Solana SDK
+and Arkworks pull in. Install once with `cargo install --locked
+cargo-audit cargo-deny`; CI runs both in the dedicated `supply-chain`
+job on every push and PR.
 
 `qedgen check --regen-drift` regenerates bundled `examples/rust/*`
 artifacts in temporary directories and fails if committed generated

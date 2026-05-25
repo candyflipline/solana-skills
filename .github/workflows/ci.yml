@@ -52,3 +52,44 @@ jobs:
 
       - name: Codegen scaffold compile smoke
         run: cargo test -p qedgen-solana-skills --test codegen_smoke -- --ignored
+
+  # Supply-chain gate. Runs independently of `test` so an advisory
+  # publish doesn't block a feature PR's other checks from reporting,
+  # and so the cargo-audit / cargo-deny tool installs don't bloat the
+  # primary cache key.
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # Cache the supply-chain tool binaries. `cargo install` is slow
+      # cold (~3 min for cargo-audit + cargo-deny); cached, the step
+      # is a no-op.
+      - name: Cache cargo-audit and cargo-deny binaries
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-audit
+            ~/.cargo/bin/cargo-deny
+          key: ${{ runner.os }}-supply-chain-tools-v1
+
+      - name: Install cargo-audit and cargo-deny
+        run: |
+          command -v cargo-audit >/dev/null || cargo install --locked cargo-audit
+          command -v cargo-deny  >/dev/null || cargo install --locked cargo-deny
+
+      # cargo-audit reads Cargo.lock and cross-references the RustSec
+      # advisory DB. Fails on any unignored vulnerability; the
+      # informational allowlist for transitive Solana SDK / Arkworks
+      # crates lives in `deny.toml`'s `[advisories].ignore` list.
+      - name: cargo audit
+        run: cargo audit --deny warnings --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2024-0388
+
+      # cargo-deny enforces the license allowlist, registry / git
+      # source allowlist, and duplicate-version warning gate from
+      # `deny.toml`.
+      - name: cargo deny check
+        run: cargo deny check
