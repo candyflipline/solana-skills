@@ -542,6 +542,63 @@ Exit codes mirror ratchet's CLI conventions: `0 = additive/safe`, `1 = breaking`
 
 **Why both.** qedgen's `#[qed(verified)]` hash-stamps the *function body*, so a rename of an `#[account]` struct compiles with a stale-but-valid proof even though the on-chain discriminator is now different and every existing account of that type is orphaned. `qedgen check-upgrade`'s `R006 account-discriminator-change` catches that class of failure; the proof layer alone doesn't look at it.
 
+## Codegen internals
+
+Starting in v2.30, `qedgen codegen` routes every backend (Lean, Kani,
+Anchor/Quasar, proptest) through a typed intermediate representation
+(`mir::Mir`) instead of consuming the parsed spec AST directly. The
+flip is transparent — no flag to enable, no behavior change for any
+existing spec (verified via byte-equivalent snapshots across every
+pilot fixture: 6 Lean × 6 Kani × 6 Anchor × 6 proptest = 24
+fixture-snapshot lock-ins, plus an additional cross-program-vault
+end-to-end check).
+
+**Why it matters.** A typed IR replaces shared-by-convention dispatch
+across the four codegens with a single `Stmt` enum every codegen has
+to match exhaustively. Cross-codegen divergence (a new spec feature
+that one backend understands and the others silently ignore) becomes
+a compile error rather than a runtime drift. The codegen surface
+isn't smaller yet — Lean / Kani / Anchor / proptest still live in
+parallel `*_mir.rs` modules alongside the legacy `*.rs` modules
+behind escape hatches — but the divergence-prevention payoff lands
+immediately for any new feature added against MIR.
+
+**Escape hatches.** If the new path produces unexpected output on
+your spec, opt back into the previous renderer via an env var:
+
+```bash
+QEDGEN_LEGACY_LEAN=1     qedgen codegen --spec my.qedspec --lean
+QEDGEN_LEGACY_KANI=1     qedgen codegen --spec my.qedspec --kani
+QEDGEN_LEGACY_CODEGEN=1  qedgen codegen --spec my.qedspec  # --target anchor / quasar
+QEDGEN_LEGACY_PROPTEST=1 qedgen codegen --spec my.qedspec --proptest
+```
+
+Two known carve-outs that ALWAYS route to legacy regardless of flag,
+even on the MIR path:
+- **sBPF specs** (`pragma sbpf`) for Lean + Kani — the MIR side
+  doesn't lift pragma info yet (Phase-0 scaffold).
+- **Record-bearing specs** (`type T { … }`) for Lean — Lean MIR's
+  indexed-state path doesn't emit `structure T` + `instance :
+  Inhabited T` yet. The other three backends handle records via
+  shared `rust_codegen_util` helpers and route through MIR
+  normally.
+
+Both are tracked for v3.0 cleanup.
+
+**If you hit a problem.** File a report at
+https://github.com/QEDGen/solana-skills/issues with the spec that
+triggered the escape hatch + the legacy-vs-default diff. We're
+treating "zero `QEDGEN_LEGACY_*` issues filed during the v2.30→v2.31
+soak" as the gate for removing the escape hatches at v2.32. The
+soak is the validation step the snapshot tests can't provide —
+they lock the 6 pilot fixtures but not the long tail of real specs.
+
+**Roadmap.**
+- **v2.30** — MIR carry-through complete; legacy paths reachable via env vars.
+- **v2.31** — soak. No code change unless escape-hatch reports surface a bug.
+- **v2.32** — delete `lean_gen.rs` + `kani.rs` (~11K LoC); remove `QEDGEN_LEGACY_LEAN` / `QEDGEN_LEGACY_KANI` env vars. Conditional on zero escape-hatch reports during the soak.
+- **v3.0** — port `generate_guards` (Anchor) + the full proptest body to MIR-direct (currently delegate to legacy); delete `codegen.rs` + `proptest_gen.rs` (~10K more LoC); remove the remaining two env vars.
+
 ## Examples
 
 ### Rust / Anchor

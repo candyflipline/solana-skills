@@ -146,12 +146,17 @@ qedgen asm2lean \
 - `main.rs` - CLI entry points (init, check, codegen, generate, fill-sorry, aristotle, spec, asm2lean, setup, consolidate)
 - `chumsky_parser.rs` - chumsky parser for `.qedspec` files (produces typed AST via `chumsky_adapter.rs`)
 - `check.rs` - Spec validation: lint, coverage matrix, drift detection
-- `lean_gen.rs` - Lean 4 code generation from parsed spec (Rust + sBPF renderers)
-- `codegen.rs` - Rust program skeleton generation from spec (Anchor and Quasar targets fully supported; `--target pinocchio` reserves the CLI surface but is not yet implemented and errors at the init dispatcher)
+- `lean_gen.rs` - Lean 4 code generation from parsed spec (Rust + sBPF renderers). **Legacy path**: reachable via `QEDGEN_LEGACY_LEAN=1`; default routes through `lean_gen_mir.rs` post v2.30.
+- `lean_gen_mir.rs` - v2.30 default Lean codegen path. Consumes `mir::Mir` instead of `ParsedSpec` directly. Byte-equivalent to `lean_gen.rs` across every pilot fixture (gated by `tests/mir_snapshot.rs`).
+- `codegen.rs` - Rust program skeleton generation from spec (Anchor and Quasar targets fully supported; `--target pinocchio` reserves the CLI surface but is not yet implemented and errors at the init dispatcher). **Legacy path**: reachable via `QEDGEN_LEGACY_CODEGEN=1`; default routes through `codegen_mir.rs` post v2.30. 9 of 10 sub-generators MIR-direct; `generate_guards` still delegated to legacy pending the v3.0 typed-`Stmt` lift.
+- `codegen_mir.rs` - v2.30 default Anchor/Quasar codegen path. Sub-generator-level port — each `emit_<X>` is independently MIR-direct or delegates to the legacy `codegen::generate_<X>` (currently just `generate_guards`).
 - `pinocchio_probe.rs` - v2.19 Pinocchio audit site enumerator. Scans `*.rs` under `src/` for 10 site kinds (`BorrowUnchecked`, `BytemuckCall`, `RawPtrCastFromAccount`, `CustomLoadCall`, `TryIntoUnwrapOnSlice`, `SetLamportsArith`, `SetAmountArith`, `IndexedAccountAccess`, `IndexedDataSlice`, `SafetyComment`), parses adjacent `// SAFETY:` comments, emits a `PinocchioCatalogue` JSON. Maps each site to a candidate `Finding` paired with both `Reproducer::MolluskPrompt` and `Reproducer::MiriPrompt`. Routed via `qedgen probe --program <path>` (auto-detect) or `--runtime pinocchio` (explicit).
 - `miri_verify.rs` - v2.19 Miri verify backend. Discovers `.qed/probes/pinocchio/*/repro_miri.rs`, shells `cargo +nightly miri test`, parses UB / aliasing / overflow / `SAFETY claim STALE` markers into structured `MiriDiagnostic`s. Dual-execution divergence detection (Miri-fail / Mollusk-pass) surfaces as `Category::ExecutionDivergence` (Critical).
-- `kani.rs` - Kani BMC harness generation
-- `proptest_gen.rs` - Proptest harness generation
+- `kani.rs` - Kani BMC harness generation. **Legacy path**: reachable via `QEDGEN_LEGACY_KANI=1`; default routes through `kani_mir.rs` post v2.30.
+- `kani_mir.rs` - v2.30 default Kani codegen path. Byte-equivalent to `kani.rs` across every pilot fixture (gated by `tests/kani_snapshot.rs`).
+- `proptest_gen.rs` - Proptest harness generation. **Legacy path**: reachable via `QEDGEN_LEGACY_PROPTEST=1`; default routes through `proptest_gen_mir.rs` post v2.30.
+- `proptest_gen_mir.rs` - v2.30 default proptest codegen path. Pure-delegation scaffold — body emit still calls `proptest_gen::generate` pending the v3.0 typed-`Stmt` lift; the MIR scaffold sets up the dispatch surface so future sub-emitter ports land without touching callers (gated by `tests/proptest_snapshot.rs`).
+- `mir.rs` - v2.30 typed Solana-native IR consumed by `{lean_gen_mir, kani_mir, codegen_mir, proptest_gen_mir}`. `lower(parsed) -> Mir` is the canonical entry. Cross-codegen divergence (one backend understanding a new spec feature, others silently ignoring) becomes a compile error rather than a runtime drift.
 - `unit_test.rs` - Unit test generation
 - `integration_test.rs` - in-process SVM integration test generation
 - `init.rs` - Project scaffolding (`qedgen init`, `.qed/` directory)
@@ -199,6 +204,13 @@ qedgen asm2lean \
 - Verification scope: program logic only (see VERIFICATION_SCOPE.md)
 - Trust boundary: SPL Token, Solana runtime, CPI mechanics
 - Pragmatic: keeps proofs tractable and completion time reasonable
+
+**Why a typed MIR between the parser and the codegens? (v2.30)**
+- Pre-v2.30 each codegen (`lean_gen` / `kani` / `codegen` / `proptest_gen`) consumed `ParsedSpec` directly and re-implemented cross-cutting transforms (lifecycle gating, effect-op dispatch, abort semantics, CPI substitution) in parallel. Divergence between backends — one understands a new spec feature, the others silently ignore it — was a recurring source of bugs.
+- v2.30 introduces `mir::Mir`, a typed IR with a closed `Stmt` enum every codegen must match exhaustively. Adding a new feature now means extending one IR node and four codegens' match arms; missing a backend is a compile error, not a runtime drift.
+- Per [[feedback-mir-is-bug-reduction]] the value is bug-class elimination, not LoC reduction. LoC actually went UP on this branch (parallel `*_mir.rs` modules sit alongside legacy until v2.32/v3.0 deletions).
+- Per [[feedback-cleanup-v3]] the legacy modules stay reachable behind env-var escape hatches (`QEDGEN_LEGACY_{LEAN,KANI,CODEGEN,PROPTEST}=1`) through the v2.30→v2.31 soak. v2.32 deletes Lean + Kani legacy (~11K LoC); v3.0 deletes codegen + proptest legacy (~10K LoC) after porting `generate_guards` + the proptest body to MIR-direct.
+- Snapshot suites (`tests/{mir,kani,codegen,proptest}_snapshot.rs`) gate every pilot fixture against checked-in references — any drift between routes fails CI immediately.
 
 ## Verification Scope
 
