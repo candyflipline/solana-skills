@@ -2047,11 +2047,12 @@ const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 /// Per-target dispatch: emits the right CPI shape per
 /// `(target, is_spl_token)` per `docs/design/quasar-cpi-spike.md` §4.
 ///
-/// - Anchor + SPL Token → `anchor_spl::token::*` builder shape
-/// - Anchor + generic   → `solana_program::program::invoke` shape
-/// - Quasar + SPL Token → `quasar_spl::TokenCpi` method chain
-/// - Quasar + generic   → not implemented (spike scope; §8 slice 3)
-/// - Pinocchio          → not implemented (separate release; §8 slice 7)
+/// - Anchor    + SPL Token → `anchor_spl::token::*` builder shape
+/// - Anchor    + generic   → `solana_program::program::invoke` shape
+/// - Quasar    + SPL Token → `quasar_spl::TokenCpi` method chain
+/// - Quasar    + generic   → not implemented (spike scope; §8 slice 3)
+/// - Pinocchio + SPL Token → `pinocchio_token::instructions::*` struct + invoke
+/// - Pinocchio + generic   → not implemented (spike scope; §8 slice 7)
 ///
 /// Returns `None` for any branch that isn't implemented yet — the
 /// caller falls back to a structured comment + `todo!()` so the agent
@@ -2074,8 +2075,9 @@ fn try_emit_cpi(
         (Target::Quasar, true) => emit_spl_token_cpi_quasar(call, handler, spec),
         // Quasar generic CPI — follow-on slice (uses `BufCpiCall`).
         (Target::Quasar, false) => None,
-        // Pinocchio — separate release; the auto-fallback path is fine.
-        (Target::Pinocchio, _) => None,
+        (Target::Pinocchio, true) => emit_spl_token_cpi_pinocchio(call, handler, spec),
+        // Pinocchio generic CPI — follow-on slice (raw invoke_signed).
+        (Target::Pinocchio, false) => None,
     }
 }
 
@@ -2568,6 +2570,88 @@ fn emit_spl_quasar(
         method_name,
         args.join(", ")
     ))
+}
+
+/// Pinocchio SPL Token dispatcher. Routes to the right
+/// `pinocchio_token::instructions::*` struct per the called handler's
+/// name. Returns None on unrecognized handlers so the caller falls
+/// back to comment + `todo!()`.
+///
+/// Spike scope (`docs/design/quasar-cpi-spike.md` §5 commit 2): only
+/// `transfer` is implemented. Other handlers (`mint_to`, `burn`,
+/// `initialize_account`, `close_account`) take the `None` exit until
+/// the follow-on slice (§8 slice 2b) lands.
+///
+/// **Note on dead-code-ness**: `--target pinocchio` codegen currently
+/// skips the Rust scaffold (`main.rs:3132`), so this emitter is never
+/// reached from the CLI today. It still gets unit-tested directly via
+/// `try_emit_cpi(_, _, _, Target::Pinocchio)`. When Pinocchio scaffold
+/// (§8 slice 6) lands, this emitter is already wired.
+fn emit_spl_token_cpi_pinocchio(
+    call: &crate::check::ParsedCall,
+    handler: &ParsedHandler,
+    spec: &ParsedSpec,
+) -> Option<String> {
+    match call.target_handler.as_str() {
+        "transfer" => emit_spl_pinocchio(
+            call,
+            handler,
+            spec,
+            "Transfer",
+            // (pinocchio_struct_field, spec_arg_name)
+            &[("from", "from"), ("to", "to"), ("authority", "authority")],
+            Some("amount"),
+        ),
+        _ => None,
+    }
+}
+
+/// Emit one `pinocchio_token::instructions::<Struct> { … }.invoke()?;`
+/// CPI per `docs/design/quasar-cpi-spike.md` §2b. Field assignments use
+/// the pinocchio-token struct field names (passed in
+/// `field_to_arg.0`), resolved against the call site's argument list
+/// (`field_to_arg.1`).
+///
+/// Note: pinocchio_token's struct field names diverge from the
+/// canonical SPL naming for some handlers (`MintTo.account` vs SPL's
+/// `to`; `MintTo.mint_authority` vs SPL's `authority`). The
+/// `field_to_arg` map handles the translation at the codegen boundary,
+/// mirroring how `emit_spl_anchor` handles the Anchor variants.
+fn emit_spl_pinocchio(
+    call: &crate::check::ParsedCall,
+    handler: &ParsedHandler,
+    spec: &ParsedSpec,
+    struct_name: &str,
+    field_to_arg: &[(&str, &str)],
+    scalar_arg: Option<&str>,
+) -> Option<String> {
+    let max_field = field_to_arg
+        .iter()
+        .map(|(f, _)| f.len())
+        .chain(scalar_arg.map(|s| s.len()))
+        .max()
+        .unwrap_or(0);
+
+    let mut out = String::new();
+    out.push_str("        pinocchio_token::instructions::");
+    out.push_str(struct_name);
+    out.push_str(" {\n");
+    for (struct_field, call_arg) in field_to_arg {
+        let arg = call.args.iter().find(|a| a.name == *call_arg)?;
+        let pad = " ".repeat(max_field - struct_field.len());
+        out.push_str(&format!(
+            "            {}:{} &self.{},\n",
+            struct_field, pad, arg.rust_expr
+        ));
+    }
+    if let Some(name) = scalar_arg {
+        let arg = call.args.iter().find(|a| a.name == name)?;
+        let rhs = resolve_call_arg_for_amount(&arg.rust_expr, handler, spec);
+        let pad = " ".repeat(max_field - name.len());
+        out.push_str(&format!("            {}:{} {},\n", name, pad, rhs));
+    }
+    out.push_str("        }.invoke()?;\n");
+    Some(out)
 }
 
 /// v2.29.2 — resolve the state-bearing account for a handler with a
@@ -6702,17 +6786,108 @@ handler send (n : U64) : State.Active -> State.Active {{
         );
     }
 
-    /// Pinocchio still has no CPI emitter in any branch — the entire
-    /// target falls through to the caller's `todo!()` shape. Distinct
-    /// release per the design doc §8 slice 7.
+    /// Spike commit 2: Pinocchio SPL Token transfer emits a struct-
+    /// construction `Transfer { … }.invoke()?` per
+    /// `docs/design/quasar-cpi-spike.md` §2b. Sibling shape to the
+    /// Quasar method chain but with field assignments.
+    ///
+    /// Note: the Pinocchio emitter is dead code from the CLI today
+    /// (scaffold gate at `main.rs:3132`); this test exercises the
+    /// emitter directly. When slice 6 lands, this is the same string
+    /// the CLI emits.
     #[test]
-    fn cpi_skips_emission_for_pinocchio() {
+    fn cpi_emits_pinocchio_spl_transfer() {
         let spec = parse_spl_transfer_caller_spec("transfer");
+        let handler = spec.handlers.iter().find(|h| h.name == "send").unwrap();
+        let call = handler.calls.first().unwrap();
+        let rendered = try_emit_cpi(call, handler, &spec, Target::Pinocchio)
+            .expect("Pinocchio SPL transfer must emit");
+        assert!(
+            rendered.contains("pinocchio_token::instructions::Transfer {"),
+            "Pinocchio shape must construct the qualified Transfer struct; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("from:") && rendered.contains("&self.src"),
+            "from field must resolve to &self.src; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("to:") && rendered.contains("&self.dst"),
+            "to field must resolve to &self.dst; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("authority:") && rendered.contains("&self.auth"),
+            "authority field must resolve to &self.auth; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("amount:"),
+            "amount scalar must appear as a struct field; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("}.invoke()?;"),
+            "Pinocchio struct must terminate with .invoke()?; got:\n{rendered}"
+        );
+        // Anti-regression: no Anchor / Quasar shape leakage.
+        assert!(
+            !rendered.contains("anchor_spl") && !rendered.contains("CpiContext"),
+            "Pinocchio emission must not leak Anchor shape; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains(".transfer("),
+            "Pinocchio is struct-construction, not method chain; got:\n{rendered}"
+        );
+    }
+
+    /// Anti-regression for the spike's narrow scope on Pinocchio:
+    /// only `transfer` works in this slice. Other SPL handlers
+    /// (`mint_to`, `burn`, …) must still take the `todo!()` exit until
+    /// `docs/design/quasar-cpi-spike.md` §8 slice 2b lands.
+    #[test]
+    fn cpi_pinocchio_spl_mint_to_falls_through_to_none() {
+        let spec = parse_spl_transfer_caller_spec("mint_to");
         let handler = spec.handlers.iter().find(|h| h.name == "send").unwrap();
         let call = handler.calls.first().unwrap();
         assert!(
             try_emit_cpi(call, handler, &spec, Target::Pinocchio).is_none(),
-            "Pinocchio CPI is unimplemented; every call site must take the None exit"
+            "Pinocchio SPL mint_to is out of spike scope; must fall through to None"
+        );
+    }
+
+    /// Pinocchio generic (non-SPL) CPI is unimplemented; the
+    /// `(Target::Pinocchio, false)` branch in `try_emit_cpi` returns
+    /// None. Per `docs/design/quasar-cpi-spike.md` §8 slice 7.
+    #[test]
+    fn cpi_pinocchio_non_spl_falls_through_to_none() {
+        // A spec whose called interface is NOT the SPL Token program.
+        let spec = crate::chumsky_adapter::parse_str(
+            r#"spec Caller
+program_id "11111111111111111111111111111111"
+
+interface MyAmm {
+  program_id "MyAmm22222222222222222222222222222222222222"
+  handler swap (amount : U64) {
+    discriminant "0x01"
+    accounts { src : writable }
+  }
+}
+
+type State | Active of { balance : U64 }
+type Error | E
+
+handler send : State.Active -> State.Active {
+  permissionless
+  accounts {
+    src : writable
+  }
+  call MyAmm.swap(src = src, amount = balance)
+}
+"#,
+        )
+        .unwrap();
+        let handler = spec.handlers.iter().find(|h| h.name == "send").unwrap();
+        let call = handler.calls.first().unwrap();
+        assert!(
+            try_emit_cpi(call, handler, &spec, Target::Pinocchio).is_none(),
+            "Pinocchio generic CPI is unimplemented; must fall through to None"
         );
     }
 

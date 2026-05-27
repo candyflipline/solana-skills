@@ -109,6 +109,70 @@ imports beyond the already-emitted `quasar_spl::*`. ~3 lines.
 Quasar's design simplifies emission. The dispatch is purely "which target",
 not "should we use trait X or wrapper Y."
 
+## 2b. Pinocchio CPI shape (from `pinocchio-token-0.3.0`)
+
+Read directly from
+`~/.cargo/registry/src/index.crates.io-*/pinocchio-token-0.3.0/`.
+
+**Core shape**: `struct + .invoke()`. No trait-method sugar (unlike Quasar),
+no CpiContext wrapper (unlike Anchor). Each SPL Token instruction has a
+struct in `pinocchio_token::instructions::*`; the user constructs it with
+references to `AccountInfo` and calls `.invoke()` (or `.invoke_signed(&[Signer])`
+for PDA-signed CPIs).
+
+```rust
+// pinocchio-token::instructions::transfer (snippet)
+pub struct Transfer<'a> {
+    pub from: &'a AccountInfo,
+    pub to: &'a AccountInfo,
+    pub authority: &'a AccountInfo,
+    pub amount: u64,
+}
+
+impl Transfer<'_> {
+    pub fn invoke(&self) -> ProgramResult { … }
+    pub fn invoke_signed(&self, signers: &[Signer]) -> ProgramResult { … }
+}
+```
+
+Same `call Token.transfer(from = src, to = dst, amount = n, authority = auth)`
+emits:
+
+```rust
+// Pinocchio (what we'll emit)
+pinocchio_token::instructions::Transfer {
+    from:      &self.src,
+    to:        &self.dst,
+    authority: &self.auth,
+    amount:    n,
+}.invoke()?;
+```
+
+**vs the other two targets** side-by-side:
+
+| Aspect | Anchor (~6 lines) | Quasar (~1 line) | Pinocchio (~6 lines) |
+|---|---|---|---|
+| Shape | builder + free fn | trait method chain | struct + `.invoke()` |
+| Token program ref | `self.token_program` field | `self.token_program` field | `pinocchio_token::ID` const |
+| Account ref | `.to_account_info()` | `&self.<field>` | `&self.<field>` |
+| Import needed | `anchor_spl::token::{self, Transfer}` | none (in prelude) | none (qualified path) |
+| PDA-signed variant | `CpiContext::new_with_signer(...)` | `.invoke_signed(&[Seed::from(...)])` | `.invoke_signed(&[Signer::from(&seeds)])` |
+
+**Note on the token program account**: Pinocchio's `Transfer` struct does NOT
+take a token-program reference. The program ID is baked in via `crate::ID`
+inside the `invoke_signed` implementation. So the spec's
+`token_program : program` account declaration is *unused* at the CPI call
+site for Pinocchio (still needed in the spec for the Anchor / Quasar
+targets). This is purely a presence-not-a-bug situation; the dispatch
+emitter for Pinocchio simply doesn't reference the resolved
+`token_program` name.
+
+**Mint_to and the other handlers**: pinocchio_token's field names diverge
+from the canonical SPL naming for some handlers (`MintTo.account` instead
+of `to`; `MintTo.mint_authority` instead of `authority`). The spike emitter
+handles this via the same `(struct_field, spec_arg_name)` mapping table the
+Anchor emitter uses — see §4.
+
 ## 3. Current dispatch + the gap
 
 `crates/qedgen/src/codegen.rs:2045-2495` is the CPI surface.
@@ -172,10 +236,54 @@ fn try_emit_cpi(
         (Target::Anchor,    false) => emit_generic_cpi_anchor(call, handler, iface, spec),
         (Target::Quasar,    true)  => emit_spl_token_cpi_quasar(call, handler, spec),
         (Target::Quasar,    false) => None, // out of spike — follow-on slice
-        (Target::Pinocchio, _)     => None, // out of spike — separate release
+        (Target::Pinocchio, true)  => emit_spl_token_cpi_pinocchio(call, handler, spec),
+        (Target::Pinocchio, false) => None, // out of spike — follow-on slice
     }
 }
 ```
+
+**Pinocchio emitter shape** (added in this iteration of the spike):
+
+```rust
+fn emit_spl_token_cpi_pinocchio(call, handler, spec) -> Option<String> {
+    match call.target_handler.as_str() {
+        "transfer" => emit_spl_pinocchio(
+            call, handler, spec, "Transfer",
+            // (pinocchio_struct_field, spec_arg_name)
+            &[("from", "from"), ("to", "to"), ("authority", "authority")],
+            Some("amount"),
+        ),
+        _ => None,
+    }
+}
+
+fn emit_spl_pinocchio(call, handler, spec, struct_name, fields, scalar) -> Option<String> {
+    // Emits:
+    //   pinocchio_token::instructions::<Struct> {
+    //       <field>: &self.<resolved>,
+    //       …
+    //       amount: n,
+    //   }.invoke()?;
+}
+```
+
+**Caller still skips Pinocchio scaffold today**. `main.rs:3117` bails on
+`--target pinocchio` without backend flags; with backend flags it proceeds
+but skips the Rust scaffold (`main.rs:3132 if !pinocchio_no_scaffold`).
+That means the Pinocchio CPI emitter is **dead code from the CLI** until
+slice 6 (Pinocchio scaffold) lands. We still implement + unit-test it now
+because:
+
+- The dispatch shape stays consistent. Quasar + Pinocchio land in the
+  same `match (target, is_spl_token)` block; readers see them as
+  parallel branches instead of a hole.
+- When the scaffold lands, CPI is already there — no rebase pain.
+- Unit tests calling `try_emit_cpi(_, _, _, Target::Pinocchio)` directly
+  exercise the emission string, same way `kani_impl` tests exercise
+  emission without invoking the full CLI.
+- The committed snapshot fixture (validation layer (b)) can include the
+  Pinocchio emission alongside Anchor + Quasar so future drift is
+  caught structurally.
 
 **Renames** (mechanical):
 - `try_emit_anchor_cpi` → `try_emit_cpi`
@@ -213,9 +321,11 @@ The dispatch fn (`try_emit_cpi`) absorbs the target switch in one place
 and stays under 30 lines. Snapshot tests cover both branches without
 cross-target leakage.
 
-## 5. Spike scope (what lands in the first commit)
+## 5. Spike scope (what lands in the first commits)
 
-In:
+This spike now lands across **two commits** on `feat/2.30`:
+
+**Commit 1 (DONE — `d56a2ad`)**: Quasar SPL transfer.
 
 1. Rename `try_emit_anchor_cpi` → `try_emit_cpi`; rename
    `emit_spl_token_cpi` → `emit_spl_token_cpi_anchor`;
@@ -225,28 +335,44 @@ In:
    `"transfer"` only.
 3. Update `try_emit_cpi` dispatch to route Quasar SPL `transfer` to the
    new emitter. Other Quasar paths stay `None` for this spike.
-4. Update the 9 in-file unit tests' call sites (pure rename).
-5. Add two new tests:
-   - `cpi_emits_quasar_spl_transfer` — asserts the one-line method-chain
-     shape lands and contains `self.token_program.transfer(`,
-     `.invoke()?`, no `anchor_spl`, no `CpiContext`.
-   - `cpi_quasar_spl_mint_to_falls_through_to_none` — explicit
-     anti-regression for the spike's narrow scope (only `transfer` works
-     for Quasar; other SPL handlers still take the `todo!()` exit).
+4. Tests: `cpi_emits_quasar_spl_transfer` (positive) +
+   `cpi_quasar_spl_mint_to_falls_through_to_none` (anti-regression for
+   spike scope) + `cpi_skips_emission_for_pinocchio` (Pinocchio still
+   falls through).
 
-Out (each is a separate follow-on slice):
+**Commit 2 (THIS extension)**: Pinocchio SPL transfer.
+
+1. Add `emit_spl_token_cpi_pinocchio` + `emit_spl_pinocchio` per §2b +
+   §4. Implement `"transfer"` only.
+2. Update `try_emit_cpi` dispatch to route Pinocchio SPL `transfer` to
+   the new emitter. Other Pinocchio paths stay `None`.
+3. Replace `cpi_skips_emission_for_pinocchio` with three tests:
+   `cpi_emits_pinocchio_spl_transfer` (positive),
+   `cpi_pinocchio_spl_mint_to_falls_through_to_none` (anti-regression
+   for spike scope), `cpi_pinocchio_non_spl_falls_through_to_none`
+   (generic Pinocchio CPI still unimplemented).
+4. Note: emitter is dead code from the CLI today (scaffold gate at
+   `main.rs:3117`); follows the §4 rationale for landing now anyway.
+
+Out (each is a separate follow-on slice in §8):
 
 - Quasar SPL `mint_to`, `burn`, `initialize_account`, `close_account` —
   mechanical adds to `emit_spl_token_cpi_quasar`'s match arm.
-- PDA-signed CPI for Quasar (`invoke_signed` with seeds). Needs spec to
-  surface the seed/bump fields; today's `try_emit_anchor_cpi` doesn't
-  emit signed CPI either.
+- Pinocchio SPL `mint_to`, `burn`, `initialize_account`, `close_account` —
+  mechanical adds to `emit_spl_token_cpi_pinocchio`'s match arm.
+- PDA-signed CPI for Quasar / Pinocchio (`invoke_signed` with
+  seeds/signers). Needs spec to surface the seed/bump fields; today's
+  Anchor emitter doesn't emit signed CPI either.
 - Generic (non-SPL) Quasar CPI — needs `BufCpiCall` (variable-length
   Borsh data). Distinct shape; warrants its own design pass.
+- Generic (non-SPL) Pinocchio CPI — needs `pinocchio::cpi::invoke_signed`
+  with raw `Instruction` + `AccountMeta` construction. Borsh-serialize
+  args inline. Distinct shape.
 - Quasar Kani-impl harness — needs `Ctx<X>` instead of `Context<X>` and
   Quasar's `parse_accounts` shape. Plumbing only; same dispatch pattern
   applies.
-- All Pinocchio work — distinct release.
+- Pinocchio Rust scaffold (slice 6) — must land before CPI is reachable
+  from the CLI. Independent of the emitter.
 
 ## 6. Validation plan
 
@@ -388,13 +514,15 @@ The full set of slices to reach parity:
 
 | # | Slice | Cost | Blocker on prior |
 |---|-------|------|------------------|
-| 1 | **THIS SPIKE** — Quasar SPL `transfer` + dispatch refactor | ~half day | — |
+| 1 | **DONE (`d56a2ad`)** — Quasar SPL `transfer` + dispatch refactor | shipped | — |
+| 1b | **DONE (this extension)** — Pinocchio SPL `transfer` emitter (dead code until slice 6) | shipped | 1 |
 | 2 | Quasar SPL `mint_to` / `burn` / `initialize_account` / `close_account` | ~half day | 1 (uses same emitter) |
+| 2b | Pinocchio SPL `mint_to` / `burn` / `initialize_account` / `close_account` | ~half day | 1b |
 | 3 | Quasar generic (non-SPL) CPI via `BufCpiCall` | ~1-2 days | 1 |
 | 4 | Quasar PDA-signed CPI (`invoke_signed` w/ Seed) — affects both SPL and generic | ~1-2 days | 2 + 3 |
 | 5 | Quasar Kani-impl harness (`Ctx<X>` shape per §7b) | ~2-3 days | 2 (gives a compilable target to verify) |
-| 6 | Pinocchio scaffold (`#![no_std]`, raw account slices, no derive macros) | ~3-5 days | — (independent) |
-| 7 | Pinocchio CPI via `pinocchio::cpi::invoke_signed` (SPL + generic) | ~2-3 days | 6 |
+| 6 | Pinocchio scaffold (`#![no_std]`, raw account slices, no derive macros) — unblocks 1b from the CLI | ~3-5 days | — (independent) |
+| 7 | Pinocchio generic (non-SPL) CPI via raw `pinocchio::cpi::invoke_signed` + Borsh | ~2-3 days | 6 |
 | 8 | Pinocchio Kani-impl harness (raw `&[AccountInfo]` per §7b) | ~2-3 days | 6 + 7 |
 | 9 | Per-target snapshot infra + CI gates | ~1 day | 2 + 7 (need real emission to snapshot) |
 
@@ -423,6 +551,16 @@ slice that unblocks every later one.
   `symbol-mangling-version = "v0"` to dodge macOS ld's symbol-length cap.
   Adding a `cargo check` step in test (c) inherits the workspace config —
   no new workaround needed.
+- **Pinocchio Cargo.toml dep**: the Pinocchio CPI emitter requires
+  `pinocchio-token = "0.3.0"` in the generated crate's Cargo.toml. The
+  current Cargo.toml emitter (`codegen.rs:5038-5055`) `unreachable!()`s on
+  `Target::Pinocchio`. Adding the dep is part of slice 6 (Pinocchio
+  scaffold) — until then, the emitter writes correct CPI text but the
+  surrounding crate doesn't exist.
+- **Pinocchio version stability**: `pinocchio-token` is `0.3.0` (as of
+  this writing). The crate is pre-1.0 and APIs can shift. Pin the exact
+  version we generate against; bump it explicitly when we re-validate.
+  Like the Quasar `quasar-spl = "0.0.0"` pin.
 
 ## 10. Commit shape
 
