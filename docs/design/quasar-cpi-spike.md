@@ -562,6 +562,204 @@ slice that unblocks every later one.
   version we generate against; bump it explicitly when we re-validate.
   Like the Quasar `quasar-spl = "0.0.0"` pin.
 
+## 11. Pinocchio Kani-impl detailed design (slice 8)
+
+The only real brownfield Pinocchio gap. This section turns §7b's sketch
+into something implementable.
+
+### 11a. What the user has, what we emit
+
+Brownfield Pinocchio user has:
+- `program/src/lib.rs` with `entrypoint!(process_instruction)`
+- `program/src/<handler>.rs` per handler: `pub fn process_<name>(accounts: &[AccountInfo], data: &[u8]) -> ProgramResult`
+- Account data parsed unsafely via `borrow_mut_data_unchecked()` + `bytemuck::from_bytes` or a custom `Account::load_mut(...)` helper
+- A `.qedspec` next to the program (or a synthesised one from `crucible_brownfield`)
+
+We emit:
+- `tests/kani_impl.rs` — a separate **`std`** test crate that depends on the user's `#![no_std]` Pinocchio program and runs Kani against its real handlers
+- One `#[kani::proof]` per handler with at least one `ensures` clause, mirroring the Anchor shape but with Pinocchio's account-construction pattern
+
+The harness lives in the user's `tests/` directory because Cargo's test
+runner promotes `tests/*.rs` to a `std`-binary crate that depends on the
+library. This is the only way to reach a `no_std` lib from a `std`-needing
+harness — same shape Cargo uses for integration tests today.
+
+### 11b. Symbolic AccountInfo construction
+
+Base template: the existing **Miri** harness at
+`examples/pinocchio-fixtures/_harness/account.rs:78-127`. It manually
+constructs Pinocchio's wire format (n_accounts header, per-account
+[dup_flag|flags|pad|key|owner|lamports|data_len|data|pad|rent_epoch],
+then instruction_data, then program_id), then `Box::leak`s the buffer and
+hands the raw pointer to Pinocchio's parser.
+
+For Kani, we keep the layout and **substitute `kani::any()` for the
+concrete field values**:
+
+```rust
+// emit_symbolic_pinocchio_accounts (sketched)
+fn build_symbolic_<handler>() -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&(N_ACCOUNTS as u64).to_le_bytes());
+    for _ in 0..N_ACCOUNTS {
+        buf.push(0xff); // dup_flag — concrete (deduplication is out of scope)
+        buf.push(kani::any::<bool>() as u8);   // is_signer
+        buf.push(kani::any::<bool>() as u8);   // is_writable
+        buf.push(false as u8);                  // executable — concrete (not exercised)
+        buf.extend_from_slice(&[0u8; 4]);
+        let key:   [u8; 32] = kani::any();
+        let owner: [u8; 32] = kani::any();
+        buf.extend_from_slice(&key);
+        buf.extend_from_slice(&owner);
+        buf.extend_from_slice(&kani::any::<u64>().to_le_bytes()); // lamports
+        buf.extend_from_slice(&(ACCOUNT_DATA_LEN as u64).to_le_bytes());
+        for _ in 0..ACCOUNT_DATA_LEN {
+            buf.push(kani::any::<u8>());
+        }
+        // pad to 8-byte boundary (concrete)
+        let pad = (8 - (ACCOUNT_DATA_LEN % 8)) % 8;
+        buf.extend_from_slice(&vec![0u8; pad]);
+        buf.extend_from_slice(&kani::any::<u64>().to_le_bytes()); // rent_epoch
+    }
+    buf.extend_from_slice(&(INSTRUCTION_DATA_LEN as u64).to_le_bytes());
+    for _ in 0..INSTRUCTION_DATA_LEN {
+        buf.push(kani::any::<u8>());
+    }
+    buf.extend_from_slice(&kani::any::<[u8; 32]>()); // program_id
+    buf
+}
+```
+
+`N_ACCOUNTS`, `ACCOUNT_DATA_LEN`, `INSTRUCTION_DATA_LEN` come from the
+spec's per-handler `accounts {…}` block + MemoryLayout (see §11d).
+
+### 11c. Handler invocation + pre/post snapshots
+
+```rust
+#[kani::proof]
+fn verify_transfer_impl_ensures_0() {
+    let buf = build_symbolic_transfer();
+    let ptr = Box::leak(buf.into_boxed_slice()).as_mut_ptr();
+
+    // Use Pinocchio's runtime parser the same way entrypoint! does.
+    let (program_id, accounts, instruction_data) = unsafe {
+        pinocchio::entrypoint::deserialize::<MAX_ACCOUNTS>(ptr)
+    };
+
+    // Pre-snapshot: deserialize account[i] into the typed View per
+    // MemoryLayout. For SPL Token accounts this is
+    // pinocchio_token::state::Account::load(...).
+    let pre_src_amount  = unsafe { TokenAccount::load_unchecked(&accounts[0]).amount() };
+    let pre_dst_amount  = unsafe { TokenAccount::load_unchecked(&accounts[1]).amount() };
+
+    let result = user_crate::transfer::process_transfer(accounts, instruction_data);
+
+    if result.is_ok() {
+        let post_src_amount = unsafe { TokenAccount::load_unchecked(&accounts[0]).amount() };
+        let post_dst_amount = unsafe { TokenAccount::load_unchecked(&accounts[1]).amount() };
+
+        // Translated ensures: post.dst.amount == pre.dst.amount + amount
+        let amount = u64::from_le_bytes(instruction_data[..8].try_into().unwrap());
+        assert!(post_dst_amount == pre_dst_amount + amount);
+    }
+}
+```
+
+The `let pre_X = …` / `let post_X = …` shape mirrors what the Anchor
+emitter does today (`kani_impl.rs:rewrite_pre_post_paths`). The
+difference is the field-access function — Anchor uses
+`ctx.accounts.<field>`, Pinocchio uses `<typed_view>::load(...)?.<field>`.
+
+### 11d. MemoryLayout requirement
+
+Per `[[feedback_memorylayout_sources]]`: brownfield Pinocchio gets layout
+via IDL (Anchor Borsh / Pinocchio `mem::offset_of!` probe). The Kani-impl
+emitter needs to:
+
+1. For each `state` field referenced by an `ensures` clause, look up the
+   account that carries it (via `on_account` or
+   `find_canonical_state_account_name`).
+2. Look up that account's layout in the MemoryLayout map.
+3. Emit the typed-view load + field access (`pinocchio_token::state::Account::load(...).amount()` for SPL Token; user-provided typed view via the spec's `layout = "..."` attribute for custom state).
+
+For the first commit of slice 8, we restrict to **SPL Token accounts only**
+(layouts known via `pinocchio_token::state`). Custom-state Pinocchio
+programs require the MemoryLayout pipeline to land first; tracked as 8b.
+
+### 11e. Open questions / risks
+
+- **Does `cargo kani` work against `no_std` lib dependencies?** Unknown. The
+  test crate itself is `std`, but the dependency tree drags in `no_std`.
+  Kani's known limitations don't explicitly call this out. Validation
+  plan (§11f) starts by answering this with a minimal smoke test before
+  the full emitter lands. If Kani can't handle this, the fallback is to
+  ship Pinocchio Kani-impl as a `cfg(miri)` harness instead (still
+  property-style, but Miri-driven concrete tests vs Kani's exhaustive
+  BMC).
+- **BMC unwind cost on symbolic byte buffers**: every byte of account
+  data + instruction data is symbolic. For a 165-byte SPL Token account
+  this is 165 × 8 = 1320 symbolic bits per account, × N accounts.
+  May need `#[kani::unwind(N)]` annotations or explicit
+  `kani::assume(...)` bounds to keep proofs tractable. Per-handler
+  tuning likely needed.
+- **Pinocchio version drift**: the wire format in `_harness/account.rs:80-98`
+  is annotated "Pinocchio v0.6.x". The current registry has
+  `pinocchio-0.10.1`. If the wire format shifted between 0.6 and 0.10,
+  the harness will silently produce mis-parsed AccountInfo. Validation
+  step (§11f) explicitly re-checks against 0.10.1's
+  `account_info.rs:from_raw_parts`.
+- **PDA validation**: Pinocchio handlers re-derive PDAs manually via
+  `find_program_address`. Kani can't symbolically execute SHA256
+  efficiently. For PDA-validating handlers, emit
+  `kani::assume(claimed_pda == expected_pda)` — punt the actual hash
+  verification, trust the assumption, document it.
+- **`unsafe` in the harness**: every `borrow_mut_data_unchecked()` call
+  is `unsafe`. Kani doesn't object to `unsafe` (it just checks UB), but
+  the emitted harness inherits the same `// SAFETY:` discipline as the
+  user's handler. Mirror their pattern.
+
+### 11f. Validation plan for slice 8
+
+Three milestones, smallest-to-largest. Don't ship the emitter without
+clearing all three.
+
+**M1 — Kani-on-no_std smoke test** (~half day): write a hand-crafted
+`tests/kani_impl.rs` against the existing `examples/pinocchio-fixtures/ptoken-transfer`
+fixture. Confirm `cargo kani --harness verify_transfer_impl_ensures_0`
+either runs to completion OR fails with a clear error that points the
+way. This answers §11e's first open question with an experiment.
+
+**M2 — Hand-crafted harness against real fixture** (~1 day): if M1
+succeeds, extend the harness to assert the transfer's conservation
+property (`pre.src.amount + pre.dst.amount == post.src.amount +
+post.dst.amount`). This should produce a Kani counterexample because
+`ptoken-transfer` uses unchecked arithmetic per the research findings.
+Validates the harness shape catches real bugs.
+
+**M3 — Codegen the harness** (~1-2 days): build `emit_kani_impl_pinocchio`
+that generates the exact string from M2 from the spec + program crate
+name. Snapshot test against the M2 reference. Wire into the dispatch
+per §7c.
+
+### 11g. Implementation skeleton (commit map)
+
+The slice lands across 3-4 commits on `feat/2.30`:
+
+1. **Smoke test** (M1): hand-write `tests/kani_impl_smoke.rs` under
+   `examples/pinocchio-fixtures/ptoken-transfer/`. No codegen yet.
+   Commit answers "can we even do this".
+2. **Reference harness** (M2): hand-write a real
+   `tests/kani_impl.rs` that asserts the conservation ensures.
+   Commit captures the target shape we'll codegen toward.
+3. **Codegen + dispatch refactor** (M3): land
+   `emit_kani_impl_pinocchio` + the §7c dispatch refactor in
+   `kani_impl::generate_from_spec`. Anchor branch keeps working,
+   Pinocchio branch reaches the new emitter, Quasar still no-ops
+   (slice 5 follow-on). Snapshot test against M2.
+4. **Optional cleanup**: extract shared helpers between Anchor and
+   Pinocchio emitters if duplication warrants it. Don't pre-optimize;
+   wait until Quasar also lands.
+
 ## 10. Commit shape
 
 Single commit on `feat/2.30`:
