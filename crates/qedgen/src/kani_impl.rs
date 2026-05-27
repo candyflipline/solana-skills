@@ -51,6 +51,7 @@ use std::path::Path;
 
 use crate::check::{self, ParsedHandler, ParsedSpec};
 use crate::codegen::{map_type, to_pascal_case};
+use crate::Target;
 
 /// Predicate: a handler triggers auto-emission of an impl-targeted harness
 /// when its `modifies` clause lists at least one field that does NOT appear
@@ -110,13 +111,19 @@ fn auto_triggered_handlers(spec: &ParsedSpec) -> Vec<&str> {
 /// Emit `programs/tests/kani_impl.rs` against the user's real Anchor
 /// handlers. `explicit_flag` is true when `--kani-impl` was passed; auto-
 /// triggered emission stamps a header comment naming the triggering
-/// handlers. Non-Anchor specs are a clean no-op (no file written).
+/// handlers. Non-Anchor targets (Quasar, Pinocchio) are a clean no-op
+/// (no file written) — see the target gate in `generate_from_spec`.
 ///
 /// Per-handler emission is gated on the handler having at least one
 /// `ensures` clause — without ensures there's nothing to assert.
-pub fn generate(spec_path: &Path, output_path: &Path, explicit_flag: bool) -> Result<()> {
+pub fn generate(
+    spec_path: &Path,
+    output_path: &Path,
+    explicit_flag: bool,
+    target: Target,
+) -> Result<()> {
     let spec = check::parse_spec_file(spec_path)?;
-    generate_from_spec(&spec, output_path, explicit_flag)
+    generate_from_spec(&spec, output_path, explicit_flag, target)
 }
 
 /// Same as `generate` but takes a pre-parsed spec. Used by the CLI when
@@ -125,7 +132,17 @@ pub fn generate_from_spec(
     spec: &ParsedSpec,
     output_path: &Path,
     explicit_flag: bool,
+    target: Target,
 ) -> Result<()> {
+    // Target gate: the impl-targeted harness builds a symbolic
+    // `Context<X>` and calls `crate::<Pascal>` (the Anchor accounts
+    // struct). On a Quasar (`quasar_lang::Ctx<X>`) or Pinocchio
+    // (`#[no_std]`, raw account slices) crate, both references are
+    // undefined — the generated file won't compile. Bail before any
+    // I/O so the docstring's "clean no-op" promise holds.
+    if !matches!(target, Target::Anchor) {
+        return Ok(());
+    }
     let auto_handlers = auto_triggered_handlers(spec);
 
     // Skip emission entirely if neither the explicit flag NOR an auto-
@@ -768,6 +785,41 @@ handler set_x (v : U64) {
         assert!(!spec_triggers_impl_harness(&spec));
     }
 
+    /// Regression: the impl-targeted harness builds `Context<X>` and
+    /// calls `crate::<Pascal>` (the Anchor accounts struct). On a
+    /// Quasar / Pinocchio crate both references are undefined, so the
+    /// emitter must short-circuit before writing the file.
+    ///
+    /// Per the brownfield Pinocchio flow: `qedgen probe --runtime
+    /// pinocchio` never invokes Kani, but the spec-after-audit step
+    /// (`codegen --target pinocchio --kani-impl`, or `--kani` with an
+    /// LP-shape handler) used to reach this code unguarded.
+    #[test]
+    fn non_anchor_targets_emit_no_file() {
+        let src = r#"spec NonAnchor
+state { x : U64 }
+handler bump (delta : U64) {
+  ensures state.x == old(state.x) + delta
+  effect { x += delta }
+}"#;
+        let spec = parse_str(src).expect("parse");
+
+        for (target, label) in [(Target::Quasar, "quasar"), (Target::Pinocchio, "pinocchio")] {
+            let tmp = std::env::temp_dir().join(format!(
+                "kani_impl_non_anchor_{}_{}.rs",
+                label,
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&tmp);
+            generate_from_spec(&spec, &tmp, /*explicit_flag=*/ true, target)
+                .expect("generate must succeed (no-op for non-Anchor)");
+            assert!(
+                !tmp.exists(),
+                "target={label}: kani_impl must NOT write a file for non-Anchor targets",
+            );
+        }
+    }
+
     /// `--kani-impl` flag explicitly forces emission for every handler
     /// with ensures, regardless of the modifies-diff.
     #[test]
@@ -785,7 +837,7 @@ handler bump (delta : U64) {
         let tmp =
             std::env::temp_dir().join(format!("kani_impl_explicit_{}.rs", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
-        generate_from_spec(&spec, &tmp, /*explicit_flag=*/ true).expect("generate");
+        generate_from_spec(&spec, &tmp, /*explicit_flag=*/ true, Target::Anchor).expect("generate");
         assert!(tmp.is_file(), "explicit flag must emit the file");
         let body = std::fs::read_to_string(&tmp).unwrap();
         assert!(
@@ -822,7 +874,8 @@ handler open (deposit_amount : U64) {
 
         let tmp = std::env::temp_dir().join(format!("kani_impl_pda_{}.rs", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
-        generate_from_spec(&spec, &tmp, /*explicit_flag=*/ false).expect("generate");
+        generate_from_spec(&spec, &tmp, /*explicit_flag=*/ false, Target::Anchor)
+            .expect("generate");
         let body = std::fs::read_to_string(&tmp).unwrap();
         assert!(
             body.contains("find_program_address(&[b\"escrow\", initializer.as_ref()]"),
@@ -850,7 +903,8 @@ handler bump (delta : U64) {
         let spec = parse_str(src).expect("parse");
         let tmp = std::env::temp_dir().join(format!("kani_impl_silent_{}.rs", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
-        generate_from_spec(&spec, &tmp, /*explicit_flag=*/ false).expect("generate");
+        generate_from_spec(&spec, &tmp, /*explicit_flag=*/ false, Target::Anchor)
+            .expect("generate");
         assert!(
             !tmp.is_file(),
             "no flag + no auto-trigger must skip file emission"
@@ -903,7 +957,8 @@ handler deposit (amt : U64) {
 
         let tmp = std::env::temp_dir().join(format!("kani_impl_track_i_{}.rs", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
-        generate_from_spec(&spec, &tmp, /*explicit_flag=*/ false).expect("generate");
+        generate_from_spec(&spec, &tmp, /*explicit_flag=*/ false, Target::Anchor)
+            .expect("generate");
         let body = std::fs::read_to_string(&tmp).unwrap();
 
         // 1. The splice-marker comment from Track H must be GONE — Track I
@@ -978,7 +1033,8 @@ handler refresh (b : U64) {
 
         let tmp = std::env::temp_dir().join(format!("kani_impl_track_k_{}.rs", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
-        generate_from_spec(&spec, &tmp, /*explicit_flag=*/ false).expect("generate");
+        generate_from_spec(&spec, &tmp, /*explicit_flag=*/ false, Target::Anchor)
+            .expect("generate");
         let body = std::fs::read_to_string(&tmp).unwrap();
 
         assert!(
@@ -1047,7 +1103,8 @@ handler deposit (amt : U64) {
 
         let tmp = std::env::temp_dir().join(format!("kani_impl_track_a_{}.rs", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
-        generate_from_spec(&spec, &tmp, /*explicit_flag=*/ false).expect("generate");
+        generate_from_spec(&spec, &tmp, /*explicit_flag=*/ false, Target::Anchor)
+            .expect("generate");
         let body = std::fs::read_to_string(&tmp).unwrap();
 
         // The substitution rewrites `pre.from_balance` /
@@ -1115,7 +1172,8 @@ handler tick (val : U64) {
 
         let tmp = std::env::temp_dir().join(format!("kani_impl_tier0_{}.rs", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
-        generate_from_spec(&spec, &tmp, /*explicit_flag=*/ false).expect("generate");
+        generate_from_spec(&spec, &tmp, /*explicit_flag=*/ false, Target::Anchor)
+            .expect("generate");
         let body = std::fs::read_to_string(&tmp).unwrap();
 
         assert!(
@@ -1181,7 +1239,8 @@ handler liquidate (loss : U64) {
 
         let tmp = std::env::temp_dir().join(format!("kani_impl_letcall_{}.rs", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
-        generate_from_spec(&spec, &tmp, /*explicit_flag=*/ false).expect("generate");
+        generate_from_spec(&spec, &tmp, /*explicit_flag=*/ false, Target::Anchor)
+            .expect("generate");
         let body = std::fs::read_to_string(&tmp).unwrap();
 
         assert!(
@@ -1244,7 +1303,8 @@ handler split (a : U64) (b : U64) {
         let tmp =
             std::env::temp_dir().join(format!("kani_impl_multi_cpi_{}.rs", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
-        generate_from_spec(&spec, &tmp, /*explicit_flag=*/ false).expect("generate");
+        generate_from_spec(&spec, &tmp, /*explicit_flag=*/ false, Target::Anchor)
+            .expect("generate");
         let body = std::fs::read_to_string(&tmp).unwrap();
 
         // 1. Two CPI assume lines must be present (one per call).

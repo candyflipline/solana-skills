@@ -3211,7 +3211,12 @@ async fn dispatch(cmd: Commands) -> Result<()> {
                 if let Err(e) = deps::require_kani() {
                     eprintln!("warning: {e}");
                 }
-                kani_impl::generate(&spec, &kani_impl_output, /*explicit_flag=*/ kani_impl)?;
+                kani_impl::generate(
+                    &spec,
+                    &kani_impl_output,
+                    /*explicit_flag=*/ kani_impl,
+                    target,
+                )?;
             }
 
             if test || all {

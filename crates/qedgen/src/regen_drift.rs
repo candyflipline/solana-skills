@@ -366,11 +366,17 @@ fn generate_existing_artifacts(root: &Path, temp_root: &Path, spec_path: &Path) 
     // with `explicit_flag=true` matches the file-present semantics — even
     // if the spec no longer auto-triggers, regen produces fresh output
     // (the file was committed once, so it's user-elected).
+    // `kani_impl` is Anchor-only — non-Anchor targets no-op in
+    // `generate_from_spec`. Regen runs only if the file already exists
+    // on disk, so prior emission must have been Anchor (other targets
+    // never write the file). Passing Target::Anchor matches that
+    // invariant and keeps the regen comparator stable.
     if root.join("tests/kani_impl.rs").is_file() {
         crate::kani_impl::generate(
             spec_path,
             &temp_root.join("tests/kani_impl.rs"),
             /*explicit_flag=*/ true,
+            crate::Target::Anchor,
         )?;
     }
     if root.join("programs/tests/kani_impl.rs").is_file() {
@@ -378,6 +384,7 @@ fn generate_existing_artifacts(root: &Path, temp_root: &Path, spec_path: &Path) 
             spec_path,
             &temp_root.join("programs/tests/kani_impl.rs"),
             /*explicit_flag=*/ true,
+            crate::Target::Anchor,
         )?;
     }
     if root.join("tests/proptest.rs").is_file() {

@@ -2033,8 +2033,9 @@ fn find_state_account_filtered(
 const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 
 /// Try to emit a real Anchor CPI invocation for one `call Interface.handler(...)`
-/// site. Returns `None` when the interface isn't recognized (caller falls
-/// back to a comment + `todo!()` so the user / an LLM fills the body).
+/// site. Returns `None` when the interface isn't recognized OR when the
+/// target framework isn't Anchor (caller falls back to a comment +
+/// `todo!()` so the user / an LLM fills the body).
 ///
 /// All five SPL Token handlers — `transfer`, `mint_to`, `burn`,
 /// `initialize_account`, `close_account` — get an `anchor_spl::token::*`
@@ -2042,11 +2043,21 @@ const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 /// `solana_program::program::invoke` shape. The canonical SPL handlers
 /// cover the bulk of CPI traffic in deployed programs, which is what
 /// keeps `todo!()` out of the typical escrow / lending / vault shape.
+///
+/// Target gate: Quasar / Pinocchio have different CPI shapes
+/// (`quasar_lang::cpi::*`, raw `pinocchio::cpi::invoke`) and emitting
+/// `anchor_lang::*` / `anchor_spl::*` into a non-Anchor crate produces
+/// code that won't compile. Until per-target CPI emitters land, leave
+/// the call as a structured comment + `todo!()` for the agent to fill.
 fn try_emit_anchor_cpi(
     call: &crate::check::ParsedCall,
     handler: &ParsedHandler,
     spec: &ParsedSpec,
+    target: Target,
 ) -> Option<String> {
+    if !matches!(target, Target::Anchor) {
+        return None;
+    }
     let iface = spec
         .interfaces
         .iter()
@@ -3883,7 +3894,7 @@ pub(crate) fn render_handler_scaffold(
         if c.result_binding.is_none() {
             continue;
         }
-        match try_emit_anchor_cpi(c, handler, spec) {
+        match try_emit_anchor_cpi(c, handler, spec, target) {
             Some(rendered) => {
                 out.push_str(&format!(
                     "        // Spec call: {}.{} (binding: {})\n",
@@ -4068,7 +4079,7 @@ pub(crate) fn render_handler_scaffold(
         if emitted_call_indices.contains(&idx) {
             continue;
         }
-        match try_emit_anchor_cpi(c, handler, spec) {
+        match try_emit_anchor_cpi(c, handler, spec, target) {
             Some(rendered) => {
                 out.push_str(&format!(
                     "        // Spec call: {}.{} (Anchor CPI emitted by v2.8 G4)\n",
@@ -6488,7 +6499,8 @@ handler send (n : U64) : State.Active -> State.Active {
             .find(|h| h.name == "send")
             .expect("send handler");
         let call = handler.calls.first().expect("call site");
-        let rendered = try_emit_anchor_cpi(call, handler, &spec).expect("should emit Anchor CPI");
+        let rendered = try_emit_anchor_cpi(call, handler, &spec, Target::Anchor)
+            .expect("should emit Anchor CPI");
         assert!(
             rendered.contains("anchor_spl::token::{self, Transfer}"),
             "must use anchor_spl::token::Transfer; got:\n{rendered}"
@@ -6500,6 +6512,60 @@ handler send (n : U64) : State.Active -> State.Active {
         assert!(
             rendered.contains("token::transfer(CpiContext::new(cpi_program, cpi_accounts), n)"),
             "amount arg `n` is a handler param and should pass through bare; got:\n{rendered}"
+        );
+    }
+
+    /// Regression: emitting `anchor_lang::*` / `anchor_spl::*` into a
+    /// Quasar (`#![no_std]`, `quasar_lang::prelude`) crate produces code
+    /// that won't compile. Until per-target CPI emitters land, the
+    /// non-Anchor path must fall through to the comment + `todo!()`
+    /// shape so the agent fills the body.
+    #[test]
+    fn cpi_skips_emission_for_non_anchor_target() {
+        let spec = crate::chumsky_adapter::parse_str(
+            r#"spec Caller
+program_id "11111111111111111111111111111111"
+
+interface Token {
+  program_id "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+  handler transfer (amount : U64) {
+    discriminant "0x03"
+    accounts {
+      from      : writable
+      to        : writable
+      authority : signer
+    }
+    requires amount > 0
+    ensures  amount > 0
+  }
+}
+
+type State | Active of { balance : U64 }
+type Error | E
+
+handler send (n : U64) : State.Active -> State.Active {
+  permissionless
+  accounts {
+    state         : writable
+    src           : writable
+    dst           : writable
+    auth          : signer
+    token_program : program
+  }
+  call Token.transfer(from = src, to = dst, amount = n, authority = auth)
+}
+"#,
+        )
+        .unwrap();
+        let handler = spec.handlers.iter().find(|h| h.name == "send").unwrap();
+        let call = handler.calls.first().unwrap();
+        assert!(
+            try_emit_anchor_cpi(call, handler, &spec, Target::Quasar).is_none(),
+            "Quasar target must NOT receive an anchor_spl CPI emission"
+        );
+        assert!(
+            try_emit_anchor_cpi(call, handler, &spec, Target::Pinocchio).is_none(),
+            "Pinocchio target must NOT receive an anchor_spl CPI emission"
         );
     }
 
@@ -6569,7 +6635,7 @@ handler send : State.Active -> State.Active {
         let handler = spec.handlers.iter().find(|h| h.name == "send").unwrap();
         let call = handler.calls.first().unwrap();
         assert!(
-            try_emit_anchor_cpi(call, handler, &spec).is_none(),
+            try_emit_anchor_cpi(call, handler, &spec, Target::Anchor).is_none(),
             "missing program account should defer to comment + todo!()"
         );
     }
@@ -6616,7 +6682,7 @@ handler send : State.Active -> State.Active {
             .find(|h| h.name == "send")
             .expect("send handler");
         let call = handler.calls.first().expect("call site");
-        let rendered = try_emit_anchor_cpi(call, handler, &spec)
+        let rendered = try_emit_anchor_cpi(call, handler, &spec, Target::Anchor)
             .expect("must emit a generic CPI shape for non-SPL Anchor programs");
 
         // Sanity-check the emitted shape:
@@ -6678,7 +6744,7 @@ handler liquidate (loss : U64) : State.Active -> State.Active {
             Some("burned"),
             "result_binding should land in ParsedCall"
         );
-        let rendered = try_emit_anchor_cpi(call, handler, &spec)
+        let rendered = try_emit_anchor_cpi(call, handler, &spec, Target::Anchor)
             .expect("must emit a generic CPI with let-binding capture");
         // Block opens as a `let burned = { … }` expression.
         assert!(
@@ -6900,7 +6966,8 @@ handler do_mint (n : U64) : State.Active -> State.Active {
         .unwrap();
         let handler = spec.handlers.iter().find(|h| h.name == "do_mint").unwrap();
         let call = handler.calls.first().unwrap();
-        let rendered = try_emit_anchor_cpi(call, handler, &spec).expect("should emit");
+        let rendered =
+            try_emit_anchor_cpi(call, handler, &spec, Target::Anchor).expect("should emit");
         assert!(
             rendered.contains("anchor_spl::token::{self, MintTo}"),
             "should use MintTo struct; got:\n{rendered}"
@@ -6962,7 +7029,8 @@ handler do_burn (n : U64) : State.Active -> State.Active {
         .unwrap();
         let handler = spec.handlers.iter().find(|h| h.name == "do_burn").unwrap();
         let call = handler.calls.first().unwrap();
-        let rendered = try_emit_anchor_cpi(call, handler, &spec).expect("should emit");
+        let rendered =
+            try_emit_anchor_cpi(call, handler, &spec, Target::Anchor).expect("should emit");
         assert!(rendered.contains("anchor_spl::token::{self, Burn}"));
         assert!(rendered.contains("token::burn(CpiContext::new"));
         // Padding aligns colons across fields; use a substring that's
@@ -7013,7 +7081,8 @@ handler do_init : State.Active -> State.Active {
         .unwrap();
         let handler = spec.handlers.iter().find(|h| h.name == "do_init").unwrap();
         let call = handler.calls.first().unwrap();
-        let rendered = try_emit_anchor_cpi(call, handler, &spec).expect("should emit");
+        let rendered =
+            try_emit_anchor_cpi(call, handler, &spec, Target::Anchor).expect("should emit");
         assert!(rendered.contains("InitializeAccount"));
         // No scalar arg — the invocation has no second positional parameter.
         assert!(
@@ -7070,7 +7139,8 @@ handler do_close : State.Active -> State.Active {
         .unwrap();
         let handler = spec.handlers.iter().find(|h| h.name == "do_close").unwrap();
         let call = handler.calls.first().unwrap();
-        let rendered = try_emit_anchor_cpi(call, handler, &spec).expect("should emit");
+        let rendered =
+            try_emit_anchor_cpi(call, handler, &spec, Target::Anchor).expect("should emit");
         assert!(rendered.contains("CloseAccount"));
         assert!(
             rendered.contains("token::close_account(CpiContext::new(cpi_program, cpi_accounts))?;")
@@ -7117,7 +7187,8 @@ handler send : State.Active -> State.Active {
         .unwrap();
         let handler = spec.handlers.iter().find(|h| h.name == "send").unwrap();
         let call = handler.calls.first().unwrap();
-        let rendered = try_emit_anchor_cpi(call, handler, &spec).expect("should emit");
+        let rendered =
+            try_emit_anchor_cpi(call, handler, &spec, Target::Anchor).expect("should emit");
         assert!(
             rendered.contains("self.state.stash"),
             "state-field amount must resolve to self.<state_acct>.<field>; got:\n{rendered}"
