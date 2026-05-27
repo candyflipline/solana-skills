@@ -575,14 +575,40 @@ Brownfield Pinocchio user has:
 - Account data parsed unsafely via `borrow_mut_data_unchecked()` + `bytemuck::from_bytes` or a custom `Account::load_mut(...)` helper
 - A `.qedspec` next to the program (or a synthesised one from `crucible_brownfield`)
 
-We emit:
-- `tests/kani_impl.rs` — a separate **`std`** test crate that depends on the user's `#![no_std]` Pinocchio program and runs Kani against its real handlers
-- One `#[kani::proof]` per handler with at least one `ensures` clause, mirroring the Anchor shape but with Pinocchio's account-construction pattern
+We emit (**revised by M1 findings** — see `examples/pinocchio-fixtures/kani-smoke/src/lib.rs` for the validated shape):
+- `program/src/kani_impl.rs` (or per-handler `kani_impl_<name>.rs`) — a new module **inside the user's lib**, gated by `#[cfg(kani)]`. NOT a separate test crate.
+- One `#[kani::proof]` per handler with at least one `ensures` clause.
 
-The harness lives in the user's `tests/` directory because Cargo's test
-runner promotes `tests/*.rs` to a `std`-binary crate that depends on the
-library. This is the only way to reach a `no_std` lib from a `std`-needing
-harness — same shape Cargo uses for integration tests today.
+The **revised** placement is forced by two findings from M1:
+
+1. **`#![no_std]` libs need explicit `extern crate kani`**. Without
+   `#[cfg(kani)] extern crate kani;` at the lib root, `cargo kani`
+   fails with "Failed to detect Kani functions." Brownfield users need
+   either this one-line addition (cleanest) or a peer module that
+   our codegen injects.
+2. **Kani only scans the lib, not `tests/*.rs`**. The original §11a
+   assumption that we could ride Cargo's `tests/` → std-binary
+   promotion was wrong. `cargo kani`'s default harness discovery
+   walks the lib's own modules only. The harness must live inside the
+   lib (gated by `cfg(kani)` so non-Kani builds skip it).
+
+Implication: the codegen emitter writes into the user's `src/`, which
+crosses a brownfield boundary we previously avoided. Options:
+
+- **Option A** (recommended): emit a new file `src/kani_impl.rs` in the
+  user's program crate + add a `#[cfg(kani)] mod kani_impl;` line to
+  their `src/lib.rs`. One-line modification to `lib.rs`; the actual
+  harness body lives in our generated module.
+- **Option B**: emit a peer crate at `<root>/kani_harness/` that
+  declares the user's program as a `[dependencies]` path dep. Avoids
+  modifying user code but requires plumbing the peer crate into
+  `cargo kani`'s discovery (passing `--manifest-path` explicitly).
+- **Option C**: ask the user to add the `extern crate kani` +
+  `mod kani_impl` lines themselves, document in the SKILL. Cleanest
+  separation; highest user friction.
+
+The first commit lands Option A. If brownfield users push back on the
+`src/lib.rs` modification, we re-evaluate.
 
 ### 11b. Symbolic AccountInfo construction
 
@@ -688,14 +714,12 @@ programs require the MemoryLayout pipeline to land first; tracked as 8b.
 
 ### 11e. Open questions / risks
 
-- **Does `cargo kani` work against `no_std` lib dependencies?** Unknown. The
-  test crate itself is `std`, but the dependency tree drags in `no_std`.
-  Kani's known limitations don't explicitly call this out. Validation
-  plan (§11f) starts by answering this with a minimal smoke test before
-  the full emitter lands. If Kani can't handle this, the fallback is to
-  ship Pinocchio Kani-impl as a `cfg(miri)` harness instead (still
-  property-style, but Miri-driven concrete tests vs Kani's exhaustive
-  BMC).
+- **Does `cargo kani` work against `no_std` lib dependencies?**
+  **ANSWERED — yes, with caveats** (M1 smoke test at
+  `examples/pinocchio-fixtures/kani-smoke/`, commit `<TODO>`).
+  Kani 0.67.0 builds + verifies against a `pinocchio = "0.8"` lib dep in
+  ~0.5s. The two caveats are now §11a Findings 1+2: lib needs `extern
+  crate kani`, and harnesses must live inside the lib (not in `tests/`).
 - **BMC unwind cost on symbolic byte buffers**: every byte of account
   data + instruction data is symbolic. For a 165-byte SPL Token account
   this is 165 × 8 = 1320 symbolic bits per account, × N accounts.
@@ -723,18 +747,39 @@ programs require the MemoryLayout pipeline to land first; tracked as 8b.
 Three milestones, smallest-to-largest. Don't ship the emitter without
 clearing all three.
 
-**M1 — Kani-on-no_std smoke test** (~half day): write a hand-crafted
-`tests/kani_impl.rs` against the existing `examples/pinocchio-fixtures/ptoken-transfer`
-fixture. Confirm `cargo kani --harness verify_transfer_impl_ensures_0`
-either runs to completion OR fails with a clear error that points the
-way. This answers §11e's first open question with an experiment.
+**M1 — Kani-on-no_std smoke test** (**DONE** — landed at
+`examples/pinocchio-fixtures/kani-smoke/`).
 
-**M2 — Hand-crafted harness against real fixture** (~1 day): if M1
-succeeds, extend the harness to assert the transfer's conservation
-property (`pre.src.amount + pre.dst.amount == post.src.amount +
-post.dst.amount`). This should produce a Kani counterexample because
-`ptoken-transfer` uses unchecked arithmetic per the research findings.
-Validates the harness shape catches real bugs.
+Originally planned against `ptoken-transfer` but redirected mid-flight:
+that fixture's source uses `pinocchio_token::state::Account` /
+`Account::load_mut`, an API that doesn't exist in the actual
+`pinocchio-token = 0.3.0` crate it depends on (real API is
+`TokenAccount` + `from_account_info_unchecked`, immutable-only). The
+fixture is source-rotted relative to its declared dep.
+
+Switched to a self-contained smoke fixture under `kani-smoke/` to
+isolate the M1 question ("does Kani work against no_std deps") from
+the orthogonal fixture-source rot. Result: ✅ verified successfully in
+<1s. Findings captured in §11a (harness placement) and §11e (open
+questions resolved).
+
+Repairing `ptoken-transfer`'s source to match the real
+`pinocchio-token 0.3.0` API is a prerequisite for M2 but not M1. Add
+to the M2 task list.
+
+**M2 — Hand-crafted harness against real fixture** (~1 day + fixture
+repair). Two pieces:
+1. **Repair `ptoken-transfer` fixture** to match real
+   `pinocchio-token 0.3.0` API (rename `Account` → `TokenAccount`,
+   replace `load_mut` / `set_amount` with the actual immutable
+   accessor pattern + raw pointer mutation if needed for the audit
+   patterns the fixture exercises).
+2. **Write the conservation harness** that asserts
+   `pre.src.amount + pre.dst.amount == post.src.amount +
+   post.dst.amount`. Per the research findings, the fixture uses
+   unchecked arithmetic at `transfer.rs:80-81`, so this should
+   produce a Kani counterexample. Validates the harness shape catches
+   real bugs.
 
 **M3 — Codegen the harness** (~1-2 days): build `emit_kani_impl_pinocchio`
 that generates the exact string from M2 from the spec + program crate
@@ -745,9 +790,11 @@ per §7c.
 
 The slice lands across 3-4 commits on `feat/2.30`:
 
-1. **Smoke test** (M1): hand-write `tests/kani_impl_smoke.rs` under
-   `examples/pinocchio-fixtures/ptoken-transfer/`. No codegen yet.
-   Commit answers "can we even do this".
+1. **Smoke test** (M1 — **DONE**): self-contained fixture at
+   `examples/pinocchio-fixtures/kani-smoke/` validates Kani works
+   against `no_std` Pinocchio. Captured two design-shifting findings:
+   harness lives in lib (not `tests/`), and lib needs `extern crate
+   kani`. See §11a.
 2. **Reference harness** (M2): hand-write a real
    `tests/kani_impl.rs` that asserts the conservation ensures.
    Commit captures the target shape we'll codegen toward.
