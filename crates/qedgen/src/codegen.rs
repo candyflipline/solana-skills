@@ -2044,43 +2044,45 @@ const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 /// cover the bulk of CPI traffic in deployed programs, which is what
 /// keeps `todo!()` out of the typical escrow / lending / vault shape.
 ///
-/// Target gate: Quasar / Pinocchio have different CPI shapes
-/// (`quasar_lang::cpi::*`, raw `pinocchio::cpi::invoke`) and emitting
-/// `anchor_lang::*` / `anchor_spl::*` into a non-Anchor crate produces
-/// code that won't compile. Until per-target CPI emitters land, leave
-/// the call as a structured comment + `todo!()` for the agent to fill.
-fn try_emit_anchor_cpi(
+/// Per-target dispatch: emits the right CPI shape per
+/// `(target, is_spl_token)` per `docs/design/quasar-cpi-spike.md` §4.
+///
+/// - Anchor + SPL Token → `anchor_spl::token::*` builder shape
+/// - Anchor + generic   → `solana_program::program::invoke` shape
+/// - Quasar + SPL Token → `quasar_spl::TokenCpi` method chain
+/// - Quasar + generic   → not implemented (spike scope; §8 slice 3)
+/// - Pinocchio          → not implemented (separate release; §8 slice 7)
+///
+/// Returns `None` for any branch that isn't implemented yet — the
+/// caller falls back to a structured comment + `todo!()` so the agent
+/// fills the body.
+fn try_emit_cpi(
     call: &crate::check::ParsedCall,
     handler: &ParsedHandler,
     spec: &ParsedSpec,
     target: Target,
 ) -> Option<String> {
-    if !matches!(target, Target::Anchor) {
-        return None;
-    }
     let iface = spec
         .interfaces
         .iter()
         .find(|i| i.name == call.target_interface)?;
+    let is_spl_token = iface.program_id.as_deref() == Some(SPL_TOKEN_PROGRAM_ID);
 
-    // SPL Token gets the special-case `anchor_spl::token::*` shapes
-    // (typed accounts structs + the existing token::transfer / mint_to /
-    // burn / initialize_account / close_account helpers — fewer lines of
-    // generated code, idiomatic for the bulk of CPI traffic).
-    if iface.program_id.as_deref() == Some(SPL_TOKEN_PROGRAM_ID) {
-        return emit_spl_token_cpi(call, handler, spec);
+    match (target, is_spl_token) {
+        (Target::Anchor, true) => emit_spl_token_cpi_anchor(call, handler, spec),
+        (Target::Anchor, false) => emit_generic_cpi_anchor(call, handler, iface, spec),
+        (Target::Quasar, true) => emit_spl_token_cpi_quasar(call, handler, spec),
+        // Quasar generic CPI — follow-on slice (uses `BufCpiCall`).
+        (Target::Quasar, false) => None,
+        // Pinocchio — separate release; the auto-fallback path is fine.
+        (Target::Pinocchio, _) => None,
     }
-
-    // Every other Anchor program gets the generic `invoke` shape
-    // (v2.9 G3): sighash discriminator + Borsh-serialized args +
-    // AccountMeta synthesis from the interface's accounts block.
-    emit_generic_anchor_cpi(call, handler, iface, spec)
 }
 
 /// SPL Token dispatcher. Routes to the right `anchor_spl::token` helper
 /// per the called handler's name. Returns None on unrecognized handlers
 /// (the caller falls back to comment + `todo!()`).
-fn emit_spl_token_cpi(
+fn emit_spl_token_cpi_anchor(
     call: &crate::check::ParsedCall,
     handler: &ParsedHandler,
     spec: &ParsedSpec,
@@ -2089,7 +2091,7 @@ fn emit_spl_token_cpi(
     let prog_name = &token_program_acct.name;
 
     match call.target_handler.as_str() {
-        "transfer" => emit_spl(
+        "transfer" => emit_spl_anchor(
             call,
             handler,
             spec,
@@ -2099,7 +2101,7 @@ fn emit_spl_token_cpi(
             Some("amount"),
             "transfer",
         ),
-        "mint_to" => emit_spl(
+        "mint_to" => emit_spl_anchor(
             call,
             handler,
             spec,
@@ -2117,7 +2119,7 @@ fn emit_spl_token_cpi(
             Some("amount"),
             "mint_to",
         ),
-        "burn" => emit_spl(
+        "burn" => emit_spl_anchor(
             call,
             handler,
             spec,
@@ -2131,7 +2133,7 @@ fn emit_spl_token_cpi(
             Some("amount"),
             "burn",
         ),
-        "initialize_account" => emit_spl(
+        "initialize_account" => emit_spl_anchor(
             call,
             handler,
             spec,
@@ -2149,7 +2151,7 @@ fn emit_spl_token_cpi(
             None,
             "initialize_account",
         ),
-        "close_account" => emit_spl(
+        "close_account" => emit_spl_anchor(
             call,
             handler,
             spec,
@@ -2275,7 +2277,7 @@ fn to_snake_case(s: &str) -> String {
 ///     ])?;
 /// }
 /// ```
-fn emit_generic_anchor_cpi(
+fn emit_generic_cpi_anchor(
     call: &crate::check::ParsedCall,
     handler: &ParsedHandler,
     iface: &crate::check::ParsedInterface,
@@ -2431,7 +2433,7 @@ fn emit_generic_anchor_cpi(
 /// some interfaces expose a more semantic name than anchor_spl uses
 /// (e.g. `mint_authority` vs `authority`).
 #[allow(clippy::too_many_arguments)]
-fn emit_spl(
+fn emit_spl_anchor(
     call: &crate::check::ParsedCall,
     handler: &ParsedHandler,
     spec: &ParsedSpec,
@@ -2493,6 +2495,79 @@ fn emit_spl(
     out.push_str(&invocation);
     out.push_str("        }\n");
     Some(out)
+}
+
+/// Quasar SPL Token dispatcher. Routes to the right `quasar_spl` method
+/// per the called handler's name. Returns None on unrecognized handlers
+/// so the caller falls back to comment + `todo!()`.
+///
+/// Spike scope (see `docs/design/quasar-cpi-spike.md` §5): only
+/// `transfer` is implemented in the first slice. Other handlers
+/// (`mint_to`, `burn`, `initialize_account`, `close_account`) take the
+/// `None` exit until the follow-on slice (§8 slice 2) lands.
+fn emit_spl_token_cpi_quasar(
+    call: &crate::check::ParsedCall,
+    handler: &ParsedHandler,
+    spec: &ParsedSpec,
+) -> Option<String> {
+    let token_program_acct = find_token_program_account(handler)?;
+    let prog_name = &token_program_acct.name;
+
+    match call.target_handler.as_str() {
+        "transfer" => emit_spl_quasar(
+            call,
+            handler,
+            spec,
+            prog_name,
+            "transfer",
+            // Quasar's TokenCpi::transfer signature is
+            // (from, to, authority, amount). Spec arg names must match
+            // the canonical SPL Token interface declared in the spec.
+            &["from", "to", "authority"],
+            Some("amount"),
+        ),
+        // Other SPL handlers fall through to the caller's `todo!()`
+        // shape until the follow-on slice lands per
+        // docs/design/quasar-cpi-spike.md §8 slice 2.
+        _ => None,
+    }
+}
+
+/// Emit one Quasar `quasar_spl::*` CPI as a single-line method chain on
+/// the token-program account: `self.<prog>.<method>(&self.<a>, …,
+/// scalar).invoke()?;`. The shape comes from `quasar-spl-0.0.0`'s
+/// `TokenCpi` trait — see `docs/design/quasar-cpi-spike.md` §2 for the
+/// side-by-side with the Anchor shape.
+///
+/// `account_args_in_order` carries the call-site arg names in the order
+/// the Quasar trait method expects (e.g. `["from", "to", "authority"]`
+/// for `transfer`). The function looks each one up in `call.args` and
+/// resolves it to `&self.<rust_expr>`. Unrecognized arg names short-
+/// circuit to `None`.
+fn emit_spl_quasar(
+    call: &crate::check::ParsedCall,
+    handler: &ParsedHandler,
+    spec: &ParsedSpec,
+    token_program: &str,
+    method_name: &str,
+    account_args_in_order: &[&str],
+    scalar_arg: Option<&str>,
+) -> Option<String> {
+    let mut args: Vec<String> = Vec::with_capacity(account_args_in_order.len() + 1);
+    for call_arg in account_args_in_order {
+        let arg = call.args.iter().find(|a| a.name == *call_arg)?;
+        args.push(format!("&self.{}", arg.rust_expr));
+    }
+    if let Some(name) = scalar_arg {
+        let arg = call.args.iter().find(|a| a.name == name)?;
+        args.push(resolve_call_arg_for_amount(&arg.rust_expr, handler, spec));
+    }
+    Some(format!(
+        "        self.{}.{}({}).invoke()?;\n",
+        token_program,
+        method_name,
+        args.join(", ")
+    ))
 }
 
 /// v2.29.2 — resolve the state-bearing account for a handler with a
@@ -3894,7 +3969,7 @@ pub(crate) fn render_handler_scaffold(
         if c.result_binding.is_none() {
             continue;
         }
-        match try_emit_anchor_cpi(c, handler, spec, target) {
+        match try_emit_cpi(c, handler, spec, target) {
             Some(rendered) => {
                 out.push_str(&format!(
                     "        // Spec call: {}.{} (binding: {})\n",
@@ -4079,7 +4154,7 @@ pub(crate) fn render_handler_scaffold(
         if emitted_call_indices.contains(&idx) {
             continue;
         }
-        match try_emit_anchor_cpi(c, handler, spec, target) {
+        match try_emit_cpi(c, handler, spec, target) {
             Some(rendered) => {
                 out.push_str(&format!(
                     "        // Spec call: {}.{} (Anchor CPI emitted by v2.8 G4)\n",
@@ -6453,7 +6528,7 @@ handler initialize : State.Active -> State.Active {
 
     // ----- v2.8 G4: Anchor CPI codegen for SPL Token transfer -----
 
-    /// Exercise try_emit_anchor_cpi against an end-to-end-parsed spec.
+    /// Exercise try_emit_cpi against an end-to-end-parsed spec.
     /// Hits the resolver pipeline (no need to construct ParsedSpec by
     /// hand) and confirms the SPL Token transfer shape lands.
     #[test]
@@ -6499,8 +6574,8 @@ handler send (n : U64) : State.Active -> State.Active {
             .find(|h| h.name == "send")
             .expect("send handler");
         let call = handler.calls.first().expect("call site");
-        let rendered = try_emit_anchor_cpi(call, handler, &spec, Target::Anchor)
-            .expect("should emit Anchor CPI");
+        let rendered =
+            try_emit_cpi(call, handler, &spec, Target::Anchor).expect("should emit Anchor CPI");
         assert!(
             rendered.contains("anchor_spl::token::{self, Transfer}"),
             "must use anchor_spl::token::Transfer; got:\n{rendered}"
@@ -6515,57 +6590,129 @@ handler send (n : U64) : State.Active -> State.Active {
         );
     }
 
-    /// Regression: emitting `anchor_lang::*` / `anchor_spl::*` into a
-    /// Quasar (`#![no_std]`, `quasar_lang::prelude`) crate produces code
-    /// that won't compile. Until per-target CPI emitters land, the
-    /// non-Anchor path must fall through to the comment + `todo!()`
-    /// shape so the agent fills the body.
-    #[test]
-    fn cpi_skips_emission_for_non_anchor_target() {
-        let spec = crate::chumsky_adapter::parse_str(
+    /// Helper for the Quasar / Pinocchio CPI tests — same SPL Token
+    /// transfer fixture shape used in
+    /// `cpi_emits_anchor_spl_transfer_for_canonical_program_id`, but
+    /// parameterized so each test can swap the called handler name in
+    /// the call site.
+    #[cfg(test)]
+    fn parse_spl_transfer_caller_spec(called_handler: &str) -> crate::check::ParsedSpec {
+        let spec_src = format!(
             r#"spec Caller
 program_id "11111111111111111111111111111111"
 
-interface Token {
+interface Token {{
   program_id "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
-  handler transfer (amount : U64) {
+  handler transfer (amount : U64) {{
     discriminant "0x03"
-    accounts {
+    accounts {{
       from      : writable
       to        : writable
       authority : signer
-    }
+    }}
     requires amount > 0
     ensures  amount > 0
-  }
-}
+  }}
+  handler mint_to (amount : U64) {{
+    discriminant "0x07"
+    accounts {{
+      mint      : writable
+      to        : writable
+      authority : signer
+    }}
+  }}
+}}
 
-type State | Active of { balance : U64 }
+type State | Active of {{ balance : U64 }}
 type Error | E
 
-handler send (n : U64) : State.Active -> State.Active {
+handler send (n : U64) : State.Active -> State.Active {{
   permissionless
-  accounts {
+  accounts {{
     state         : writable
     src           : writable
     dst           : writable
+    mint          : writable
     auth          : signer
     token_program : program
-  }
-  call Token.transfer(from = src, to = dst, amount = n, authority = auth)
-}
+  }}
+  call Token.{}(from = src, to = dst, mint = mint, amount = n, authority = auth)
+}}
 "#,
-        )
-        .unwrap();
+            called_handler
+        );
+        crate::chumsky_adapter::parse_str(&spec_src).unwrap()
+    }
+
+    /// Spike: Quasar SPL Token transfer emits a one-line method chain
+    /// on the token-program account, NOT an `anchor_spl::*` builder.
+    /// Per `docs/design/quasar-cpi-spike.md` §2 the shape is:
+    ///   self.token_program.transfer(&self.src, &self.dst, &self.auth, n).invoke()?;
+    #[test]
+    fn cpi_emits_quasar_spl_transfer() {
+        let spec = parse_spl_transfer_caller_spec("transfer");
+        let handler = spec.handlers.iter().find(|h| h.name == "send").unwrap();
+        let call = handler.calls.first().unwrap();
+        let rendered = try_emit_cpi(call, handler, &spec, Target::Quasar)
+            .expect("Quasar SPL transfer must emit");
+        assert!(
+            rendered.contains("self.token_program.transfer("),
+            "Quasar shape must invoke transfer on the token-program account; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("&self.src"),
+            "from arg must resolve to &self.src; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("&self.dst"),
+            "to arg must resolve to &self.dst; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("&self.auth"),
+            "authority arg must resolve to &self.auth; got:\n{rendered}"
+        );
+        assert!(
+            rendered.trim_end().ends_with(".invoke()?;"),
+            "Quasar trait chain must terminate with .invoke()?; got:\n{rendered}"
+        );
+        // Anti-regression: must NOT leak the Anchor shape.
+        assert!(
+            !rendered.contains("anchor_spl"),
+            "Quasar emission must not import anchor_spl; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("CpiContext"),
+            "Quasar emission must not construct CpiContext; got:\n{rendered}"
+        );
+    }
+
+    /// Anti-regression for the spike's narrow scope: only `transfer`
+    /// works for Quasar SPL in this slice. Other SPL handlers
+    /// (`mint_to`, `burn`, …) must still take the `todo!()` exit until
+    /// the follow-on slice lands per
+    /// `docs/design/quasar-cpi-spike.md` §8 slice 2.
+    #[test]
+    fn cpi_quasar_spl_mint_to_falls_through_to_none() {
+        let spec = parse_spl_transfer_caller_spec("mint_to");
         let handler = spec.handlers.iter().find(|h| h.name == "send").unwrap();
         let call = handler.calls.first().unwrap();
         assert!(
-            try_emit_anchor_cpi(call, handler, &spec, Target::Quasar).is_none(),
-            "Quasar target must NOT receive an anchor_spl CPI emission"
+            try_emit_cpi(call, handler, &spec, Target::Quasar).is_none(),
+            "Quasar SPL mint_to is out of spike scope; must fall through to None"
         );
+    }
+
+    /// Pinocchio still has no CPI emitter in any branch — the entire
+    /// target falls through to the caller's `todo!()` shape. Distinct
+    /// release per the design doc §8 slice 7.
+    #[test]
+    fn cpi_skips_emission_for_pinocchio() {
+        let spec = parse_spl_transfer_caller_spec("transfer");
+        let handler = spec.handlers.iter().find(|h| h.name == "send").unwrap();
+        let call = handler.calls.first().unwrap();
         assert!(
-            try_emit_anchor_cpi(call, handler, &spec, Target::Pinocchio).is_none(),
-            "Pinocchio target must NOT receive an anchor_spl CPI emission"
+            try_emit_cpi(call, handler, &spec, Target::Pinocchio).is_none(),
+            "Pinocchio CPI is unimplemented; every call site must take the None exit"
         );
     }
 
@@ -6635,7 +6782,7 @@ handler send : State.Active -> State.Active {
         let handler = spec.handlers.iter().find(|h| h.name == "send").unwrap();
         let call = handler.calls.first().unwrap();
         assert!(
-            try_emit_anchor_cpi(call, handler, &spec, Target::Anchor).is_none(),
+            try_emit_cpi(call, handler, &spec, Target::Anchor).is_none(),
             "missing program account should defer to comment + todo!()"
         );
     }
@@ -6682,7 +6829,7 @@ handler send : State.Active -> State.Active {
             .find(|h| h.name == "send")
             .expect("send handler");
         let call = handler.calls.first().expect("call site");
-        let rendered = try_emit_anchor_cpi(call, handler, &spec, Target::Anchor)
+        let rendered = try_emit_cpi(call, handler, &spec, Target::Anchor)
             .expect("must emit a generic CPI shape for non-SPL Anchor programs");
 
         // Sanity-check the emitted shape:
@@ -6744,7 +6891,7 @@ handler liquidate (loss : U64) : State.Active -> State.Active {
             Some("burned"),
             "result_binding should land in ParsedCall"
         );
-        let rendered = try_emit_anchor_cpi(call, handler, &spec, Target::Anchor)
+        let rendered = try_emit_cpi(call, handler, &spec, Target::Anchor)
             .expect("must emit a generic CPI with let-binding capture");
         // Block opens as a `let burned = { … }` expression.
         assert!(
@@ -6966,8 +7113,7 @@ handler do_mint (n : U64) : State.Active -> State.Active {
         .unwrap();
         let handler = spec.handlers.iter().find(|h| h.name == "do_mint").unwrap();
         let call = handler.calls.first().unwrap();
-        let rendered =
-            try_emit_anchor_cpi(call, handler, &spec, Target::Anchor).expect("should emit");
+        let rendered = try_emit_cpi(call, handler, &spec, Target::Anchor).expect("should emit");
         assert!(
             rendered.contains("anchor_spl::token::{self, MintTo}"),
             "should use MintTo struct; got:\n{rendered}"
@@ -7029,8 +7175,7 @@ handler do_burn (n : U64) : State.Active -> State.Active {
         .unwrap();
         let handler = spec.handlers.iter().find(|h| h.name == "do_burn").unwrap();
         let call = handler.calls.first().unwrap();
-        let rendered =
-            try_emit_anchor_cpi(call, handler, &spec, Target::Anchor).expect("should emit");
+        let rendered = try_emit_cpi(call, handler, &spec, Target::Anchor).expect("should emit");
         assert!(rendered.contains("anchor_spl::token::{self, Burn}"));
         assert!(rendered.contains("token::burn(CpiContext::new"));
         // Padding aligns colons across fields; use a substring that's
@@ -7081,8 +7226,7 @@ handler do_init : State.Active -> State.Active {
         .unwrap();
         let handler = spec.handlers.iter().find(|h| h.name == "do_init").unwrap();
         let call = handler.calls.first().unwrap();
-        let rendered =
-            try_emit_anchor_cpi(call, handler, &spec, Target::Anchor).expect("should emit");
+        let rendered = try_emit_cpi(call, handler, &spec, Target::Anchor).expect("should emit");
         assert!(rendered.contains("InitializeAccount"));
         // No scalar arg — the invocation has no second positional parameter.
         assert!(
@@ -7139,8 +7283,7 @@ handler do_close : State.Active -> State.Active {
         .unwrap();
         let handler = spec.handlers.iter().find(|h| h.name == "do_close").unwrap();
         let call = handler.calls.first().unwrap();
-        let rendered =
-            try_emit_anchor_cpi(call, handler, &spec, Target::Anchor).expect("should emit");
+        let rendered = try_emit_cpi(call, handler, &spec, Target::Anchor).expect("should emit");
         assert!(rendered.contains("CloseAccount"));
         assert!(
             rendered.contains("token::close_account(CpiContext::new(cpi_program, cpi_accounts))?;")
@@ -7187,8 +7330,7 @@ handler send : State.Active -> State.Active {
         .unwrap();
         let handler = spec.handlers.iter().find(|h| h.name == "send").unwrap();
         let call = handler.calls.first().unwrap();
-        let rendered =
-            try_emit_anchor_cpi(call, handler, &spec, Target::Anchor).expect("should emit");
+        let rendered = try_emit_cpi(call, handler, &spec, Target::Anchor).expect("should emit");
         assert!(
             rendered.contains("self.state.stash"),
             "state-field amount must resolve to self.<state_acct>.<field>; got:\n{rendered}"
