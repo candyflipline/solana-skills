@@ -767,19 +767,64 @@ Repairing `ptoken-transfer`'s source to match the real
 `pinocchio-token 0.3.0` API is a prerequisite for M2 but not M1. Add
 to the M2 task list.
 
-**M2 — Hand-crafted harness against real fixture** (~1 day + fixture
-repair). Two pieces:
-1. **Repair `ptoken-transfer` fixture** to match real
-   `pinocchio-token 0.3.0` API (rename `Account` → `TokenAccount`,
-   replace `load_mut` / `set_amount` with the actual immutable
-   accessor pattern + raw pointer mutation if needed for the audit
-   patterns the fixture exercises).
-2. **Write the conservation harness** that asserts
-   `pre.src.amount + pre.dst.amount == post.src.amount +
-   post.dst.amount`. Per the research findings, the fixture uses
-   unchecked arithmetic at `transfer.rs:80-81`, so this should
-   produce a Kani counterexample. Validates the harness shape catches
-   real bugs.
+**M2 — Hand-crafted harness against real fixture** (**DONE** — landed
+at `examples/pinocchio-fixtures/ptoken-transfer/src/kani_impl.rs`).
+
+Two pieces shipped:
+
+1. **Repaired `ptoken-transfer` fixture** to match real
+   `pinocchio-token 0.3.0` API (`TokenAccount` +
+   `from_account_info_unchecked` + raw-pointer mutation for the
+   amount field, since `TokenAccount` exposes no setters). Also
+   bumped `pinocchio = "0.6"` → `"0.8"` to match
+   `pinocchio-token`'s transitive pin. Audit patterns preserved:
+   unchecked `+` / `-` on amounts, SAFETY-claim chain, unsafe load.
+
+2. **Conservation harness** that catches the overflow at
+   `transfer.rs:99` (`let dst_amount_after = dst_amount_before +
+   amount;`). Kani returns `VERIFICATION:- FAILED` in 1.1s with:
+
+   ```
+   Failed Checks: attempt to add with overflow
+    File: "src/transfer.rs", line 99
+   ```
+
+### M2 design pivot: stack-allocated `AccountInfo`, NOT wire-format
+
+First attempt used the wire-format approach from
+`_harness/account.rs:78-127` — `Box::leak`ing a ~42KB buffer through
+`pinocchio::entrypoint::deserialize`. Kani made it through but the
+SAT instance blew up (18.5M variables, 270M clauses; 218s on SSA
+conversion, didn't finish solving within 4 min). Cost drivers: the
+symbolic pointer-indirection reads through the leaked buffer plus
+the memcmp unrolling in pinocchio's owner-check loops.
+
+**Pivot**: build `Account`-layout structs directly on the stack via a
+local `#[repr(C)] AccountLayout` type mirroring
+`pinocchio::account_info::Account`, then `transmute::<*mut
+AccountLayout, AccountInfo>(ptr)`. Sound because `AccountInfo` is
+`#[repr(C)] struct { raw: *mut Account }` — single-field pointer
+wrapper. Compile-time `size_of` assertion catches the most common
+layout drift.
+
+This drops the symbolic surface from a 42KB buffer to four
+`StackAccount<165>` structs with only the per-account `amount` field
+symbolic. Kani went from "timed out at 4 min" to "found bug in
+1.1s" — a ~250× speedup.
+
+**Implication for slice 8 M3 codegen**: emit the stack-layout
+approach, not the wire-format one. The codegen needs to:
+- Emit a `#[repr(C)] AccountLayout` struct definition + the
+  `size_of::<AccountLayout>() == 88` assertion (per program crate,
+  once)
+- Emit per-handler `build_<account_kind>` helpers (per declared
+  account in the spec)
+- Emit `account_info_from_stack` transmute helper (once)
+- Emit `#[kani::unwind(34)]` for memcmp bounds (Pubkey size + slack)
+
+`#[kani::unwind(N)]` tuning is per-handler. M2 used 34 (Pubkey
+memcmp is 32 bytes, +2 slack). If the handler has nested loops
+(e.g. a non-Pubkey comparison), the bound needs to grow.
 
 **M3 — Codegen the harness** (~1-2 days): build `emit_kani_impl_pinocchio`
 that generates the exact string from M2 from the spec + program crate
@@ -795,9 +840,12 @@ The slice lands across 3-4 commits on `feat/2.30`:
    against `no_std` Pinocchio. Captured two design-shifting findings:
    harness lives in lib (not `tests/`), and lib needs `extern crate
    kani`. See §11a.
-2. **Reference harness** (M2): hand-write a real
-   `tests/kani_impl.rs` that asserts the conservation ensures.
-   Commit captures the target shape we'll codegen toward.
+2. **Reference harness** (M2 — **DONE**): hand-written
+   `src/kani_impl.rs` (not `tests/`, per M1 finding) with the
+   stack-allocated `AccountInfo` shape that catches the overflow at
+   `transfer.rs:99`. Codegen target shape captured. Also repaired
+   the `ptoken-transfer` fixture source to match
+   `pinocchio-token 0.3.0` API.
 3. **Codegen + dispatch refactor** (M3): land
    `emit_kani_impl_pinocchio` + the §7c dispatch refactor in
    `kani_impl::generate_from_spec`. Anchor branch keeps working,
