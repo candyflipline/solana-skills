@@ -1,6 +1,8 @@
 # Quasar CPI emission — spike design
 
-**Status**: proposal, awaiting review
+**Status**: in progress — Quasar CPI (transfer) + Pinocchio CPI (transfer) +
+Pinocchio Kani-impl (M1/M2/M3) all landed on `feat/2.30`. See
+`quasar-cpi-HANDOFF.md` for the resume-here punch list.
 **Author**: @abishekk92 (drafted with Claude)
 **Branch**: `feat/2.30`
 **Scope**: end-to-end slice that lights up `--target quasar` for SPL Token
