@@ -1282,6 +1282,7 @@ pub(crate) fn render_pinocchio_handler_scaffold(
     out.push_str(
         "use pinocchio::{account_info::AccountInfo, program_error::ProgramError, ProgramResult};\n",
     );
+    out.push_str("use zeropod::ZeroPodFixed;\n");
     out.push_str("use crate::state::*;\n");
     if !spec.ref_impls.is_empty() {
         out.push_str("use crate::ref_impls::*;\n");
@@ -1326,9 +1327,7 @@ pub(crate) fn render_pinocchio_handler_scaffold(
             param_names.join(", ")
         ));
     }
-    out.push_str("        // TODO(slice 6 step 4b): effects — read/write zeropod state via\n");
-    out.push_str("        // <State>::from_bytes_mut(self.<acct>.borrow_mut_data_unchecked()?)\n");
-    out.push_str("        // + any SPL CPIs. Mechanical effect + CPI emission lands next.\n");
+    emit_pinocchio_effect_body(&mut out, handler, spec);
     out.push_str("        Ok(())\n");
     out.push_str("    }\n");
     out.push_str("}\n\n");
@@ -1398,6 +1397,104 @@ pub(crate) fn render_pinocchio_handler_scaffold(
     out.push_str("}\n");
 
     Ok(out)
+}
+
+/// Emit the `.handler()` effect body for a Pinocchio handler (slice 6 4b).
+/// Mechanical SCALAR state effects (`field := v`, `field += / -= / +=! /
+/// +=? n`) lower to a one-time mutable zeropod decode of the state account
+/// plus per-field `.get()`-based arithmetic (universally safe — native int
+/// op then `.into()` back to the Pod field). RHS expressions route through
+/// `bind_pinocchio_expr` so param + scalar-state reads resolve.
+///
+/// Deferred (emit a documented breadcrumb): non-scalar effects (array /
+/// nested / variant-payload writes), events, transfers, and SPL CPIs — the
+/// `emit_spl_pinocchio` CPI emitter's `&self.<acct>` shape needs
+/// reconciling with the `&AccountInfo` struct fields first.
+fn emit_pinocchio_effect_body(out: &mut String, handler: &ParsedHandler, spec: &ParsedSpec) {
+    let prog = to_pascal_case(&spec.program_name);
+    let err = format!("{}Error", prog);
+    let has = |n: &str| spec.error_codes.iter().any(|c| c == n);
+    let overflow = if has("MathOverflow") {
+        format!("ProgramError::from({}::MathOverflow)", err)
+    } else {
+        "ProgramError::ArithmeticOverflow".to_string()
+    };
+    let underflow = if has("MathUnderflow") {
+        format!("ProgramError::from({}::MathUnderflow)", err)
+    } else if has("MathOverflow") {
+        format!("ProgramError::from({}::MathOverflow)", err)
+    } else {
+        "ProgramError::ArithmeticOverflow".to_string()
+    };
+
+    // Classify scalar state effects (lhs is a simple field after stripping
+    // any `Variant.` prefix — no `.` / `[` remaining).
+    let scalar: Vec<(String, &str, &str)> = handler
+        .effects
+        .iter()
+        .filter_map(|(lhs, op, rhs)| {
+            let field = strip_variant_prefix(lhs, spec);
+            if field.contains('.') || field.contains('[') {
+                None
+            } else {
+                Some((field, op.as_str(), rhs.as_str()))
+            }
+        })
+        .collect();
+
+    // Single-account decode only (multi-account state typing is deferred).
+    let single_state = spec.account_types.len() <= 1;
+    if !scalar.is_empty() && single_state {
+        if let Some(acct) = resolve_handler_state_account(handler, spec) {
+            out.push_str(&format!(
+                "        let __state = {}Account::from_bytes_mut(unsafe {{ self.{}.borrow_mut_data_unchecked() }})\n            .map_err(|_| ProgramError::InvalidAccountData)?;\n",
+                prog, acct.name
+            ));
+            for (field, op, rhs) in &scalar {
+                let r = bind_pinocchio_expr(rhs, handler, "__state");
+                let line = match *op {
+                    "set" => format!("        __state.{field} = ({r}).into();\n"),
+                    "add" => format!(
+                        "        __state.{field} = __state.{field}.get().checked_add({r}).ok_or({overflow})?.into();\n"
+                    ),
+                    "sub" => format!(
+                        "        __state.{field} = __state.{field}.get().checked_sub({r}).ok_or({underflow})?.into();\n"
+                    ),
+                    "add_sat" => format!(
+                        "        __state.{field} = __state.{field}.get().saturating_add({r}).into();\n"
+                    ),
+                    "sub_sat" => format!(
+                        "        __state.{field} = __state.{field}.get().saturating_sub({r}).into();\n"
+                    ),
+                    "add_wrap" => format!(
+                        "        __state.{field} = __state.{field}.get().wrapping_add({r}).into();\n"
+                    ),
+                    "sub_wrap" => format!(
+                        "        __state.{field} = __state.{field}.get().wrapping_sub({r}).into();\n"
+                    ),
+                    other => format!("        // TODO: effect op `{other}` on `{field}` not mechanized\n"),
+                };
+                out.push_str(&line);
+            }
+        } else {
+            out.push_str(
+                "        // TODO(slice 6 4b): could not resolve the state account for effects\n",
+            );
+        }
+    }
+
+    // Deferred surfaces — documented breadcrumbs (not silently dropped).
+    let complex_effects =
+        handler.effects.len() > scalar.len() || (!scalar.is_empty() && !single_state);
+    if complex_effects {
+        out.push_str("        // TODO(slice 6 4b-cont): non-scalar effects (array / nested /\n        // variant-payload writes) + multi-account state.\n");
+    }
+    if !handler.calls.is_empty() {
+        out.push_str("        // TODO(slice 6 4b-cont): SPL CPIs — reconcile emit_spl_pinocchio's\n        // &self.<acct> shape with the &AccountInfo struct fields.\n");
+    }
+    if !handler.emits.is_empty() || !handler.transfers.is_empty() {
+        out.push_str("        // TODO(slice 6 4b-cont): events / transfers.\n");
+    }
 }
 
 /// v2.24 S5b — `true` when the spec's state is a multi-variant ADT
@@ -6669,6 +6766,18 @@ handler deposit (amount : U64) {
             out.contains("pub fn handler(&mut self, amount: u64) -> ProgramResult {")
                 && out.contains("guards::deposit(self, amount)?;"),
             "handler must take params + call guards; got:\n{out}"
+        );
+        // Effect body: zeropod mutable decode + checked scalar arithmetic.
+        // (No MathOverflow declared → falls back to ProgramError::ArithmeticOverflow.)
+        assert!(
+            out.contains(
+                "VaultAccount::from_bytes_mut(unsafe { self.vault.borrow_mut_data_unchecked() })"
+            ),
+            "effect body must mutably decode the state account; got:\n{out}"
+        );
+        assert!(
+            out.contains("__state.balance = __state.balance.get().checked_add(amount).ok_or(ProgramError::ArithmeticOverflow)?.into();"),
+            "scalar `+=` must lower to a checked .get()/.into() update; got:\n{out}"
         );
         // process_<name> wrapper: positional account binding + LE param
         // parse + struct build + dispatch.
