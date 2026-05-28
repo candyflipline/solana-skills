@@ -17,7 +17,7 @@ Mission:
 - Fill generated Rust handler TODOs as an agent task, then build and test.
 - Use `qedgen verify` and drift gates to keep proofs and code synchronized.
 
-Do not present generated Rust as complete business logic. Anchor and Quasar output is an implementation scaffold. Handler files can intentionally contain `todo!()` for transfers, events, CPI wiring, and non-mechanical effects until the agent fills them.
+Do not present generated Rust as complete business logic. Anchor, Quasar, and Pinocchio output is an implementation scaffold. Handler files can intentionally contain `todo!()` (or documented breadcrumbs) for transfers, events, CPI wiring, and non-mechanical effects until the agent fills them.
 
 ## First Contact (Brownfield)
 
@@ -99,7 +99,7 @@ Step 3. Scaffold generated artifacts.
 $QEDGEN codegen --spec program.qedspec --target anchor --all
 ```
 
-Use `--target quasar` for Quasar. Pinocchio is reserved and should not be promised as complete.
+Use `--target quasar` for Quasar or `--target pinocchio` for Pinocchio (`#![no_std]` + `entrypoint!` dispatch, zeropod zero-copy state, `&AccountInfo` account structs with `.handler()` methods, checked effects, SPL Token CPIs). All three targets emit a full program scaffold; generic (non-SPL) and PDA-signed CPIs are not yet wired for Pinocchio.
 
 Step 4. Fill generated Rust.
 
@@ -335,7 +335,7 @@ When you need the **data shape** of another program's account (not its CPI surfa
 
 - `qedgen check` lint or hard error (spec doesn't validate)
 - `qedgen codegen` hard error
-- **`cargo check` / `cargo build` on the generated Rust crate** (Anchor or Quasar scaffold doesn't compile)
+- **`cargo check` / `cargo build` on the generated Rust crate** (Anchor / Quasar / Pinocchio scaffold doesn't compile)
 - **`cargo kani` / `cargo test --release` on the generated Kani harness** (proof fails to elaborate, not just fails to verify)
 - **`cargo test` on the generated proptest harness** (proptest doesn't compile or panics outside the property body)
 - **`lake build` on the generated Lean `Spec.lean` / `Proofs.lean`** (proof file doesn't elaborate — missing import, unknown identifier, type mismatch in the generated theorem statement)
