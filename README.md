@@ -22,7 +22,7 @@
 
 ---
 
-Write what your Solana program must guarantee in a `.qedspec` file. QEDGen validates the spec, finds bugs your tests miss, then generates the verification artifacts and implementation scaffold needed to keep them fixed: **property tests**, **Kani harnesses**, **Lean 4 proofs**, **agent-fill program scaffolds**, and **CI workflows** — all from a single source of truth. Frameworks: **Anchor** and **Quasar** (greenfield scaffold via `qedgen init --target ...`), plus **sBPF assembly**. Brownfield audit covers **Anchor / Quasar / Pinocchio / native / sBPF** via `qedgen probe` (with Miri-backed UB detection for Pinocchio) and lifts findings into a ratifiable spec.
+Write what your Solana program must guarantee in a `.qedspec` file. QEDGen validates the spec, finds bugs your tests miss, then generates the verification artifacts and implementation scaffold needed to keep them fixed: **property tests**, **Kani harnesses**, **Lean 4 proofs**, **agent-fill program scaffolds**, and **CI workflows** — all from a single source of truth. Frameworks: **Anchor**, **Quasar**, and **Pinocchio** (greenfield scaffold via `qedgen init --target ...`), plus **sBPF assembly**. Brownfield audit covers **Anchor / Quasar / Pinocchio / native / sBPF** via `qedgen probe` (with Miri-backed UB detection for Pinocchio) and lifts findings into a ratifiable spec.
 
 NOTE: Project is alpha stage, we are constantly shipping. So there would be bugs and breaking API changes.
 

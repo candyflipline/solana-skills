@@ -37,7 +37,7 @@ $QEDGEN init --name counter  --spec counter.qedspec --target anchor
 | `--spec` | Path | - | Spec path (file or directory) — written into `.qed/config.json` so `check`/`codegen` can resolve it automatically |
 | `--asm` | Path | - | sBPF assembly source (runs asm2lean automatically) |
 | `--mathlib` | bool | false | Include Mathlib dependency |
-| `--target` | enum | - | Also generate the program crate + Kani harnesses for the named framework target. Values: `anchor` (Anchor-compatible Rust), `quasar` (Blueshift Quasar — `#![no_std]`, explicit discriminators, `Ctx<X>`), `pinocchio` (reserved CLI surface; codegen not yet implemented — selecting it errors). Requires `--spec`. Omit to skip program scaffolding entirely. |
+| `--target` | enum | - | Also generate the program crate + Kani harnesses for the named framework target. Values: `anchor` (Anchor-compatible Rust), `quasar` (Blueshift Quasar — `#![no_std]`, explicit discriminators, `Ctx<X>`), `pinocchio` (Pinocchio `#![no_std]` — `entrypoint!` + byte-discriminant dispatch, zeropod zero-copy state, `&AccountInfo` account structs with `.handler()` methods). Requires `--spec`. Omit to skip program scaffolding entirely. |
 | `--output-dir` | Path | `./formal_verification` | Output directory |
 
 The written `.qed/config.json`:
@@ -489,7 +489,7 @@ $QEDGEN codegen --ci
 | Flag | Type | Default | Description |
 |---|---|---|---|
 | `--spec` | Path | optional | Spec file or directory. Defaults to `.qed/config.json spec` |
-| `--target` | enum | `anchor` | Framework target for the Rust program crate. Values: `anchor` (Anchor-compatible, fully implemented — default); `quasar` (Blueshift `quasar_lang`, fully implemented); `pinocchio` (reserved CLI surface; scaffold codegen not yet implemented). For Pinocchio specs, the scaffold step is skipped but `--kani` / `--proptest` / `--lean` / `--integration` / `--ci` still run — pass `--target pinocchio --kani --proptest --lean` (or `--all`) to generate just the verification backends without an unwanted Anchor scaffold. Bare `--target pinocchio` (no backend flags) errors with the same message. Verification backends are spec-driven and target-agnostic by design (see the comment at the top of any generated `tests/kani.rs`). |
+| `--target` | enum | `anchor` | Framework target for the Rust program crate. Values: `anchor` (Anchor-compatible, default); `quasar` (Blueshift `quasar_lang`); `pinocchio` (Pinocchio `#![no_std]` — `entrypoint!` + byte-discriminant dispatch, zeropod zero-copy state, `&AccountInfo` account structs with `.handler()` methods, checked effects, SPL Token CPIs). All three targets emit the full program scaffold. The verification backends (`--kani` / `--proptest` / `--lean` / `--integration` / `--ci`) are spec-driven and target-agnostic — they run for any target (see the comment at the top of any generated `tests/kani.rs`). |
 | `--output-dir` | Path | `./programs` | Output directory for Rust skeleton |
 | `--all` | bool | false | Generate all artifacts |
 | `--lean` | bool | false | Generate Lean 4 proofs |
