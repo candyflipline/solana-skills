@@ -1410,10 +1410,14 @@ pub(crate) fn render_pinocchio_handler_scaffold(
 /// op then `.into()` back to the Pod field). RHS expressions route through
 /// `bind_pinocchio_expr` so param + scalar-state reads resolve.
 ///
+/// SPL Token CPIs from explicit `call Interface.handler(...)` sites lower
+/// via `try_emit_cpi(_, Target::Pinocchio)` (slice 6 step 5b) — the handler
+/// struct's `&'a AccountInfo` fields match `pinocchio_token`'s CPI struct
+/// fields directly.
+///
 /// Deferred (emit a documented breadcrumb): non-scalar effects (array /
-/// nested / variant-payload writes), events, transfers, and SPL CPIs — the
-/// `emit_spl_pinocchio` CPI emitter's `&self.<acct>` shape needs
-/// reconciling with the `&AccountInfo` struct fields first.
+/// nested / variant-payload writes), events, `transfers { … }` sugar
+/// (agent-fill on every target), and generic non-SPL CPI (slice 7).
 fn emit_pinocchio_effect_body(out: &mut String, handler: &ParsedHandler, spec: &ParsedSpec) {
     let prog = to_pascal_case(&spec.program_name);
     let err = format!("{}Error", prog);
@@ -1493,9 +1497,31 @@ fn emit_pinocchio_effect_body(out: &mut String, handler: &ParsedHandler, spec: &
     if complex_effects {
         out.push_str("        // TODO(slice 6 4b-cont): non-scalar effects (array / nested /\n        // variant-payload writes) + multi-account state.\n");
     }
-    if !handler.calls.is_empty() {
-        out.push_str("        // TODO(slice 6 4b-cont): SPL CPIs — reconcile emit_spl_pinocchio's\n        // &self.<acct> shape with the &AccountInfo struct fields.\n");
+    // SPL Token CPIs from explicit `call Interface.handler(...)` sites
+    // (slice 6 step 5b). The handler struct's `&'a AccountInfo` fields
+    // are exactly what `pinocchio_token::instructions::*` takes, so the
+    // emitter's `self.<acct>` resolves directly. Non-SPL (generic invoke)
+    // call sites return `None` (slice 7) and fall through to a breadcrumb.
+    let mut any_unmechanized_call = false;
+    for c in &handler.calls {
+        match try_emit_cpi(c, handler, spec, Target::Pinocchio) {
+            Some(rendered) => {
+                out.push_str(&format!(
+                    "        // Spec call: {}.{}\n",
+                    c.target_interface, c.target_handler
+                ));
+                out.push_str(&rendered);
+            }
+            None => any_unmechanized_call = true,
+        }
     }
+    if any_unmechanized_call {
+        out.push_str("        // TODO(slice 7): generic (non-SPL) CPI call sites are not yet\n        // mechanized for Pinocchio (raw invoke_signed + Borsh).\n");
+    }
+
+    // `transfers { … }` stays agent-fill on every target — codegen owns
+    // deterministic translation, the agent owns the CPI/authority business
+    // logic. Events likewise carry no payload binding in the spec.
     if !handler.emits.is_empty() || !handler.transfers.is_empty() {
         out.push_str("        // TODO(slice 6 4b-cont): events / transfers.\n");
     }
@@ -3323,8 +3349,12 @@ fn emit_spl_pinocchio(
     for (struct_field, call_arg) in field_to_arg {
         let arg = call.args.iter().find(|a| a.name == *call_arg)?;
         let pad = " ".repeat(max_field - struct_field.len());
+        // The Pinocchio handler struct stores each account as
+        // `&'a AccountInfo`, and `pinocchio_token`'s CPI structs take
+        // `&'a AccountInfo` fields — so `self.<acct>` is already the
+        // right type. (A leading `&` would yield `&&AccountInfo`.)
         out.push_str(&format!(
-            "            {}:{} &self.{},\n",
+            "            {}:{} self.{},\n",
             struct_field, pad, arg.rust_expr
         ));
     }
@@ -8106,16 +8136,22 @@ handler do_init : State.Active -> State.Active {
             "Pinocchio shape must construct the qualified Transfer struct; got:\n{rendered}"
         );
         assert!(
-            rendered.contains("from:") && rendered.contains("&self.src"),
-            "from field must resolve to &self.src; got:\n{rendered}"
+            rendered.contains("from:") && rendered.contains("self.src"),
+            "from field must resolve to self.src; got:\n{rendered}"
         );
         assert!(
-            rendered.contains("to:") && rendered.contains("&self.dst"),
-            "to field must resolve to &self.dst; got:\n{rendered}"
+            rendered.contains("to:") && rendered.contains("self.dst"),
+            "to field must resolve to self.dst; got:\n{rendered}"
         );
         assert!(
-            rendered.contains("authority:") && rendered.contains("&self.auth"),
-            "authority field must resolve to &self.auth; got:\n{rendered}"
+            rendered.contains("authority:") && rendered.contains("self.auth"),
+            "authority field must resolve to self.auth; got:\n{rendered}"
+        );
+        // The struct fields are `&'a AccountInfo`, so the emitter must NOT
+        // prepend `&` (that would yield `&&AccountInfo`).
+        assert!(
+            !rendered.contains("&self."),
+            "Pinocchio CPI must pass `self.<acct>` not `&self.<acct>`; got:\n{rendered}"
         );
         assert!(
             rendered.contains("amount:"),
@@ -8151,16 +8187,20 @@ handler do_init : State.Active -> State.Active {
             "must construct the MintTo struct; got:\n{rendered}"
         );
         assert!(
-            rendered.contains("mint:") && rendered.contains("&self.the_mint"),
+            rendered.contains("mint:") && rendered.contains("self.the_mint"),
             "mint field; got:\n{rendered}"
         );
         assert!(
-            rendered.contains("account:") && rendered.contains("&self.holder_ta"),
+            rendered.contains("account:") && rendered.contains("self.holder_ta"),
             "recipient maps to pinocchio field `account` ← spec `to`; got:\n{rendered}"
         );
         assert!(
-            rendered.contains("mint_authority:") && rendered.contains("&self.minter"),
+            rendered.contains("mint_authority:") && rendered.contains("self.minter"),
             "signer maps to `mint_authority`; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("&self."),
+            "Pinocchio CPI must pass `self.<acct>` not `&self.<acct>`; got:\n{rendered}"
         );
         assert!(
             rendered.contains("amount:") && rendered.contains("}.invoke()?;"),
@@ -8182,7 +8222,7 @@ handler do_init : State.Active -> State.Active {
             "must construct the Burn struct; got:\n{rendered}"
         );
         assert!(
-            rendered.contains("account:") && rendered.contains("&self.src"),
+            rendered.contains("account:") && rendered.contains("self.src"),
             "source maps to pinocchio field `account` ← spec `from`; got:\n{rendered}"
         );
         assert!(
@@ -8205,7 +8245,7 @@ handler do_init : State.Active -> State.Active {
             "must construct InitializeAccount; got:\n{rendered}"
         );
         assert!(
-            rendered.contains("rent_sysvar:") && rendered.contains("&self.rent_sysvar"),
+            rendered.contains("rent_sysvar:") && rendered.contains("self.rent_sysvar"),
             "rent maps to pinocchio field `rent_sysvar`; got:\n{rendered}"
         );
         // No scalar — no `amount:` field.
@@ -8225,9 +8265,9 @@ handler do_init : State.Active -> State.Active {
             .expect("Pinocchio SPL close_account must emit");
         assert!(
             rendered.contains("pinocchio_token::instructions::CloseAccount {")
-                && rendered.contains("&self.target_acct")
-                && rendered.contains("&self.sweep_target")
-                && rendered.contains("&self.closer"),
+                && rendered.contains("self.target_acct")
+                && rendered.contains("self.sweep_target")
+                && rendered.contains("self.closer"),
             "close_account must resolve account/destination/authority; got:\n{rendered}"
         );
         assert!(

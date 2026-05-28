@@ -101,8 +101,10 @@ pub(crate) enum Target {
     /// ProgramError>`, `#[program] mod`, explicit
     /// `#[instruction(discriminator = N)]` on each handler.
     Quasar,
-    /// Pinocchio (no_std) Rust program. Reserved CLI surface; codegen
-    /// is not yet implemented and selecting it errors.
+    /// Pinocchio (no_std) Rust program. `#![no_std]`,
+    /// `entrypoint!` + byte-discriminant dispatch, `&AccountInfo`
+    /// account structs with `.handler()` methods, `zeropod` zero-copy
+    /// state, `Result<(), ProgramError>`. MIR-native codegen.
     Pinocchio,
 }
 
@@ -3111,38 +3113,15 @@ async fn dispatch(cmd: Commands) -> Result<()> {
             fill_tests,
         } => {
             require_git_repo()?;
-            // v2.24.x: Pinocchio reserves the Rust-scaffold CLI surface
-            // but has no scaffold implementation yet. Verification
-            // backends (Kani / proptest / Lean / integration_test /
-            // CI / crucible) are spec-driven and target-agnostic —
-            // they reason about spec semantics, not the runtime
-            // representation — so they run cleanly for Pinocchio
-            // specs even without a Rust scaffold. Skip the
-            // `codegen::generate` step on Pinocchio when the user
-            // asked for at least one backend flag (or `--all`).
-            // Bail loudly only when the user requested the scaffold
-            // alone (no backend flags) and Pinocchio is the chosen
-            // target — that's the unambiguous "I want a Pinocchio
-            // Rust program" case the scaffold can't satisfy.
-            let any_backend =
-                kani || kani_impl || proptest || lean || test || integration || ci || crucible;
-            let pinocchio_no_scaffold = matches!(target, Target::Pinocchio);
-            if pinocchio_no_scaffold && !any_backend && !all {
-                anyhow::bail!(
-                    "`--target pinocchio` is not yet implemented for Rust scaffold codegen. \
-                     `--target anchor` and `--target quasar` are supported for scaffold. \
-                     To generate just the verification backends (Kani / proptest / Lean / etc.) \
-                     for a Pinocchio spec, pass `--kani`, `--proptest`, `--lean`, or `--all` \
-                     alongside `--target pinocchio` — the scaffold step will be skipped and \
-                     the backends will run against the spec directly."
-                );
-            }
+            // Pinocchio is MIR-native (slice 6): the scaffold emits via
+            // `codegen_mir` for all three targets. `is_pinocchio` still
+            // gates the post-regen stamped-drift scan below (the Pinocchio
+            // scaffold carries no `#[qed(verified)]` stamps to drift yet).
+            let is_pinocchio = matches!(target, Target::Pinocchio);
             let cwd = std::env::current_dir()?;
             let spec = init::resolve_spec_path(spec.as_deref(), &cwd)?;
-            // Rust skeleton — Anchor and Quasar emit; Pinocchio skips
-            // (handled above + here so `--all` on Pinocchio still
-            // works for the backend artifacts).
-            if !pinocchio_no_scaffold {
+            // Rust skeleton — all three targets emit via the MIR path.
+            {
                 // v2.30 Phase 4i — MIR is the default Anchor/Quasar
                 // codegen path. 9 of 10 sub-generators
                 // (cargo_toml / math / events / errors / ref_impls /
@@ -3150,11 +3129,10 @@ async fn dispatch(cmd: Commands) -> Result<()> {
                 // MIR-direct; `guards` stays delegated to legacy
                 // pending the typed-Stmt refactor (v3.0).
                 // `QEDGEN_LEGACY_CODEGEN=1` opts back into the
-                // ParsedSpec-direct renderer as an escape hatch.
-                // `QEDGEN_USE_MIR_CODEGEN=1` is no-longer-required
-                // but kept as a no-op alias for shell history / CI
-                // compatibility.
-                if std::env::var("QEDGEN_LEGACY_CODEGEN").is_ok() {
+                // ParsedSpec-direct renderer as an escape hatch — but
+                // only for Anchor/Quasar; the legacy renderer has no
+                // Pinocchio arm, so Pinocchio always takes the MIR path.
+                if std::env::var("QEDGEN_LEGACY_CODEGEN").is_ok() && !is_pinocchio {
                     codegen::generate(&spec, &output_dir, target)?;
                 } else {
                     let parsed = check::parse_spec_file(&spec)?;
@@ -3360,7 +3338,7 @@ async fn dispatch(cmd: Commands) -> Result<()> {
             // user-owned `#[qed(verified)]` stamps to drift). Also
             // skipped on output_dir miss, since the drift scan only
             // makes sense when the scaffold tree was actually emitted.
-            if !pinocchio_no_scaffold && output_dir.exists() {
+            if !is_pinocchio && output_dir.exists() {
                 match drift::check_stamped_drift(&output_dir) {
                     Ok(stamped) if !stamped.is_empty() => {
                         eprintln!(

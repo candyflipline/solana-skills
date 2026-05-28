@@ -47,13 +47,15 @@ a7f7374  feat(pinocchio): M3 — codegen the impl-targeted Kani harness
 | Pinocchio SPL mint_to/burn/init/close (slice 2b) | ✅ done | all four arms added to `emit_spl_token_cpi_pinocchio`; field-name divergences (`MintTo.account`←`to`, `MintTo.mint_authority`, `Burn.account`←`from`, `InitializeAccount.rent_sysvar`←`rent`) verified against `pinocchio-token-0.3.0/src/instructions/`. NOTE: re-applied by hand on the correct base after the bg worktree agent landed on stale `main` (fd017a6) — see gotcha 8 |
 | Quasar generic (non-SPL) CPI (slice 3) | ⬜ | needs `BufCpiCall` (variable-len Borsh) — own design pass |
 | Quasar/Pinocchio PDA-signed CPI (slice 4) | ⬜ | `invoke_signed` w/ seeds; spec must surface seed/bump fields |
-| Pinocchio scaffold (slice 6) | ⬜ big | `#![no_std]` lib + entrypoint; unblocks Pinocchio CPI from the CLI + lets us auto-inject the kani lib.rs lines |
-| Pinocchio generic CPI (slice 7) | ⬜ | raw `pinocchio::cpi::invoke_signed` + Borsh |
+| Pinocchio scaffold (slice 6) | ✅ done | MIR-native scaffold (lib + entrypoint + byte-dispatch, zeropod state, `&AccountInfo` account structs + `.handler()`, guards, errors, scalar effects). Steps 1–5 + the milestone close (2026-05-28): SPL `call` CPIs wired into the handler body via `try_emit_cpi(_, Pinocchio)`, AND the `codegen` command (not just `init`) now emits the Pinocchio scaffold. A `call Token.transfer(...)` spec `cargo build`s end-to-end from the CLI. |
+| Pinocchio generic CPI (slice 7) | ⬜ | raw `pinocchio::cpi::invoke_signed` + Borsh (non-SPL `call` sites emit a slice-7 breadcrumb today) |
+| Pinocchio events / ref_impls / tests | ⬜ | `emit_events` + `emit_imported_mirror` still `unreachable!()` for Pinocchio (guarded by early-return; only event/import specs hit them). `transfers {}` sugar stays agent-fill on every target. |
+| Pinocchio greenfield fixture + build gate | ⬜ | commit an `examples/pinocchio-fixtures/<greenfield>/` example + a `cargo build` CI gate so the milestone can't silently rot (the build-order step 5 item; see `[[project_example_codegen_drift]]`) |
 | Pinocchio Kani-impl custom state (slice 8b) | ⬜ | non-SPL accounts need the MemoryLayout pipeline |
 
-Recommended next: **slice 2 + 2b** (cheapest, rounds out SPL coverage) OR
-**slice 6** (Pinocchio scaffold — the big unblocker that lights up the
-Pinocchio CPI emitter from the CLI).
+Recommended next: **the greenfield fixture + build gate** (locks in the
+slice-6 milestone against drift), then **slice 7** (generic Pinocchio CPI)
+or **slice 4** (PDA-signed `invoke_signed`).
 
 ## Critical gotchas (these cost real time — don't re-discover)
 
@@ -92,10 +94,15 @@ Pinocchio CPI emitter from the CLI).
    transitive pin (mixed versions = "multiple different versions of crate
    `pinocchio`" errors).
 
-6. **Pinocchio CPI emitter is dead code from the CLI today** — `--target
-   pinocchio` skips the Rust scaffold (`main.rs:3132`), so `try_emit_cpi`'s
-   Pinocchio arm is never reached. It's unit-tested directly. Lights up when
-   slice 6 lands. (The Kani-impl path IS reachable via `--kani-impl`.)
+6. **RESOLVED (2026-05-28): Pinocchio CPI emitter is now live from the CLI.**
+   The `emit_spl_pinocchio` `&self.<acct>` shape that §12a claimed was
+   "correct as-is" was WRONG: the handler struct fields are `&'a AccountInfo`,
+   and `pinocchio_token`'s CPI struct fields take `&'a AccountInfo`, so the
+   emitter must pass `self.<acct>` — a leading `&` yields `&&AccountInfo` and
+   won't compile. Fixed in `emit_spl_pinocchio` + the 5 Pinocchio CPI unit
+   tests. Both `init` and `codegen` now emit the scaffold and reach the
+   emitter; verified by `cargo build` on a `call Token.transfer(...)` spec.
+   (The Kani-impl path was already reachable via `--kani-impl`.)
 
 7. **The struct-based harnesses (Anchor + Quasar) are agent-fill skeletons —
    NOT end-to-end `cargo kani` validated.** `build_<handler>() -> crate::<Pascal>`
