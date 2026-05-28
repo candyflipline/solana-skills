@@ -847,6 +847,17 @@ pub(crate) fn generate_lib(
     }
     out.push('\n');
 
+    // Pinocchio: no `#[program]` mod — emit the entrypoint + a
+    // byte-discriminant `process_instruction` dispatcher instead, then
+    // finish (skips the Anchor/Quasar `#[program]` block + the Anchor
+    // crate-root accounts structs). (slice 6 step 2, §12)
+    if matches!(target, Target::Pinocchio) {
+        emit_pinocchio_lib_tail(&mut out, spec, program_id);
+        out.push_str("// ---- END GENERATED ----\n");
+        std::fs::write(src_dir.join("lib.rs"), &out)?;
+        return Ok(());
+    }
+
     out.push_str(&format!("declare_id!(\"{}\");\n\n", program_id));
 
     out.push_str("#[program]\n");
@@ -977,6 +988,44 @@ pub(crate) fn generate_lib(
 
     std::fs::write(src_dir.join("lib.rs"), &out)?;
     Ok(())
+}
+
+/// Emit the Pinocchio `lib.rs` tail: program ID, the `entrypoint!` macro,
+/// and a `process_instruction` dispatcher that reads the leading
+/// discriminant byte and routes to each handler's `process_<name>`
+/// wrapper (declared in `instructions/<name>.rs`, slice 6 step 4).
+/// Replaces the Anchor/Quasar `#[program]` mod entirely (§12b).
+///
+/// `entrypoint!` expands to `program_entrypoint!` + `default_allocator!` +
+/// `default_panic_handler!`; all three are internally `target_os =
+/// "solana"`-gated (host builds link std's allocator/panic handler), so
+/// the invocation is emitted unconditionally.
+fn emit_pinocchio_lib_tail(out: &mut String, spec: &ParsedSpec, program_id: &str) {
+    out.push_str(&format!(
+        "pinocchio_pubkey::declare_id!(\"{}\");\n\n",
+        program_id
+    ));
+    out.push_str("pinocchio::entrypoint!(process_instruction);\n\n");
+    out.push_str("/// Instruction dispatch — the leading byte of `instruction_data`\n");
+    out.push_str("/// selects the handler (discriminant = declaration order).\n");
+    out.push_str("pub fn process_instruction(\n");
+    out.push_str("    _program_id: &pinocchio::pubkey::Pubkey,\n");
+    out.push_str("    accounts: &[AccountInfo],\n");
+    out.push_str("    instruction_data: &[u8],\n");
+    out.push_str(") -> ProgramResult {\n");
+    out.push_str("    let (discriminant, data) = instruction_data\n");
+    out.push_str("        .split_first()\n");
+    out.push_str("        .ok_or(ProgramError::InvalidInstructionData)?;\n");
+    out.push_str("    match *discriminant {\n");
+    for (i, handler) in spec.handlers.iter().enumerate() {
+        out.push_str(&format!(
+            "        {} => instructions::process_{}(accounts, data),\n",
+            i, handler.name
+        ));
+    }
+    out.push_str("        _ => Err(ProgramError::InvalidInstructionData),\n");
+    out.push_str("    }\n");
+    out.push_str("}\n");
 }
 
 /// v2.24 S5b — `true` when the spec's state is a multi-variant ADT
@@ -5290,6 +5339,10 @@ const QEDGEN_OWNED_DEPS: &[&str] = &[
     "anchor-spl",
     "quasar-lang",
     "quasar-spl",
+    "pinocchio",
+    "pinocchio-token",
+    "pinocchio-pubkey",
+    "zeropod",
     "qedgen-macros",
 ];
 
@@ -5372,7 +5425,18 @@ fn render_qedgen_cargo_toml(spec: &ParsedSpec, fp: &SpecFingerprint, target: Tar
                 out.push_str("quasar-spl = { version = \"0.0.0\" }\n");
             }
         }
-        Target::Pinocchio => unreachable!("Pinocchio is rejected at the init dispatcher"),
+        Target::Pinocchio => {
+            // Greenfield Pinocchio scaffold (slice 6, §12c). `pinocchio`
+            // (entrypoint + AccountInfo), `pinocchio-pubkey` (declare_id!),
+            // and `zeropod` (zero-copy state). `pinocchio-token` only when
+            // the spec does Token CPIs.
+            out.push_str("pinocchio = \"0.8\"\n");
+            out.push_str("pinocchio-pubkey = \"0.3\"\n");
+            out.push_str("zeropod = \"0.1\"\n");
+            if needs_spl {
+                out.push_str("pinocchio-token = \"0.3\"\n");
+            }
+        }
     }
     out.push_str(&format!(
         "qedgen-macros = {{ git = \"https://github.com/qedgen/solana-skills\", tag = \"v{}\" }}\n",
