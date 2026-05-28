@@ -1060,7 +1060,11 @@ fn emit_pinocchio_lib_tail(out: &mut String, spec: &ParsedSpec, program_id: &str
         "pinocchio_pubkey::declare_id!(\"{}\");\n\n",
         program_id
     ));
-    out.push_str("pinocchio::entrypoint!(process_instruction);\n\n");
+    // `entrypoint!`'s single-arg arm recursively calls `entrypoint!`
+    // *unqualified*, so it must be imported (a `pinocchio::entrypoint!`
+    // path call fails to resolve the inner recursion).
+    out.push_str("use pinocchio::entrypoint;\n");
+    out.push_str("entrypoint!(process_instruction);\n\n");
     out.push_str("/// Instruction dispatch — the leading byte of `instruction_data`\n");
     out.push_str("/// selects the handler (discriminant = declaration order).\n");
     out.push_str("pub fn process_instruction(\n");
@@ -1100,7 +1104,7 @@ pub(crate) fn emit_pinocchio_state(
     out: &mut String,
 ) -> Result<()> {
     out.push_str(&marker("DO NOT EDIT", fp, "src/state.rs"));
-    out.push_str("use zeropod::{pod::*, ZeroPod};\n\n");
+    out.push_str("use zeropod::ZeroPod;\n\n");
 
     // Record types referenced by state fields → ZeroPod structs (emitted
     // ahead of the account structs that nest them).
@@ -6704,7 +6708,7 @@ handler initialize (amount : U64) : State.Uninitialized -> State.Open {
 
         // zeropod imports, not the pinocchio AccountInfo prelude.
         assert!(
-            state.contains("use zeropod::{pod::*, ZeroPod};"),
+            state.contains("use zeropod::ZeroPod;"),
             "must import zeropod; got:\n{state}"
         );
         // Discriminant tag enum from the variant names.

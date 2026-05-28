@@ -537,10 +537,11 @@ fn emit_instructions(
     for handler in &mir.handlers {
         mod_out.push_str(&format!("pub mod {};\n", handler.name));
     }
-    // Quasar re-exports `Accounts` structs from each
-    // `instructions/<name>.rs`; Anchor keeps them in lib.rs at
+    // Quasar + Pinocchio re-export their account structs from each
+    // `instructions/<name>.rs` (Pinocchio's `guards.rs` resolves `<Pascal>`
+    // via `use crate::instructions::*;`); Anchor keeps them in lib.rs at
     // crate root.
-    if matches!(target, Target::Quasar) {
+    if matches!(target, Target::Quasar | Target::Pinocchio) {
         mod_out.push('\n');
         for handler in &mir.handlers {
             let pascal = to_pascal_case(&handler.name);
@@ -1140,7 +1141,9 @@ fn emit_errors(
     let prelude_import = match target {
         Target::Anchor => "use anchor_lang::prelude::*;\n",
         Target::Quasar => "use quasar_lang::prelude::*;\n",
-        Target::Pinocchio => unreachable!("Pinocchio is rejected at the init dispatcher"),
+        // Pinocchio has no `#[error_code]` macro — plain enum + a
+        // hand-written `From<…> for ProgramError` (emitted below).
+        Target::Pinocchio => "use pinocchio::program_error::ProgramError;\n",
     };
 
     let error_name = format!("{}Error", crate::codegen::to_pascal_case(&mir.name));
@@ -1220,12 +1223,27 @@ fn emit_errors(
         codes.push("InvalidPda".to_string());
     }
 
-    out.push_str("#[error_code]\n");
-    out.push_str(&format!("pub enum {} {{\n", error_name));
-    for (i, code) in codes.iter().enumerate() {
-        out.push_str(&format!("    {} = {},\n", code, i));
+    if matches!(target, Target::Pinocchio) {
+        // Pinocchio: plain `#[repr(u32)]` enum + `From<…> for ProgramError`
+        // (guards/handlers convert via `ProgramError::from(<Enum>::<V>)`).
+        out.push_str("#[derive(Clone, Copy, PartialEq, Eq)]\n#[repr(u32)]\n");
+        out.push_str(&format!("pub enum {} {{\n", error_name));
+        for (i, code) in codes.iter().enumerate() {
+            out.push_str(&format!("    {} = {},\n", code, i));
+        }
+        out.push_str("}\n\n");
+        out.push_str(&format!(
+            "impl From<{0}> for ProgramError {{\n    fn from(e: {0}) -> Self {{\n        ProgramError::Custom(e as u32)\n    }}\n}}\n",
+            error_name
+        ));
+    } else {
+        out.push_str("#[error_code]\n");
+        out.push_str(&format!("pub enum {} {{\n", error_name));
+        for (i, code) in codes.iter().enumerate() {
+            out.push_str(&format!("    {} = {},\n", code, i));
+        }
+        out.push_str("}\n");
     }
-    out.push_str("}\n");
     out.push_str("// ---- END GENERATED ----\n");
 
     std::fs::write(src_dir.join("errors.rs"), &out)?;

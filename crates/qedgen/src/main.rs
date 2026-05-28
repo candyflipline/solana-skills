@@ -2245,18 +2245,6 @@ async fn dispatch(cmd: Commands) -> Result<()> {
             target,
             output_dir,
         } => {
-            // Pinocchio reserves the CLI surface but is not yet
-            // implemented. Anchor and Quasar branches are wired
-            // end-to-end below.
-            if matches!(target, Some(Target::Pinocchio)) {
-                anyhow::bail!(
-                    "`--target pinocchio` is not yet implemented. \
-                     `--target anchor` and `--target quasar` are \
-                     supported; omit `--target` to skip program \
-                     scaffolding entirely."
-                );
-            }
-
             // Program scaffolding (codegen + kani harnesses + unit tests)
             // requires the original `.qedspec` — `init` writes a
             // separate `Spec.lean` skeleton, but the codegen path parses
@@ -2302,8 +2290,13 @@ async fn dispatch(cmd: Commands) -> Result<()> {
                 // program_root, which had no Cargo.toml above it.
                 let kani_path = program_dir.join("tests/kani.rs");
 
-                // Generate the framework-flavored Rust program skeleton.
-                codegen::generate(qedspec_path, &program_dir, target)?;
+                // Generate the framework-flavored Rust program skeleton via
+                // the default MIR path (codegen_mir) — same as the `codegen`
+                // command. Routes Pinocchio through its MIR-native emitters
+                // and keeps init consistent with the MIR-is-the-path design.
+                let parsed = check::parse_spec_file(qedspec_path)?;
+                let mir = mir::lower(&parsed);
+                codegen_mir::generate(&mir, &parsed, qedspec_path, &program_dir, target)?;
 
                 // Kani harnesses are framework-neutral (no Anchor/Quasar
                 // types — pure spec-derived state model).
