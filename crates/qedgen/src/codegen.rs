@@ -847,17 +847,6 @@ pub(crate) fn generate_lib(
     }
     out.push('\n');
 
-    // Pinocchio: no `#[program]` mod — emit the entrypoint + a
-    // byte-discriminant `process_instruction` dispatcher instead, then
-    // finish (skips the Anchor/Quasar `#[program]` block + the Anchor
-    // crate-root accounts structs). (slice 6 step 2, §12)
-    if matches!(target, Target::Pinocchio) {
-        emit_pinocchio_lib_tail(&mut out, spec, program_id);
-        out.push_str("// ---- END GENERATED ----\n");
-        std::fs::write(src_dir.join("lib.rs"), &out)?;
-        return Ok(());
-    }
-
     out.push_str(&format!("declare_id!(\"{}\");\n\n", program_id));
 
     out.push_str("#[program]\n");
@@ -990,6 +979,72 @@ pub(crate) fn generate_lib(
     Ok(())
 }
 
+/// Self-contained Pinocchio `src/lib.rs` emitter — a shared helper called
+/// by `codegen_mir::emit_lib` for the Pinocchio target (slice 6, §12b).
+/// Pinocchio is MIR-only: the legacy `generate_lib` pipeline does NOT route
+/// Pinocchio. This helper survives the v3.0 legacy-pipeline deletion.
+///
+/// Emits the no_std crate root + module decls + `declare_id!` +
+/// `entrypoint!` + the byte-dispatch `process_instruction`. Idempotent: a
+/// pre-existing `src/lib.rs` is left untouched (user-owned).
+pub(crate) fn emit_pinocchio_program_lib(
+    spec: &ParsedSpec,
+    fp: &SpecFingerprint,
+    output_dir: &Path,
+) -> Result<()> {
+    let surface = FrameworkSurface::for_target(Target::Pinocchio);
+    let src_dir = output_dir.join("src");
+    std::fs::create_dir_all(&src_dir)?;
+    let lib_path = src_dir.join("lib.rs");
+    if lib_path.exists() {
+        eprintln!(
+            "programs/{}/src/lib.rs already exists — skipping (user-owned). guards.rs regenerated.",
+            output_dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("<program>")
+        );
+        return Ok(());
+    }
+    let program_id = spec
+        .program_id
+        .as_deref()
+        .unwrap_or("11111111111111111111111111111111");
+
+    let mut out = String::new();
+    out.push_str(&marker("DO NOT EDIT", fp, "src/lib.rs"));
+    out.push_str(surface.crate_attrs);
+    out.push_str(surface.prelude_import);
+    out.push('\n');
+    out.push_str("mod instructions;\n");
+    if !spec.events.is_empty() {
+        out.push_str("pub mod events;\n");
+    }
+    if !spec.error_codes.is_empty() {
+        out.push_str("pub mod errors;\n");
+    }
+    out.push_str("pub mod state;\n");
+    out.push_str("pub mod guards;\n");
+    if guards_use_math_helpers(spec) {
+        out.push_str("pub mod math;\n");
+    }
+    if !spec.ref_impls.is_empty() {
+        out.push_str("pub mod ref_impls;\n");
+    }
+    if spec
+        .imported_namespaces
+        .values()
+        .any(|ns| !ns.account_types.is_empty())
+    {
+        out.push_str("pub mod imported;\n");
+    }
+    out.push('\n');
+    emit_pinocchio_lib_tail(&mut out, spec, program_id);
+    out.push_str("// ---- END GENERATED ----\n");
+    std::fs::write(src_dir.join("lib.rs"), &out)?;
+    Ok(())
+}
+
 /// Emit the Pinocchio `lib.rs` tail: program ID, the `entrypoint!` macro,
 /// and a `process_instruction` dispatcher that reads the leading
 /// discriminant byte and routes to each handler's `process_<name>`
@@ -1039,7 +1094,11 @@ fn emit_pinocchio_lib_tail(out: &mut String, spec: &ParsedSpec, program_id: &str
 /// path uses, so the delegated guard codegen stays consistent). Sum-type
 /// variant payloads are flattened into one superset struct; the tag byte
 /// selects the live variant.
-fn emit_pinocchio_state(spec: &ParsedSpec, fp: &SpecFingerprint, out: &mut String) -> Result<()> {
+pub(crate) fn emit_pinocchio_state(
+    spec: &ParsedSpec,
+    fp: &SpecFingerprint,
+    out: &mut String,
+) -> Result<()> {
     out.push_str(&marker("DO NOT EDIT", fp, "src/state.rs"));
     out.push_str("use zeropod::{pod::*, ZeroPod};\n\n");
 
@@ -1227,16 +1286,6 @@ pub(crate) fn generate_state(
     let surface = FrameworkSurface::for_target(target);
     let src_dir = output_dir.join("src");
     std::fs::create_dir_all(&src_dir)?;
-
-    // Pinocchio: zeropod zero-copy state — a separate emission shape
-    // (different imports, `#[derive(ZeroPod)]` not `#[account]`, sum-type
-    // → tag byte + superset struct). (slice 6 step 3, §12a)
-    if matches!(target, Target::Pinocchio) {
-        let mut out = String::new();
-        emit_pinocchio_state(spec, fp, &mut out)?;
-        std::fs::write(src_dir.join("state.rs"), &out)?;
-        return Ok(());
-    }
 
     let is_multi = spec.account_types.len() > 1;
 
@@ -5582,18 +5631,10 @@ fn render_qedgen_cargo_toml(spec: &ParsedSpec, fp: &SpecFingerprint, target: Tar
                 out.push_str("quasar-spl = { version = \"0.0.0\" }\n");
             }
         }
-        Target::Pinocchio => {
-            // Greenfield Pinocchio scaffold (slice 6, §12c). `pinocchio`
-            // (entrypoint + AccountInfo), `pinocchio-pubkey` (declare_id!),
-            // and `zeropod` (zero-copy state). `pinocchio-token` only when
-            // the spec does Token CPIs.
-            out.push_str("pinocchio = \"0.8\"\n");
-            out.push_str("pinocchio-pubkey = \"0.3\"\n");
-            out.push_str("zeropod = \"0.1\"\n");
-            if needs_spl {
-                out.push_str("pinocchio-token = \"0.3\"\n");
-            }
-        }
+        // Pinocchio cargo deps live in the MIR path (codegen_mir's
+        // render_cargo_toml) — the legacy pipeline doesn't emit Pinocchio
+        // (slice 6: MIR is the path).
+        Target::Pinocchio => unreachable!("Pinocchio codegen is MIR-only — see codegen_mir"),
     }
     out.push_str(&format!(
         "qedgen-macros = {{ git = \"https://github.com/qedgen/solana-skills\", tag = \"v{}\" }}\n",
@@ -6161,12 +6202,12 @@ handler initialize (amount : U64) : State.Uninitialized -> State.Open {
 "#;
         let spec = crate::chumsky_adapter::parse_str(src).unwrap();
         let fp = crate::fingerprint::compute_fingerprint(&spec);
-        let dir = tempfile::tempdir().unwrap();
-        let out_dir = dir.path().join("programs");
-        std::fs::create_dir_all(&out_dir).unwrap();
 
-        generate_state(&spec, &fp, &out_dir, Target::Pinocchio).unwrap();
-        let state = std::fs::read_to_string(out_dir.join("src/state.rs")).unwrap();
+        // Pinocchio state emission is a shared helper (codegen_mir calls it
+        // directly; the legacy generate_state pipeline no longer routes
+        // Pinocchio — MIR is the path).
+        let mut state = String::new();
+        emit_pinocchio_state(&spec, &fp, &mut state).unwrap();
 
         // zeropod imports, not the pinocchio AccountInfo prelude.
         assert!(

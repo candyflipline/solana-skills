@@ -145,7 +145,7 @@ pub fn generate(
     // Phase 4d — MIR-direct port.
     emit_imported_mirror(mir, parsed, &fp, output_dir, target)?;
     // Phase 4b/1 — MIR-direct port.
-    emit_cargo_toml(mir, parsed, &fp, output_dir, target)?;
+    emit_cargo_toml(mir, &fp, output_dir, target)?;
 
     let file_count = 4
         + parsed.handlers.len()
@@ -181,17 +181,10 @@ pub fn generate(
 /// pins, same `qedgen-macros` git tag, same `[workspace]` footer.
 fn emit_cargo_toml(
     mir: &Mir,
-    parsed: &ParsedSpec,
     fp: &crate::fingerprint::SpecFingerprint,
     output_dir: &Path,
     target: Target,
 ) -> Result<()> {
-    // Pinocchio dep set isn't MIR-direct yet — delegate to the legacy
-    // codegen.rs emitter (single source of truth for the pinocchio /
-    // pinocchio-token / pinocchio-pubkey / zeropod deps).
-    if matches!(target, Target::Pinocchio) {
-        return crate::codegen::generate_cargo_toml(parsed, fp, output_dir, target);
-    }
     let fresh = render_cargo_toml(mir, fp, target);
     let path = output_dir.join("Cargo.toml");
     let final_toml = match std::fs::read_to_string(&path) {
@@ -246,7 +239,17 @@ fn render_cargo_toml(
                 out.push_str("quasar-spl = { version = \"0.0.0\" }\n");
             }
         }
-        Target::Pinocchio => unreachable!("Pinocchio is rejected at the init dispatcher"),
+        Target::Pinocchio => {
+            // Greenfield Pinocchio scaffold (slice 6, §12c). pinocchio
+            // (entrypoint + AccountInfo), pinocchio-pubkey (declare_id!),
+            // zeropod (zero-copy state); pinocchio-token only for Token CPIs.
+            out.push_str("pinocchio = \"0.8\"\n");
+            out.push_str("pinocchio-pubkey = \"0.3\"\n");
+            out.push_str("zeropod = \"0.1\"\n");
+            if needs_spl {
+                out.push_str("pinocchio-token = \"0.3\"\n");
+            }
+        }
     }
     out.push_str(&format!(
         "qedgen-macros = {{ git = \"https://github.com/qedgen/solana-skills\", tag = \"v{}\" }}\n",
@@ -293,12 +296,12 @@ fn emit_lib(
 ) -> Result<()> {
     use crate::codegen::{to_pascal_case, FrameworkSurface};
 
-    // Pinocchio lib emission isn't MIR-direct yet — delegate to the legacy
-    // codegen.rs emitter (same pattern as generate_guards, line 135). The
-    // Pinocchio path emits the entrypoint + byte-dispatch from ParsedSpec
-    // directly; a MIR-direct port is v3.0-class (slice 6, §12b).
+    // Pinocchio is MIR-only: emit via the dedicated shared helper (NOT
+    // the legacy generate_lib pipeline, which doesn't route Pinocchio).
+    // The helper emits the no_std entrypoint + byte-dispatch from
+    // ParsedSpec (slice 6, §12b).
     if matches!(target, Target::Pinocchio) {
-        return crate::codegen::generate_lib(parsed, fp, output_dir, target);
+        return crate::codegen::emit_pinocchio_program_lib(parsed, fp, output_dir);
     }
 
     let surface = FrameworkSurface::for_target(target);
@@ -627,11 +630,15 @@ fn emit_state(
         FrameworkSurface,
     };
 
-    // Pinocchio state emission (zeropod zero-copy structs) isn't
-    // MIR-direct yet — delegate to the legacy codegen.rs emitter (same
-    // pattern as generate_guards). MIR-direct port is v3.0-class.
+    // Pinocchio is MIR-only: emit zeropod zero-copy state via the
+    // dedicated shared helper (NOT the legacy generate_state pipeline).
     if matches!(target, Target::Pinocchio) {
-        return crate::codegen::generate_state(parsed, fp, output_dir, target);
+        let src_dir = output_dir.join("src");
+        std::fs::create_dir_all(&src_dir)?;
+        let mut out = String::new();
+        crate::codegen::emit_pinocchio_state(parsed, fp, &mut out)?;
+        std::fs::write(src_dir.join("state.rs"), &out)?;
+        return Ok(());
     }
 
     let surface = FrameworkSurface::for_target(target);
