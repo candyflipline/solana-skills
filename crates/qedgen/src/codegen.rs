@@ -1028,6 +1028,153 @@ fn emit_pinocchio_lib_tail(out: &mut String, spec: &ParsedSpec, program_id: &str
     out.push_str("}\n");
 }
 
+/// Emit `src/state.rs` for the Pinocchio target (slice 6 step 3, §12a).
+///
+/// zeropod zero-copy: each persisted struct is the *schema* — declared
+/// with plain Rust field types (`u64`, `[u8; 32]`, nested records) — and
+/// `#[derive(ZeroPod)]` generates the alignment-1 `<Struct>Zc` companion
+/// that handlers mutate in place via `from_bytes_mut`. Lifecycle / sum-type
+/// State lowers to a `u8` discriminant field + a `#[repr(u8)]` enum of
+/// named constants (the same `status: u8` + `enum` shape the Anchor/Quasar
+/// path uses, so the delegated guard codegen stays consistent). Sum-type
+/// variant payloads are flattened into one superset struct; the tag byte
+/// selects the live variant.
+fn emit_pinocchio_state(spec: &ParsedSpec, fp: &SpecFingerprint, out: &mut String) -> Result<()> {
+    out.push_str(&marker("DO NOT EDIT", fp, "src/state.rs"));
+    out.push_str("use zeropod::{pod::*, ZeroPod};\n\n");
+
+    // Record types referenced by state fields → ZeroPod structs (emitted
+    // ahead of the account structs that nest them).
+    for record in &spec.records {
+        out.push_str("#[derive(ZeroPod)]\n");
+        out.push_str(&format!("pub struct {} {{\n", record.name));
+        for (fname, ftype) in &record.fields {
+            out.push_str(&format!(
+                "    pub {}: {},\n",
+                fname,
+                map_type_standalone(ftype, spec)?
+            ));
+        }
+        out.push_str("}\n\n");
+    }
+
+    if spec.account_types.len() > 1 {
+        // Multi-account: one ZeroPod struct per account type.
+        for acct in &spec.account_types {
+            let struct_name = format!("{}Account", acct.name);
+            let enum_name = format!("{}Status", acct.name);
+            emit_pinocchio_state_struct(
+                out,
+                &struct_name,
+                &acct.fields,
+                acct.pda_ref.is_some(),
+                &acct.lifecycle,
+                &enum_name,
+                spec,
+            )?;
+        }
+    } else if spec
+        .account_types
+        .first()
+        .map(|a| a.variants.len() > 1)
+        .unwrap_or(false)
+    {
+        // Sum-type State → discriminant tag byte + flat superset struct.
+        let acct = &spec.account_types[0];
+        let state_name = format!("{}Account", to_pascal_case(&spec.program_name));
+        let tag_name = format!("{}Tag", state_name);
+        out.push_str(&format!(
+            "/// Discriminant tag for `{}`. Variant payloads are stored\n\
+             /// flattened in the struct below; the `tag` byte selects the\n\
+             /// live variant.\n",
+            state_name
+        ));
+        out.push_str("#[derive(Clone, Copy, PartialEq, Eq)]\n#[repr(u8)]\n");
+        out.push_str(&format!("pub enum {} {{\n", tag_name));
+        for (i, v) in acct.variants.iter().enumerate() {
+            out.push_str(&format!("    {} = {},\n", v.name, i));
+        }
+        out.push_str("}\n\n");
+
+        out.push_str("#[derive(ZeroPod)]\n");
+        out.push_str(&format!("pub struct {} {{\n", state_name));
+        out.push_str("    pub tag: u8,\n");
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for v in &acct.variants {
+            for (fname, ftype) in &v.fields {
+                if seen.insert(fname.clone()) {
+                    out.push_str(&format!(
+                        "    pub {}: {},\n",
+                        fname,
+                        map_type_standalone(ftype, spec)?
+                    ));
+                }
+            }
+        }
+        if !spec.pdas.is_empty() && !seen.contains("bump") {
+            out.push_str("    pub bump: u8,\n");
+        }
+        out.push_str("}\n\n");
+    } else {
+        // Single flat record state.
+        let state_name = format!("{}Account", to_pascal_case(&spec.program_name));
+        emit_pinocchio_state_struct(
+            out,
+            &state_name,
+            &spec.state_fields,
+            !spec.pdas.is_empty(),
+            &spec.lifecycle_states,
+            "Status",
+            spec,
+        )?;
+    }
+
+    out.push_str("// ---- END GENERATED ----\n");
+    Ok(())
+}
+
+/// Emit one Pinocchio `#[derive(ZeroPod)]` state struct (+ its optional
+/// `#[repr(u8)]` lifecycle enum). `has_pda` appends a `bump: u8`;
+/// `lifecycle` (when non-empty) emits the named-constant enum + a
+/// `status: u8` field. Shared by the single-account + multi-account
+/// branches of `emit_pinocchio_state`.
+fn emit_pinocchio_state_struct(
+    out: &mut String,
+    struct_name: &str,
+    fields: &[(String, String)],
+    has_pda: bool,
+    lifecycle: &[String],
+    enum_name: &str,
+    spec: &ParsedSpec,
+) -> Result<()> {
+    if !lifecycle.is_empty() {
+        out.push_str(&format!("/// {} lifecycle states.\n", enum_name));
+        out.push_str("#[derive(Clone, Copy, PartialEq, Eq)]\n#[repr(u8)]\n");
+        out.push_str(&format!("pub enum {} {{\n", enum_name));
+        for (i, s) in lifecycle.iter().enumerate() {
+            out.push_str(&format!("    {} = {},\n", s, i));
+        }
+        out.push_str("}\n\n");
+    }
+    out.push_str("#[derive(ZeroPod)]\n");
+    out.push_str(&format!("pub struct {} {{\n", struct_name));
+    for (fname, ftype) in fields {
+        out.push_str(&format!(
+            "    pub {}: {},\n",
+            fname,
+            map_type_standalone(ftype, spec)?
+        ));
+    }
+    if has_pda && !fields.iter().any(|(n, _)| n == "bump") {
+        out.push_str("    pub bump: u8,\n");
+    }
+    if !lifecycle.is_empty() && !fields.iter().any(|(n, _)| n == "status") {
+        out.push_str("    pub status: u8,\n");
+    }
+    out.push_str("}\n\n");
+    Ok(())
+}
+
 /// v2.24 S5b — `true` when the spec's state is a multi-variant ADT
 /// (two or more variants in a single account type) AND the spec has
 /// declared the `WrongState` error variant that the new emission
@@ -1080,6 +1227,16 @@ pub(crate) fn generate_state(
     let surface = FrameworkSurface::for_target(target);
     let src_dir = output_dir.join("src");
     std::fs::create_dir_all(&src_dir)?;
+
+    // Pinocchio: zeropod zero-copy state — a separate emission shape
+    // (different imports, `#[derive(ZeroPod)]` not `#[account]`, sum-type
+    // → tag byte + superset struct). (slice 6 step 3, §12a)
+    if matches!(target, Target::Pinocchio) {
+        let mut out = String::new();
+        emit_pinocchio_state(spec, fp, &mut out)?;
+        std::fs::write(src_dir.join("state.rs"), &out)?;
+        return Ok(());
+    }
 
     let is_multi = spec.account_types.len() > 1;
 
@@ -5969,6 +6126,76 @@ handler cancel : State.Open -> State.Closed {
         assert!(guards.contains("EscrowError::Unauthorized.into()"));
         assert!(guards.contains("EscrowError::InvalidLifecycle.into()"));
         assert!(!guards.contains("to_account_view"));
+    }
+
+    /// Slice 6 step 3 — Pinocchio state.rs is zeropod zero-copy: a
+    /// sum-type State lowers to a `#[repr(u8)]` discriminant tag enum +
+    /// a flat `#[derive(ZeroPod)]` superset struct (tag byte + every
+    /// variant field flattened, deduped). No `#[account]` / Anchor shape.
+    #[test]
+    fn pinocchio_state_sum_type_lowers_to_tag_plus_superset() {
+        let src = r#"spec Escrow
+
+type State
+  | Uninitialized
+  | Open of {
+      initializer : Pubkey,
+      amount      : U64,
+    }
+  | Closed
+
+type Error
+  | InvalidAmount
+  | WrongState
+
+handler initialize (amount : U64) : State.Uninitialized -> State.Open {
+  auth initializer
+  accounts {
+    initializer : signer, writable
+  }
+  requires amount > 0 else InvalidAmount
+  effect {
+    Open.initializer := initializer.pubkey
+  }
+}
+"#;
+        let spec = crate::chumsky_adapter::parse_str(src).unwrap();
+        let fp = crate::fingerprint::compute_fingerprint(&spec);
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path().join("programs");
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        generate_state(&spec, &fp, &out_dir, Target::Pinocchio).unwrap();
+        let state = std::fs::read_to_string(out_dir.join("src/state.rs")).unwrap();
+
+        // zeropod imports, not the pinocchio AccountInfo prelude.
+        assert!(
+            state.contains("use zeropod::{pod::*, ZeroPod};"),
+            "must import zeropod; got:\n{state}"
+        );
+        // Discriminant tag enum from the variant names.
+        assert!(
+            state.contains("#[repr(u8)]")
+                && state.contains("pub enum EscrowAccountTag {")
+                && state.contains("Uninitialized = 0,")
+                && state.contains("Open = 1,")
+                && state.contains("Closed = 2,"),
+            "must emit a #[repr(u8)] tag enum from variants; got:\n{state}"
+        );
+        // Flat ZeroPod superset struct: tag byte + flattened variant fields
+        // (Pubkey -> [u8; 32], U64 -> u64; the derive makes the Pod companion).
+        assert!(
+            state.contains("#[derive(ZeroPod)]\npub struct EscrowAccount {")
+                && state.contains("pub tag: u8,")
+                && state.contains("pub initializer: [u8; 32],")
+                && state.contains("pub amount: u64,"),
+            "must flatten variant payloads into one ZeroPod struct; got:\n{state}"
+        );
+        // No Anchor/Quasar shape leakage.
+        assert!(
+            !state.contains("#[account]") && !state.contains("EscrowAccountInner"),
+            "Pinocchio state must not emit the #[account] wrapper/inner-enum; got:\n{state}"
+        );
     }
 
     /// v2.24 S5b — multi-variant ADT state lowers to the
