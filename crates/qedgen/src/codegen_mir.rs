@@ -145,7 +145,7 @@ pub fn generate(
     // Phase 4d — MIR-direct port.
     emit_imported_mirror(mir, parsed, &fp, output_dir, target)?;
     // Phase 4b/1 — MIR-direct port.
-    emit_cargo_toml(mir, &fp, output_dir, target)?;
+    emit_cargo_toml(mir, parsed, &fp, output_dir, target)?;
 
     let file_count = 4
         + parsed.handlers.len()
@@ -181,10 +181,17 @@ pub fn generate(
 /// pins, same `qedgen-macros` git tag, same `[workspace]` footer.
 fn emit_cargo_toml(
     mir: &Mir,
+    parsed: &ParsedSpec,
     fp: &crate::fingerprint::SpecFingerprint,
     output_dir: &Path,
     target: Target,
 ) -> Result<()> {
+    // Pinocchio dep set isn't MIR-direct yet — delegate to the legacy
+    // codegen.rs emitter (single source of truth for the pinocchio /
+    // pinocchio-token / pinocchio-pubkey / zeropod deps).
+    if matches!(target, Target::Pinocchio) {
+        return crate::codegen::generate_cargo_toml(parsed, fp, output_dir, target);
+    }
     let fresh = render_cargo_toml(mir, fp, target);
     let path = output_dir.join("Cargo.toml");
     let final_toml = match std::fs::read_to_string(&path) {
@@ -285,6 +292,14 @@ fn emit_lib(
     target: Target,
 ) -> Result<()> {
     use crate::codegen::{to_pascal_case, FrameworkSurface};
+
+    // Pinocchio lib emission isn't MIR-direct yet — delegate to the legacy
+    // codegen.rs emitter (same pattern as generate_guards, line 135). The
+    // Pinocchio path emits the entrypoint + byte-dispatch from ParsedSpec
+    // directly; a MIR-direct port is v3.0-class (slice 6, §12b).
+    if matches!(target, Target::Pinocchio) {
+        return crate::codegen::generate_lib(parsed, fp, output_dir, target);
+    }
 
     let surface = FrameworkSurface::for_target(target);
     let src_dir = output_dir.join("src");
@@ -611,6 +626,13 @@ fn emit_state(
         is_multi_variant_adt_state_pub, map_type_for_target, map_type_pod, to_pascal_case,
         FrameworkSurface,
     };
+
+    // Pinocchio state emission (zeropod zero-copy structs) isn't
+    // MIR-direct yet — delegate to the legacy codegen.rs emitter (same
+    // pattern as generate_guards). MIR-direct port is v3.0-class.
+    if matches!(target, Target::Pinocchio) {
+        return crate::codegen::generate_state(parsed, fp, output_dir, target);
+    }
 
     let surface = FrameworkSurface::for_target(target);
     let src_dir = output_dir.join("src");
