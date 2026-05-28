@@ -2499,14 +2499,15 @@ fn emit_spl_anchor(
     Some(out)
 }
 
-/// Quasar SPL Token dispatcher. Routes to the right `quasar_spl` method
-/// per the called handler's name. Returns None on unrecognized handlers
-/// so the caller falls back to comment + `todo!()`.
+/// Quasar SPL Token dispatcher. Routes to the right `quasar_spl::TokenCpi`
+/// method per the called handler's name. Returns None on unrecognized
+/// handlers so the caller falls back to comment + `todo!()`.
 ///
-/// Spike scope (see `docs/design/quasar-cpi-spike.md` §5): only
-/// `transfer` is implemented in the first slice. Other handlers
-/// (`mint_to`, `burn`, `initialize_account`, `close_account`) take the
-/// `None` exit until the follow-on slice (§8 slice 2) lands.
+/// Coverage (slice 2): `transfer`, `mint_to`, `burn`, `close_account`.
+/// `initialize_account` stays `None` — `quasar-spl` exposes only
+/// `initialize_account3`, whose `owner: &Address` positional is a raw key
+/// (not an account view) and which omits the rent sysvar, so it doesn't
+/// fit the uniform `emit_spl_quasar` helper (see the match arm).
 fn emit_spl_token_cpi_quasar(
     call: &crate::check::ParsedCall,
     handler: &ParsedHandler,
@@ -2528,9 +2529,46 @@ fn emit_spl_token_cpi_quasar(
             &["from", "to", "authority"],
             Some("amount"),
         ),
-        // Other SPL handlers fall through to the caller's `todo!()`
-        // shape until the follow-on slice lands per
-        // docs/design/quasar-cpi-spike.md §8 slice 2.
+        "mint_to" => emit_spl_quasar(
+            call,
+            handler,
+            spec,
+            prog_name,
+            "mint_to",
+            // TokenCpi::mint_to(mint, to, authority, amount). The spec's
+            // canonical SPL interface names the authority slot
+            // `mint_authority`; it resolves positionally into the trait's
+            // `authority` parameter.
+            &["mint", "to", "mint_authority"],
+            Some("amount"),
+        ),
+        "burn" => emit_spl_quasar(
+            call,
+            handler,
+            spec,
+            prog_name,
+            "burn",
+            // TokenCpi::burn(from, mint, authority, amount).
+            &["from", "mint", "authority"],
+            Some("amount"),
+        ),
+        "close_account" => emit_spl_quasar(
+            call,
+            handler,
+            spec,
+            prog_name,
+            "close_account",
+            // TokenCpi::close_account(account, destination, authority) —
+            // no scalar.
+            &["account", "destination", "authority"],
+            None,
+        ),
+        // `initialize_account` has no uniform Quasar shape: `quasar-spl`
+        // exposes only `initialize_account3`, whose third positional is
+        // `owner: &Address` (a raw key, not an account view) and which
+        // omits the rent sysvar. That divergent signature doesn't fit the
+        // positional-account-view `emit_spl_quasar` helper, so it falls
+        // through to the caller's `todo!()`.
         _ => None,
     }
 }
@@ -2577,10 +2615,12 @@ fn emit_spl_quasar(
 /// name. Returns None on unrecognized handlers so the caller falls
 /// back to comment + `todo!()`.
 ///
-/// Spike scope (`docs/design/quasar-cpi-spike.md` §5 commit 2): only
-/// `transfer` is implemented. Other handlers (`mint_to`, `burn`,
-/// `initialize_account`, `close_account`) take the `None` exit until
-/// the follow-on slice (§8 slice 2b) lands.
+/// Coverage (slice 2b): all five canonical SPL handlers — `transfer`,
+/// `mint_to`, `burn`, `initialize_account`, `close_account`. Field-name
+/// divergences from canonical SPL naming (`MintTo.account` for the
+/// recipient, `MintTo.mint_authority`, `Burn.account` for the source,
+/// `InitializeAccount.rent_sysvar`) are handled per-arm in the
+/// `(pinocchio_field, spec_arg)` map.
 ///
 /// **Note on dead-code-ness**: `--target pinocchio` codegen currently
 /// skips the Rust scaffold (`main.rs:3132`), so this emitter is never
@@ -2601,6 +2641,60 @@ fn emit_spl_token_cpi_pinocchio(
             // (pinocchio_struct_field, spec_arg_name)
             &[("from", "from"), ("to", "to"), ("authority", "authority")],
             Some("amount"),
+        ),
+        "mint_to" => emit_spl_pinocchio(
+            call,
+            handler,
+            spec,
+            "MintTo",
+            // pinocchio-token's MintTo names the recipient `account`
+            // (canonical SPL `to`) and the signer `mint_authority`.
+            &[
+                ("mint", "mint"),
+                ("account", "to"),
+                ("mint_authority", "mint_authority"),
+            ],
+            Some("amount"),
+        ),
+        "burn" => emit_spl_pinocchio(
+            call,
+            handler,
+            spec,
+            "Burn",
+            // Burn names the source slot `account` (canonical SPL `from`).
+            &[
+                ("account", "from"),
+                ("mint", "mint"),
+                ("authority", "authority"),
+            ],
+            Some("amount"),
+        ),
+        "initialize_account" => emit_spl_pinocchio(
+            call,
+            handler,
+            spec,
+            "InitializeAccount",
+            // InitializeAccount names the rent sysvar `rent_sysvar`
+            // (canonical SPL `rent`). No scalar.
+            &[
+                ("account", "account"),
+                ("mint", "mint"),
+                ("owner", "owner"),
+                ("rent_sysvar", "rent"),
+            ],
+            None,
+        ),
+        "close_account" => emit_spl_pinocchio(
+            call,
+            handler,
+            spec,
+            "CloseAccount",
+            &[
+                ("account", "account"),
+                ("destination", "destination"),
+                ("authority", "authority"),
+            ],
+            None,
         ),
         _ => None,
     }
@@ -6728,6 +6822,124 @@ handler send (n : U64) : State.Active -> State.Active {{
         crate::chumsky_adapter::parse_str(&spec_src).unwrap()
     }
 
+    /// Caller fixture for `mint_to`: the canonical SPL interface names the
+    /// signer slot `mint_authority`. Shared by the Quasar + Pinocchio
+    /// mint_to tests (the shared transfer fixture passes `authority`, which
+    /// mint_to doesn't accept).
+    fn parse_mint_to_caller_spec() -> ParsedSpec {
+        crate::chumsky_adapter::parse_str(
+            r#"spec Caller
+program_id "11111111111111111111111111111111"
+
+interface Token {
+  program_id "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+  handler mint_to (amount : U64) {
+    discriminant "0x07"
+    accounts {
+      mint            : writable
+      to              : writable, type token
+      mint_authority  : signer
+    }
+  }
+}
+
+type State | Active of { stash : U64 }
+type Error | E
+
+handler do_mint (n : U64) : State.Active -> State.Active {
+  permissionless
+  accounts {
+    state          : writable
+    the_mint       : writable
+    holder_ta      : writable, type token
+    minter         : signer
+    token_program  : program
+  }
+  call Token.mint_to(mint = the_mint, to = holder_ta, mint_authority = minter, amount = n)
+}
+"#,
+        )
+        .unwrap()
+    }
+
+    /// Caller fixture for `close_account` (no scalar; account/destination/
+    /// authority). Shared by the Quasar + Pinocchio close tests.
+    fn parse_close_account_caller_spec() -> ParsedSpec {
+        crate::chumsky_adapter::parse_str(
+            r#"spec Caller
+program_id "11111111111111111111111111111111"
+
+interface Token {
+  program_id "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+  handler close_account {
+    discriminant "0x09"
+    accounts {
+      account     : writable, type token
+      destination : writable
+      authority   : signer
+    }
+  }
+}
+
+type State | Active of { x : U64 }
+type Error | E
+
+handler do_close : State.Active -> State.Active {
+  permissionless
+  accounts {
+    state          : writable
+    target_acct    : writable, type token
+    sweep_target   : writable
+    closer         : signer
+    token_program  : program
+  }
+  call Token.close_account(account = target_acct, destination = sweep_target, authority = closer)
+}
+"#,
+        )
+        .unwrap()
+    }
+
+    /// Caller fixture for `initialize_account` (no scalar; account/mint/
+    /// owner/rent). Shared by the Quasar (→ None) + Pinocchio init tests.
+    fn parse_init_account_caller_spec() -> ParsedSpec {
+        crate::chumsky_adapter::parse_str(
+            r#"spec Caller
+program_id "11111111111111111111111111111111"
+
+interface Token {
+  program_id "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+  handler initialize_account {
+    discriminant "0x01"
+    accounts {
+      account : writable
+      mint    : readonly
+      owner   : readonly
+      rent    : readonly
+    }
+  }
+}
+
+type State | Active of { x : U64 }
+type Error | E
+
+handler do_init : State.Active -> State.Active {
+  permissionless
+  accounts {
+    state          : writable
+    new_acct       : writable
+    the_mint       : writable
+    the_owner      : writable
+    rent_sysvar    : writable
+    token_program  : program
+  }
+  call Token.initialize_account(account = new_acct, mint = the_mint, owner = the_owner, rent = rent_sysvar)
+}
+"#,
+        )
+        .unwrap()
+    }
+
     /// Spike: Quasar SPL Token transfer emits a one-line method chain
     /// on the token-program account, NOT an `anchor_spl::*` builder.
     /// Per `docs/design/quasar-cpi-spike.md` §2 the shape is:
@@ -6770,19 +6982,83 @@ handler send (n : U64) : State.Active -> State.Active {{
         );
     }
 
-    /// Anti-regression for the spike's narrow scope: only `transfer`
-    /// works for Quasar SPL in this slice. Other SPL handlers
-    /// (`mint_to`, `burn`, …) must still take the `todo!()` exit until
-    /// the follow-on slice lands per
-    /// `docs/design/quasar-cpi-spike.md` §8 slice 2.
+    /// Slice 2: Quasar SPL `mint_to` emits the trait method chain. The
+    /// spec names the signer `mint_authority`; it resolves positionally
+    /// into `TokenCpi::mint_to(mint, to, authority, amount)`.
     #[test]
-    fn cpi_quasar_spl_mint_to_falls_through_to_none() {
-        let spec = parse_spl_transfer_caller_spec("mint_to");
+    fn cpi_emits_quasar_spl_mint_to() {
+        let spec = parse_mint_to_caller_spec();
+        let handler = spec.handlers.iter().find(|h| h.name == "do_mint").unwrap();
+        let call = handler.calls.first().unwrap();
+        let rendered = try_emit_cpi(call, handler, &spec, Target::Quasar)
+            .expect("Quasar SPL mint_to must emit");
+        assert!(
+            rendered.contains("self.token_program.mint_to("),
+            "must invoke mint_to on the token-program account; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("&self.the_mint")
+                && rendered.contains("&self.holder_ta")
+                && rendered.contains("&self.minter"),
+            "mint/to/mint_authority must resolve to call-site accounts; got:\n{rendered}"
+        );
+        assert!(
+            rendered.trim_end().ends_with(".invoke()?;"),
+            "must terminate with .invoke()?; got:\n{rendered}"
+        );
+    }
+
+    /// Slice 2: Quasar SPL `burn` — TokenCpi::burn(from, mint, authority,
+    /// amount). The shared transfer fixture supplies exactly this arg set.
+    #[test]
+    fn cpi_emits_quasar_spl_burn() {
+        let spec = parse_spl_transfer_caller_spec("burn");
         let handler = spec.handlers.iter().find(|h| h.name == "send").unwrap();
+        let call = handler.calls.first().unwrap();
+        let rendered =
+            try_emit_cpi(call, handler, &spec, Target::Quasar).expect("Quasar SPL burn must emit");
+        assert!(
+            rendered.contains("self.token_program.burn(")
+                && rendered.contains("&self.src")
+                && rendered.contains("&self.mint")
+                && rendered.contains("&self.auth"),
+            "burn must resolve from/mint/authority; got:\n{rendered}"
+        );
+    }
+
+    /// Slice 2: Quasar SPL `close_account` — no scalar; three account args
+    /// (account, destination, authority).
+    #[test]
+    fn cpi_emits_quasar_spl_close_account_no_amount() {
+        let spec = parse_close_account_caller_spec();
+        let handler = spec.handlers.iter().find(|h| h.name == "do_close").unwrap();
+        let call = handler.calls.first().unwrap();
+        let rendered = try_emit_cpi(call, handler, &spec, Target::Quasar)
+            .expect("Quasar SPL close_account must emit");
+        assert!(
+            rendered.contains("self.token_program.close_account(")
+                && rendered.contains("&self.target_acct")
+                && rendered.contains("&self.sweep_target")
+                && rendered.contains("&self.closer"),
+            "close_account must resolve account/destination/authority; got:\n{rendered}"
+        );
+        assert!(
+            rendered.trim_end().ends_with(".invoke()?;"),
+            "must terminate with .invoke()?; got:\n{rendered}"
+        );
+    }
+
+    /// Slice 2: Quasar SPL `initialize_account` stays `None` — `quasar-spl`
+    /// exposes only `initialize_account3` (owner is a raw `&Address`, no
+    /// rent sysvar), which doesn't fit the uniform account-view helper.
+    #[test]
+    fn cpi_quasar_spl_initialize_account_falls_through_to_none() {
+        let spec = parse_init_account_caller_spec();
+        let handler = spec.handlers.iter().find(|h| h.name == "do_init").unwrap();
         let call = handler.calls.first().unwrap();
         assert!(
             try_emit_cpi(call, handler, &spec, Target::Quasar).is_none(),
-            "Quasar SPL mint_to is out of spike scope; must fall through to None"
+            "Quasar initialize_account has no uniform shape; must fall through to None"
         );
     }
 
@@ -6837,18 +7113,103 @@ handler send (n : U64) : State.Active -> State.Active {{
         );
     }
 
-    /// Anti-regression for the spike's narrow scope on Pinocchio:
-    /// only `transfer` works in this slice. Other SPL handlers
-    /// (`mint_to`, `burn`, …) must still take the `todo!()` exit until
-    /// `docs/design/quasar-cpi-spike.md` §8 slice 2b lands.
+    /// Slice 2b: Pinocchio SPL `mint_to` constructs the MintTo struct.
+    /// pinocchio-token names the recipient slot `account` (canonical SPL
+    /// `to`) and the signer `mint_authority`.
     #[test]
-    fn cpi_pinocchio_spl_mint_to_falls_through_to_none() {
-        let spec = parse_spl_transfer_caller_spec("mint_to");
+    fn cpi_emits_pinocchio_spl_mint_to() {
+        let spec = parse_mint_to_caller_spec();
+        let handler = spec.handlers.iter().find(|h| h.name == "do_mint").unwrap();
+        let call = handler.calls.first().unwrap();
+        let rendered = try_emit_cpi(call, handler, &spec, Target::Pinocchio)
+            .expect("Pinocchio SPL mint_to must emit");
+        assert!(
+            rendered.contains("pinocchio_token::instructions::MintTo {"),
+            "must construct the MintTo struct; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("mint:") && rendered.contains("&self.the_mint"),
+            "mint field; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("account:") && rendered.contains("&self.holder_ta"),
+            "recipient maps to pinocchio field `account` ← spec `to`; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("mint_authority:") && rendered.contains("&self.minter"),
+            "signer maps to `mint_authority`; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("amount:") && rendered.contains("}.invoke()?;"),
+            "amount scalar + .invoke()?; got:\n{rendered}"
+        );
+    }
+
+    /// Slice 2b: Pinocchio SPL `burn` — Burn names the source slot
+    /// `account` (canonical SPL `from`).
+    #[test]
+    fn cpi_emits_pinocchio_spl_burn() {
+        let spec = parse_spl_transfer_caller_spec("burn");
         let handler = spec.handlers.iter().find(|h| h.name == "send").unwrap();
         let call = handler.calls.first().unwrap();
+        let rendered = try_emit_cpi(call, handler, &spec, Target::Pinocchio)
+            .expect("Pinocchio SPL burn must emit");
         assert!(
-            try_emit_cpi(call, handler, &spec, Target::Pinocchio).is_none(),
-            "Pinocchio SPL mint_to is out of spike scope; must fall through to None"
+            rendered.contains("pinocchio_token::instructions::Burn {"),
+            "must construct the Burn struct; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("account:") && rendered.contains("&self.src"),
+            "source maps to pinocchio field `account` ← spec `from`; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("mint:") && rendered.contains("authority:"),
+            "mint + authority fields; got:\n{rendered}"
+        );
+    }
+
+    /// Slice 2b: Pinocchio SPL `initialize_account` — no scalar; rent
+    /// sysvar maps to pinocchio field `rent_sysvar` (canonical SPL `rent`).
+    #[test]
+    fn cpi_emits_pinocchio_spl_initialize_account_no_amount() {
+        let spec = parse_init_account_caller_spec();
+        let handler = spec.handlers.iter().find(|h| h.name == "do_init").unwrap();
+        let call = handler.calls.first().unwrap();
+        let rendered = try_emit_cpi(call, handler, &spec, Target::Pinocchio)
+            .expect("Pinocchio SPL initialize_account must emit");
+        assert!(
+            rendered.contains("pinocchio_token::instructions::InitializeAccount {"),
+            "must construct InitializeAccount; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("rent_sysvar:") && rendered.contains("&self.rent_sysvar"),
+            "rent maps to pinocchio field `rent_sysvar`; got:\n{rendered}"
+        );
+        // No scalar — no `amount:` field.
+        assert!(
+            !rendered.contains("amount:") && rendered.contains("}.invoke()?;"),
+            "no-amount handler must not emit an amount field; got:\n{rendered}"
+        );
+    }
+
+    /// Slice 2b: Pinocchio SPL `close_account` — no scalar.
+    #[test]
+    fn cpi_emits_pinocchio_spl_close_account_no_amount() {
+        let spec = parse_close_account_caller_spec();
+        let handler = spec.handlers.iter().find(|h| h.name == "do_close").unwrap();
+        let call = handler.calls.first().unwrap();
+        let rendered = try_emit_cpi(call, handler, &spec, Target::Pinocchio)
+            .expect("Pinocchio SPL close_account must emit");
+        assert!(
+            rendered.contains("pinocchio_token::instructions::CloseAccount {")
+                && rendered.contains("&self.target_acct")
+                && rendered.contains("&self.sweep_target")
+                && rendered.contains("&self.closer"),
+            "close_account must resolve account/destination/authority; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("amount:") && rendered.contains("}.invoke()?;"),
+            "no-amount handler must not emit an amount field; got:\n{rendered}"
         );
     }
 
