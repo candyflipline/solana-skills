@@ -207,12 +207,15 @@ Once the spec exists, gate CI on it staying in sync with the program:
 qedgen check --spec my_program.qedspec --anchor-project ./programs/my_program
 ```
 
-### Greenfield — Anchor or Quasar
+### Greenfield — Anchor, Quasar, or Pinocchio
 
-The same `.qedspec` codegens to either framework via `--target`. Anchor
-is the default; pass `--target quasar` for a Blueshift Quasar
-(`#![no_std]` + `quasar_lang`) program crate with explicit
-discriminators and `Ctx<X>` instead of `Context<X>`.
+The same `.qedspec` codegens to any of three framework targets via
+`--target`. Anchor is the default; `--target quasar` emits a Blueshift
+Quasar (`#![no_std]` + `quasar_lang`) crate with explicit discriminators
+and `Ctx<X>` instead of `Context<X>`; `--target pinocchio` emits a
+Pinocchio (`#![no_std]`) crate with `entrypoint!` byte-discriminant
+dispatch, `zeropod` zero-copy state, and `&AccountInfo` account structs
+with `.handler()` methods.
 
 ```bash
 # Anchor (default)
@@ -222,14 +225,18 @@ qedgen codegen --spec my_program.qedspec --all
 # Quasar
 qedgen init --name my_program --spec my_program.qedspec --target quasar
 qedgen codegen --spec my_program.qedspec --target quasar --all
+
+# Pinocchio
+qedgen init --name my_program --spec my_program.qedspec --target pinocchio
+qedgen codegen --spec my_program.qedspec --target pinocchio --all
 ```
 
 Lean proofs, Kani harnesses, proptest harnesses, and CI workflows are
 target-agnostic — they're driven by the spec, not the framework, so
 the verification artifacts are identical across `--target` choices.
 The deploy-safety lint (`qedgen readiness` / `qedgen check-upgrade`)
-also speaks both Anchor and Quasar IDLs; see the *Deploy-safety lint*
-section below.
+speaks Anchor and Quasar IDLs; see the *Deploy-safety lint* section
+below.
 
 ### Spec-driven pipeline
 
@@ -548,13 +555,14 @@ Exit codes mirror ratchet's CLI conventions: `0 = additive/safe`, `1 = breaking`
 ## Codegen internals
 
 Starting in v2.30, `qedgen codegen` routes every backend (Lean, Kani,
-Anchor/Quasar, proptest) through a typed intermediate representation
-(`mir::Mir`) instead of consuming the parsed spec AST directly. The
-flip is transparent — no flag to enable, no behavior change for any
-existing spec (verified via byte-equivalent snapshots across every
-pilot fixture: 6 Lean × 6 Kani × 6 Anchor × 6 proptest = 24
-fixture-snapshot lock-ins, plus an additional cross-program-vault
-end-to-end check).
+Anchor / Quasar / Pinocchio, proptest) through a typed intermediate
+representation (`mir::Mir`) instead of consuming the parsed spec AST
+directly. The flip is transparent — no flag to enable, no behavior
+change for any existing spec (verified via byte-equivalent snapshots
+across every pilot fixture: 6 Lean × 6 Kani × 6 Anchor × 6 proptest =
+24 fixture-snapshot lock-ins, plus an additional cross-program-vault
+end-to-end check). The v2.31 Pinocchio scaffold is MIR-native from the
+start — it has no legacy renderer and no escape hatch.
 
 **Why it matters.** A typed IR replaces shared-by-convention dispatch
 across the four codegens with a single `Stmt` enum every codegen has
