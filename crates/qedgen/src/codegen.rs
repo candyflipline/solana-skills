@@ -2241,7 +2241,7 @@ fn find_program_account_for_interface<'a>(
 /// (`MyAmm`) to its conventional handler-side program account name
 /// (`my_amm_program`). Single-pass — adds an underscore before each
 /// uppercase letter (except the first) and lowercases the result.
-fn to_snake_case(s: &str) -> String {
+pub(crate) fn to_snake_case(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 4);
     for (i, c) in s.chars().enumerate() {
         if i > 0 && c.is_ascii_uppercase() {

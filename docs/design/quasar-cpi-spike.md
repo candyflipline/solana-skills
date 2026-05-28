@@ -826,10 +826,47 @@ approach, not the wire-format one. The codegen needs to:
 memcmp is 32 bytes, +2 slack). If the handler has nested loops
 (e.g. a non-Pubkey comparison), the bound needs to grow.
 
-**M3 — Codegen the harness** (~1-2 days): build `emit_kani_impl_pinocchio`
-that generates the exact string from M2 from the spec + program crate
-name. Snapshot test against the M2 reference. Wire into the dispatch
-per §7c.
+**M3 — Codegen the harness** (**DONE**). Built `emit_kani_impl_pinocchio`
+in `crates/qedgen/src/kani_impl.rs` + the §7c dispatch refactor.
+
+Validation: generated a harness from a spec matching the
+`ptoken-transfer` fixture (`qedgen codegen --target pinocchio
+--kani-impl`), dropped it into the fixture, ran `cargo kani`. Result:
+`VERIFICATION:- FAILED` in 1.38s, catching **both** arithmetic bugs —
+`transfer.rs:99` (unchecked add) AND `:100` (unchecked sub). The
+generated harness catches *more* than the hand-written M2 reference
+(which assumed `amount <= src_amount` to isolate the add). Confirms
+Kani's automatic overflow/underflow checks on the real handler path
+do the verification without an explicit ensures translation.
+
+Design choices that landed:
+- **No explicit ensures assertion in the base harness.** The M2 bug
+  fired via Kani's automatic overflow check, before any conservation
+  assertion ran. So the emitter builds symbolic accounts + calls the
+  handler; Kani's built-in UB/overflow checks catch arithmetic bugs.
+  Spec `ensures` clauses are emitted as reference comments for the
+  agent to promote to explicit cross-field assertions where needed.
+- **Account classification heuristic**: writable non-signer →
+  `build_token_account` (holds mutable state); signer/readonly →
+  `build_minimal_account`. Matches the ptoken-transfer shape;
+  documented so users adjust.
+- **Call-path normalization**: spec handler `transfer` →
+  `crate::transfer::process_transfer` (module = base, fn =
+  `process_<base>`), stripping a leading `process_` if the spec name
+  already carries it.
+- **Output path redirect**: `redirect_kani_impl_to_src` rewrites the
+  default `…/tests/kani_impl.rs` → `…/src/kani_impl.rs` for Pinocchio
+  (M1 finding: Kani only scans the lib). Explicit overrides pass
+  through.
+
+Deferred (not blocking): a snapshot test diffing the generated output
+against a committed reference. The unit test
+`pinocchio_target_emits_stack_harness` asserts the structural
+elements; the end-to-end `cargo kani` run is the behavioral proof.
+The two `src/lib.rs` lines (`extern crate kani` + `mod kani_impl`)
+are still user-added (documented in the generated file header); a
+follow-up can auto-inject them when the Pinocchio scaffold (slice 6)
+lands and qedgen owns `lib.rs`.
 
 ### 11g. Implementation skeleton (commit map)
 
@@ -846,14 +883,17 @@ The slice lands across 3-4 commits on `feat/2.30`:
    `transfer.rs:99`. Codegen target shape captured. Also repaired
    the `ptoken-transfer` fixture source to match
    `pinocchio-token 0.3.0` API.
-3. **Codegen + dispatch refactor** (M3): land
+3. **Codegen + dispatch refactor** (M3 — **DONE**): landed
    `emit_kani_impl_pinocchio` + the §7c dispatch refactor in
-   `kani_impl::generate_from_spec`. Anchor branch keeps working,
-   Pinocchio branch reaches the new emitter, Quasar still no-ops
-   (slice 5 follow-on). Snapshot test against M2.
-4. **Optional cleanup**: extract shared helpers between Anchor and
-   Pinocchio emitters if duplication warrants it. Don't pre-optimize;
-   wait until Quasar also lands.
+   `kani_impl::generate_from_spec`. Anchor branch unchanged (extracted
+   to `emit_kani_impl_anchor`), Pinocchio branch reaches the new
+   emitter, Quasar still no-ops (slice 5 follow-on). Plus the
+   `redirect_kani_impl_to_src` output-path fix. Validated end-to-end:
+   generated harness catches `transfer.rs:99` + `:100` under Kani.
+4. **Optional cleanup** (future): extract shared helpers between
+   Anchor and Pinocchio emitters if duplication warrants it. Don't
+   pre-optimize; wait until Quasar Kani-impl (slice 5) also lands so
+   the shared shape is clear across all three.
 
 ## 10. Commit shape
 

@@ -49,8 +49,8 @@
 use anyhow::Result;
 use std::path::Path;
 
-use crate::check::{self, ParsedHandler, ParsedSpec};
-use crate::codegen::{map_type, to_pascal_case};
+use crate::check::{self, ParsedHandler, ParsedHandlerAccount, ParsedSpec};
+use crate::codegen::{map_type, to_pascal_case, to_snake_case};
 use crate::Target;
 
 /// Predicate: a handler triggers auto-emission of an impl-targeted harness
@@ -134,13 +134,14 @@ pub fn generate_from_spec(
     explicit_flag: bool,
     target: Target,
 ) -> Result<()> {
-    // Target gate: the impl-targeted harness builds a symbolic
-    // `Context<X>` and calls `crate::<Pascal>` (the Anchor accounts
-    // struct). On a Quasar (`quasar_lang::Ctx<X>`) or Pinocchio
-    // (`#[no_std]`, raw account slices) crate, both references are
-    // undefined — the generated file won't compile. Bail before any
-    // I/O so the docstring's "clean no-op" promise holds.
-    if !matches!(target, Target::Anchor) {
+    // Target gate (per docs/design/quasar-cpi-spike.md §7c):
+    //   - Anchor    → `Context<X>` + `crate::<Pascal>` accounts struct
+    //   - Pinocchio → stack-allocated `AccountInfo` via `#[repr(C)]`
+    //     layout mirror + transmute (slice 8 M3; the shape validated
+    //     by examples/pinocchio-fixtures/ptoken-transfer/src/kani_impl.rs)
+    //   - Quasar    → no impl-targeted harness yet (slice 5). No-op so
+    //     the docstring's "clean no-op" promise holds.
+    if matches!(target, Target::Quasar) {
         return Ok(());
     }
     let auto_handlers = auto_triggered_handlers(spec);
@@ -186,6 +187,38 @@ pub fn generate_from_spec(
         std::fs::create_dir_all(parent)?;
     }
 
+    // Body dispatch. The gating above (auto-trigger, ensures-present,
+    // emit-targets) is target-agnostic; only the harness body shape
+    // differs per framework.
+    match target {
+        Target::Anchor => emit_kani_impl_anchor(
+            spec,
+            output_path,
+            &emit_targets,
+            &auto_handlers,
+            explicit_flag,
+        ),
+        Target::Pinocchio => emit_kani_impl_pinocchio(
+            spec,
+            output_path,
+            &emit_targets,
+            &auto_handlers,
+            explicit_flag,
+        ),
+        // Handled by the early no-op above; unreachable here.
+        Target::Quasar => Ok(()),
+    }
+}
+
+/// Emit the Anchor impl-targeted harness: symbolic `Context<X>` +
+/// `crate::<Pascal>` accounts struct, calling the user's real handler.
+fn emit_kani_impl_anchor(
+    spec: &ParsedSpec,
+    output_path: &Path,
+    emit_targets: &[&ParsedHandler],
+    auto_handlers: &[&str],
+    explicit_flag: bool,
+) -> Result<()> {
     let fp = crate::fingerprint::compute_fingerprint(spec);
     let hash = fp
         .file_hashes
@@ -213,7 +246,7 @@ pub fn generate_from_spec(
         out.push_str("// signal). The agent-fill `todo!()` site is expected to compute\n");
         out.push_str("// those fields against the spec's ensures; this harness verifies\n");
         out.push_str("// the result.\n");
-        for name in &auto_handlers {
+        for name in auto_handlers {
             out.push_str(&format!("//   - {}\n", name));
         }
         out.push_str("//\n");
@@ -235,7 +268,7 @@ pub fn generate_from_spec(
     // but with `kani::any()` substituted for concrete keypair init. The
     // user's handler is called via `accounts.handler(<params>)` — same
     // method signature the integration test invokes.
-    emit_symbolic_accounts_module(&mut out, spec, &emit_targets)?;
+    emit_symbolic_accounts_module(&mut out, spec, emit_targets)?;
 
     // ── Per-handler proof harnesses ─────────────────────────────────────
     out.push_str(
@@ -247,7 +280,7 @@ pub fn generate_from_spec(
     );
 
     let mut emitted_count = 0;
-    for handler in &emit_targets {
+    for handler in emit_targets {
         for (idx, ensures) in handler.ensures.iter().enumerate() {
             emit_handler_harness(&mut out, handler, idx, ensures, spec)?;
             emitted_count += 1;
@@ -264,6 +297,431 @@ pub fn generate_from_spec(
         output_path.display()
     );
 
+    Ok(())
+}
+
+// ============================================================================
+// Pinocchio impl-targeted harness (slice 8 M3)
+// ============================================================================
+
+/// Emit the Pinocchio impl-targeted harness. Unlike the Anchor branch
+/// (symbolic `Context<X>` + accounts struct), Pinocchio handlers take
+/// raw `&[AccountInfo]`, so the harness builds `Account`-layout structs
+/// directly on the stack and transmutes pointers into `AccountInfo`.
+///
+/// The shape is validated by
+/// `examples/pinocchio-fixtures/ptoken-transfer/src/kani_impl.rs` (M2),
+/// which caught a real token-overflow bug in 1.1s. See
+/// `docs/design/quasar-cpi-spike.md` §11 for the full design + the
+/// pivot rationale (stack allocation vs the wire-format approach that
+/// blew BMC budget).
+///
+/// **Key correctness lever**: Kani's *automatic* arithmetic-overflow /
+/// UB checks run on every path through the real handler. The M2 bug
+/// fired as "attempt to add with overflow" before any explicit
+/// assertion. So the base harness — build symbolic accounts, call the
+/// handler — already catches arithmetic bugs without an explicit
+/// `ensures` translation. The spec's `ensures` clauses are emitted as
+/// reference comments + an optional agent-fill assertion block.
+fn emit_kani_impl_pinocchio(
+    spec: &ParsedSpec,
+    output_path: &Path,
+    emit_targets: &[&ParsedHandler],
+    auto_handlers: &[&str],
+    explicit_flag: bool,
+) -> Result<()> {
+    let fp = crate::fingerprint::compute_fingerprint(spec);
+    let hash = fp
+        .file_hashes
+        .get("src/kani_impl.rs")
+        .cloned()
+        .unwrap_or_default();
+
+    let mut out = String::new();
+
+    // ── File header ──────────────────────────────────────────────────────
+    out.push_str(&crate::banner::banner(None, &hash));
+    out.push_str("//\n");
+    out.push_str("// Impl-targeted Kani harnesses for a Pinocchio (#![no_std]) program.\n");
+    out.push_str("// Builds symbolic `AccountInfo` values on the stack and calls the\n");
+    out.push_str("// user's real `process_<handler>` against them. Kani's automatic\n");
+    out.push_str("// overflow / underflow / UB checks run on every path through the\n");
+    out.push_str("// real handler — a counterexample blames the impl.\n");
+    out.push_str("//\n");
+    out.push_str("// PLACEMENT (per the M1 smoke-test findings, design doc §11a):\n");
+    out.push_str("//   1. This file lives in the program crate's `src/` (NOT `tests/`):\n");
+    out.push_str("//      `cargo kani` only discovers `#[kani::proof]` in the lib, not\n");
+    out.push_str("//      in integration tests.\n");
+    out.push_str("//   2. Add these two lines to the crate root (`src/lib.rs`):\n");
+    out.push_str("//        #[cfg(kani)] extern crate kani;\n");
+    out.push_str("//        #[cfg(kani)] mod kani_impl;\n");
+    out.push_str("//      The `extern crate kani` is required for `cargo kani` to find\n");
+    out.push_str("//      its instrumentation entry in a #![no_std] crate.\n");
+    if !explicit_flag {
+        out.push_str("//\n");
+        out.push_str("// Auto-triggered for handlers with modifies-not-in-effect:\n");
+        for name in auto_handlers {
+            out.push_str(&format!("//   - {}\n", name));
+        }
+    }
+    out.push_str("//\n");
+    out.push_str("// To run:  cargo kani --harness <name>   (requires cargo-kani)\n");
+    out.push_str("// ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----\n");
+    out.push_str("#![cfg(kani)]\n");
+    out.push_str("#![allow(dead_code, unused_imports, unused_variables)]\n\n");
+
+    emit_pinocchio_scaffold(&mut out);
+
+    out.push_str(
+        "// ============================================================================\n",
+    );
+    out.push_str("// Per-handler proof harnesses\n");
+    out.push_str(
+        "// ============================================================================\n\n",
+    );
+
+    let mut emitted_count = 0;
+    for handler in emit_targets {
+        emit_pinocchio_handler_harness(&mut out, handler, spec)?;
+        emitted_count += 1;
+    }
+
+    out.push_str("// ---- GENERATED BY QEDGEN — DO NOT EDIT BELOW THIS LINE ----\n");
+
+    std::fs::write(output_path, &out)?;
+    eprintln!(
+        "Generated {} Pinocchio impl-targeted Kani harness(es) in {}",
+        emitted_count,
+        output_path.display()
+    );
+    Ok(())
+}
+
+/// Emit the deterministic shared scaffold: the `Account`-layout mirror,
+/// the stack-account container, the SPL Token layout constants, and the
+/// build / transmute / read helpers. Byte-for-byte the same regardless
+/// of the spec (the per-handler harnesses below reference these).
+fn emit_pinocchio_scaffold(out: &mut String) {
+    out.push_str(PINOCCHIO_SCAFFOLD);
+    out.push('\n');
+}
+
+/// The shared scaffold, validated against the M2 reference harness.
+const PINOCCHIO_SCAFFOLD: &str = r#"extern crate alloc;
+
+use core::mem::ManuallyDrop;
+use pinocchio::account_info::AccountInfo;
+
+/// Layout-mirror of `pinocchio::account_info::Account` (pinocchio 0.8.x).
+/// Drift causes immediate UB on first field access; the size assertion
+/// catches the common add/remove-field form.
+#[repr(C)]
+struct AccountLayout {
+    borrow_state: u8,
+    is_signer: u8,
+    is_writable: u8,
+    executable: u8,
+    original_data_len: u32,
+    key: [u8; 32],
+    owner: [u8; 32],
+    lamports: u64,
+    data_len: u64,
+}
+const _: () = assert!(core::mem::size_of::<AccountLayout>() == 88);
+
+/// 88-byte header followed contiguously by the account's data region.
+#[repr(C, align(8))]
+struct StackAccount<const DATA_LEN: usize> {
+    hdr: AccountLayout,
+    data: [u8; DATA_LEN],
+}
+
+// SPL Token `TokenAccount` data-region offsets (pinocchio-token 0.3.0).
+const TOKEN_OWNER_OFF: usize = 32;
+const TOKEN_AMOUNT_OFF: usize = 64;
+const TOKEN_STATE_OFF: usize = 108;
+const TOKEN_DATA_LEN: usize = 165;
+
+/// SPL Token program ID — the `from_account_info` owner check target.
+const SPL_TOKEN_PROGRAM_ID: [u8; 32] = [
+    0x06, 0xdd, 0xf6, 0xe1, 0xd7, 0x65, 0xa1, 0x93, 0xd9, 0xcb, 0xe1, 0x46, 0xce, 0xeb, 0x79,
+    0xac, 0x1c, 0xb4, 0x85, 0xed, 0x5f, 0x5b, 0x37, 0x91, 0x3a, 0x8c, 0xf5, 0x85, 0x7e, 0xff,
+    0x00, 0xa9,
+];
+const STATE_INITIALIZED: u8 = 1;
+const BORROW_STATE_CLEAR: u8 = 0;
+
+/// Build a stack-resident SPL Token account. `amount` is the field a
+/// harness wires up as `kani::any()`.
+fn build_token_account(
+    key: [u8; 32],
+    is_writable: bool,
+    is_signer: bool,
+    owner_in_data: [u8; 32],
+    amount: u64,
+) -> StackAccount<TOKEN_DATA_LEN> {
+    let mut acct = StackAccount {
+        hdr: AccountLayout {
+            borrow_state: BORROW_STATE_CLEAR,
+            is_signer: is_signer as u8,
+            is_writable: is_writable as u8,
+            executable: 0,
+            original_data_len: 0,
+            key,
+            owner: SPL_TOKEN_PROGRAM_ID,
+            lamports: 0,
+            data_len: TOKEN_DATA_LEN as u64,
+        },
+        data: [0u8; TOKEN_DATA_LEN],
+    };
+    acct.data[TOKEN_OWNER_OFF..TOKEN_OWNER_OFF + 32].copy_from_slice(&owner_in_data);
+    acct.data[TOKEN_AMOUNT_OFF..TOKEN_AMOUNT_OFF + 8].copy_from_slice(&amount.to_le_bytes());
+    acct.data[TOKEN_STATE_OFF] = STATE_INITIALIZED;
+    acct
+}
+
+/// Build a non-token account (mint / authority / signer slot). No data
+/// region — the handler only reads `is_signer` / `key`.
+fn build_minimal_account(key: [u8; 32], is_signer: bool, is_writable: bool) -> StackAccount<0> {
+    StackAccount {
+        hdr: AccountLayout {
+            borrow_state: BORROW_STATE_CLEAR,
+            is_signer: is_signer as u8,
+            is_writable: is_writable as u8,
+            executable: 0,
+            original_data_len: 0,
+            key,
+            owner: [0u8; 32],
+            lamports: 0,
+            data_len: 0,
+        },
+        data: [],
+    }
+}
+
+/// Transmute a `*mut StackAccount<N>::hdr` to `AccountInfo`.
+///
+/// SAFETY: `AccountInfo` is `#[repr(C)] struct { raw: *mut Account }` —
+/// a single-field pointer wrapper. `StackAccount<N>::hdr` mirrors
+/// `Account`'s layout (asserted above). The caller must keep `stack`
+/// alive for the lifetime of the returned `AccountInfo`.
+unsafe fn account_info_from_stack<const N: usize>(stack: &mut StackAccount<N>) -> AccountInfo {
+    let hdr_ptr: *mut AccountLayout = &mut stack.hdr;
+    core::mem::transmute::<*mut AccountLayout, AccountInfo>(hdr_ptr)
+}
+
+/// Read the `amount` from a stack token account's data region.
+fn read_token_amount<const N: usize>(stack: &StackAccount<N>) -> u64 {
+    u64::from_le_bytes(
+        stack.data[TOKEN_AMOUNT_OFF..TOKEN_AMOUNT_OFF + 8]
+            .try_into()
+            .unwrap(),
+    )
+}
+"#;
+
+/// Normalize a spec handler name into `(module, fn_name)` for the
+/// `crate::<module>::<fn_name>` call path. Pinocchio convention is
+/// `src/<module>.rs` exposing `pub fn process_<base>`. We strip a
+/// leading `process_` from the spec name to recover the base, then
+/// reattach it for the fn while using the base as the module.
+///
+///   "transfer"          → ("transfer", "process_transfer")
+///   "process_transfer"  → ("transfer", "process_transfer")
+fn pinocchio_call_path(handler_name: &str) -> (String, String) {
+    let snake = to_snake_case(handler_name);
+    let base = snake.strip_prefix("process_").unwrap_or(&snake).to_string();
+    let fn_name = format!("process_{}", base);
+    (base, fn_name)
+}
+
+/// Rust primitive for a numeric DSL type, used to declare the symbolic
+/// param so `to_le_bytes()` packs the right width. Returns None for
+/// non-numeric / unsupported types (the harness emits a `todo!()` for
+/// those params).
+fn numeric_param_rust_type(dsl_type: &str) -> Option<&'static str> {
+    match dsl_type {
+        "U8" => Some("u8"),
+        "I8" => Some("i8"),
+        "U16" => Some("u16"),
+        "I16" => Some("i16"),
+        "U32" => Some("u32"),
+        "I32" => Some("i32"),
+        "U64" => Some("u64"),
+        "I64" => Some("i64"),
+        "U128" => Some("u128"),
+        "I128" => Some("i128"),
+        _ => None,
+    }
+}
+
+/// Emit one `#[kani::proof]` harness for a Pinocchio handler. Builds
+/// symbolic stack accounts from the handler's `accounts {}` block,
+/// packs symbolic params into instruction data, and calls the real
+/// `process_<name>`. Kani's automatic overflow / UB checks do the
+/// verification; spec `ensures` clauses are emitted as reference
+/// comments.
+fn emit_pinocchio_handler_harness(
+    out: &mut String,
+    handler: &ParsedHandler,
+    _spec: &ParsedSpec,
+) -> Result<()> {
+    let (module, fn_name) = pinocchio_call_path(&handler.name);
+    let snake = to_snake_case(&handler.name);
+
+    // Classify accounts: writable non-signer → SPL Token account (holds
+    // mutable state); everything else → minimal account. Heuristic;
+    // documented so the user can adjust if their program shape differs.
+    let is_token = |a: &ParsedHandlerAccount| a.is_writable && !a.is_signer;
+
+    // The first signer's key threads through as the token-account owner
+    // so the handler's owner check passes. Falls back to a fixed key.
+    let authority_idx = handler.accounts.iter().position(|a| a.is_signer);
+
+    out.push_str(&format!(
+        "/// Impl-targeted harness for `{}`. Kani's automatic\n",
+        fn_name
+    ));
+    out.push_str("/// overflow / underflow / UB checks run on every path through the\n");
+    out.push_str("/// real handler. `#[kani::unwind(34)]` bounds the 32-byte Pubkey\n");
+    out.push_str("/// memcmp loops in pinocchio's owner checks (+2 slack).\n");
+    out.push_str("#[kani::proof]\n");
+    out.push_str("#[kani::unwind(34)]\n");
+    out.push_str(&format!("fn verify_{}_impl() {{\n", snake));
+
+    // Authority key (concrete) — threaded as token owner.
+    out.push_str("    let authority_key: [u8; 32] = [7u8; 32];\n");
+
+    // Symbolic amounts for token accounts.
+    for (i, a) in handler.accounts.iter().enumerate() {
+        if is_token(a) {
+            out.push_str(&format!(
+                "    let {}_amount: u64 = kani::any();\n",
+                to_snake_case(&a.name)
+            ));
+        }
+        let _ = i;
+    }
+
+    // Symbolic params, declared with the primitive matching the spec
+    // type so `to_le_bytes()` packs the right width below.
+    for (pname, ptype) in &handler.takes_params {
+        match numeric_param_rust_type(ptype) {
+            Some(rust_ty) => {
+                out.push_str(&format!(
+                    "    let {}: {} = kani::any(); // spec type: {}\n",
+                    to_snake_case(pname),
+                    rust_ty,
+                    ptype
+                ));
+            }
+            None => {
+                out.push_str(&format!(
+                    "    // TODO: declare symbolic param `{}` (spec type {})\n",
+                    pname, ptype
+                ));
+            }
+        }
+    }
+    out.push('\n');
+
+    // Build accounts in declared order.
+    let mut acct_idents: Vec<String> = Vec::with_capacity(handler.accounts.len());
+    for (i, a) in handler.accounts.iter().enumerate() {
+        let ident = to_snake_case(&a.name);
+        acct_idents.push(ident.clone());
+        let key_byte = (i + 1) as u8;
+        if is_token(a) {
+            // owner_in_data: authority's key for the slot the authority
+            // signs for (heuristic: the first token account), else junk.
+            let owner_expr = if authority_idx.is_some() && i == 0 {
+                "authority_key".to_string()
+            } else {
+                "[9u8; 32]".to_string()
+            };
+            out.push_str(&format!(
+                "    let mut {ident} = build_token_account([{key_byte}u8; 32], {writable}, {signer}, {owner_expr}, {ident}_amount);\n",
+                ident = ident,
+                key_byte = key_byte,
+                writable = a.is_writable,
+                signer = a.is_signer,
+                owner_expr = owner_expr,
+            ));
+        } else {
+            let key_expr = if a.is_signer {
+                "authority_key".to_string()
+            } else {
+                format!("[{}u8; 32]", key_byte)
+            };
+            out.push_str(&format!(
+                "    let mut {ident} = build_minimal_account({key_expr}, {signer}, {writable});\n",
+                ident = ident,
+                key_expr = key_expr,
+                signer = a.is_signer,
+                writable = a.is_writable,
+            ));
+        }
+    }
+    out.push('\n');
+
+    // Assemble the AccountInfo array.
+    let n = handler.accounts.len();
+    out.push_str(&format!(
+        "    let accounts: [ManuallyDrop<AccountInfo>; {n}] = unsafe {{\n        [\n"
+    ));
+    for ident in &acct_idents {
+        out.push_str(&format!(
+            "            ManuallyDrop::new(account_info_from_stack(&mut {ident})),\n"
+        ));
+    }
+    out.push_str("        ]\n    };\n");
+    out.push_str(&format!(
+        "    let accounts_slice: &[AccountInfo] = unsafe {{\n        core::slice::from_raw_parts(&accounts as *const _ as *const AccountInfo, {n})\n    }};\n\n"
+    ));
+
+    // Pack instruction data from params.
+    out.push_str("    let mut instruction_data = alloc::vec::Vec::new();\n");
+    for (pname, ptype) in &handler.takes_params {
+        match numeric_param_rust_type(ptype) {
+            Some(_) => {
+                out.push_str(&format!(
+                    "    instruction_data.extend_from_slice(&{}.to_le_bytes());\n",
+                    to_snake_case(pname)
+                ));
+            }
+            None => {
+                out.push_str(&format!(
+                    "    // TODO: pack param `{}` (spec type {}) into instruction_data\n",
+                    pname, ptype
+                ));
+            }
+        }
+    }
+    out.push('\n');
+
+    // Call the real handler.
+    out.push_str("    // Call the user's real handler. Kani's automatic checks\n");
+    out.push_str("    // (overflow / underflow / pointer UB) verify this path.\n");
+    out.push_str(&format!(
+        "    let _result = crate::{module}::{fn_name}(accounts_slice, &instruction_data);\n",
+        module = module,
+        fn_name = fn_name,
+    ));
+
+    // Reference: spec ensures clauses. Kani's built-in checks already
+    // cover arithmetic UB; explicit cross-field invariant assertions go
+    // here if the ensures expresses something Kani can't infer.
+    if !handler.ensures.is_empty() {
+        out.push('\n');
+        out.push_str("    // Spec ensures (reference). Kani's automatic checks cover\n");
+        out.push_str("    // arithmetic UB; add explicit assertions below for cross-field\n");
+        out.push_str("    // invariants (read post-state via read_token_amount(&<acct>)).\n");
+        for e in &handler.ensures {
+            out.push_str(&format!("    //   ensures {}\n", e.rust_expr_binary.trim()));
+        }
+    }
+
+    out.push_str("}\n\n");
     Ok(())
 }
 
@@ -787,15 +1245,12 @@ handler set_x (v : U64) {
 
     /// Regression: the impl-targeted harness builds `Context<X>` and
     /// calls `crate::<Pascal>` (the Anchor accounts struct). On a
-    /// Quasar / Pinocchio crate both references are undefined, so the
-    /// emitter must short-circuit before writing the file.
-    ///
-    /// Per the brownfield Pinocchio flow: `qedgen probe --runtime
-    /// pinocchio` never invokes Kani, but the spec-after-audit step
-    /// (`codegen --target pinocchio --kani-impl`, or `--kani` with an
-    /// LP-shape handler) used to reach this code unguarded.
+    /// Quasar still has no impl-targeted harness (slice 5 pending), so
+    /// the emitter short-circuits before writing the file. Pinocchio
+    /// no longer takes this path — see
+    /// `pinocchio_target_emits_stack_harness`.
     #[test]
-    fn non_anchor_targets_emit_no_file() {
+    fn quasar_target_emits_no_file() {
         let src = r#"spec NonAnchor
 state { x : U64 }
 handler bump (delta : U64) {
@@ -804,20 +1259,104 @@ handler bump (delta : U64) {
 }"#;
         let spec = parse_str(src).expect("parse");
 
-        for (target, label) in [(Target::Quasar, "quasar"), (Target::Pinocchio, "pinocchio")] {
-            let tmp = std::env::temp_dir().join(format!(
-                "kani_impl_non_anchor_{}_{}.rs",
-                label,
-                std::process::id()
-            ));
-            let _ = std::fs::remove_file(&tmp);
-            generate_from_spec(&spec, &tmp, /*explicit_flag=*/ true, target)
-                .expect("generate must succeed (no-op for non-Anchor)");
-            assert!(
-                !tmp.exists(),
-                "target={label}: kani_impl must NOT write a file for non-Anchor targets",
-            );
-        }
+        let tmp = std::env::temp_dir().join(format!("kani_impl_quasar_{}.rs", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        generate_from_spec(&spec, &tmp, /*explicit_flag=*/ true, Target::Quasar)
+            .expect("generate must succeed (no-op for Quasar)");
+        assert!(
+            !tmp.exists(),
+            "Quasar has no impl-targeted harness yet; must not write a file",
+        );
+    }
+
+    /// Slice 8 M3: Pinocchio emits a stack-allocated `AccountInfo`
+    /// harness. Validates the deterministic scaffold + per-handler
+    /// proof shape that the M2 reference
+    /// (examples/pinocchio-fixtures/ptoken-transfer/src/kani_impl.rs)
+    /// proved catches real overflow bugs.
+    #[test]
+    fn pinocchio_target_emits_stack_harness() {
+        // SPL-transfer-shaped handler: two writable token accounts
+        // (source, destination), a readonly mint, a signer authority.
+        let src = r#"spec PtokenTransfer
+state { dummy : U64 }
+handler transfer (amount : U64) {
+  accounts {
+    source : writable
+    mint : readonly
+    destination : writable
+    authority : signer
+  }
+  ensures state.dummy == old(state.dummy)
+  effect { dummy := dummy }
+}"#;
+        let spec = parse_str(src).expect("parse");
+
+        let tmp =
+            std::env::temp_dir().join(format!("kani_impl_pinocchio_{}.rs", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        generate_from_spec(&spec, &tmp, /*explicit_flag=*/ true, Target::Pinocchio)
+            .expect("Pinocchio kani_impl must emit");
+        assert!(tmp.is_file(), "Pinocchio target must write a harness file");
+        let body = std::fs::read_to_string(&tmp).unwrap();
+
+        // Deterministic scaffold present.
+        assert!(
+            body.contains("struct AccountLayout"),
+            "must emit the Account layout mirror; got:\n{body}"
+        );
+        assert!(
+            body.contains("assert!(core::mem::size_of::<AccountLayout>() == 88)"),
+            "must emit the layout size assertion; got:\n{body}"
+        );
+        assert!(
+            body.contains("fn build_token_account")
+                && body.contains("fn build_minimal_account")
+                && body.contains("fn account_info_from_stack"),
+            "must emit the build + transmute helpers; got:\n{body}"
+        );
+
+        // Per-handler proof.
+        assert!(
+            body.contains("#[kani::proof]") && body.contains("#[kani::unwind(34)]"),
+            "must emit the proof attribute + memcmp unwind bound; got:\n{body}"
+        );
+        assert!(
+            body.contains("fn verify_transfer_impl()"),
+            "must emit the per-handler proof fn; got:\n{body}"
+        );
+
+        // Account classification: writable non-signer → token account;
+        // signer/readonly → minimal.
+        assert!(
+            body.contains("let mut source = build_token_account(")
+                && body.contains("let mut destination = build_token_account("),
+            "writable non-signer accounts must build as token accounts; got:\n{body}"
+        );
+        assert!(
+            body.contains("let mut mint = build_minimal_account(")
+                && body.contains("let mut authority = build_minimal_account("),
+            "readonly + signer accounts must build as minimal accounts; got:\n{body}"
+        );
+
+        // Param packing + real handler call.
+        assert!(
+            body.contains("let amount: u64 = kani::any();")
+                && body.contains("instruction_data.extend_from_slice(&amount.to_le_bytes());"),
+            "U64 param must be symbolic + LE-packed; got:\n{body}"
+        );
+        assert!(
+            body.contains("crate::transfer::process_transfer(accounts_slice, &instruction_data)"),
+            "must call the real handler at crate::transfer::process_transfer; got:\n{body}"
+        );
+
+        // Must NOT leak the Anchor shape.
+        assert!(
+            !body.contains("Context<") && !body.contains("symbolic_accounts"),
+            "Pinocchio harness must not leak the Anchor Context shape; got:\n{body}"
+        );
+
+        let _ = std::fs::remove_file(&tmp);
     }
 
     /// `--kani-impl` flag explicitly forces emission for every handler

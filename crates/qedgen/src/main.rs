@@ -1107,6 +1107,26 @@ enum AristotleCommands {
 /// is found before hitting the filesystem root. qedgen refuses to write
 /// scaffolding unless the user has a git repo — the safety net for
 /// regeneration is a clean working tree.
+/// Redirect a `…/tests/kani_impl.rs` path to a sibling `…/src/kani_impl.rs`.
+/// Pinocchio Kani harnesses must live in the lib (`src/`) because
+/// `cargo kani` only discovers `#[kani::proof]` there, not in `tests/`
+/// (M1 smoke-test finding, design doc §11a). Paths whose parent is not
+/// `tests` pass through unchanged so an explicit `--kani-impl-output`
+/// override is respected.
+fn redirect_kani_impl_to_src(path: &std::path::Path) -> PathBuf {
+    let file = path
+        .file_name()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("kani_impl.rs"));
+    match path.parent() {
+        Some(parent) if parent.file_name().and_then(|s| s.to_str()) == Some("tests") => {
+            // …/tests/kani_impl.rs → …/src/kani_impl.rs
+            parent.parent().unwrap_or(parent).join("src").join(&file)
+        }
+        _ => path.to_path_buf(),
+    }
+}
+
 fn has_git_repo(start: &std::path::Path) -> bool {
     let mut cur = match start.canonicalize() {
         Ok(p) => p,
@@ -3211,9 +3231,19 @@ async fn dispatch(cmd: Commands) -> Result<()> {
                 if let Err(e) = deps::require_kani() {
                     eprintln!("warning: {e}");
                 }
+                // Pinocchio harnesses must live in the program crate's
+                // `src/` — `cargo kani` only discovers `#[kani::proof]`
+                // in the lib, not in `tests/` (M1 smoke-test finding,
+                // design doc §11a). Redirect the default Anchor-shaped
+                // `…/tests/kani_impl.rs` path to a sibling `…/src/`.
+                let kani_impl_path = if matches!(target, Target::Pinocchio) {
+                    redirect_kani_impl_to_src(&kani_impl_output)
+                } else {
+                    kani_impl_output.clone()
+                };
                 kani_impl::generate(
                     &spec,
-                    &kani_impl_output,
+                    &kani_impl_path,
                     /*explicit_flag=*/ kani_impl,
                     target,
                 )?;
@@ -3559,8 +3589,32 @@ async fn dispatch(cmd: Commands) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{expand_ci_template, format_lint_warning};
+    use super::{expand_ci_template, format_lint_warning, redirect_kani_impl_to_src};
     use crate::check::{CompletenessWarning, Severity};
+    use std::path::PathBuf;
+
+    #[test]
+    fn kani_impl_path_redirects_tests_to_src_for_pinocchio() {
+        // Default Anchor-shaped path → sibling src/.
+        assert_eq!(
+            redirect_kani_impl_to_src(&PathBuf::from("./programs/tests/kani_impl.rs")),
+            PathBuf::from("./programs/src/kani_impl.rs"),
+        );
+        // Bare tests/ root → src/.
+        assert_eq!(
+            redirect_kani_impl_to_src(&PathBuf::from("tests/kani_impl.rs")),
+            PathBuf::from("src/kani_impl.rs"),
+        );
+        // Non-tests parent passes through (explicit override respected).
+        assert_eq!(
+            redirect_kani_impl_to_src(&PathBuf::from("./custom/kani_impl.rs")),
+            PathBuf::from("./custom/kani_impl.rs"),
+        );
+        assert_eq!(
+            redirect_kani_impl_to_src(&PathBuf::from("./programs/src/kani_impl.rs")),
+            PathBuf::from("./programs/src/kani_impl.rs"),
+        );
+    }
 
     #[test]
     fn plain_text_lint_output_includes_priority() {
