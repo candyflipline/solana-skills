@@ -5054,6 +5054,12 @@ pub(crate) fn generate_guards(
     let src_dir = output_dir.join("src");
     std::fs::create_dir_all(&src_dir)?;
 
+    // Pinocchio: dedicated guard emission (raw &AccountInfo ctx + zeropod
+    // state decode), shared with the codegen_mir delegation. (slice 6 4b)
+    if matches!(target, Target::Pinocchio) {
+        return emit_pinocchio_guards(spec, fp, output_dir);
+    }
+
     let mut out = String::new();
     out.push_str(&marker(
         "DO NOT EDIT — regenerated from .qedspec",
@@ -5671,6 +5677,230 @@ pub(crate) fn generate_guards(
 
         out.push_str("    Ok(())\n");
         out.push_str("}\n\n");
+    }
+
+    out.push_str("// ---- END GENERATED ----\n");
+    std::fs::write(src_dir.join("guards.rs"), &out)?;
+    Ok(())
+}
+
+/// True when `expr` references the spec's state binder `s` (a word-bounded
+/// `s` immediately followed by `.`), i.e. it reads a state field.
+fn references_pinocchio_state(expr: &str) -> bool {
+    let bytes = expr.as_bytes();
+    for i in 0..bytes.len() {
+        if bytes[i] == b's'
+            && (i == 0 || !is_ident_char(bytes[i - 1]))
+            && i + 1 < bytes.len()
+            && bytes[i + 1] == b'.'
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Rewrite a spec-rendered Pod expression (`rust_expr_pod`) for the
+/// Pinocchio guard / handler context: the state binder `s` → `state_var`
+/// (the decoded zeropod `&Zc` view), and bare handler-account idents (or
+/// `<acct>.pubkey`) → `ctx.<acct>.key()`. zeropod field accesses already
+/// carry `.get()` in the Pod form, so the rewritten expression typechecks
+/// against the decoded view.
+fn bind_pinocchio_expr(expr: &str, handler: &ParsedHandler, state_var: &str) -> String {
+    let account_names: std::collections::HashSet<&str> =
+        handler.accounts.iter().map(|a| a.name.as_str()).collect();
+    let bytes = expr.as_bytes();
+    let mut out = String::with_capacity(expr.len() + 16);
+    let mut i = 0;
+    while i < bytes.len() {
+        let prev_ok = i == 0 || !is_ident_char(bytes[i - 1]);
+        if prev_ok && is_ident_char(bytes[i]) {
+            let start = i;
+            let mut j = i;
+            while j < bytes.len() && is_ident_char(bytes[j]) {
+                j += 1;
+            }
+            let ident = &expr[start..j];
+            if ident == "s" {
+                // `s.<field>` → `<state_var>.<field>.get()` for a scalar
+                // read (zeropod Pod fields need an explicit `.get()` to
+                // produce the native integer). Complex paths (`s.x.y` /
+                // `s.x[i]`) emit the path head without `.get()` — those
+                // nested/array reads are a follow-on.
+                if j < bytes.len() && bytes[j] == b'.' {
+                    let fstart = j + 1;
+                    let mut k = fstart;
+                    while k < bytes.len() && is_ident_char(bytes[k]) {
+                        k += 1;
+                    }
+                    let field = &expr[fstart..k];
+                    let complex = k < bytes.len() && (bytes[k] == b'.' || bytes[k] == b'[');
+                    if !field.is_empty() && !complex {
+                        out.push_str(&format!("{}.{}.get()", state_var, field));
+                    } else {
+                        out.push_str(&format!("{}.{}", state_var, field));
+                    }
+                    i = k;
+                    continue;
+                }
+                out.push_str(state_var);
+                i = j;
+                continue;
+            }
+            if account_names.contains(ident) {
+                // `<acct>.pubkey` (spec's "this account's address") and a
+                // bare `<acct>` both lower to the runtime key load.
+                let pubkey = b".pubkey";
+                if j + pubkey.len() <= bytes.len()
+                    && &bytes[j..j + pubkey.len()] == pubkey
+                    && (j + pubkey.len() == bytes.len() || !is_ident_char(bytes[j + pubkey.len()]))
+                {
+                    out.push_str(&format!("ctx.{}.key()", ident));
+                    i = j + pubkey.len();
+                    continue;
+                }
+                out.push_str(&format!("ctx.{}.key()", ident));
+                i = j;
+                continue;
+            }
+            out.push_str(ident);
+            i = j;
+            continue;
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+/// Emit `src/guards.rs` for the Pinocchio target (slice 6 4b). Per-handler
+/// guard fns take `ctx: &<Pascal>` + params and return `ProgramResult`.
+/// Handles signer-`auth` (`is_signer`) and `requires` / `aborts_if` (param
+/// clauses directly; scalar state clauses via a one-time zeropod decode of
+/// the state account, reusing `rust_expr_pod` since zeropod shares
+/// quasar-pod's `.get()` API). Lifecycle pre-checks + PDA verification, and
+/// state clauses on multi-account specs, are deferred (documented skip).
+fn emit_pinocchio_guards(spec: &ParsedSpec, fp: &SpecFingerprint, output_dir: &Path) -> Result<()> {
+    let src_dir = output_dir.join("src");
+    std::fs::create_dir_all(&src_dir)?;
+
+    let mut out = String::new();
+    out.push_str(&marker(
+        "DO NOT EDIT — regenerated from .qedspec",
+        fp,
+        "src/guards.rs",
+    ));
+    out.push_str("//! Per-handler guard checks derived from the `.qedspec` (Pinocchio).\n\n");
+    out.push_str(
+        "#![allow(unused_variables, unused_imports, dead_code, clippy::too_many_arguments)]\n\n",
+    );
+    out.push_str(
+        "use pinocchio::{account_info::AccountInfo, program_error::ProgramError, ProgramResult};\n",
+    );
+    out.push_str("use zeropod::ZeroPodFixed;\n");
+    out.push_str("use crate::state::*;\n");
+    if !spec.error_codes.is_empty() {
+        out.push_str("use crate::errors::*;\n");
+    }
+    if !spec.ref_impls.is_empty() {
+        out.push_str("use crate::ref_impls::*;\n");
+    }
+    out.push_str("use crate::instructions::*;\n\n");
+
+    let err_enum = format!("{}Error", to_pascal_case(&spec.program_name));
+    // Multi-account state decode is deferred — the decode type is
+    // unambiguous only for single-account specs.
+    let single_state = spec.account_types.len() <= 1;
+    let state_type = format!("{}Account", to_pascal_case(&spec.program_name));
+
+    for handler in &spec.handlers {
+        let pascal = to_pascal_case(&handler.name);
+        let mut params = vec![format!("ctx: &{}", pascal)];
+        for (pname, ptype) in &handler.takes_params {
+            params.push(format!("{}: {}", pname, map_type_standalone(ptype, spec)?));
+        }
+        out.push_str(&format!(
+            "/// Guards for `{}` — generated from the spec's `requires` / `auth` clauses.\n",
+            handler.name
+        ));
+        out.push_str(&format!(
+            "pub fn {}({}) -> ProgramResult {{\n",
+            handler.name,
+            params.join(", ")
+        ));
+
+        if let Some(who) = &handler.who {
+            if handler
+                .accounts
+                .iter()
+                .any(|a| &a.name == who && a.is_signer)
+            {
+                out.push_str(&format!("    // auth {}\n", who));
+                out.push_str(&format!(
+                    "    if !ctx.{}.is_signer() {{\n        return Err(ProgramError::MissingRequiredSignature);\n    }}\n",
+                    who
+                ));
+            }
+        }
+
+        let needs_state = handler
+            .requires
+            .iter()
+            .any(|r| references_pinocchio_state(&r.rust_expr))
+            || handler
+                .aborts_if
+                .iter()
+                .any(|a| references_pinocchio_state(&a.rust_expr));
+        let decoded = if needs_state && single_state {
+            match resolve_handler_state_account(handler, spec) {
+                Some(acct) => {
+                    out.push_str(&format!(
+                        "    let __state = {}::from_bytes(unsafe {{ ctx.{}.borrow_data_unchecked() }})\n        .map_err(|_| ProgramError::InvalidAccountData)?;\n",
+                        state_type, acct.name
+                    ));
+                    true
+                }
+                None => false,
+            }
+        } else {
+            false
+        };
+
+        for req in &handler.requires {
+            let raw = req.rust_expr.trim();
+            if references_pinocchio_state(raw) && !decoded {
+                out.push_str(&format!(
+                    "    // TODO(slice 6 4b-cont): state-referencing requires (multi-account /\n    //   unresolved state account) — not enforced yet: {}\n",
+                    req.lean_expr.trim()
+                ));
+                continue;
+            }
+            out.push_str(&format!("    // requires: {}\n", req.lean_expr.trim()));
+            let rust = bind_pinocchio_expr(raw, handler, "__state");
+            let err = match &req.error_name {
+                Some(e) => format!("ProgramError::from({}::{})", err_enum, e),
+                None => "ProgramError::Custom(0xFF)".to_string(),
+            };
+            out.push_str(&format!("    if !({}) {{ return Err({}); }}\n", rust, err));
+        }
+
+        for ab in &handler.aborts_if {
+            let raw = ab.rust_expr.trim();
+            if references_pinocchio_state(raw) && !decoded {
+                out.push_str(&format!(
+                    "    // TODO(slice 6 4b-cont): state-referencing abort — not enforced yet: {}\n",
+                    ab.lean_expr.trim()
+                ));
+                continue;
+            }
+            let rust = bind_pinocchio_expr(raw, handler, "__state");
+            out.push_str(&format!(
+                "    if ({}) {{ return Err(ProgramError::from({}::{})); }}\n",
+                rust, err_enum, ab.error_name
+            ));
+        }
+
+        out.push_str("    Ok(())\n}\n\n");
     }
 
     out.push_str("// ---- END GENERATED ----\n");
@@ -6455,6 +6685,67 @@ handler deposit (amount : U64) {
         assert!(
             !out.contains("Context<") && !out.contains("Ctx<") && !out.contains("to_account_info"),
             "Pinocchio scaffold must not leak the Anchor/Quasar context shape; got:\n{out}"
+        );
+    }
+
+    /// Slice 6 step 4b — Pinocchio guards.rs: signer-`auth` via `is_signer`,
+    /// param `requires` directly, and state-referencing `requires` via a
+    /// one-time zeropod decode (`State::from_bytes` + `__state.<field>.get()`).
+    #[test]
+    fn pinocchio_guards_signer_param_and_state_requires() {
+        let src = r#"spec Vault
+type Error | InvalidAmount | Insufficient
+state { balance : U64 }
+handler withdraw (amount : U64) {
+  auth owner
+  accounts {
+    owner : signer
+    vault : writable
+  }
+  requires amount > 0 else InvalidAmount
+  requires state.balance >= amount else Insufficient
+  effect { balance -= amount }
+}
+"#;
+        let spec = crate::chumsky_adapter::parse_str(src).unwrap();
+        let fp = crate::fingerprint::compute_fingerprint(&spec);
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path().join("programs");
+        std::fs::create_dir_all(out_dir.join("src")).unwrap();
+
+        emit_pinocchio_guards(&spec, &fp, &out_dir).unwrap();
+        let guards = std::fs::read_to_string(out_dir.join("src/guards.rs")).unwrap();
+
+        // Guard fn signature + pinocchio/zeropod imports.
+        assert!(
+            guards.contains("use zeropod::ZeroPodFixed;")
+                && guards
+                    .contains("pub fn withdraw(ctx: &Withdraw, amount: u64) -> ProgramResult {"),
+            "guard fn signature + imports; got:\n{guards}"
+        );
+        // Signer-auth.
+        assert!(
+            guards.contains("if !ctx.owner.is_signer() {")
+                && guards.contains("return Err(ProgramError::MissingRequiredSignature);"),
+            "must emit the signer-auth check; got:\n{guards}"
+        );
+        // Param requires — direct.
+        assert!(
+            guards.contains(
+                "if !(amount > 0) { return Err(ProgramError::from(VaultError::InvalidAmount)); }"
+            ),
+            "param requires must emit a direct if-check; got:\n{guards}"
+        );
+        // State requires — decode + .get() on the decoded view.
+        assert!(
+            guards
+                .contains("VaultAccount::from_bytes(unsafe { ctx.vault.borrow_data_unchecked() })"),
+            "state-referencing requires must decode the state account; got:\n{guards}"
+        );
+        assert!(
+            guards.contains("__state.balance.get() >= amount")
+                && guards.contains("VaultError::Insufficient"),
+            "state requires must read via the decoded __state view; got:\n{guards}"
         );
     }
 
