@@ -1,4 +1,4 @@
-//! M1 smoke test for `docs/design/quasar-cpi-spike.md` §11f.
+//! M1 smoke test for the Pinocchio Kani-impl design.
 //!
 //! **Question this answers**: can `cargo kani` build + analyze a test
 //! crate whose dependency tree includes a `#![no_std]` Pinocchio lib?

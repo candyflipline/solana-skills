@@ -1,8 +1,7 @@
 //! Slice 8 M2 — conservation harness for `process_transfer`.
 //!
-//! Reference shape for the eventual codegen emitter
-//! (`crates/qedgen/src/kani_impl.rs` follow-on per
-//! `docs/design/quasar-cpi-spike.md` §11g commit 3).
+//! Reference shape for the codegen emitter
+//! (`crates/qedgen/src/kani_impl.rs`).
 //!
 //! ## Why we bypass `pinocchio::entrypoint::deserialize`
 //!

@@ -139,7 +139,7 @@ pub fn generate_from_spec(
     explicit_flag: bool,
     target: Target,
 ) -> Result<()> {
-    // Target gate (per docs/design/quasar-cpi-spike.md §7c). All three
+    // Target gate. All three
     // targets now emit; only the harness body shape differs per framework
     // (see the `match target` dispatch below). The gating that follows
     // (auto-trigger, ensures-present, emit-targets) is target-agnostic.
@@ -434,10 +434,8 @@ fn emit_kani_impl_quasar(
 ///
 /// The shape is validated by
 /// `examples/pinocchio-fixtures/ptoken-transfer/src/kani_impl.rs` (M2),
-/// which caught a real token-overflow bug in 1.1s. See
-/// `docs/design/quasar-cpi-spike.md` §11 for the full design + the
-/// pivot rationale (stack allocation vs the wire-format approach that
-/// blew BMC budget).
+/// which caught a real token-overflow bug in 1.1s. The design pivots to
+/// stack allocation over the wire-format approach that blew BMC budget.
 ///
 /// **Key correctness lever**: Kani's *automatic* arithmetic-overflow /
 /// UB checks run on every path through the real handler. The M2 bug

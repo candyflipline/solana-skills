@@ -2661,7 +2661,7 @@ const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 /// keeps `todo!()` out of the typical escrow / lending / vault shape.
 ///
 /// Per-target dispatch: emits the right CPI shape per
-/// `(target, is_spl_token)` per `docs/design/quasar-cpi-spike.md` §4.
+/// `(target, is_spl_token)`.
 ///
 /// - Anchor    + SPL Token → `anchor_spl::token::*` builder shape
 /// - Anchor    + generic   → `solana_program::program::invoke` shape
@@ -3192,8 +3192,7 @@ fn emit_spl_token_cpi_quasar(
 /// Emit one Quasar `quasar_spl::*` CPI as a single-line method chain on
 /// the token-program account: `self.<prog>.<method>(&self.<a>, …,
 /// scalar).invoke()?;`. The shape comes from `quasar-spl-0.0.0`'s
-/// `TokenCpi` trait — see `docs/design/quasar-cpi-spike.md` §2 for the
-/// side-by-side with the Anchor shape.
+/// `TokenCpi` trait (sibling shape to the Anchor builder).
 ///
 /// `account_args_in_order` carries the call-site arg names in the order
 /// the Quasar trait method expects (e.g. `["from", "to", "authority"]`
@@ -3317,7 +3316,7 @@ fn emit_spl_token_cpi_pinocchio(
 }
 
 /// Emit one `pinocchio_token::instructions::<Struct> { … }.invoke()?;`
-/// CPI per `docs/design/quasar-cpi-spike.md` §2b. Field assignments use
+/// CPI. Field assignments use
 /// the pinocchio-token struct field names (passed in
 /// `field_to_arg.0`), resolved against the call site's argument list
 /// (`field_to_arg.1`).
@@ -7995,7 +7994,7 @@ handler do_init : State.Active -> State.Active {
 
     /// Spike: Quasar SPL Token transfer emits a one-line method chain
     /// on the token-program account, NOT an `anchor_spl::*` builder.
-    /// Per `docs/design/quasar-cpi-spike.md` §2 the shape is:
+    /// The shape is:
     ///   self.token_program.transfer(&self.src, &self.dst, &self.auth, n).invoke()?;
     #[test]
     fn cpi_emits_quasar_spl_transfer() {
@@ -8116,8 +8115,7 @@ handler do_init : State.Active -> State.Active {
     }
 
     /// Spike commit 2: Pinocchio SPL Token transfer emits a struct-
-    /// construction `Transfer { … }.invoke()?` per
-    /// `docs/design/quasar-cpi-spike.md` §2b. Sibling shape to the
+    /// construction `Transfer { … }.invoke()?` — sibling shape to the
     /// Quasar method chain but with field assignments.
     ///
     /// Note: the Pinocchio emitter is dead code from the CLI today
@@ -8278,7 +8276,7 @@ handler do_init : State.Active -> State.Active {
 
     /// Pinocchio generic (non-SPL) CPI is unimplemented; the
     /// `(Target::Pinocchio, false)` branch in `try_emit_cpi` returns
-    /// None. Per `docs/design/quasar-cpi-spike.md` §8 slice 7.
+    /// None (generic non-SPL Pinocchio CPI is a follow-on slice).
     #[test]
     fn cpi_pinocchio_non_spl_falls_through_to_none() {
         // A spec whose called interface is NOT the SPL Token program.

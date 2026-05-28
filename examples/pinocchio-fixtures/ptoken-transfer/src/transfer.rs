@@ -17,7 +17,7 @@
 //!
 //! Real p-token is far larger; this fixture is scoped to the patterns
 //! the v2.19 success bar tests + the conservation property the slice 8
-//! M2 Kani harness exercises (`docs/design/quasar-cpi-spike.md` §11f).
+//! M2 Kani harness exercises.
 //!
 //! ## API repair (slice 8 M2)
 //!

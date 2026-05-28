@@ -1,7 +1,6 @@
 # QEDGen v2.31 — Multi-Target Greenfield Codegen (Quasar + Pinocchio)
 
 **Date:** 2026-05-28
-**Design:** `docs/design/quasar-cpi-spike.md` · `docs/design/quasar-cpi-HANDOFF.md`
 
 ## Headline
 
@@ -106,8 +105,6 @@ pass.
 
 ## Cross-references
 
-- `docs/design/quasar-cpi-spike.md` — full per-target CPI + Kani + Pinocchio-scaffold design
-- `docs/design/quasar-cpi-HANDOFF.md` — slice-by-slice status + gotchas
 - `crates/qedgen/src/codegen.rs` — `try_emit_cpi`, `emit_spl_{anchor,quasar,pinocchio}`, `emit_pinocchio_program_lib`, `emit_pinocchio_effect_body`
 - `crates/qedgen/src/codegen_mir.rs` — MIR-native Pinocchio scaffold (state / lib / instructions / errors / events)
 - `examples/pinocchio-fixtures/vault-greenfield/` — greenfield spec backing the compile gate
