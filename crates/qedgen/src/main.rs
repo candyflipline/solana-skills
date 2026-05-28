@@ -3231,12 +3231,17 @@ async fn dispatch(cmd: Commands) -> Result<()> {
                 if let Err(e) = deps::require_kani() {
                     eprintln!("warning: {e}");
                 }
-                // Pinocchio harnesses must live in the program crate's
-                // `src/` — `cargo kani` only discovers `#[kani::proof]`
-                // in the lib, not in `tests/` (M1 smoke-test finding,
-                // design doc §11a). Redirect the default Anchor-shaped
+                // Pinocchio AND Quasar harnesses must live in the program
+                // crate's `src/` — `cargo kani` only discovers
+                // `#[kani::proof]` in the lib, not in `tests/` (M1
+                // smoke-test finding, design doc §11a), and the harness's
+                // `crate::<Pascal>` references only resolve from inside the
+                // lib crate. Redirect the default Anchor-shaped
                 // `…/tests/kani_impl.rs` path to a sibling `…/src/`.
-                let kani_impl_path = if matches!(target, Target::Pinocchio) {
+                // (Anchor stays in `tests/` — its tests/-placement is the
+                // pre-existing default; revisiting it is out of slice-5
+                // scope.)
+                let kani_impl_path = if matches!(target, Target::Pinocchio | Target::Quasar) {
                     redirect_kani_impl_to_src(&kani_impl_output)
                 } else {
                     kani_impl_output.clone()

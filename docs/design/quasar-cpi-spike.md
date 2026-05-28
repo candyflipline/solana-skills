@@ -1,8 +1,8 @@
 # Quasar CPI emission — spike design
 
 **Status**: in progress — Quasar CPI (transfer) + Pinocchio CPI (transfer) +
-Pinocchio Kani-impl (M1/M2/M3) all landed on `feat/2.30`. See
-`quasar-cpi-HANDOFF.md` for the resume-here punch list.
+Pinocchio Kani-impl (M1/M2/M3) + Quasar Kani-impl (slice 5) all landed on
+`feat/2.30`. See `quasar-cpi-HANDOFF.md` for the resume-here punch list.
 **Author**: @abishekk92 (drafted with Claude)
 **Branch**: `feat/2.30`
 **Scope**: end-to-end slice that lights up `--target quasar` for SPL Token
@@ -446,27 +446,32 @@ let result = MyHandler::handler(ctx, arg);
 // post-state assertions
 ```
 
-**Quasar (new — slice 5 in §8)** — emit `Ctx<MyHandler>` shape. From
-`quasar-lang-0.0.0/src/context.rs:51`:
-```rust
-// Build symbolic Ctx<MyAccounts>
-let accounts: MyAccounts = build_my_accounts();  // ParseAccounts impl
-let program_id_bytes: [u8; 32] = kani::any();
-let data: &[u8] = &[];                            // dispatch! consumes disc
-let ctx = Ctx::<MyAccounts> {
-    accounts,
-    bumps: kani::any(),
-    program_id: &program_id_bytes,
-    data,
-};
-let result = my_handler(ctx, arg);                // Result<(), ProgramError>
-```
+**Quasar (DONE — slice 5)** — `emit_kani_impl_quasar` in `kani_impl.rs`.
 
-Key shape differences vs Anchor: `Ctx<T>` wraps `accounts: T` + `bumps:
-T::Bumps` + raw `program_id: &[u8; 32]` rather than Anchor's `Context<T>`
-with `ctx.accounts.*`. Return type is `Result<(), ProgramError>` not
-`Result<()>` (Anchor's alias). Pre/post snapshot reads from
-`ctx.accounts.<field>` rather than `accounts.<field>`.
+The `Ctx<MyAccounts>` sketch this section originally proposed turned out to
+be the *wrong* call target. The qedgen Quasar scaffold emits the user's
+handler logic as a **method on the accounts struct** —
+`impl <Pascal> { pub fn handler(&mut self, …) -> Result<(), ProgramError> }`
+— and the `#[program]` mod's `Ctx<X>` dispatcher is a one-liner that just
+forwards `ctx.accounts.handler(…)` (verified in
+`examples/rust/percolator/programs/src/lib.rs` + `…/instructions/deposit.rs`).
+So the harness calls the `.handler(…)` method directly — exactly what the
+Anchor branch already does — bypassing the `Ctx` wrapper / discriminator
+dispatch (which we don't want to verify anyway). This means **the Anchor and
+Quasar impl-harness shapes are identical**: both build a symbolic
+`crate::<Pascal>` accounts struct, call `.handler(args)`, and snapshot via
+`accounts.<state_account>.<field>`. `emit_kani_impl_quasar` reuses the Anchor
+`emit_symbolic_accounts_module` + `emit_handler_harness` verbatim; only the
+file header (framework name, `src/` placement note, the `Ctx<X>`-forwarding
+context) differs. The shared emitters gained a `framework: &str` label so no
+"Anchor" string leaks into a Quasar file.
+
+Caveat (see HANDOFF gotcha 7): like the Anchor branch, the Quasar
+`build_<handler>()` body is a `todo!()` agent-fill skeleton — constructing a
+symbolic `&'info mut Account<T>` needs real account-data wiring — so the
+emitted file does NOT compile / run under `cargo kani` out of the box. Slice
+5 ships Quasar at *parity with Anchor* (unit-tested + eyeballed), not at
+Pinocchio's concrete end-to-end bar.
 
 **Pinocchio (new — slice 8 in §8)** — no derive macros, no `Ctx` wrapper.
 Pinocchio's process entrypoint takes raw slices:
@@ -484,30 +489,26 @@ declared layout) rather than reaching through a wrapper. Likely needs
 explicit `MemoryLayout` integration per
 `[[feedback_memorylayout_sources]]`.
 
-### 7c. Dispatch refactor for `kani_impl.rs`
+### 7c. Dispatch refactor for `kani_impl.rs` (DONE)
 
-When slice 5 (Quasar) lands, refactor `kani_impl::generate_from_spec` the
-same way §4 refactors `try_emit_cpi`:
+`kani_impl::generate_from_spec` now dispatches per-target the same way §4
+refactors `try_emit_cpi`. The target-agnostic gates (auto-trigger,
+ensures-empty, emit-targets) run first; only the body shape differs:
 
 ```rust
-pub fn generate_from_spec(
-    spec: &ParsedSpec,
-    output_path: &Path,
-    explicit_flag: bool,
-    target: Target,
-) -> Result<()> {
-    // Existing gates (auto-trigger, ensures-empty) stay.
-    match target {
-        Target::Anchor    => emit_kani_impl_anchor(spec, output_path, explicit_flag),
-        Target::Quasar    => emit_kani_impl_quasar(spec, output_path, explicit_flag),
-        Target::Pinocchio => emit_kani_impl_pinocchio(spec, output_path, explicit_flag),
-    }
+match target {
+    Target::Anchor    => emit_kani_impl_anchor(spec, output_path, emit_targets, auto, explicit),
+    Target::Quasar    => emit_kani_impl_quasar(spec, output_path, emit_targets, auto, explicit),
+    Target::Pinocchio => emit_kani_impl_pinocchio(spec, output_path, emit_targets, auto, explicit),
 }
 ```
 
 The `target != Anchor → return Ok(())` short-circuit added by commit
-`43a532d` becomes `target == Pinocchio → return Ok(())` once Quasar lands,
-then disappears entirely once Pinocchio lands.
+`43a532d` is now **gone entirely** — all three targets emit (Pinocchio M3
+and Quasar slice 5 both landed). The CLI's `redirect_kani_impl_to_src`
+applies to `Pinocchio | Quasar` (both need `src/` placement for Kani lib
+scanning + `crate::` resolution); Anchor keeps its pre-existing `tests/`
+default (see HANDOFF gotcha 1).
 
 ## 8. Extrapolation roadmap
 
@@ -518,11 +519,11 @@ The full set of slices to reach parity:
 |---|-------|------|------------------|
 | 1 | **DONE (`d56a2ad`)** — Quasar SPL `transfer` + dispatch refactor | shipped | — |
 | 1b | **DONE (this extension)** — Pinocchio SPL `transfer` emitter (dead code until slice 6) | shipped | 1 |
-| 2 | Quasar SPL `mint_to` / `burn` / `initialize_account` / `close_account` | ~half day | 1 (uses same emitter) |
-| 2b | Pinocchio SPL `mint_to` / `burn` / `initialize_account` / `close_account` | ~half day | 1b |
+| 2 | **DONE** — Quasar SPL `mint_to` / `burn` / `close_account` (`initialize_account` → `None`: quasar-spl only has `initialize_account3`) | shipped | — |
+| 2b | **DONE** — Pinocchio SPL `mint_to` / `burn` / `initialize_account` / `close_account` | shipped | — |
 | 3 | Quasar generic (non-SPL) CPI via `BufCpiCall` | ~1-2 days | 1 |
 | 4 | Quasar PDA-signed CPI (`invoke_signed` w/ Seed) — affects both SPL and generic | ~1-2 days | 2 + 3 |
-| 5 | Quasar Kani-impl harness (`Ctx<X>` shape per §7b) | ~2-3 days | 2 (gives a compilable target to verify) |
+| 5 | **DONE** — Quasar Kani-impl harness (`.handler()` shape per §7b; reuses the Anchor emitters) | shipped | — (independent of 2) |
 | 6 | Pinocchio scaffold (`#![no_std]`, raw account slices, no derive macros) — unblocks 1b from the CLI | ~3-5 days | — (independent) |
 | 7 | Pinocchio generic (non-SPL) CPI via raw `pinocchio::cpi::invoke_signed` + Borsh | ~2-3 days | 6 |
 | 8 | Pinocchio Kani-impl harness (raw `&[AccountInfo]` per §7b) | ~2-3 days | 6 + 7 |
