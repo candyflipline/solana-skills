@@ -112,9 +112,29 @@ impl FrameworkSurface {
                 explicit_handler_discriminator: true,
                 explicit_account_discriminator: true,
             },
-            Target::Pinocchio => {
-                unreachable!("Pinocchio is rejected at the init dispatcher")
-            }
+            Target::Pinocchio => FrameworkSurface {
+                target,
+                // Same host-std / on-chain-no_std split as Quasar: host
+                // builds (cargo test / cargo kani) keep std; the BPF build
+                // is no_std. pinocchio's `entrypoint!` macro supplies the
+                // on-chain panic handler + allocator. (slice 6, §12)
+                crate_attrs:
+                    "#![allow(unexpected_cfgs)]\n#![cfg_attr(any(target_os = \"solana\", target_arch = \"bpf\"), no_std)]\n\n",
+                prelude_import:
+                    "use pinocchio::{account_info::AccountInfo, program_error::ProgramError, ProgramResult};\n",
+                // Pinocchio has no `Context`/`Ctx` wrapper and no
+                // `#[program]` mod — it uses a free `process_instruction`
+                // entrypoint that byte-dispatches to per-handler
+                // `process_<name>` fns. These two fields are unused for
+                // Pinocchio; generators gate their use on the target.
+                context_type: "",
+                handler_result_type: "Result<(), ProgramError>",
+                accounts_lifetime: "'a",
+                program_mod_vis: "",
+                // 1-byte leading discriminant dispatch in process_instruction.
+                explicit_handler_discriminator: true,
+                explicit_account_discriminator: true,
+            },
         }
     }
 
@@ -131,6 +151,18 @@ impl FrameworkSurface {
 
     pub(crate) fn is_quasar(&self) -> bool {
         matches!(self.target, Target::Quasar)
+    }
+
+    pub(crate) fn is_pinocchio(&self) -> bool {
+        matches!(self.target, Target::Pinocchio)
+    }
+
+    /// Pinocchio account-field type: every `#[derive(Accounts)]`-equivalent
+    /// field is a raw `&'a AccountInfo` (interior-mutable; no typed wrapper).
+    /// Typing happens via `zeropod` decode inside `.handler()` (slice 6, §12).
+    /// Shared by all the `*_type` helpers below.
+    fn pinocchio_account_type(&self) -> String {
+        format!("&{} AccountInfo", self.accounts_lifetime)
     }
 
     /// Per-target import line for SPL token / mint types. Selects only
@@ -194,6 +226,9 @@ impl FrameworkSurface {
 
     fn signer_type(&self, mutable: bool) -> String {
         let lt = self.accounts_lifetime;
+        if self.is_pinocchio() {
+            return self.pinocchio_account_type();
+        }
         if self.is_quasar() {
             format!("&{} {}Signer", lt, mut_prefix(mutable))
         } else {
@@ -209,6 +244,9 @@ impl FrameworkSurface {
         // generated handler can call `.transfer()` / `.mint_to()` etc.
         // Anything else stays `Program<System>`.
         let is_token = name == "token_program" || account_type == Some("token");
+        if self.is_pinocchio() {
+            return self.pinocchio_account_type();
+        }
         if self.is_quasar() {
             let inner = if is_token { "Token" } else { "System" };
             format!("&{} {}Program<{}>", lt, mut_prefix(mutable), inner)
@@ -221,6 +259,9 @@ impl FrameworkSurface {
 
     fn token_account_type(&self, mutable: bool) -> String {
         let lt = self.accounts_lifetime;
+        if self.is_pinocchio() {
+            return self.pinocchio_account_type();
+        }
         if self.is_quasar() {
             format!("&{} {}Account<Token>", lt, mut_prefix(mutable))
         } else {
@@ -230,6 +271,9 @@ impl FrameworkSurface {
 
     fn mint_account_type(&self, mutable: bool) -> String {
         let lt = self.accounts_lifetime;
+        if self.is_pinocchio() {
+            return self.pinocchio_account_type();
+        }
         if self.is_quasar() {
             format!("&{} {}Account<Mint>", lt, mut_prefix(mutable))
         } else {
@@ -239,6 +283,11 @@ impl FrameworkSurface {
 
     fn state_account_type(&self, state_name: &str, mutable: bool) -> String {
         let lt = self.accounts_lifetime;
+        if self.is_pinocchio() {
+            // Raw &AccountInfo; state decoded from the data bytes via
+            // zeropod inside .handler() (slice 6 step 3/4).
+            return self.pinocchio_account_type();
+        }
         if self.is_quasar() {
             format!("&{} {}Account<{}>", lt, mut_prefix(mutable), state_name)
         } else {
@@ -251,11 +300,17 @@ impl FrameworkSurface {
     /// Quasar imported-namespace support is reserved for v2.30.
     fn imported_account_type(&self, ns: &str, source_type: &str, _mutable: bool) -> String {
         let lt = self.accounts_lifetime;
+        if self.is_pinocchio() {
+            return self.pinocchio_account_type();
+        }
         format!("Account<{}, crate::imported::{}::{}>", lt, ns, source_type)
     }
 
     fn unchecked_account_type(&self, mutable: bool) -> String {
         let lt = self.accounts_lifetime;
+        if self.is_pinocchio() {
+            return self.pinocchio_account_type();
+        }
         if self.is_quasar() {
             format!("&{} {}UncheckedAccount", lt, mut_prefix(mutable))
         } else {
@@ -266,8 +321,11 @@ impl FrameworkSurface {
     fn error_expr(&self, enum_name: &str, variant: &str) -> String {
         match self.target {
             Target::Anchor => format!("{}::{}.into()", enum_name, variant),
-            Target::Quasar => format!("ProgramError::from({}::{})", enum_name, variant),
-            Target::Pinocchio => unreachable!(),
+            // Both Quasar and Pinocchio return bare `ProgramError`; the
+            // generated error enum impls `From<Enum> for ProgramError`.
+            Target::Quasar | Target::Pinocchio => {
+                format!("ProgramError::from({}::{})", enum_name, variant)
+            }
         }
     }
 
@@ -279,16 +337,16 @@ impl FrameworkSurface {
     fn generic_error_expr(&self) -> &'static str {
         match self.target {
             Target::Anchor => "anchor_lang::error::Error::from(ProgramError::Custom(0xFF))",
-            Target::Quasar => "ProgramError::Custom(0xFF)",
-            Target::Pinocchio => unreachable!(),
+            Target::Quasar | Target::Pinocchio => "ProgramError::Custom(0xFF)",
         }
     }
 
     fn guard_accounts_import(&self) -> &'static str {
         match self.target {
             Target::Anchor => "use crate::*;\n\n",
-            Target::Quasar => "use crate::instructions::*;\n\n",
-            Target::Pinocchio => unreachable!(),
+            // Pinocchio keeps the per-handler accounts struct in
+            // `instructions/<name>.rs` like Quasar (slice 6, §12).
+            Target::Quasar | Target::Pinocchio => "use crate::instructions::*;\n\n",
         }
     }
 
@@ -296,7 +354,8 @@ impl FrameworkSurface {
         match self.target {
             Target::Anchor => format!("ctx.{}.key()", account_name),
             Target::Quasar => format!("(*ctx.{}.to_account_view().address())", account_name),
-            Target::Pinocchio => unreachable!(),
+            // pinocchio's AccountInfo::key() returns &Pubkey ([u8; 32]).
+            Target::Pinocchio => format!("ctx.{}.key()", account_name),
         }
     }
 
@@ -304,7 +363,13 @@ impl FrameworkSurface {
         match self.target {
             Target::Anchor => format!("ctx.{}.owner", token_account_name),
             Target::Quasar => format!("(*ctx.{}.owner())", token_account_name),
-            Target::Pinocchio => unreachable!(),
+            // Pinocchio reads the SPL token-account owner from the account
+            // DATA (not AccountInfo::owner, which is the owning program).
+            // The zeropod-decode form lands with guard codegen (slice 6
+            // step 4); not reached until then (init bails until step 2).
+            Target::Pinocchio => {
+                unreachable!("pinocchio token-owner read lands with guard codegen — slice 6 step 4")
+            }
         }
     }
 
@@ -456,7 +521,10 @@ pub(crate) fn map_type_for_target(
     match target {
         Target::Anchor => map_type_anchor(dsl_type, spec),
         Target::Quasar => map_type_quasar(dsl_type, spec),
-        Target::Pinocchio => unreachable!(),
+        // Instruction params decode from raw bytes into plain Rust scalars
+        // (u64, etc.) — the same standalone mapping. State-field pod types
+        // (PodU64, …) are a separate generate_state concern (slice 6 step 3).
+        Target::Pinocchio => map_type_standalone(dsl_type, spec),
     }
 }
 
