@@ -919,3 +919,91 @@ docs/design/quasar-cpi-spike.md.
 If validation layer (c) reveals an issue with `cargo check` against
 quasar-spl, that's a second commit (potentially a real bug fix, not just
 a doc tweak).
+
+## 12. Pinocchio scaffold — detailed design (slice 6)
+
+The big unblocker: emit a buildable greenfield Pinocchio program crate
+from a `.qedspec`, so `--target pinocchio` produces a real scaffold (and
+`try_emit_cpi`'s Pinocchio SPL arm — slice 2b — becomes reachable from the
+CLI). Mirrors §11's design-before-build convention. **Status**: design;
+implementation pending.
+
+### 12a. Locked decisions (from the 2026-05-28 design pass)
+
+- **Handler shape**: struct + `.handler()`, mirroring Anchor/Quasar.
+  Emit `struct <Pascal><'a> { <field>: &'a AccountInfo, … }` +
+  `impl <Pascal><'_> { fn handler(&mut self, <params>) -> ProgramResult }`,
+  plus a thin free-fn `process_<name>(accounts, data)` wrapper that binds
+  the account slice into the struct and calls `.handler()`. This makes the
+  existing Pinocchio SPL CPI emitter's `&self.<acct>` correct as-is and
+  keeps the slice-8 Kani harness's `process_<name>(accounts, data)` call
+  correct (it calls the wrapper).
+- **State**: zero-copy via the standalone **`zeropod`** crate
+  (blueshift-gg/zeropod) — sibling of quasar-lang's `quasar-pod`. Same
+  per-target model as Quasar (which already emits `quasar-pod` types);
+  Anchor stays Borsh. See `[[feedback_state_repr_per_target]]`.
+  - scalar fields → `PodU64`/`PodU128`/`PodI128`/`PodBool`/…
+  - sum-type State (`type State | Active of {x} | Closed`) → a
+    `#[repr(u8)] #[derive(ZeroPod)] enum StateTag { Active, Closed }` +
+    a flat `#[derive(ZeroPod)] struct State { tag: StateTag, <all variant
+    fields flattened> }` (superset; tag selects which are live). Same
+    shape as the Anchor S5b wrapper-struct+inner-enum pattern. Discriminant-
+    only enums are DESIRABLE on-chain (fixed size, predictable, auditable),
+    not a limitation.
+  - per-handler read/write: `let s = State::from_bytes_mut(acct.borrow_mut_data_unchecked())?;`
+    then mutate `s.<field> = …` zero-copy. `ZcValidate` on read gives
+    discriminant-in-range / bool 0/1 / UTF-8 checks for free.
+- **Scope**: full scaffold (all sub-generators), not MVP.
+
+### 12b. Divergence from the `#[program]`-mod `FrameworkSurface`
+
+`FrameworkSurface` + `generate_lib`/`generate_instructions` assume the
+Anchor/Quasar `#[program] mod` + `Context`/`Ctx<X>` + `#[derive(Accounts)]`
+model. Pinocchio diverges and needs bespoke paths:
+
+- **Entrypoint + dispatch**: no `#[program]` mod. `lib.rs` emits
+  `#![no_std]` + `entrypoint!(process_instruction)` + a
+  `process_instruction(program_id, accounts, data)` that reads a leading
+  1-byte discriminant and routes to `process_<name>` (byte-N per handler,
+  same ordinal scheme Quasar uses for `#[instruction(discriminator = N)]`).
+- **`FrameworkSurface` fields that don't map**: `context_type` and
+  `program_mod_vis` are unused for Pinocchio (no `Context`, no `#[program]
+  mod`). Set to `""` and gate their use behind the existing target checks.
+- **Fields that DO map**: `crate_attrs = "#![no_std]\n…"`,
+  `handler_result_type = "Result<(), ProgramError>"`,
+  `accounts_lifetime = "'a"`, `explicit_handler_discriminator = true`
+  (byte-dispatch), `explicit_account_discriminator = true`.
+- **Account-field types collapse**: `signer_type` / `program_type` /
+  `token_account_type` / `mint_account_type` / `state_account_type` /
+  `unchecked_account_type` ALL → `&'a AccountInfo` (Pinocchio has no typed
+  account wrappers; typing happens via `zeropod` decode inside `.handler()`).
+  Simpler than Anchor/Quasar.
+- **Expr methods**: guard/effect codegen uses `ctx.<acct>` for
+  Anchor/Quasar; Pinocchio's `.handler(&mut self)` receiver means
+  `self.<acct>`. `account_key_expr` → `self.<acct>.key()`,
+  `token_owner_expr` → decode-and-read via zeropod. `error_expr` →
+  `ProgramError::from(<Enum>::<Variant>)`; `generic_error_expr` →
+  `ProgramError::Custom(0xFF)`.
+
+### 12c. Cargo.toml
+
+`pinocchio = "0.8"`, `pinocchio-token = "0.3"` (matches the ptoken fixture
++ the slice-2b SPL emitter), `zeropod = "0.1"`. `#![no_std]`; alloc only if
+a handler needs it. Self-contained `[workspace]` like the fixtures.
+
+### 12d. Build order (incremental commits)
+
+1. `FrameworkSurface` Pinocchio arm (config fields + the ~12 method arms;
+   compiles, behavior-neutral since `init` still bails).
+2. `generate_cargo_toml` + `generate_lib` (entrypoint + dispatch) Pinocchio
+   paths; unblock the `init` dispatcher (`main.rs:2251`) LAST in this step
+   so no panicking CLI path is exposed mid-build.
+3. `generate_state` (zeropod structs + discriminant-tag enums).
+4. account-struct + `process_<name>` wrapper + `.handler()`
+   (`generate_instructions`); guards/errors/effects with checked arith.
+5. events / ref_impls / unit+integration tests; a `pinocchio-fixtures/`
+   greenfield example + `cargo build` gate.
+
+Milestone for "slice 6 done": a trivial `.qedspec` emits a crate that
+`cargo build`s, and an SPL-transfer spec reaches the slice-2b CPI emitter
+end-to-end from the CLI.
