@@ -21,6 +21,14 @@ toolchain on the eval host.
 | `ptoken-close-account/` | p-token `processor/close_account.rs` | `SetLamportsArith` (sweep), lifecycle state reset, mutable-borrow aliasing |
 | `pata-create/` | p-ata `processor/create.rs` | `IndexedAccountAccess`, missing PDA derivation, cross-program-invoke obligation |
 
+## Greenfield codegen example (not an audit fixture)
+
+`vault-greenfield/` is a different kind of fixture: a `.qedspec` that
+`qedgen codegen --target pinocchio` turns into a buildable crate. It has no
+`expected_findings.json` — it is the source for the Pinocchio scaffold
+compile gate (`codegen_smoke::vault_pinocchio_scaffold_compiles`). See its
+own README.
+
 ## Shared harness
 
 `_harness/` ships the reproducer primitives every Miri repro imports

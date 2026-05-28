@@ -1,0 +1,50 @@
+spec Vault
+program_id "11111111111111111111111111111111"
+
+// Bundled SPL Token interface — `call Token.transfer(...)` below lowers to
+// `pinocchio_token::instructions::Transfer { … }.invoke()?;` (slice 2b).
+interface Token {
+  program_id "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+  handler transfer (amount : U64) {
+    discriminant "0x03"
+    accounts {
+      from      : writable
+      to        : writable
+      authority : signer
+    }
+    requires amount > 0
+    ensures  amount > 0
+  }
+}
+
+type State | Active of { total : U64 }
+type Error | InvalidAmount | MathOverflow | MathUnderflow
+
+/// Pure-state handler: checked add (overflow → MathOverflow), signer
+/// guard, no CPI.
+handler deposit (amount : U64) : State.Active -> State.Active {
+  permissionless
+  accounts {
+    state     : writable
+    depositor : signer
+  }
+  requires amount > 0 else InvalidAmount
+  modifies [total]
+  effect { total += amount }
+}
+
+/// State + SPL transfer CPI: checked sub, then move tokens out of the vault.
+handler withdraw (amount : U64) : State.Active -> State.Active {
+  permissionless
+  accounts {
+    state         : writable
+    vault_ta      : writable, type token, authority state
+    owner_ta      : writable, type token
+    auth          : signer
+    token_program : program
+  }
+  requires amount > 0 else InvalidAmount
+  modifies [total]
+  effect { total -= amount }
+  call Token.transfer(from = vault_ta, to = owner_ta, amount = amount, authority = auth)
+}

@@ -136,6 +136,50 @@ fn smoke_anchor_scaffold_with_proptest(example: &str) {
         .arg("proptest"));
 }
 
+/// Generate `<spec>` as a Pinocchio scaffold into a fresh tempdir and run
+/// `cargo build` on it. The Pinocchio path is MIR-native (slice 6): the
+/// scaffold emits lib + entrypoint + byte-dispatch, zeropod state, guards,
+/// errors, checked effects, and SPL Token CPIs (`call Token.transfer(...)`
+/// → `pinocchio_token::instructions::Transfer { … }.invoke()?;`).
+///
+/// `cargo build` (not `check`) so the `#![no_std]` + `entrypoint!` crate is
+/// exercised through codegen. The spec carries an inline SPL `interface`,
+/// so no `qed.toml` is needed. Regenerating from the committed spec (rather
+/// than building a checked-in tree) keeps the gate testing *current*
+/// codegen output — it can't silently drift.
+fn smoke_pinocchio_scaffold(fixture: &str, spec_file: &str) {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let spec_src = repo_root()
+        .join("examples/pinocchio-fixtures")
+        .join(fixture)
+        .join(spec_file);
+    let spec_path = temp.path().join(spec_file);
+    std::fs::copy(&spec_src, &spec_path).unwrap_or_else(|e| panic!("copy {fixture} spec: {e}"));
+    std::fs::create_dir(temp.path().join(".qed")).expect("create .qed");
+
+    run(Command::new("git").arg("init").current_dir(temp.path()));
+
+    let output_dir = temp.path().join("programs");
+    run(Command::new(env!("CARGO_BIN_EXE_qedgen"))
+        .arg("codegen")
+        .arg("--spec")
+        .arg(&spec_path)
+        .arg("--target")
+        .arg("pinocchio")
+        .arg("--output-dir")
+        .arg(&output_dir)
+        .current_dir(temp.path()));
+
+    // Same unreleased-tag problem as the Anchor smoke: rewrite the
+    // `qedgen-macros` git dep to the in-repo path dep before compiling.
+    redirect_macros_to_path(&output_dir.join("Cargo.toml"));
+
+    run(Command::new("cargo")
+        .arg("build")
+        .arg("--manifest-path")
+        .arg(output_dir.join("Cargo.toml")));
+}
+
 /// Rewrite the `qedgen-macros` line in a generated Cargo.toml from a git
 /// dep tagged at the current crate version (which doesn't exist on GitHub
 /// until release time) to a `path` dep pointing at the in-repo crate.
@@ -188,4 +232,10 @@ fn percolator_anchor_scaffold_compiles() {
 #[ignore = "runs qedgen codegen + cargo test --test proptest on a generated Anchor crate"]
 fn escrow_anchor_proptest_runs() {
     smoke_anchor_scaffold_with_proptest("escrow");
+}
+
+#[test]
+#[ignore = "runs qedgen codegen + cargo build on a generated Pinocchio crate"]
+fn vault_pinocchio_scaffold_compiles() {
+    smoke_pinocchio_scaffold("vault-greenfield", "vault.qedspec");
 }

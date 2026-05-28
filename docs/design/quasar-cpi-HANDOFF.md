@@ -50,12 +50,14 @@ a7f7374  feat(pinocchio): M3 — codegen the impl-targeted Kani harness
 | Pinocchio scaffold (slice 6) | ✅ done | MIR-native scaffold (lib + entrypoint + byte-dispatch, zeropod state, `&AccountInfo` account structs + `.handler()`, guards, errors, scalar effects). Steps 1–5 + the milestone close (2026-05-28): SPL `call` CPIs wired into the handler body via `try_emit_cpi(_, Pinocchio)`, AND the `codegen` command (not just `init`) now emits the Pinocchio scaffold. A `call Token.transfer(...)` spec `cargo build`s end-to-end from the CLI. |
 | Pinocchio generic CPI (slice 7) | ⬜ | raw `pinocchio::cpi::invoke_signed` + Borsh (non-SPL `call` sites emit a slice-7 breadcrumb today) |
 | Pinocchio events / ref_impls / tests | ⬜ | `emit_events` + `emit_imported_mirror` still `unreachable!()` for Pinocchio (guarded by early-return; only event/import specs hit them). `transfers {}` sugar stays agent-fill on every target. |
-| Pinocchio greenfield fixture + build gate | ⬜ | commit an `examples/pinocchio-fixtures/<greenfield>/` example + a `cargo build` CI gate so the milestone can't silently rot (the build-order step 5 item; see `[[project_example_codegen_drift]]`) |
+| Pinocchio greenfield fixture + build gate | ✅ done | `examples/pinocchio-fixtures/vault-greenfield/vault.qedspec` (zeropod state + checked effects + guards + errors + SPL transfer CPI) + `codegen_smoke::vault_pinocchio_scaffold_compiles` regenerates from the spec and `cargo build`s it. The existing CI step (`cargo test --test codegen_smoke -- --ignored`) auto-runs it. |
 | Pinocchio Kani-impl custom state (slice 8b) | ⬜ | non-SPL accounts need the MemoryLayout pipeline |
 
-Recommended next: **the greenfield fixture + build gate** (locks in the
-slice-6 milestone against drift), then **slice 7** (generic Pinocchio CPI)
-or **slice 4** (PDA-signed `invoke_signed`).
+Recommended next: **slice 7** (generic non-SPL Pinocchio CPI — raw
+`invoke_signed` + Borsh) or **slice 4** (PDA-signed `invoke_signed` with
+spec-surfaced seed/bump). Pinocchio events / ref_impls / test-gen
+(`emit_events` + `emit_imported_mirror` still `unreachable!()`) is the
+remaining scaffold gap, only hit by event/import specs.
 
 ## Critical gotchas (these cost real time — don't re-discover)
 
