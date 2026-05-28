@@ -584,15 +584,22 @@ fn emit_instructions(
             continue;
         }
 
-        let out = crate::codegen::render_handler_scaffold(
-            handler,
-            parsed,
-            is_multi,
-            &default_state_name,
-            &spec_src,
-            &spec_attr,
-            target,
-        )?;
+        // Pinocchio uses a dedicated scaffold (struct of &AccountInfo +
+        // process_<name> wrapper + .handler()); the Anchor/Quasar
+        // Context-based render_handler_scaffold doesn't apply (slice 6 §12b).
+        let out = if matches!(target, Target::Pinocchio) {
+            crate::codegen::render_pinocchio_handler_scaffold(handler, parsed)?
+        } else {
+            crate::codegen::render_handler_scaffold(
+                handler,
+                parsed,
+                is_multi,
+                &default_state_name,
+                &spec_src,
+                &spec_attr,
+                target,
+            )?
+        };
         std::fs::write(&handler_path, &out)?;
     }
 

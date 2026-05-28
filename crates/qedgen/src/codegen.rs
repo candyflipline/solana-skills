@@ -1074,8 +1074,8 @@ fn emit_pinocchio_lib_tail(out: &mut String, spec: &ParsedSpec, program_id: &str
     out.push_str("    match *discriminant {\n");
     for (i, handler) in spec.handlers.iter().enumerate() {
         out.push_str(&format!(
-            "        {} => instructions::process_{}(accounts, data),\n",
-            i, handler.name
+            "        {} => instructions::{}::process_{}(accounts, data),\n",
+            i, handler.name, handler.name
         ));
     }
     out.push_str("        _ => Err(ProgramError::InvalidInstructionData),\n");
@@ -1232,6 +1232,172 @@ fn emit_pinocchio_state_struct(
     }
     out.push_str("}\n\n");
     Ok(())
+}
+
+/// DSL integer type → (Rust primitive, byte width) for little-endian
+/// (de)serialization of instruction-data params. None for non-integer
+/// types (the Pinocchio wrapper emits a `todo!()` for those).
+fn numeric_param_width(dsl_type: &str) -> Option<(&'static str, usize)> {
+    match dsl_type.trim() {
+        "U8" => Some(("u8", 1)),
+        "I8" => Some(("i8", 1)),
+        "U16" => Some(("u16", 2)),
+        "I16" => Some(("i16", 2)),
+        "U32" => Some(("u32", 4)),
+        "I32" => Some(("i32", 4)),
+        "U64" => Some(("u64", 8)),
+        "I64" => Some(("i64", 8)),
+        "U128" => Some(("u128", 16)),
+        "I128" => Some(("i128", 16)),
+        _ => None,
+    }
+}
+
+/// Emit one Pinocchio `instructions/<name>.rs` scaffold (slice 6 step 4a).
+/// Shared helper; `codegen_mir::emit_instructions` calls it for the
+/// Pinocchio target. USER-OWNED (emitted only when the file is missing).
+///
+/// Shape: a `struct <Pascal><'a>` of `&AccountInfo` fields + an
+/// `impl { fn handler(&mut self, …) -> ProgramResult }` (calls
+/// `crate::guards::<name>`, then applies effects) + a free
+/// `process_<name>(accounts, data)` wrapper the entrypoint dispatcher
+/// calls — it binds the account slice positionally, parses params from
+/// `instruction_data` (LE, offset-tracked), builds the struct, and calls
+/// `.handler()`.
+///
+/// step 4a scope: the account-binding + param-parse + dispatch shape. The
+/// `.handler()` effect body (zeropod state read/write + SPL CPI) + the
+/// Pinocchio `guards.rs` path are step 4b — the body is a `todo!()`
+/// breadcrumb for now.
+pub(crate) fn render_pinocchio_handler_scaffold(
+    handler: &ParsedHandler,
+    spec: &ParsedSpec,
+) -> Result<String> {
+    let pascal = to_pascal_case(&handler.name);
+    let mut out = String::new();
+
+    out.push_str("// User-owned. Regenerating the spec does NOT overwrite this file.\n");
+    out.push_str("// Guard checks live in the sibling `crate::guards` module and ARE\n");
+    out.push_str("// regenerated on every `qedgen codegen`.\n\n");
+    out.push_str(
+        "use pinocchio::{account_info::AccountInfo, program_error::ProgramError, ProgramResult};\n",
+    );
+    out.push_str("use crate::state::*;\n");
+    if !spec.ref_impls.is_empty() {
+        out.push_str("use crate::ref_impls::*;\n");
+    }
+    out.push_str("use crate::guards;\n");
+    if !spec.error_codes.is_empty() {
+        out.push_str("use crate::errors::*;\n");
+    }
+    out.push('\n');
+
+    // Accounts struct — every field is a raw &AccountInfo (zeropod decode
+    // happens inside .handler()).
+    out.push_str(&format!("pub struct {}<'a> {{\n", pascal));
+    for acct in &handler.accounts {
+        out.push_str(&format!("    pub {}: &'a AccountInfo,\n", acct.name));
+    }
+    out.push_str("}\n\n");
+
+    let params_sig: String = handler
+        .takes_params
+        .iter()
+        .map(|(n, t)| map_type_standalone(t, spec).map(|ty| format!(", {}: {}", n, ty)))
+        .collect::<Result<Vec<_>>>()?
+        .join("");
+    let param_names: Vec<&str> = handler
+        .takes_params
+        .iter()
+        .map(|(n, _)| n.as_str())
+        .collect();
+
+    out.push_str(&format!("impl {}<'_> {{\n", pascal));
+    out.push_str(&format!(
+        "    pub fn handler(&mut self{}) -> ProgramResult {{\n",
+        params_sig
+    ));
+    if param_names.is_empty() {
+        out.push_str(&format!("        guards::{}(self)?;\n", handler.name));
+    } else {
+        out.push_str(&format!(
+            "        guards::{}(self, {})?;\n",
+            handler.name,
+            param_names.join(", ")
+        ));
+    }
+    out.push_str("        // TODO(slice 6 step 4b): effects — read/write zeropod state via\n");
+    out.push_str("        // <State>::from_bytes_mut(self.<acct>.borrow_mut_data_unchecked()?)\n");
+    out.push_str("        // + any SPL CPIs. Mechanical effect + CPI emission lands next.\n");
+    out.push_str("        Ok(())\n");
+    out.push_str("    }\n");
+    out.push_str("}\n\n");
+
+    out.push_str(&format!(
+        "/// Entrypoint wrapper — binds the account slice + parses params, then\n\
+         /// calls `{}::handler`. Invoked by `process_instruction` in lib.rs.\n",
+        pascal
+    ));
+    out.push_str(&format!(
+        "pub fn process_{}(accounts: &[AccountInfo], instruction_data: &[u8]) -> ProgramResult {{\n",
+        handler.name
+    ));
+    if handler.accounts.is_empty() {
+        out.push_str("    let _ = accounts;\n");
+    } else {
+        let names: Vec<&str> = handler.accounts.iter().map(|a| a.name.as_str()).collect();
+        out.push_str(&format!(
+            "    let [{}, ..] = accounts else {{\n",
+            names.join(", ")
+        ));
+        out.push_str("        return Err(ProgramError::NotEnoughAccountKeys);\n");
+        out.push_str("    };\n");
+    }
+    if handler.takes_params.is_empty() {
+        out.push_str("    let _ = instruction_data;\n");
+    } else {
+        let mut offset = 0usize;
+        for (pname, ptype) in &handler.takes_params {
+            match numeric_param_width(ptype) {
+                Some((rust_ty, width)) => {
+                    out.push_str(&format!(
+                        "    let {} = {}::from_le_bytes(\n        instruction_data\n            .get({}..{})\n            .ok_or(ProgramError::InvalidInstructionData)?\n            .try_into()\n            .map_err(|_| ProgramError::InvalidInstructionData)?,\n    );\n",
+                        pname,
+                        rust_ty,
+                        offset,
+                        offset + width
+                    ));
+                    offset += width;
+                }
+                None => {
+                    out.push_str(&format!(
+                        "    // TODO: parse non-numeric param `{}` (spec type {}) from instruction_data\n",
+                        pname, ptype
+                    ));
+                    out.push_str(&format!(
+                        "    let {}: {} = todo!(\"parse {} from instruction_data\");\n",
+                        pname,
+                        map_type_standalone(ptype, spec)?,
+                        pname
+                    ));
+                }
+            }
+        }
+    }
+    let field_init: String = handler
+        .accounts
+        .iter()
+        .map(|a| a.name.clone())
+        .collect::<Vec<_>>()
+        .join(", ");
+    out.push_str(&format!(
+        "    let mut ctx = {} {{ {} }};\n",
+        pascal, field_init
+    ));
+    out.push_str(&format!("    ctx.handler({})\n", param_names.join(", ")));
+    out.push_str("}\n");
+
+    Ok(out)
 }
 
 /// v2.24 S5b — `true` when the spec's state is a multi-variant ADT
@@ -6236,6 +6402,59 @@ handler initialize (amount : U64) : State.Uninitialized -> State.Open {
         assert!(
             !state.contains("#[account]") && !state.contains("EscrowAccountInner"),
             "Pinocchio state must not emit the #[account] wrapper/inner-enum; got:\n{state}"
+        );
+    }
+
+    /// Slice 6 step 4a — Pinocchio instruction scaffold: a struct of
+    /// `&AccountInfo` fields + a `process_<name>` wrapper that binds the
+    /// account slice positionally, LE-parses numeric params, and calls
+    /// `.handler()` (which calls `guards::<name>`).
+    #[test]
+    fn pinocchio_handler_scaffold_emits_struct_and_process_wrapper() {
+        let src = r#"spec Vault
+type Error | InvalidAmount
+state { balance : U64 }
+handler deposit (amount : U64) {
+  accounts {
+    authority : signer, writable
+    vault     : writable
+  }
+  requires amount > 0 else InvalidAmount
+  effect { balance += amount }
+}
+"#;
+        let spec = crate::chumsky_adapter::parse_str(src).unwrap();
+        let handler = spec.handlers.iter().find(|h| h.name == "deposit").unwrap();
+        let out = render_pinocchio_handler_scaffold(handler, &spec).unwrap();
+
+        // Accounts struct of &AccountInfo (no typed wrappers).
+        assert!(
+            out.contains("pub struct Deposit<'a> {")
+                && out.contains("pub authority: &'a AccountInfo,")
+                && out.contains("pub vault: &'a AccountInfo,"),
+            "must emit a &AccountInfo accounts struct; got:\n{out}"
+        );
+        // Handler method takes the param + calls the guard.
+        assert!(
+            out.contains("pub fn handler(&mut self, amount: u64) -> ProgramResult {")
+                && out.contains("guards::deposit(self, amount)?;"),
+            "handler must take params + call guards; got:\n{out}"
+        );
+        // process_<name> wrapper: positional account binding + LE param
+        // parse + struct build + dispatch.
+        assert!(
+            out.contains("pub fn process_deposit(accounts: &[AccountInfo], instruction_data: &[u8]) -> ProgramResult {")
+                && out.contains("let [authority, vault, ..] = accounts else {")
+                && out.contains("return Err(ProgramError::NotEnoughAccountKeys);")
+                && out.contains("u64::from_le_bytes(")
+                && out.contains("let mut ctx = Deposit { authority, vault };")
+                && out.contains("ctx.handler(amount)"),
+            "process wrapper must bind accounts + parse params + dispatch; got:\n{out}"
+        );
+        // No Anchor/Quasar Context shape.
+        assert!(
+            !out.contains("Context<") && !out.contains("Ctx<") && !out.contains("to_account_info"),
+            "Pinocchio scaffold must not leak the Anchor/Quasar context shape; got:\n{out}"
         );
     }
 
