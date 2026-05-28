@@ -239,7 +239,17 @@ fn render_cargo_toml(
                 out.push_str("quasar-spl = { version = \"0.0.0\" }\n");
             }
         }
-        Target::Pinocchio => unreachable!("Pinocchio is rejected at the init dispatcher"),
+        Target::Pinocchio => {
+            // Greenfield Pinocchio scaffold (slice 6, §12c). pinocchio
+            // (entrypoint + AccountInfo), pinocchio-pubkey (declare_id!),
+            // zeropod (zero-copy state); pinocchio-token only for Token CPIs.
+            out.push_str("pinocchio = \"0.8\"\n");
+            out.push_str("pinocchio-pubkey = \"0.3\"\n");
+            out.push_str("zeropod = \"0.1\"\n");
+            if needs_spl {
+                out.push_str("pinocchio-token = \"0.3\"\n");
+            }
+        }
     }
     out.push_str(&format!(
         "qedgen-macros = {{ git = \"https://github.com/qedgen/solana-skills\", tag = \"v{}\" }}\n",
@@ -285,6 +295,14 @@ fn emit_lib(
     target: Target,
 ) -> Result<()> {
     use crate::codegen::{to_pascal_case, FrameworkSurface};
+
+    // Pinocchio is MIR-only: emit via the dedicated shared helper (NOT
+    // the legacy generate_lib pipeline, which doesn't route Pinocchio).
+    // The helper emits the no_std entrypoint + byte-dispatch from
+    // ParsedSpec (slice 6, §12b).
+    if matches!(target, Target::Pinocchio) {
+        return crate::codegen::emit_pinocchio_program_lib(parsed, fp, output_dir);
+    }
 
     let surface = FrameworkSurface::for_target(target);
     let src_dir = output_dir.join("src");
@@ -519,10 +537,11 @@ fn emit_instructions(
     for handler in &mir.handlers {
         mod_out.push_str(&format!("pub mod {};\n", handler.name));
     }
-    // Quasar re-exports `Accounts` structs from each
-    // `instructions/<name>.rs`; Anchor keeps them in lib.rs at
+    // Quasar + Pinocchio re-export their account structs from each
+    // `instructions/<name>.rs` (Pinocchio's `guards.rs` resolves `<Pascal>`
+    // via `use crate::instructions::*;`); Anchor keeps them in lib.rs at
     // crate root.
-    if matches!(target, Target::Quasar) {
+    if matches!(target, Target::Quasar | Target::Pinocchio) {
         mod_out.push('\n');
         for handler in &mir.handlers {
             let pascal = to_pascal_case(&handler.name);
@@ -566,15 +585,22 @@ fn emit_instructions(
             continue;
         }
 
-        let out = crate::codegen::render_handler_scaffold(
-            handler,
-            parsed,
-            is_multi,
-            &default_state_name,
-            &spec_src,
-            &spec_attr,
-            target,
-        )?;
+        // Pinocchio uses a dedicated scaffold (struct of &AccountInfo +
+        // process_<name> wrapper + .handler()); the Anchor/Quasar
+        // Context-based render_handler_scaffold doesn't apply (slice 6 §12b).
+        let out = if matches!(target, Target::Pinocchio) {
+            crate::codegen::render_pinocchio_handler_scaffold(handler, parsed)?
+        } else {
+            crate::codegen::render_handler_scaffold(
+                handler,
+                parsed,
+                is_multi,
+                &default_state_name,
+                &spec_src,
+                &spec_attr,
+                target,
+            )?
+        };
         std::fs::write(&handler_path, &out)?;
     }
 
@@ -611,6 +637,17 @@ fn emit_state(
         is_multi_variant_adt_state_pub, map_type_for_target, map_type_pod, to_pascal_case,
         FrameworkSurface,
     };
+
+    // Pinocchio is MIR-only: emit zeropod zero-copy state via the
+    // dedicated shared helper (NOT the legacy generate_state pipeline).
+    if matches!(target, Target::Pinocchio) {
+        let src_dir = output_dir.join("src");
+        std::fs::create_dir_all(&src_dir)?;
+        let mut out = String::new();
+        crate::codegen::emit_pinocchio_state(parsed, fp, &mut out)?;
+        std::fs::write(src_dir.join("state.rs"), &out)?;
+        return Ok(());
+    }
 
     let surface = FrameworkSurface::for_target(target);
     let src_dir = output_dir.join("src");
@@ -877,7 +914,14 @@ fn emit_imported_mirror(
     let (prelude_import, explicit_account_discriminator): (&str, bool) = match target {
         Target::Anchor => ("use anchor_lang::prelude::*;\n", false),
         Target::Quasar => ("use quasar_lang::prelude::*;\n", true),
-        Target::Pinocchio => unreachable!("Pinocchio is rejected at the init dispatcher"),
+        // Imported account-type mirrors need the zeropod decode shape for
+        // Pinocchio (slice 6 follow-on); not emitted yet. Fail cleanly
+        // instead of panicking. Inline the interface, or use Anchor/Quasar.
+        Target::Pinocchio => anyhow::bail!(
+            "imported account-type mirrors are not yet supported for the \
+             Pinocchio target. Inline the interface's account types into the \
+             spec, or generate this program for the Anchor or Quasar target."
+        ),
     };
 
     let src_dir = output_dir.join("src");
@@ -1104,7 +1148,9 @@ fn emit_errors(
     let prelude_import = match target {
         Target::Anchor => "use anchor_lang::prelude::*;\n",
         Target::Quasar => "use quasar_lang::prelude::*;\n",
-        Target::Pinocchio => unreachable!("Pinocchio is rejected at the init dispatcher"),
+        // Pinocchio has no `#[error_code]` macro — plain enum + a
+        // hand-written `From<…> for ProgramError` (emitted below).
+        Target::Pinocchio => "use pinocchio::program_error::ProgramError;\n",
     };
 
     let error_name = format!("{}Error", crate::codegen::to_pascal_case(&mir.name));
@@ -1184,12 +1230,27 @@ fn emit_errors(
         codes.push("InvalidPda".to_string());
     }
 
-    out.push_str("#[error_code]\n");
-    out.push_str(&format!("pub enum {} {{\n", error_name));
-    for (i, code) in codes.iter().enumerate() {
-        out.push_str(&format!("    {} = {},\n", code, i));
+    if matches!(target, Target::Pinocchio) {
+        // Pinocchio: plain `#[repr(u32)]` enum + `From<…> for ProgramError`
+        // (guards/handlers convert via `ProgramError::from(<Enum>::<V>)`).
+        out.push_str("#[derive(Clone, Copy, PartialEq, Eq)]\n#[repr(u32)]\n");
+        out.push_str(&format!("pub enum {} {{\n", error_name));
+        for (i, code) in codes.iter().enumerate() {
+            out.push_str(&format!("    {} = {},\n", code, i));
+        }
+        out.push_str("}\n\n");
+        out.push_str(&format!(
+            "impl From<{0}> for ProgramError {{\n    fn from(e: {0}) -> Self {{\n        ProgramError::Custom(e as u32)\n    }}\n}}\n",
+            error_name
+        ));
+    } else {
+        out.push_str("#[error_code]\n");
+        out.push_str(&format!("pub enum {} {{\n", error_name));
+        for (i, code) in codes.iter().enumerate() {
+            out.push_str(&format!("    {} = {},\n", code, i));
+        }
+        out.push_str("}\n");
     }
-    out.push_str("}\n");
     out.push_str("// ---- END GENERATED ----\n");
 
     std::fs::write(src_dir.join("errors.rs"), &out)?;
@@ -1283,10 +1344,16 @@ fn emit_events(
     // Per-target framework surface. Hardcoded here for events only
     // (the full `FrameworkSurface` struct stays module-private in
     // `codegen.rs`; Phase 4b ports use the minimal slice they need).
-    let (prelude_import, explicit_discriminator): (&str, bool) = match target {
-        Target::Anchor => ("use anchor_lang::prelude::*;\n", false),
-        Target::Quasar => ("use quasar_lang::prelude::*;\n", true),
-        Target::Pinocchio => unreachable!("Pinocchio is rejected at the init dispatcher"),
+    let prelude_import: &str = match target {
+        Target::Anchor => "use anchor_lang::prelude::*;\n",
+        Target::Quasar => "use quasar_lang::prelude::*;\n",
+        // Pinocchio has no event framework / macro. Events are plain data
+        // structs the program serializes and logs itself (e.g. via the
+        // `sol_log_data` syscall) — no framework prelude to import.
+        Target::Pinocchio => {
+            "// Pinocchio has no event macro — these are plain data structs.\n\
+             // Serialize + emit them yourself (e.g. via the `sol_log_data` syscall).\n"
+        }
     };
 
     let mut out = String::new();
@@ -1309,10 +1376,13 @@ fn emit_events(
                 )
             })?;
 
-        if explicit_discriminator {
-            out.push_str(&format!("#[event(discriminator = {})]\n", i + 1));
-        } else {
-            out.push_str("#[event]\n");
+        // Per-target struct attribute: Anchor/Quasar use the framework
+        // `#[event]` macro (Quasar wants an explicit discriminator);
+        // Pinocchio has none, so emit a plain `#[derive(Clone)]` struct.
+        match target {
+            Target::Anchor => out.push_str("#[event]\n"),
+            Target::Quasar => out.push_str(&format!("#[event(discriminator = {})]\n", i + 1)),
+            Target::Pinocchio => out.push_str("#[derive(Clone)]\n"),
         }
         out.push_str(&format!("pub struct {} {{\n", event.name));
         for (fname, ftype) in &parsed_event.fields {
@@ -1439,5 +1509,42 @@ mod tests {
         let (mir, parsed) = lower_fixture("examples/rust/escrow/escrow.qedspec");
         assert!(!parsed.handlers.is_empty(), "escrow has handlers");
         assert!(!mir.state.variants.is_empty(), "escrow has state variants");
+    }
+
+    /// Pinocchio has no `#[event]` macro — `emit_events` must emit a plain
+    /// `#[derive(Clone)]` data struct, not panic (the slice-6 milestone-2
+    /// `unreachable!()` shipped a crash on any Pinocchio spec with `emits`).
+    #[test]
+    fn pinocchio_events_emit_plain_struct_no_event_macro() {
+        let (mir, parsed) =
+            lower_fixture("examples/pinocchio-fixtures/vault-greenfield/vault.qedspec");
+        assert!(!mir.events.is_empty(), "vault-greenfield declares an event");
+
+        let fp = crate::fingerprint::compute_fingerprint(&parsed);
+        let temp = std::env::temp_dir().join(format!("qedgen-evt-test-{}", std::process::id()));
+        std::fs::create_dir_all(temp.join("src")).expect("mk src");
+
+        emit_events(&mir, &parsed, &fp, &temp, Target::Pinocchio)
+            .expect("Pinocchio events must emit, not panic");
+
+        let rendered = std::fs::read_to_string(temp.join("src/events.rs")).expect("events.rs");
+        std::fs::remove_dir_all(&temp).ok();
+
+        assert!(
+            rendered.contains("pub struct Withdrawn"),
+            "event struct must be emitted; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("#[derive(Clone)]"),
+            "Pinocchio events are plain derive-Clone structs; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("#[event"),
+            "Pinocchio has no #[event] macro; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("anchor_lang") && !rendered.contains("quasar_lang"),
+            "no Anchor/Quasar prelude leakage; got:\n{rendered}"
+        );
     }
 }

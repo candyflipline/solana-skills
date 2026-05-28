@@ -112,9 +112,29 @@ impl FrameworkSurface {
                 explicit_handler_discriminator: true,
                 explicit_account_discriminator: true,
             },
-            Target::Pinocchio => {
-                unreachable!("Pinocchio is rejected at the init dispatcher")
-            }
+            Target::Pinocchio => FrameworkSurface {
+                target,
+                // Same host-std / on-chain-no_std split as Quasar: host
+                // builds (cargo test / cargo kani) keep std; the BPF build
+                // is no_std. pinocchio's `entrypoint!` macro supplies the
+                // on-chain panic handler + allocator. (slice 6, §12)
+                crate_attrs:
+                    "#![allow(unexpected_cfgs)]\n#![cfg_attr(any(target_os = \"solana\", target_arch = \"bpf\"), no_std)]\n\n",
+                prelude_import:
+                    "use pinocchio::{account_info::AccountInfo, program_error::ProgramError, ProgramResult};\n",
+                // Pinocchio has no `Context`/`Ctx` wrapper and no
+                // `#[program]` mod — it uses a free `process_instruction`
+                // entrypoint that byte-dispatches to per-handler
+                // `process_<name>` fns. These two fields are unused for
+                // Pinocchio; generators gate their use on the target.
+                context_type: "",
+                handler_result_type: "Result<(), ProgramError>",
+                accounts_lifetime: "'a",
+                program_mod_vis: "",
+                // 1-byte leading discriminant dispatch in process_instruction.
+                explicit_handler_discriminator: true,
+                explicit_account_discriminator: true,
+            },
         }
     }
 
@@ -131,6 +151,18 @@ impl FrameworkSurface {
 
     pub(crate) fn is_quasar(&self) -> bool {
         matches!(self.target, Target::Quasar)
+    }
+
+    pub(crate) fn is_pinocchio(&self) -> bool {
+        matches!(self.target, Target::Pinocchio)
+    }
+
+    /// Pinocchio account-field type: every `#[derive(Accounts)]`-equivalent
+    /// field is a raw `&'a AccountInfo` (interior-mutable; no typed wrapper).
+    /// Typing happens via `zeropod` decode inside `.handler()` (slice 6, §12).
+    /// Shared by all the `*_type` helpers below.
+    fn pinocchio_account_type(&self) -> String {
+        format!("&{} AccountInfo", self.accounts_lifetime)
     }
 
     /// Per-target import line for SPL token / mint types. Selects only
@@ -194,6 +226,9 @@ impl FrameworkSurface {
 
     fn signer_type(&self, mutable: bool) -> String {
         let lt = self.accounts_lifetime;
+        if self.is_pinocchio() {
+            return self.pinocchio_account_type();
+        }
         if self.is_quasar() {
             format!("&{} {}Signer", lt, mut_prefix(mutable))
         } else {
@@ -209,6 +244,9 @@ impl FrameworkSurface {
         // generated handler can call `.transfer()` / `.mint_to()` etc.
         // Anything else stays `Program<System>`.
         let is_token = name == "token_program" || account_type == Some("token");
+        if self.is_pinocchio() {
+            return self.pinocchio_account_type();
+        }
         if self.is_quasar() {
             let inner = if is_token { "Token" } else { "System" };
             format!("&{} {}Program<{}>", lt, mut_prefix(mutable), inner)
@@ -221,6 +259,9 @@ impl FrameworkSurface {
 
     fn token_account_type(&self, mutable: bool) -> String {
         let lt = self.accounts_lifetime;
+        if self.is_pinocchio() {
+            return self.pinocchio_account_type();
+        }
         if self.is_quasar() {
             format!("&{} {}Account<Token>", lt, mut_prefix(mutable))
         } else {
@@ -230,6 +271,9 @@ impl FrameworkSurface {
 
     fn mint_account_type(&self, mutable: bool) -> String {
         let lt = self.accounts_lifetime;
+        if self.is_pinocchio() {
+            return self.pinocchio_account_type();
+        }
         if self.is_quasar() {
             format!("&{} {}Account<Mint>", lt, mut_prefix(mutable))
         } else {
@@ -239,6 +283,11 @@ impl FrameworkSurface {
 
     fn state_account_type(&self, state_name: &str, mutable: bool) -> String {
         let lt = self.accounts_lifetime;
+        if self.is_pinocchio() {
+            // Raw &AccountInfo; state decoded from the data bytes via
+            // zeropod inside .handler() (slice 6 step 3/4).
+            return self.pinocchio_account_type();
+        }
         if self.is_quasar() {
             format!("&{} {}Account<{}>", lt, mut_prefix(mutable), state_name)
         } else {
@@ -251,11 +300,17 @@ impl FrameworkSurface {
     /// Quasar imported-namespace support is reserved for v2.30.
     fn imported_account_type(&self, ns: &str, source_type: &str, _mutable: bool) -> String {
         let lt = self.accounts_lifetime;
+        if self.is_pinocchio() {
+            return self.pinocchio_account_type();
+        }
         format!("Account<{}, crate::imported::{}::{}>", lt, ns, source_type)
     }
 
     fn unchecked_account_type(&self, mutable: bool) -> String {
         let lt = self.accounts_lifetime;
+        if self.is_pinocchio() {
+            return self.pinocchio_account_type();
+        }
         if self.is_quasar() {
             format!("&{} {}UncheckedAccount", lt, mut_prefix(mutable))
         } else {
@@ -266,8 +321,11 @@ impl FrameworkSurface {
     fn error_expr(&self, enum_name: &str, variant: &str) -> String {
         match self.target {
             Target::Anchor => format!("{}::{}.into()", enum_name, variant),
-            Target::Quasar => format!("ProgramError::from({}::{})", enum_name, variant),
-            Target::Pinocchio => unreachable!(),
+            // Both Quasar and Pinocchio return bare `ProgramError`; the
+            // generated error enum impls `From<Enum> for ProgramError`.
+            Target::Quasar | Target::Pinocchio => {
+                format!("ProgramError::from({}::{})", enum_name, variant)
+            }
         }
     }
 
@@ -279,16 +337,16 @@ impl FrameworkSurface {
     fn generic_error_expr(&self) -> &'static str {
         match self.target {
             Target::Anchor => "anchor_lang::error::Error::from(ProgramError::Custom(0xFF))",
-            Target::Quasar => "ProgramError::Custom(0xFF)",
-            Target::Pinocchio => unreachable!(),
+            Target::Quasar | Target::Pinocchio => "ProgramError::Custom(0xFF)",
         }
     }
 
     fn guard_accounts_import(&self) -> &'static str {
         match self.target {
             Target::Anchor => "use crate::*;\n\n",
-            Target::Quasar => "use crate::instructions::*;\n\n",
-            Target::Pinocchio => unreachable!(),
+            // Pinocchio keeps the per-handler accounts struct in
+            // `instructions/<name>.rs` like Quasar (slice 6, §12).
+            Target::Quasar | Target::Pinocchio => "use crate::instructions::*;\n\n",
         }
     }
 
@@ -296,7 +354,8 @@ impl FrameworkSurface {
         match self.target {
             Target::Anchor => format!("ctx.{}.key()", account_name),
             Target::Quasar => format!("(*ctx.{}.to_account_view().address())", account_name),
-            Target::Pinocchio => unreachable!(),
+            // pinocchio's AccountInfo::key() returns &Pubkey ([u8; 32]).
+            Target::Pinocchio => format!("ctx.{}.key()", account_name),
         }
     }
 
@@ -304,7 +363,13 @@ impl FrameworkSurface {
         match self.target {
             Target::Anchor => format!("ctx.{}.owner", token_account_name),
             Target::Quasar => format!("(*ctx.{}.owner())", token_account_name),
-            Target::Pinocchio => unreachable!(),
+            // Pinocchio reads the SPL token-account owner from the account
+            // DATA (not AccountInfo::owner, which is the owning program).
+            // The zeropod-decode form lands with guard codegen (slice 6
+            // step 4); not reached until then (init bails until step 2).
+            Target::Pinocchio => {
+                unreachable!("pinocchio token-owner read lands with guard codegen — slice 6 step 4")
+            }
         }
     }
 
@@ -456,7 +521,10 @@ pub(crate) fn map_type_for_target(
     match target {
         Target::Anchor => map_type_anchor(dsl_type, spec),
         Target::Quasar => map_type_quasar(dsl_type, spec),
-        Target::Pinocchio => unreachable!(),
+        // Instruction params decode from raw bytes into plain Rust scalars
+        // (u64, etc.) — the same standalone mapping. State-field pod types
+        // (PodU64, …) are a separate generate_state concern (slice 6 step 3).
+        Target::Pinocchio => map_type_standalone(dsl_type, spec),
     }
 }
 
@@ -909,6 +977,554 @@ pub(crate) fn generate_lib(
 
     std::fs::write(src_dir.join("lib.rs"), &out)?;
     Ok(())
+}
+
+/// Self-contained Pinocchio `src/lib.rs` emitter — a shared helper called
+/// by `codegen_mir::emit_lib` for the Pinocchio target (slice 6, §12b).
+/// Pinocchio is MIR-only: the legacy `generate_lib` pipeline does NOT route
+/// Pinocchio. This helper survives the v3.0 legacy-pipeline deletion.
+///
+/// Emits the no_std crate root + module decls + `declare_id!` +
+/// `entrypoint!` + the byte-dispatch `process_instruction`. Idempotent: a
+/// pre-existing `src/lib.rs` is left untouched (user-owned).
+pub(crate) fn emit_pinocchio_program_lib(
+    spec: &ParsedSpec,
+    fp: &SpecFingerprint,
+    output_dir: &Path,
+) -> Result<()> {
+    let surface = FrameworkSurface::for_target(Target::Pinocchio);
+    let src_dir = output_dir.join("src");
+    std::fs::create_dir_all(&src_dir)?;
+    let lib_path = src_dir.join("lib.rs");
+    if lib_path.exists() {
+        eprintln!(
+            "programs/{}/src/lib.rs already exists — skipping (user-owned). guards.rs regenerated.",
+            output_dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("<program>")
+        );
+        return Ok(());
+    }
+    let program_id = spec
+        .program_id
+        .as_deref()
+        .unwrap_or("11111111111111111111111111111111");
+
+    let mut out = String::new();
+    out.push_str(&marker("DO NOT EDIT", fp, "src/lib.rs"));
+    out.push_str(surface.crate_attrs);
+    out.push_str(surface.prelude_import);
+    out.push('\n');
+    out.push_str("mod instructions;\n");
+    if !spec.events.is_empty() {
+        out.push_str("pub mod events;\n");
+    }
+    if !spec.error_codes.is_empty() {
+        out.push_str("pub mod errors;\n");
+    }
+    out.push_str("pub mod state;\n");
+    out.push_str("pub mod guards;\n");
+    if guards_use_math_helpers(spec) {
+        out.push_str("pub mod math;\n");
+    }
+    if !spec.ref_impls.is_empty() {
+        out.push_str("pub mod ref_impls;\n");
+    }
+    if spec
+        .imported_namespaces
+        .values()
+        .any(|ns| !ns.account_types.is_empty())
+    {
+        out.push_str("pub mod imported;\n");
+    }
+    out.push('\n');
+    emit_pinocchio_lib_tail(&mut out, spec, program_id);
+    out.push_str("// ---- END GENERATED ----\n");
+    std::fs::write(src_dir.join("lib.rs"), &out)?;
+    Ok(())
+}
+
+/// Emit the Pinocchio `lib.rs` tail: program ID, the `entrypoint!` macro,
+/// and a `process_instruction` dispatcher that reads the leading
+/// discriminant byte and routes to each handler's `process_<name>`
+/// wrapper (declared in `instructions/<name>.rs`, slice 6 step 4).
+/// Replaces the Anchor/Quasar `#[program]` mod entirely (§12b).
+///
+/// `entrypoint!` expands to `program_entrypoint!` + `default_allocator!` +
+/// `default_panic_handler!`; all three are internally `target_os =
+/// "solana"`-gated (host builds link std's allocator/panic handler), so
+/// the invocation is emitted unconditionally.
+fn emit_pinocchio_lib_tail(out: &mut String, spec: &ParsedSpec, program_id: &str) {
+    out.push_str(&format!(
+        "pinocchio_pubkey::declare_id!(\"{}\");\n\n",
+        program_id
+    ));
+    // `entrypoint!`'s single-arg arm recursively calls `entrypoint!`
+    // *unqualified*, so it must be imported (a `pinocchio::entrypoint!`
+    // path call fails to resolve the inner recursion).
+    out.push_str("use pinocchio::entrypoint;\n");
+    out.push_str("entrypoint!(process_instruction);\n\n");
+    out.push_str("/// Instruction dispatch — the leading byte of `instruction_data`\n");
+    out.push_str("/// selects the handler (discriminant = declaration order).\n");
+    out.push_str("pub fn process_instruction(\n");
+    out.push_str("    _program_id: &pinocchio::pubkey::Pubkey,\n");
+    out.push_str("    accounts: &[AccountInfo],\n");
+    out.push_str("    instruction_data: &[u8],\n");
+    out.push_str(") -> ProgramResult {\n");
+    out.push_str("    let (discriminant, data) = instruction_data\n");
+    out.push_str("        .split_first()\n");
+    out.push_str("        .ok_or(ProgramError::InvalidInstructionData)?;\n");
+    out.push_str("    match *discriminant {\n");
+    for (i, handler) in spec.handlers.iter().enumerate() {
+        out.push_str(&format!(
+            "        {} => instructions::{}::process_{}(accounts, data),\n",
+            i, handler.name, handler.name
+        ));
+    }
+    out.push_str("        _ => Err(ProgramError::InvalidInstructionData),\n");
+    out.push_str("    }\n");
+    out.push_str("}\n");
+}
+
+/// Emit `src/state.rs` for the Pinocchio target (slice 6 step 3, §12a).
+///
+/// zeropod zero-copy: each persisted struct is the *schema* — declared
+/// with plain Rust field types (`u64`, `[u8; 32]`, nested records) — and
+/// `#[derive(ZeroPod)]` generates the alignment-1 `<Struct>Zc` companion
+/// that handlers mutate in place via `from_bytes_mut`. Lifecycle / sum-type
+/// State lowers to a `u8` discriminant field + a `#[repr(u8)]` enum of
+/// named constants (the same `status: u8` + `enum` shape the Anchor/Quasar
+/// path uses, so the delegated guard codegen stays consistent). Sum-type
+/// variant payloads are flattened into one superset struct; the tag byte
+/// selects the live variant.
+pub(crate) fn emit_pinocchio_state(
+    spec: &ParsedSpec,
+    fp: &SpecFingerprint,
+    out: &mut String,
+) -> Result<()> {
+    out.push_str(&marker("DO NOT EDIT", fp, "src/state.rs"));
+    out.push_str("use zeropod::ZeroPod;\n\n");
+
+    // Record types referenced by state fields → ZeroPod structs (emitted
+    // ahead of the account structs that nest them).
+    for record in &spec.records {
+        out.push_str("#[derive(ZeroPod)]\n");
+        out.push_str(&format!("pub struct {} {{\n", record.name));
+        for (fname, ftype) in &record.fields {
+            out.push_str(&format!(
+                "    pub {}: {},\n",
+                fname,
+                map_type_standalone(ftype, spec)?
+            ));
+        }
+        out.push_str("}\n\n");
+    }
+
+    if spec.account_types.len() > 1 {
+        // Multi-account: one ZeroPod struct per account type.
+        for acct in &spec.account_types {
+            let struct_name = format!("{}Account", acct.name);
+            let enum_name = format!("{}Status", acct.name);
+            emit_pinocchio_state_struct(
+                out,
+                &struct_name,
+                &acct.fields,
+                acct.pda_ref.is_some(),
+                &acct.lifecycle,
+                &enum_name,
+                spec,
+            )?;
+        }
+    } else if spec
+        .account_types
+        .first()
+        .map(|a| a.variants.len() > 1)
+        .unwrap_or(false)
+    {
+        // Sum-type State → discriminant tag byte + flat superset struct.
+        let acct = &spec.account_types[0];
+        let state_name = format!("{}Account", to_pascal_case(&spec.program_name));
+        let tag_name = format!("{}Tag", state_name);
+        out.push_str(&format!(
+            "/// Discriminant tag for `{}`. Variant payloads are stored\n\
+             /// flattened in the struct below; the `tag` byte selects the\n\
+             /// live variant.\n",
+            state_name
+        ));
+        out.push_str("#[derive(Clone, Copy, PartialEq, Eq)]\n#[repr(u8)]\n");
+        out.push_str(&format!("pub enum {} {{\n", tag_name));
+        for (i, v) in acct.variants.iter().enumerate() {
+            out.push_str(&format!("    {} = {},\n", v.name, i));
+        }
+        out.push_str("}\n\n");
+
+        out.push_str("#[derive(ZeroPod)]\n");
+        out.push_str(&format!("pub struct {} {{\n", state_name));
+        out.push_str("    pub tag: u8,\n");
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for v in &acct.variants {
+            for (fname, ftype) in &v.fields {
+                if seen.insert(fname.clone()) {
+                    out.push_str(&format!(
+                        "    pub {}: {},\n",
+                        fname,
+                        map_type_standalone(ftype, spec)?
+                    ));
+                }
+            }
+        }
+        if !spec.pdas.is_empty() && !seen.contains("bump") {
+            out.push_str("    pub bump: u8,\n");
+        }
+        out.push_str("}\n\n");
+    } else {
+        // Single flat record state.
+        let state_name = format!("{}Account", to_pascal_case(&spec.program_name));
+        emit_pinocchio_state_struct(
+            out,
+            &state_name,
+            &spec.state_fields,
+            !spec.pdas.is_empty(),
+            &spec.lifecycle_states,
+            "Status",
+            spec,
+        )?;
+    }
+
+    out.push_str("// ---- END GENERATED ----\n");
+    Ok(())
+}
+
+/// Emit one Pinocchio `#[derive(ZeroPod)]` state struct (+ its optional
+/// `#[repr(u8)]` lifecycle enum). `has_pda` appends a `bump: u8`;
+/// `lifecycle` (when non-empty) emits the named-constant enum + a
+/// `status: u8` field. Shared by the single-account + multi-account
+/// branches of `emit_pinocchio_state`.
+fn emit_pinocchio_state_struct(
+    out: &mut String,
+    struct_name: &str,
+    fields: &[(String, String)],
+    has_pda: bool,
+    lifecycle: &[String],
+    enum_name: &str,
+    spec: &ParsedSpec,
+) -> Result<()> {
+    if !lifecycle.is_empty() {
+        out.push_str(&format!("/// {} lifecycle states.\n", enum_name));
+        out.push_str("#[derive(Clone, Copy, PartialEq, Eq)]\n#[repr(u8)]\n");
+        out.push_str(&format!("pub enum {} {{\n", enum_name));
+        for (i, s) in lifecycle.iter().enumerate() {
+            out.push_str(&format!("    {} = {},\n", s, i));
+        }
+        out.push_str("}\n\n");
+    }
+    out.push_str("#[derive(ZeroPod)]\n");
+    out.push_str(&format!("pub struct {} {{\n", struct_name));
+    for (fname, ftype) in fields {
+        out.push_str(&format!(
+            "    pub {}: {},\n",
+            fname,
+            map_type_standalone(ftype, spec)?
+        ));
+    }
+    if has_pda && !fields.iter().any(|(n, _)| n == "bump") {
+        out.push_str("    pub bump: u8,\n");
+    }
+    if !lifecycle.is_empty() && !fields.iter().any(|(n, _)| n == "status") {
+        out.push_str("    pub status: u8,\n");
+    }
+    out.push_str("}\n\n");
+    Ok(())
+}
+
+/// DSL integer type → (Rust primitive, byte width) for little-endian
+/// (de)serialization of instruction-data params. None for non-integer
+/// types (the Pinocchio wrapper emits a `todo!()` for those).
+fn numeric_param_width(dsl_type: &str) -> Option<(&'static str, usize)> {
+    match dsl_type.trim() {
+        "U8" => Some(("u8", 1)),
+        "I8" => Some(("i8", 1)),
+        "U16" => Some(("u16", 2)),
+        "I16" => Some(("i16", 2)),
+        "U32" => Some(("u32", 4)),
+        "I32" => Some(("i32", 4)),
+        "U64" => Some(("u64", 8)),
+        "I64" => Some(("i64", 8)),
+        "U128" => Some(("u128", 16)),
+        "I128" => Some(("i128", 16)),
+        _ => None,
+    }
+}
+
+/// Emit one Pinocchio `instructions/<name>.rs` scaffold (slice 6 step 4a).
+/// Shared helper; `codegen_mir::emit_instructions` calls it for the
+/// Pinocchio target. USER-OWNED (emitted only when the file is missing).
+///
+/// Shape: a `struct <Pascal><'a>` of `&AccountInfo` fields + an
+/// `impl { fn handler(&mut self, …) -> ProgramResult }` (calls
+/// `crate::guards::<name>`, then applies effects) + a free
+/// `process_<name>(accounts, data)` wrapper the entrypoint dispatcher
+/// calls — it binds the account slice positionally, parses params from
+/// `instruction_data` (LE, offset-tracked), builds the struct, and calls
+/// `.handler()`.
+///
+/// step 4a scope: the account-binding + param-parse + dispatch shape. The
+/// `.handler()` effect body (zeropod state read/write + SPL CPI) + the
+/// Pinocchio `guards.rs` path are step 4b — the body is a `todo!()`
+/// breadcrumb for now.
+pub(crate) fn render_pinocchio_handler_scaffold(
+    handler: &ParsedHandler,
+    spec: &ParsedSpec,
+) -> Result<String> {
+    let pascal = to_pascal_case(&handler.name);
+    let mut out = String::new();
+
+    out.push_str("// User-owned. Regenerating the spec does NOT overwrite this file.\n");
+    out.push_str("// Guard checks live in the sibling `crate::guards` module and ARE\n");
+    out.push_str("// regenerated on every `qedgen codegen`.\n\n");
+    out.push_str(
+        "use pinocchio::{account_info::AccountInfo, program_error::ProgramError, ProgramResult};\n",
+    );
+    out.push_str("use zeropod::ZeroPodFixed;\n");
+    out.push_str("use crate::state::*;\n");
+    if !spec.ref_impls.is_empty() {
+        out.push_str("use crate::ref_impls::*;\n");
+    }
+    out.push_str("use crate::guards;\n");
+    if !spec.error_codes.is_empty() {
+        out.push_str("use crate::errors::*;\n");
+    }
+    out.push('\n');
+
+    // Accounts struct — every field is a raw &AccountInfo (zeropod decode
+    // happens inside .handler()).
+    out.push_str(&format!("pub struct {}<'a> {{\n", pascal));
+    for acct in &handler.accounts {
+        out.push_str(&format!("    pub {}: &'a AccountInfo,\n", acct.name));
+    }
+    out.push_str("}\n\n");
+
+    let params_sig: String = handler
+        .takes_params
+        .iter()
+        .map(|(n, t)| map_type_standalone(t, spec).map(|ty| format!(", {}: {}", n, ty)))
+        .collect::<Result<Vec<_>>>()?
+        .join("");
+    let param_names: Vec<&str> = handler
+        .takes_params
+        .iter()
+        .map(|(n, _)| n.as_str())
+        .collect();
+
+    out.push_str(&format!("impl {}<'_> {{\n", pascal));
+    out.push_str(&format!(
+        "    pub fn handler(&mut self{}) -> ProgramResult {{\n",
+        params_sig
+    ));
+    if param_names.is_empty() {
+        out.push_str(&format!("        guards::{}(self)?;\n", handler.name));
+    } else {
+        out.push_str(&format!(
+            "        guards::{}(self, {})?;\n",
+            handler.name,
+            param_names.join(", ")
+        ));
+    }
+    emit_pinocchio_effect_body(&mut out, handler, spec);
+    out.push_str("        Ok(())\n");
+    out.push_str("    }\n");
+    out.push_str("}\n\n");
+
+    out.push_str(&format!(
+        "/// Entrypoint wrapper — binds the account slice + parses params, then\n\
+         /// calls `{}::handler`. Invoked by `process_instruction` in lib.rs.\n",
+        pascal
+    ));
+    out.push_str(&format!(
+        "pub fn process_{}(accounts: &[AccountInfo], instruction_data: &[u8]) -> ProgramResult {{\n",
+        handler.name
+    ));
+    if handler.accounts.is_empty() {
+        out.push_str("    let _ = accounts;\n");
+    } else {
+        let names: Vec<&str> = handler.accounts.iter().map(|a| a.name.as_str()).collect();
+        out.push_str(&format!(
+            "    let [{}, ..] = accounts else {{\n",
+            names.join(", ")
+        ));
+        out.push_str("        return Err(ProgramError::NotEnoughAccountKeys);\n");
+        out.push_str("    };\n");
+    }
+    if handler.takes_params.is_empty() {
+        out.push_str("    let _ = instruction_data;\n");
+    } else {
+        let mut offset = 0usize;
+        for (pname, ptype) in &handler.takes_params {
+            match numeric_param_width(ptype) {
+                Some((rust_ty, width)) => {
+                    out.push_str(&format!(
+                        "    let {} = {}::from_le_bytes(\n        instruction_data\n            .get({}..{})\n            .ok_or(ProgramError::InvalidInstructionData)?\n            .try_into()\n            .map_err(|_| ProgramError::InvalidInstructionData)?,\n    );\n",
+                        pname,
+                        rust_ty,
+                        offset,
+                        offset + width
+                    ));
+                    offset += width;
+                }
+                None => {
+                    out.push_str(&format!(
+                        "    // TODO: parse non-numeric param `{}` (spec type {}) from instruction_data\n",
+                        pname, ptype
+                    ));
+                    out.push_str(&format!(
+                        "    let {}: {} = todo!(\"parse {} from instruction_data\");\n",
+                        pname,
+                        map_type_standalone(ptype, spec)?,
+                        pname
+                    ));
+                }
+            }
+        }
+    }
+    let field_init: String = handler
+        .accounts
+        .iter()
+        .map(|a| a.name.clone())
+        .collect::<Vec<_>>()
+        .join(", ");
+    out.push_str(&format!(
+        "    let mut ctx = {} {{ {} }};\n",
+        pascal, field_init
+    ));
+    out.push_str(&format!("    ctx.handler({})\n", param_names.join(", ")));
+    out.push_str("}\n");
+
+    Ok(out)
+}
+
+/// Emit the `.handler()` effect body for a Pinocchio handler (slice 6 4b).
+/// Mechanical SCALAR state effects (`field := v`, `field += / -= / +=! /
+/// +=? n`) lower to a one-time mutable zeropod decode of the state account
+/// plus per-field `.get()`-based arithmetic (universally safe — native int
+/// op then `.into()` back to the Pod field). RHS expressions route through
+/// `bind_pinocchio_expr` so param + scalar-state reads resolve.
+///
+/// SPL Token CPIs from explicit `call Interface.handler(...)` sites lower
+/// via `try_emit_cpi(_, Target::Pinocchio)` (slice 6 step 5b) — the handler
+/// struct's `&'a AccountInfo` fields match `pinocchio_token`'s CPI struct
+/// fields directly.
+///
+/// Deferred (emit a documented breadcrumb): non-scalar effects (array /
+/// nested / variant-payload writes), events, `transfers { … }` sugar
+/// (agent-fill on every target), and generic non-SPL CPI (slice 7).
+fn emit_pinocchio_effect_body(out: &mut String, handler: &ParsedHandler, spec: &ParsedSpec) {
+    let prog = to_pascal_case(&spec.program_name);
+    let err = format!("{}Error", prog);
+    let has = |n: &str| spec.error_codes.iter().any(|c| c == n);
+    let overflow = if has("MathOverflow") {
+        format!("ProgramError::from({}::MathOverflow)", err)
+    } else {
+        "ProgramError::ArithmeticOverflow".to_string()
+    };
+    let underflow = if has("MathUnderflow") {
+        format!("ProgramError::from({}::MathUnderflow)", err)
+    } else if has("MathOverflow") {
+        format!("ProgramError::from({}::MathOverflow)", err)
+    } else {
+        "ProgramError::ArithmeticOverflow".to_string()
+    };
+
+    // Classify scalar state effects (lhs is a simple field after stripping
+    // any `Variant.` prefix — no `.` / `[` remaining).
+    let scalar: Vec<(String, &str, &str)> = handler
+        .effects
+        .iter()
+        .filter_map(|(lhs, op, rhs)| {
+            let field = strip_variant_prefix(lhs, spec);
+            if field.contains('.') || field.contains('[') {
+                None
+            } else {
+                Some((field, op.as_str(), rhs.as_str()))
+            }
+        })
+        .collect();
+
+    // Single-account decode only (multi-account state typing is deferred).
+    let single_state = spec.account_types.len() <= 1;
+    if !scalar.is_empty() && single_state {
+        if let Some(acct) = resolve_handler_state_account(handler, spec) {
+            out.push_str(&format!(
+                "        let __state = {}Account::from_bytes_mut(unsafe {{ self.{}.borrow_mut_data_unchecked() }})\n            .map_err(|_| ProgramError::InvalidAccountData)?;\n",
+                prog, acct.name
+            ));
+            for (field, op, rhs) in &scalar {
+                let r = bind_pinocchio_expr(rhs, handler, "__state");
+                let line = match *op {
+                    "set" => format!("        __state.{field} = ({r}).into();\n"),
+                    "add" => format!(
+                        "        __state.{field} = __state.{field}.get().checked_add({r}).ok_or({overflow})?.into();\n"
+                    ),
+                    "sub" => format!(
+                        "        __state.{field} = __state.{field}.get().checked_sub({r}).ok_or({underflow})?.into();\n"
+                    ),
+                    "add_sat" => format!(
+                        "        __state.{field} = __state.{field}.get().saturating_add({r}).into();\n"
+                    ),
+                    "sub_sat" => format!(
+                        "        __state.{field} = __state.{field}.get().saturating_sub({r}).into();\n"
+                    ),
+                    "add_wrap" => format!(
+                        "        __state.{field} = __state.{field}.get().wrapping_add({r}).into();\n"
+                    ),
+                    "sub_wrap" => format!(
+                        "        __state.{field} = __state.{field}.get().wrapping_sub({r}).into();\n"
+                    ),
+                    other => format!("        // TODO: effect op `{other}` on `{field}` not mechanized\n"),
+                };
+                out.push_str(&line);
+            }
+        } else {
+            out.push_str(
+                "        // TODO(slice 6 4b): could not resolve the state account for effects\n",
+            );
+        }
+    }
+
+    // Deferred surfaces — documented breadcrumbs (not silently dropped).
+    let complex_effects =
+        handler.effects.len() > scalar.len() || (!scalar.is_empty() && !single_state);
+    if complex_effects {
+        out.push_str("        // TODO(slice 6 4b-cont): non-scalar effects (array / nested /\n        // variant-payload writes) + multi-account state.\n");
+    }
+    // SPL Token CPIs from explicit `call Interface.handler(...)` sites
+    // (slice 6 step 5b). The handler struct's `&'a AccountInfo` fields
+    // are exactly what `pinocchio_token::instructions::*` takes, so the
+    // emitter's `self.<acct>` resolves directly. Non-SPL (generic invoke)
+    // call sites return `None` (slice 7) and fall through to a breadcrumb.
+    let mut any_unmechanized_call = false;
+    for c in &handler.calls {
+        match try_emit_cpi(c, handler, spec, Target::Pinocchio) {
+            Some(rendered) => {
+                out.push_str(&format!(
+                    "        // Spec call: {}.{}\n",
+                    c.target_interface, c.target_handler
+                ));
+                out.push_str(&rendered);
+            }
+            None => any_unmechanized_call = true,
+        }
+    }
+    if any_unmechanized_call {
+        out.push_str("        // TODO(slice 7): generic (non-SPL) CPI call sites are not yet\n        // mechanized for Pinocchio (raw invoke_signed + Borsh).\n");
+    }
+
+    // `transfers { … }` stays agent-fill on every target — codegen owns
+    // deterministic translation, the agent owns the CPI/authority business
+    // logic. Events likewise carry no payload binding in the spec.
+    if !handler.emits.is_empty() || !handler.transfers.is_empty() {
+        out.push_str("        // TODO(slice 6 4b-cont): events / transfers.\n");
+    }
 }
 
 /// v2.24 S5b — `true` when the spec's state is a multi-variant ADT
@@ -2033,8 +2649,9 @@ fn find_state_account_filtered(
 const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 
 /// Try to emit a real Anchor CPI invocation for one `call Interface.handler(...)`
-/// site. Returns `None` when the interface isn't recognized (caller falls
-/// back to a comment + `todo!()` so the user / an LLM fills the body).
+/// site. Returns `None` when the interface isn't recognized OR when the
+/// target framework isn't Anchor (caller falls back to a comment +
+/// `todo!()` so the user / an LLM fills the body).
 ///
 /// All five SPL Token handlers — `transfer`, `mint_to`, `burn`,
 /// `initialize_account`, `close_account` — get an `anchor_spl::token::*`
@@ -2042,34 +2659,48 @@ const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 /// `solana_program::program::invoke` shape. The canonical SPL handlers
 /// cover the bulk of CPI traffic in deployed programs, which is what
 /// keeps `todo!()` out of the typical escrow / lending / vault shape.
-fn try_emit_anchor_cpi(
+///
+/// Per-target dispatch: emits the right CPI shape per
+/// `(target, is_spl_token)`.
+///
+/// - Anchor    + SPL Token → `anchor_spl::token::*` builder shape
+/// - Anchor    + generic   → `solana_program::program::invoke` shape
+/// - Quasar    + SPL Token → `quasar_spl::TokenCpi` method chain
+/// - Quasar    + generic   → not implemented (spike scope; §8 slice 3)
+/// - Pinocchio + SPL Token → `pinocchio_token::instructions::*` struct + invoke
+/// - Pinocchio + generic   → not implemented (spike scope; §8 slice 7)
+///
+/// Returns `None` for any branch that isn't implemented yet — the
+/// caller falls back to a structured comment + `todo!()` so the agent
+/// fills the body.
+fn try_emit_cpi(
     call: &crate::check::ParsedCall,
     handler: &ParsedHandler,
     spec: &ParsedSpec,
+    target: Target,
 ) -> Option<String> {
     let iface = spec
         .interfaces
         .iter()
         .find(|i| i.name == call.target_interface)?;
+    let is_spl_token = iface.program_id.as_deref() == Some(SPL_TOKEN_PROGRAM_ID);
 
-    // SPL Token gets the special-case `anchor_spl::token::*` shapes
-    // (typed accounts structs + the existing token::transfer / mint_to /
-    // burn / initialize_account / close_account helpers — fewer lines of
-    // generated code, idiomatic for the bulk of CPI traffic).
-    if iface.program_id.as_deref() == Some(SPL_TOKEN_PROGRAM_ID) {
-        return emit_spl_token_cpi(call, handler, spec);
+    match (target, is_spl_token) {
+        (Target::Anchor, true) => emit_spl_token_cpi_anchor(call, handler, spec),
+        (Target::Anchor, false) => emit_generic_cpi_anchor(call, handler, iface, spec),
+        (Target::Quasar, true) => emit_spl_token_cpi_quasar(call, handler, spec),
+        // Quasar generic CPI — follow-on slice (uses `BufCpiCall`).
+        (Target::Quasar, false) => None,
+        (Target::Pinocchio, true) => emit_spl_token_cpi_pinocchio(call, handler, spec),
+        // Pinocchio generic CPI — follow-on slice (raw invoke_signed).
+        (Target::Pinocchio, false) => None,
     }
-
-    // Every other Anchor program gets the generic `invoke` shape
-    // (v2.9 G3): sighash discriminator + Borsh-serialized args +
-    // AccountMeta synthesis from the interface's accounts block.
-    emit_generic_anchor_cpi(call, handler, iface, spec)
 }
 
 /// SPL Token dispatcher. Routes to the right `anchor_spl::token` helper
 /// per the called handler's name. Returns None on unrecognized handlers
 /// (the caller falls back to comment + `todo!()`).
-fn emit_spl_token_cpi(
+fn emit_spl_token_cpi_anchor(
     call: &crate::check::ParsedCall,
     handler: &ParsedHandler,
     spec: &ParsedSpec,
@@ -2078,7 +2709,7 @@ fn emit_spl_token_cpi(
     let prog_name = &token_program_acct.name;
 
     match call.target_handler.as_str() {
-        "transfer" => emit_spl(
+        "transfer" => emit_spl_anchor(
             call,
             handler,
             spec,
@@ -2088,7 +2719,7 @@ fn emit_spl_token_cpi(
             Some("amount"),
             "transfer",
         ),
-        "mint_to" => emit_spl(
+        "mint_to" => emit_spl_anchor(
             call,
             handler,
             spec,
@@ -2106,7 +2737,7 @@ fn emit_spl_token_cpi(
             Some("amount"),
             "mint_to",
         ),
-        "burn" => emit_spl(
+        "burn" => emit_spl_anchor(
             call,
             handler,
             spec,
@@ -2120,7 +2751,7 @@ fn emit_spl_token_cpi(
             Some("amount"),
             "burn",
         ),
-        "initialize_account" => emit_spl(
+        "initialize_account" => emit_spl_anchor(
             call,
             handler,
             spec,
@@ -2138,7 +2769,7 @@ fn emit_spl_token_cpi(
             None,
             "initialize_account",
         ),
-        "close_account" => emit_spl(
+        "close_account" => emit_spl_anchor(
             call,
             handler,
             spec,
@@ -2226,7 +2857,7 @@ fn find_program_account_for_interface<'a>(
 /// (`MyAmm`) to its conventional handler-side program account name
 /// (`my_amm_program`). Single-pass — adds an underscore before each
 /// uppercase letter (except the first) and lowercases the result.
-fn to_snake_case(s: &str) -> String {
+pub(crate) fn to_snake_case(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 4);
     for (i, c) in s.chars().enumerate() {
         if i > 0 && c.is_ascii_uppercase() {
@@ -2264,7 +2895,7 @@ fn to_snake_case(s: &str) -> String {
 ///     ])?;
 /// }
 /// ```
-fn emit_generic_anchor_cpi(
+fn emit_generic_cpi_anchor(
     call: &crate::check::ParsedCall,
     handler: &ParsedHandler,
     iface: &crate::check::ParsedInterface,
@@ -2420,7 +3051,7 @@ fn emit_generic_anchor_cpi(
 /// some interfaces expose a more semantic name than anchor_spl uses
 /// (e.g. `mint_authority` vs `authority`).
 #[allow(clippy::too_many_arguments)]
-fn emit_spl(
+fn emit_spl_anchor(
     call: &crate::check::ParsedCall,
     handler: &ParsedHandler,
     spec: &ParsedSpec,
@@ -2481,6 +3112,258 @@ fn emit_spl(
     };
     out.push_str(&invocation);
     out.push_str("        }\n");
+    Some(out)
+}
+
+/// Quasar SPL Token dispatcher. Routes to the right `quasar_spl::TokenCpi`
+/// method per the called handler's name. Returns None on unrecognized
+/// handlers so the caller falls back to comment + `todo!()`.
+///
+/// Coverage (slice 2): `transfer`, `mint_to`, `burn`, `close_account`.
+/// `initialize_account` stays `None` — `quasar-spl` exposes only
+/// `initialize_account3`, whose `owner: &Address` positional is a raw key
+/// (not an account view) and which omits the rent sysvar, so it doesn't
+/// fit the uniform `emit_spl_quasar` helper (see the match arm).
+fn emit_spl_token_cpi_quasar(
+    call: &crate::check::ParsedCall,
+    handler: &ParsedHandler,
+    spec: &ParsedSpec,
+) -> Option<String> {
+    let token_program_acct = find_token_program_account(handler)?;
+    let prog_name = &token_program_acct.name;
+
+    match call.target_handler.as_str() {
+        "transfer" => emit_spl_quasar(
+            call,
+            handler,
+            spec,
+            prog_name,
+            "transfer",
+            // Quasar's TokenCpi::transfer signature is
+            // (from, to, authority, amount). Spec arg names must match
+            // the canonical SPL Token interface declared in the spec.
+            &["from", "to", "authority"],
+            Some("amount"),
+        ),
+        "mint_to" => emit_spl_quasar(
+            call,
+            handler,
+            spec,
+            prog_name,
+            "mint_to",
+            // TokenCpi::mint_to(mint, to, authority, amount). The spec's
+            // canonical SPL interface names the authority slot
+            // `mint_authority`; it resolves positionally into the trait's
+            // `authority` parameter.
+            &["mint", "to", "mint_authority"],
+            Some("amount"),
+        ),
+        "burn" => emit_spl_quasar(
+            call,
+            handler,
+            spec,
+            prog_name,
+            "burn",
+            // TokenCpi::burn(from, mint, authority, amount).
+            &["from", "mint", "authority"],
+            Some("amount"),
+        ),
+        "close_account" => emit_spl_quasar(
+            call,
+            handler,
+            spec,
+            prog_name,
+            "close_account",
+            // TokenCpi::close_account(account, destination, authority) —
+            // no scalar.
+            &["account", "destination", "authority"],
+            None,
+        ),
+        // `initialize_account` has no uniform Quasar shape: `quasar-spl`
+        // exposes only `initialize_account3`, whose third positional is
+        // `owner: &Address` (a raw key, not an account view) and which
+        // omits the rent sysvar. That divergent signature doesn't fit the
+        // positional-account-view `emit_spl_quasar` helper, so it falls
+        // through to the caller's `todo!()`.
+        _ => None,
+    }
+}
+
+/// Emit one Quasar `quasar_spl::*` CPI as a single-line method chain on
+/// the token-program account: `self.<prog>.<method>(&self.<a>, …,
+/// scalar).invoke()?;`. The shape comes from `quasar-spl-0.0.0`'s
+/// `TokenCpi` trait (sibling shape to the Anchor builder).
+///
+/// `account_args_in_order` carries the call-site arg names in the order
+/// the Quasar trait method expects (e.g. `["from", "to", "authority"]`
+/// for `transfer`). The function looks each one up in `call.args` and
+/// resolves it to `&self.<rust_expr>`. Unrecognized arg names short-
+/// circuit to `None`.
+fn emit_spl_quasar(
+    call: &crate::check::ParsedCall,
+    handler: &ParsedHandler,
+    spec: &ParsedSpec,
+    token_program: &str,
+    method_name: &str,
+    account_args_in_order: &[&str],
+    scalar_arg: Option<&str>,
+) -> Option<String> {
+    let mut args: Vec<String> = Vec::with_capacity(account_args_in_order.len() + 1);
+    for call_arg in account_args_in_order {
+        let arg = call.args.iter().find(|a| a.name == *call_arg)?;
+        args.push(format!("&self.{}", arg.rust_expr));
+    }
+    if let Some(name) = scalar_arg {
+        let arg = call.args.iter().find(|a| a.name == name)?;
+        args.push(resolve_call_arg_for_amount(&arg.rust_expr, handler, spec));
+    }
+    Some(format!(
+        "        self.{}.{}({}).invoke()?;\n",
+        token_program,
+        method_name,
+        args.join(", ")
+    ))
+}
+
+/// Pinocchio SPL Token dispatcher. Routes to the right
+/// `pinocchio_token::instructions::*` struct per the called handler's
+/// name. Returns None on unrecognized handlers so the caller falls
+/// back to comment + `todo!()`.
+///
+/// Coverage (slice 2b): all five canonical SPL handlers — `transfer`,
+/// `mint_to`, `burn`, `initialize_account`, `close_account`. Field-name
+/// divergences from canonical SPL naming (`MintTo.account` for the
+/// recipient, `MintTo.mint_authority`, `Burn.account` for the source,
+/// `InitializeAccount.rent_sysvar`) are handled per-arm in the
+/// `(pinocchio_field, spec_arg)` map.
+///
+/// **Note on dead-code-ness**: `--target pinocchio` codegen currently
+/// skips the Rust scaffold (`main.rs:3132`), so this emitter is never
+/// reached from the CLI today. It still gets unit-tested directly via
+/// `try_emit_cpi(_, _, _, Target::Pinocchio)`. When Pinocchio scaffold
+/// (§8 slice 6) lands, this emitter is already wired.
+fn emit_spl_token_cpi_pinocchio(
+    call: &crate::check::ParsedCall,
+    handler: &ParsedHandler,
+    spec: &ParsedSpec,
+) -> Option<String> {
+    match call.target_handler.as_str() {
+        "transfer" => emit_spl_pinocchio(
+            call,
+            handler,
+            spec,
+            "Transfer",
+            // (pinocchio_struct_field, spec_arg_name)
+            &[("from", "from"), ("to", "to"), ("authority", "authority")],
+            Some("amount"),
+        ),
+        "mint_to" => emit_spl_pinocchio(
+            call,
+            handler,
+            spec,
+            "MintTo",
+            // pinocchio-token's MintTo names the recipient `account`
+            // (canonical SPL `to`) and the signer `mint_authority`.
+            &[
+                ("mint", "mint"),
+                ("account", "to"),
+                ("mint_authority", "mint_authority"),
+            ],
+            Some("amount"),
+        ),
+        "burn" => emit_spl_pinocchio(
+            call,
+            handler,
+            spec,
+            "Burn",
+            // Burn names the source slot `account` (canonical SPL `from`).
+            &[
+                ("account", "from"),
+                ("mint", "mint"),
+                ("authority", "authority"),
+            ],
+            Some("amount"),
+        ),
+        "initialize_account" => emit_spl_pinocchio(
+            call,
+            handler,
+            spec,
+            "InitializeAccount",
+            // InitializeAccount names the rent sysvar `rent_sysvar`
+            // (canonical SPL `rent`). No scalar.
+            &[
+                ("account", "account"),
+                ("mint", "mint"),
+                ("owner", "owner"),
+                ("rent_sysvar", "rent"),
+            ],
+            None,
+        ),
+        "close_account" => emit_spl_pinocchio(
+            call,
+            handler,
+            spec,
+            "CloseAccount",
+            &[
+                ("account", "account"),
+                ("destination", "destination"),
+                ("authority", "authority"),
+            ],
+            None,
+        ),
+        _ => None,
+    }
+}
+
+/// Emit one `pinocchio_token::instructions::<Struct> { … }.invoke()?;`
+/// CPI. Field assignments use
+/// the pinocchio-token struct field names (passed in
+/// `field_to_arg.0`), resolved against the call site's argument list
+/// (`field_to_arg.1`).
+///
+/// Note: pinocchio_token's struct field names diverge from the
+/// canonical SPL naming for some handlers (`MintTo.account` vs SPL's
+/// `to`; `MintTo.mint_authority` vs SPL's `authority`). The
+/// `field_to_arg` map handles the translation at the codegen boundary,
+/// mirroring how `emit_spl_anchor` handles the Anchor variants.
+fn emit_spl_pinocchio(
+    call: &crate::check::ParsedCall,
+    handler: &ParsedHandler,
+    spec: &ParsedSpec,
+    struct_name: &str,
+    field_to_arg: &[(&str, &str)],
+    scalar_arg: Option<&str>,
+) -> Option<String> {
+    let max_field = field_to_arg
+        .iter()
+        .map(|(f, _)| f.len())
+        .chain(scalar_arg.map(|s| s.len()))
+        .max()
+        .unwrap_or(0);
+
+    let mut out = String::new();
+    out.push_str("        pinocchio_token::instructions::");
+    out.push_str(struct_name);
+    out.push_str(" {\n");
+    for (struct_field, call_arg) in field_to_arg {
+        let arg = call.args.iter().find(|a| a.name == *call_arg)?;
+        let pad = " ".repeat(max_field - struct_field.len());
+        // The Pinocchio handler struct stores each account as
+        // `&'a AccountInfo`, and `pinocchio_token`'s CPI structs take
+        // `&'a AccountInfo` fields — so `self.<acct>` is already the
+        // right type. (A leading `&` would yield `&&AccountInfo`.)
+        out.push_str(&format!(
+            "            {}:{} self.{},\n",
+            struct_field, pad, arg.rust_expr
+        ));
+    }
+    if let Some(name) = scalar_arg {
+        let arg = call.args.iter().find(|a| a.name == name)?;
+        let rhs = resolve_call_arg_for_amount(&arg.rust_expr, handler, spec);
+        let pad = " ".repeat(max_field - name.len());
+        out.push_str(&format!("            {}:{} {},\n", name, pad, rhs));
+    }
+    out.push_str("        }.invoke()?;\n");
     Some(out)
 }
 
@@ -3883,7 +4766,7 @@ pub(crate) fn render_handler_scaffold(
         if c.result_binding.is_none() {
             continue;
         }
-        match try_emit_anchor_cpi(c, handler, spec) {
+        match try_emit_cpi(c, handler, spec, target) {
             Some(rendered) => {
                 out.push_str(&format!(
                     "        // Spec call: {}.{} (binding: {})\n",
@@ -4068,7 +4951,7 @@ pub(crate) fn render_handler_scaffold(
         if emitted_call_indices.contains(&idx) {
             continue;
         }
-        match try_emit_anchor_cpi(c, handler, spec) {
+        match try_emit_cpi(c, handler, spec, target) {
             Some(rendered) => {
                 out.push_str(&format!(
                     "        // Spec call: {}.{} (Anchor CPI emitted by v2.8 G4)\n",
@@ -4300,6 +5183,12 @@ pub(crate) fn generate_guards(
     let lifetime_params = surface.lifetime_params();
     let src_dir = output_dir.join("src");
     std::fs::create_dir_all(&src_dir)?;
+
+    // Pinocchio: dedicated guard emission (raw &AccountInfo ctx + zeropod
+    // state decode), shared with the codegen_mir delegation. (slice 6 4b)
+    if matches!(target, Target::Pinocchio) {
+        return emit_pinocchio_guards(spec, fp, output_dir);
+    }
 
     let mut out = String::new();
     out.push_str(&marker(
@@ -4925,6 +5814,230 @@ pub(crate) fn generate_guards(
     Ok(())
 }
 
+/// True when `expr` references the spec's state binder `s` (a word-bounded
+/// `s` immediately followed by `.`), i.e. it reads a state field.
+fn references_pinocchio_state(expr: &str) -> bool {
+    let bytes = expr.as_bytes();
+    for i in 0..bytes.len() {
+        if bytes[i] == b's'
+            && (i == 0 || !is_ident_char(bytes[i - 1]))
+            && i + 1 < bytes.len()
+            && bytes[i + 1] == b'.'
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Rewrite a spec-rendered Pod expression (`rust_expr_pod`) for the
+/// Pinocchio guard / handler context: the state binder `s` → `state_var`
+/// (the decoded zeropod `&Zc` view), and bare handler-account idents (or
+/// `<acct>.pubkey`) → `ctx.<acct>.key()`. zeropod field accesses already
+/// carry `.get()` in the Pod form, so the rewritten expression typechecks
+/// against the decoded view.
+fn bind_pinocchio_expr(expr: &str, handler: &ParsedHandler, state_var: &str) -> String {
+    let account_names: std::collections::HashSet<&str> =
+        handler.accounts.iter().map(|a| a.name.as_str()).collect();
+    let bytes = expr.as_bytes();
+    let mut out = String::with_capacity(expr.len() + 16);
+    let mut i = 0;
+    while i < bytes.len() {
+        let prev_ok = i == 0 || !is_ident_char(bytes[i - 1]);
+        if prev_ok && is_ident_char(bytes[i]) {
+            let start = i;
+            let mut j = i;
+            while j < bytes.len() && is_ident_char(bytes[j]) {
+                j += 1;
+            }
+            let ident = &expr[start..j];
+            if ident == "s" {
+                // `s.<field>` → `<state_var>.<field>.get()` for a scalar
+                // read (zeropod Pod fields need an explicit `.get()` to
+                // produce the native integer). Complex paths (`s.x.y` /
+                // `s.x[i]`) emit the path head without `.get()` — those
+                // nested/array reads are a follow-on.
+                if j < bytes.len() && bytes[j] == b'.' {
+                    let fstart = j + 1;
+                    let mut k = fstart;
+                    while k < bytes.len() && is_ident_char(bytes[k]) {
+                        k += 1;
+                    }
+                    let field = &expr[fstart..k];
+                    let complex = k < bytes.len() && (bytes[k] == b'.' || bytes[k] == b'[');
+                    if !field.is_empty() && !complex {
+                        out.push_str(&format!("{}.{}.get()", state_var, field));
+                    } else {
+                        out.push_str(&format!("{}.{}", state_var, field));
+                    }
+                    i = k;
+                    continue;
+                }
+                out.push_str(state_var);
+                i = j;
+                continue;
+            }
+            if account_names.contains(ident) {
+                // `<acct>.pubkey` (spec's "this account's address") and a
+                // bare `<acct>` both lower to the runtime key load.
+                let pubkey = b".pubkey";
+                if j + pubkey.len() <= bytes.len()
+                    && &bytes[j..j + pubkey.len()] == pubkey
+                    && (j + pubkey.len() == bytes.len() || !is_ident_char(bytes[j + pubkey.len()]))
+                {
+                    out.push_str(&format!("ctx.{}.key()", ident));
+                    i = j + pubkey.len();
+                    continue;
+                }
+                out.push_str(&format!("ctx.{}.key()", ident));
+                i = j;
+                continue;
+            }
+            out.push_str(ident);
+            i = j;
+            continue;
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+/// Emit `src/guards.rs` for the Pinocchio target (slice 6 4b). Per-handler
+/// guard fns take `ctx: &<Pascal>` + params and return `ProgramResult`.
+/// Handles signer-`auth` (`is_signer`) and `requires` / `aborts_if` (param
+/// clauses directly; scalar state clauses via a one-time zeropod decode of
+/// the state account, reusing `rust_expr_pod` since zeropod shares
+/// quasar-pod's `.get()` API). Lifecycle pre-checks + PDA verification, and
+/// state clauses on multi-account specs, are deferred (documented skip).
+fn emit_pinocchio_guards(spec: &ParsedSpec, fp: &SpecFingerprint, output_dir: &Path) -> Result<()> {
+    let src_dir = output_dir.join("src");
+    std::fs::create_dir_all(&src_dir)?;
+
+    let mut out = String::new();
+    out.push_str(&marker(
+        "DO NOT EDIT — regenerated from .qedspec",
+        fp,
+        "src/guards.rs",
+    ));
+    out.push_str("//! Per-handler guard checks derived from the `.qedspec` (Pinocchio).\n\n");
+    out.push_str(
+        "#![allow(unused_variables, unused_imports, dead_code, clippy::too_many_arguments)]\n\n",
+    );
+    out.push_str(
+        "use pinocchio::{account_info::AccountInfo, program_error::ProgramError, ProgramResult};\n",
+    );
+    out.push_str("use zeropod::ZeroPodFixed;\n");
+    out.push_str("use crate::state::*;\n");
+    if !spec.error_codes.is_empty() {
+        out.push_str("use crate::errors::*;\n");
+    }
+    if !spec.ref_impls.is_empty() {
+        out.push_str("use crate::ref_impls::*;\n");
+    }
+    out.push_str("use crate::instructions::*;\n\n");
+
+    let err_enum = format!("{}Error", to_pascal_case(&spec.program_name));
+    // Multi-account state decode is deferred — the decode type is
+    // unambiguous only for single-account specs.
+    let single_state = spec.account_types.len() <= 1;
+    let state_type = format!("{}Account", to_pascal_case(&spec.program_name));
+
+    for handler in &spec.handlers {
+        let pascal = to_pascal_case(&handler.name);
+        let mut params = vec![format!("ctx: &{}", pascal)];
+        for (pname, ptype) in &handler.takes_params {
+            params.push(format!("{}: {}", pname, map_type_standalone(ptype, spec)?));
+        }
+        out.push_str(&format!(
+            "/// Guards for `{}` — generated from the spec's `requires` / `auth` clauses.\n",
+            handler.name
+        ));
+        out.push_str(&format!(
+            "pub fn {}({}) -> ProgramResult {{\n",
+            handler.name,
+            params.join(", ")
+        ));
+
+        if let Some(who) = &handler.who {
+            if handler
+                .accounts
+                .iter()
+                .any(|a| &a.name == who && a.is_signer)
+            {
+                out.push_str(&format!("    // auth {}\n", who));
+                out.push_str(&format!(
+                    "    if !ctx.{}.is_signer() {{\n        return Err(ProgramError::MissingRequiredSignature);\n    }}\n",
+                    who
+                ));
+            }
+        }
+
+        let needs_state = handler
+            .requires
+            .iter()
+            .any(|r| references_pinocchio_state(&r.rust_expr))
+            || handler
+                .aborts_if
+                .iter()
+                .any(|a| references_pinocchio_state(&a.rust_expr));
+        let decoded = if needs_state && single_state {
+            match resolve_handler_state_account(handler, spec) {
+                Some(acct) => {
+                    out.push_str(&format!(
+                        "    let __state = {}::from_bytes(unsafe {{ ctx.{}.borrow_data_unchecked() }})\n        .map_err(|_| ProgramError::InvalidAccountData)?;\n",
+                        state_type, acct.name
+                    ));
+                    true
+                }
+                None => false,
+            }
+        } else {
+            false
+        };
+
+        for req in &handler.requires {
+            let raw = req.rust_expr.trim();
+            if references_pinocchio_state(raw) && !decoded {
+                out.push_str(&format!(
+                    "    // TODO(slice 6 4b-cont): state-referencing requires (multi-account /\n    //   unresolved state account) — not enforced yet: {}\n",
+                    req.lean_expr.trim()
+                ));
+                continue;
+            }
+            out.push_str(&format!("    // requires: {}\n", req.lean_expr.trim()));
+            let rust = bind_pinocchio_expr(raw, handler, "__state");
+            let err = match &req.error_name {
+                Some(e) => format!("ProgramError::from({}::{})", err_enum, e),
+                None => "ProgramError::Custom(0xFF)".to_string(),
+            };
+            out.push_str(&format!("    if !({}) {{ return Err({}); }}\n", rust, err));
+        }
+
+        for ab in &handler.aborts_if {
+            let raw = ab.rust_expr.trim();
+            if references_pinocchio_state(raw) && !decoded {
+                out.push_str(&format!(
+                    "    // TODO(slice 6 4b-cont): state-referencing abort — not enforced yet: {}\n",
+                    ab.lean_expr.trim()
+                ));
+                continue;
+            }
+            let rust = bind_pinocchio_expr(raw, handler, "__state");
+            out.push_str(&format!(
+                "    if ({}) {{ return Err(ProgramError::from({}::{})); }}\n",
+                rust, err_enum, ab.error_name
+            ));
+        }
+
+        out.push_str("    Ok(())\n}\n\n");
+    }
+
+    out.push_str("// ---- END GENERATED ----\n");
+    std::fs::write(src_dir.join("guards.rs"), &out)?;
+    Ok(())
+}
+
 /// Infer the state struct name for a handler account in multi-account specs.
 fn infer_state_name(
     acct: &crate::check::ParsedHandlerAccount,
@@ -4958,6 +6071,10 @@ const QEDGEN_OWNED_DEPS: &[&str] = &[
     "anchor-spl",
     "quasar-lang",
     "quasar-spl",
+    "pinocchio",
+    "pinocchio-token",
+    "pinocchio-pubkey",
+    "zeropod",
     "qedgen-macros",
 ];
 
@@ -5040,7 +6157,10 @@ fn render_qedgen_cargo_toml(spec: &ParsedSpec, fp: &SpecFingerprint, target: Tar
                 out.push_str("quasar-spl = { version = \"0.0.0\" }\n");
             }
         }
-        Target::Pinocchio => unreachable!("Pinocchio is rejected at the init dispatcher"),
+        // Pinocchio cargo deps live in the MIR path (codegen_mir's
+        // render_cargo_toml) — the legacy pipeline doesn't emit Pinocchio
+        // (slice 6: MIR is the path).
+        Target::Pinocchio => unreachable!("Pinocchio codegen is MIR-only — see codegen_mir"),
     }
     out.push_str(&format!(
         "qedgen-macros = {{ git = \"https://github.com/qedgen/solana-skills\", tag = \"v{}\" }}\n",
@@ -5573,6 +6693,202 @@ handler cancel : State.Open -> State.Closed {
         assert!(guards.contains("EscrowError::Unauthorized.into()"));
         assert!(guards.contains("EscrowError::InvalidLifecycle.into()"));
         assert!(!guards.contains("to_account_view"));
+    }
+
+    /// Slice 6 step 3 — Pinocchio state.rs is zeropod zero-copy: a
+    /// sum-type State lowers to a `#[repr(u8)]` discriminant tag enum +
+    /// a flat `#[derive(ZeroPod)]` superset struct (tag byte + every
+    /// variant field flattened, deduped). No `#[account]` / Anchor shape.
+    #[test]
+    fn pinocchio_state_sum_type_lowers_to_tag_plus_superset() {
+        let src = r#"spec Escrow
+
+type State
+  | Uninitialized
+  | Open of {
+      initializer : Pubkey,
+      amount      : U64,
+    }
+  | Closed
+
+type Error
+  | InvalidAmount
+  | WrongState
+
+handler initialize (amount : U64) : State.Uninitialized -> State.Open {
+  auth initializer
+  accounts {
+    initializer : signer, writable
+  }
+  requires amount > 0 else InvalidAmount
+  effect {
+    Open.initializer := initializer.pubkey
+  }
+}
+"#;
+        let spec = crate::chumsky_adapter::parse_str(src).unwrap();
+        let fp = crate::fingerprint::compute_fingerprint(&spec);
+
+        // Pinocchio state emission is a shared helper (codegen_mir calls it
+        // directly; the legacy generate_state pipeline no longer routes
+        // Pinocchio — MIR is the path).
+        let mut state = String::new();
+        emit_pinocchio_state(&spec, &fp, &mut state).unwrap();
+
+        // zeropod imports, not the pinocchio AccountInfo prelude.
+        assert!(
+            state.contains("use zeropod::ZeroPod;"),
+            "must import zeropod; got:\n{state}"
+        );
+        // Discriminant tag enum from the variant names.
+        assert!(
+            state.contains("#[repr(u8)]")
+                && state.contains("pub enum EscrowAccountTag {")
+                && state.contains("Uninitialized = 0,")
+                && state.contains("Open = 1,")
+                && state.contains("Closed = 2,"),
+            "must emit a #[repr(u8)] tag enum from variants; got:\n{state}"
+        );
+        // Flat ZeroPod superset struct: tag byte + flattened variant fields
+        // (Pubkey -> [u8; 32], U64 -> u64; the derive makes the Pod companion).
+        assert!(
+            state.contains("#[derive(ZeroPod)]\npub struct EscrowAccount {")
+                && state.contains("pub tag: u8,")
+                && state.contains("pub initializer: [u8; 32],")
+                && state.contains("pub amount: u64,"),
+            "must flatten variant payloads into one ZeroPod struct; got:\n{state}"
+        );
+        // No Anchor/Quasar shape leakage.
+        assert!(
+            !state.contains("#[account]") && !state.contains("EscrowAccountInner"),
+            "Pinocchio state must not emit the #[account] wrapper/inner-enum; got:\n{state}"
+        );
+    }
+
+    /// Slice 6 step 4a — Pinocchio instruction scaffold: a struct of
+    /// `&AccountInfo` fields + a `process_<name>` wrapper that binds the
+    /// account slice positionally, LE-parses numeric params, and calls
+    /// `.handler()` (which calls `guards::<name>`).
+    #[test]
+    fn pinocchio_handler_scaffold_emits_struct_and_process_wrapper() {
+        let src = r#"spec Vault
+type Error | InvalidAmount
+state { balance : U64 }
+handler deposit (amount : U64) {
+  accounts {
+    authority : signer, writable
+    vault     : writable
+  }
+  requires amount > 0 else InvalidAmount
+  effect { balance += amount }
+}
+"#;
+        let spec = crate::chumsky_adapter::parse_str(src).unwrap();
+        let handler = spec.handlers.iter().find(|h| h.name == "deposit").unwrap();
+        let out = render_pinocchio_handler_scaffold(handler, &spec).unwrap();
+
+        // Accounts struct of &AccountInfo (no typed wrappers).
+        assert!(
+            out.contains("pub struct Deposit<'a> {")
+                && out.contains("pub authority: &'a AccountInfo,")
+                && out.contains("pub vault: &'a AccountInfo,"),
+            "must emit a &AccountInfo accounts struct; got:\n{out}"
+        );
+        // Handler method takes the param + calls the guard.
+        assert!(
+            out.contains("pub fn handler(&mut self, amount: u64) -> ProgramResult {")
+                && out.contains("guards::deposit(self, amount)?;"),
+            "handler must take params + call guards; got:\n{out}"
+        );
+        // Effect body: zeropod mutable decode + checked scalar arithmetic.
+        // (No MathOverflow declared → falls back to ProgramError::ArithmeticOverflow.)
+        assert!(
+            out.contains(
+                "VaultAccount::from_bytes_mut(unsafe { self.vault.borrow_mut_data_unchecked() })"
+            ),
+            "effect body must mutably decode the state account; got:\n{out}"
+        );
+        assert!(
+            out.contains("__state.balance = __state.balance.get().checked_add(amount).ok_or(ProgramError::ArithmeticOverflow)?.into();"),
+            "scalar `+=` must lower to a checked .get()/.into() update; got:\n{out}"
+        );
+        // process_<name> wrapper: positional account binding + LE param
+        // parse + struct build + dispatch.
+        assert!(
+            out.contains("pub fn process_deposit(accounts: &[AccountInfo], instruction_data: &[u8]) -> ProgramResult {")
+                && out.contains("let [authority, vault, ..] = accounts else {")
+                && out.contains("return Err(ProgramError::NotEnoughAccountKeys);")
+                && out.contains("u64::from_le_bytes(")
+                && out.contains("let mut ctx = Deposit { authority, vault };")
+                && out.contains("ctx.handler(amount)"),
+            "process wrapper must bind accounts + parse params + dispatch; got:\n{out}"
+        );
+        // No Anchor/Quasar Context shape.
+        assert!(
+            !out.contains("Context<") && !out.contains("Ctx<") && !out.contains("to_account_info"),
+            "Pinocchio scaffold must not leak the Anchor/Quasar context shape; got:\n{out}"
+        );
+    }
+
+    /// Slice 6 step 4b — Pinocchio guards.rs: signer-`auth` via `is_signer`,
+    /// param `requires` directly, and state-referencing `requires` via a
+    /// one-time zeropod decode (`State::from_bytes` + `__state.<field>.get()`).
+    #[test]
+    fn pinocchio_guards_signer_param_and_state_requires() {
+        let src = r#"spec Vault
+type Error | InvalidAmount | Insufficient
+state { balance : U64 }
+handler withdraw (amount : U64) {
+  auth owner
+  accounts {
+    owner : signer
+    vault : writable
+  }
+  requires amount > 0 else InvalidAmount
+  requires state.balance >= amount else Insufficient
+  effect { balance -= amount }
+}
+"#;
+        let spec = crate::chumsky_adapter::parse_str(src).unwrap();
+        let fp = crate::fingerprint::compute_fingerprint(&spec);
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path().join("programs");
+        std::fs::create_dir_all(out_dir.join("src")).unwrap();
+
+        emit_pinocchio_guards(&spec, &fp, &out_dir).unwrap();
+        let guards = std::fs::read_to_string(out_dir.join("src/guards.rs")).unwrap();
+
+        // Guard fn signature + pinocchio/zeropod imports.
+        assert!(
+            guards.contains("use zeropod::ZeroPodFixed;")
+                && guards
+                    .contains("pub fn withdraw(ctx: &Withdraw, amount: u64) -> ProgramResult {"),
+            "guard fn signature + imports; got:\n{guards}"
+        );
+        // Signer-auth.
+        assert!(
+            guards.contains("if !ctx.owner.is_signer() {")
+                && guards.contains("return Err(ProgramError::MissingRequiredSignature);"),
+            "must emit the signer-auth check; got:\n{guards}"
+        );
+        // Param requires — direct.
+        assert!(
+            guards.contains(
+                "if !(amount > 0) { return Err(ProgramError::from(VaultError::InvalidAmount)); }"
+            ),
+            "param requires must emit a direct if-check; got:\n{guards}"
+        );
+        // State requires — decode + .get() on the decoded view.
+        assert!(
+            guards
+                .contains("VaultAccount::from_bytes(unsafe { ctx.vault.borrow_data_unchecked() })"),
+            "state-referencing requires must decode the state account; got:\n{guards}"
+        );
+        assert!(
+            guards.contains("__state.balance.get() >= amount")
+                && guards.contains("VaultError::Insufficient"),
+            "state requires must read via the decoded __state view; got:\n{guards}"
+        );
     }
 
     /// v2.24 S5b — multi-variant ADT state lowers to the
@@ -6442,7 +7758,7 @@ handler initialize : State.Active -> State.Active {
 
     // ----- v2.8 G4: Anchor CPI codegen for SPL Token transfer -----
 
-    /// Exercise try_emit_anchor_cpi against an end-to-end-parsed spec.
+    /// Exercise try_emit_cpi against an end-to-end-parsed spec.
     /// Hits the resolver pipeline (no need to construct ParsedSpec by
     /// hand) and confirms the SPL Token transfer shape lands.
     #[test]
@@ -6488,7 +7804,8 @@ handler send (n : U64) : State.Active -> State.Active {
             .find(|h| h.name == "send")
             .expect("send handler");
         let call = handler.calls.first().expect("call site");
-        let rendered = try_emit_anchor_cpi(call, handler, &spec).expect("should emit Anchor CPI");
+        let rendered =
+            try_emit_cpi(call, handler, &spec, Target::Anchor).expect("should emit Anchor CPI");
         assert!(
             rendered.contains("anchor_spl::token::{self, Transfer}"),
             "must use anchor_spl::token::Transfer; got:\n{rendered}"
@@ -6500,6 +7817,499 @@ handler send (n : U64) : State.Active -> State.Active {
         assert!(
             rendered.contains("token::transfer(CpiContext::new(cpi_program, cpi_accounts), n)"),
             "amount arg `n` is a handler param and should pass through bare; got:\n{rendered}"
+        );
+    }
+
+    /// Helper for the Quasar / Pinocchio CPI tests — same SPL Token
+    /// transfer fixture shape used in
+    /// `cpi_emits_anchor_spl_transfer_for_canonical_program_id`, but
+    /// parameterized so each test can swap the called handler name in
+    /// the call site.
+    #[cfg(test)]
+    fn parse_spl_transfer_caller_spec(called_handler: &str) -> crate::check::ParsedSpec {
+        let spec_src = format!(
+            r#"spec Caller
+program_id "11111111111111111111111111111111"
+
+interface Token {{
+  program_id "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+  handler transfer (amount : U64) {{
+    discriminant "0x03"
+    accounts {{
+      from      : writable
+      to        : writable
+      authority : signer
+    }}
+    requires amount > 0
+    ensures  amount > 0
+  }}
+  handler mint_to (amount : U64) {{
+    discriminant "0x07"
+    accounts {{
+      mint      : writable
+      to        : writable
+      authority : signer
+    }}
+  }}
+}}
+
+type State | Active of {{ balance : U64 }}
+type Error | E
+
+handler send (n : U64) : State.Active -> State.Active {{
+  permissionless
+  accounts {{
+    state         : writable
+    src           : writable
+    dst           : writable
+    mint          : writable
+    auth          : signer
+    token_program : program
+  }}
+  call Token.{}(from = src, to = dst, mint = mint, amount = n, authority = auth)
+}}
+"#,
+            called_handler
+        );
+        crate::chumsky_adapter::parse_str(&spec_src).unwrap()
+    }
+
+    /// Caller fixture for `mint_to`: the canonical SPL interface names the
+    /// signer slot `mint_authority`. Shared by the Quasar + Pinocchio
+    /// mint_to tests (the shared transfer fixture passes `authority`, which
+    /// mint_to doesn't accept).
+    fn parse_mint_to_caller_spec() -> ParsedSpec {
+        crate::chumsky_adapter::parse_str(
+            r#"spec Caller
+program_id "11111111111111111111111111111111"
+
+interface Token {
+  program_id "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+  handler mint_to (amount : U64) {
+    discriminant "0x07"
+    accounts {
+      mint            : writable
+      to              : writable, type token
+      mint_authority  : signer
+    }
+  }
+}
+
+type State | Active of { stash : U64 }
+type Error | E
+
+handler do_mint (n : U64) : State.Active -> State.Active {
+  permissionless
+  accounts {
+    state          : writable
+    the_mint       : writable
+    holder_ta      : writable, type token
+    minter         : signer
+    token_program  : program
+  }
+  call Token.mint_to(mint = the_mint, to = holder_ta, mint_authority = minter, amount = n)
+}
+"#,
+        )
+        .unwrap()
+    }
+
+    /// Caller fixture for `close_account` (no scalar; account/destination/
+    /// authority). Shared by the Quasar + Pinocchio close tests.
+    fn parse_close_account_caller_spec() -> ParsedSpec {
+        crate::chumsky_adapter::parse_str(
+            r#"spec Caller
+program_id "11111111111111111111111111111111"
+
+interface Token {
+  program_id "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+  handler close_account {
+    discriminant "0x09"
+    accounts {
+      account     : writable, type token
+      destination : writable
+      authority   : signer
+    }
+  }
+}
+
+type State | Active of { x : U64 }
+type Error | E
+
+handler do_close : State.Active -> State.Active {
+  permissionless
+  accounts {
+    state          : writable
+    target_acct    : writable, type token
+    sweep_target   : writable
+    closer         : signer
+    token_program  : program
+  }
+  call Token.close_account(account = target_acct, destination = sweep_target, authority = closer)
+}
+"#,
+        )
+        .unwrap()
+    }
+
+    /// Caller fixture for `initialize_account` (no scalar; account/mint/
+    /// owner/rent). Shared by the Quasar (→ None) + Pinocchio init tests.
+    fn parse_init_account_caller_spec() -> ParsedSpec {
+        crate::chumsky_adapter::parse_str(
+            r#"spec Caller
+program_id "11111111111111111111111111111111"
+
+interface Token {
+  program_id "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+  handler initialize_account {
+    discriminant "0x01"
+    accounts {
+      account : writable
+      mint    : readonly
+      owner   : readonly
+      rent    : readonly
+    }
+  }
+}
+
+type State | Active of { x : U64 }
+type Error | E
+
+handler do_init : State.Active -> State.Active {
+  permissionless
+  accounts {
+    state          : writable
+    new_acct       : writable
+    the_mint       : writable
+    the_owner      : writable
+    rent_sysvar    : writable
+    token_program  : program
+  }
+  call Token.initialize_account(account = new_acct, mint = the_mint, owner = the_owner, rent = rent_sysvar)
+}
+"#,
+        )
+        .unwrap()
+    }
+
+    /// Spike: Quasar SPL Token transfer emits a one-line method chain
+    /// on the token-program account, NOT an `anchor_spl::*` builder.
+    /// The shape is:
+    ///   self.token_program.transfer(&self.src, &self.dst, &self.auth, n).invoke()?;
+    #[test]
+    fn cpi_emits_quasar_spl_transfer() {
+        let spec = parse_spl_transfer_caller_spec("transfer");
+        let handler = spec.handlers.iter().find(|h| h.name == "send").unwrap();
+        let call = handler.calls.first().unwrap();
+        let rendered = try_emit_cpi(call, handler, &spec, Target::Quasar)
+            .expect("Quasar SPL transfer must emit");
+        assert!(
+            rendered.contains("self.token_program.transfer("),
+            "Quasar shape must invoke transfer on the token-program account; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("&self.src"),
+            "from arg must resolve to &self.src; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("&self.dst"),
+            "to arg must resolve to &self.dst; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("&self.auth"),
+            "authority arg must resolve to &self.auth; got:\n{rendered}"
+        );
+        assert!(
+            rendered.trim_end().ends_with(".invoke()?;"),
+            "Quasar trait chain must terminate with .invoke()?; got:\n{rendered}"
+        );
+        // Anti-regression: must NOT leak the Anchor shape.
+        assert!(
+            !rendered.contains("anchor_spl"),
+            "Quasar emission must not import anchor_spl; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("CpiContext"),
+            "Quasar emission must not construct CpiContext; got:\n{rendered}"
+        );
+    }
+
+    /// Slice 2: Quasar SPL `mint_to` emits the trait method chain. The
+    /// spec names the signer `mint_authority`; it resolves positionally
+    /// into `TokenCpi::mint_to(mint, to, authority, amount)`.
+    #[test]
+    fn cpi_emits_quasar_spl_mint_to() {
+        let spec = parse_mint_to_caller_spec();
+        let handler = spec.handlers.iter().find(|h| h.name == "do_mint").unwrap();
+        let call = handler.calls.first().unwrap();
+        let rendered = try_emit_cpi(call, handler, &spec, Target::Quasar)
+            .expect("Quasar SPL mint_to must emit");
+        assert!(
+            rendered.contains("self.token_program.mint_to("),
+            "must invoke mint_to on the token-program account; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("&self.the_mint")
+                && rendered.contains("&self.holder_ta")
+                && rendered.contains("&self.minter"),
+            "mint/to/mint_authority must resolve to call-site accounts; got:\n{rendered}"
+        );
+        assert!(
+            rendered.trim_end().ends_with(".invoke()?;"),
+            "must terminate with .invoke()?; got:\n{rendered}"
+        );
+    }
+
+    /// Slice 2: Quasar SPL `burn` — TokenCpi::burn(from, mint, authority,
+    /// amount). The shared transfer fixture supplies exactly this arg set.
+    #[test]
+    fn cpi_emits_quasar_spl_burn() {
+        let spec = parse_spl_transfer_caller_spec("burn");
+        let handler = spec.handlers.iter().find(|h| h.name == "send").unwrap();
+        let call = handler.calls.first().unwrap();
+        let rendered =
+            try_emit_cpi(call, handler, &spec, Target::Quasar).expect("Quasar SPL burn must emit");
+        assert!(
+            rendered.contains("self.token_program.burn(")
+                && rendered.contains("&self.src")
+                && rendered.contains("&self.mint")
+                && rendered.contains("&self.auth"),
+            "burn must resolve from/mint/authority; got:\n{rendered}"
+        );
+    }
+
+    /// Slice 2: Quasar SPL `close_account` — no scalar; three account args
+    /// (account, destination, authority).
+    #[test]
+    fn cpi_emits_quasar_spl_close_account_no_amount() {
+        let spec = parse_close_account_caller_spec();
+        let handler = spec.handlers.iter().find(|h| h.name == "do_close").unwrap();
+        let call = handler.calls.first().unwrap();
+        let rendered = try_emit_cpi(call, handler, &spec, Target::Quasar)
+            .expect("Quasar SPL close_account must emit");
+        assert!(
+            rendered.contains("self.token_program.close_account(")
+                && rendered.contains("&self.target_acct")
+                && rendered.contains("&self.sweep_target")
+                && rendered.contains("&self.closer"),
+            "close_account must resolve account/destination/authority; got:\n{rendered}"
+        );
+        assert!(
+            rendered.trim_end().ends_with(".invoke()?;"),
+            "must terminate with .invoke()?; got:\n{rendered}"
+        );
+    }
+
+    /// Slice 2: Quasar SPL `initialize_account` stays `None` — `quasar-spl`
+    /// exposes only `initialize_account3` (owner is a raw `&Address`, no
+    /// rent sysvar), which doesn't fit the uniform account-view helper.
+    #[test]
+    fn cpi_quasar_spl_initialize_account_falls_through_to_none() {
+        let spec = parse_init_account_caller_spec();
+        let handler = spec.handlers.iter().find(|h| h.name == "do_init").unwrap();
+        let call = handler.calls.first().unwrap();
+        assert!(
+            try_emit_cpi(call, handler, &spec, Target::Quasar).is_none(),
+            "Quasar initialize_account has no uniform shape; must fall through to None"
+        );
+    }
+
+    /// Spike commit 2: Pinocchio SPL Token transfer emits a struct-
+    /// construction `Transfer { … }.invoke()?` — sibling shape to the
+    /// Quasar method chain but with field assignments.
+    ///
+    /// Note: the Pinocchio emitter is dead code from the CLI today
+    /// (scaffold gate at `main.rs:3132`); this test exercises the
+    /// emitter directly. When slice 6 lands, this is the same string
+    /// the CLI emits.
+    #[test]
+    fn cpi_emits_pinocchio_spl_transfer() {
+        let spec = parse_spl_transfer_caller_spec("transfer");
+        let handler = spec.handlers.iter().find(|h| h.name == "send").unwrap();
+        let call = handler.calls.first().unwrap();
+        let rendered = try_emit_cpi(call, handler, &spec, Target::Pinocchio)
+            .expect("Pinocchio SPL transfer must emit");
+        assert!(
+            rendered.contains("pinocchio_token::instructions::Transfer {"),
+            "Pinocchio shape must construct the qualified Transfer struct; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("from:") && rendered.contains("self.src"),
+            "from field must resolve to self.src; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("to:") && rendered.contains("self.dst"),
+            "to field must resolve to self.dst; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("authority:") && rendered.contains("self.auth"),
+            "authority field must resolve to self.auth; got:\n{rendered}"
+        );
+        // The struct fields are `&'a AccountInfo`, so the emitter must NOT
+        // prepend `&` (that would yield `&&AccountInfo`).
+        assert!(
+            !rendered.contains("&self."),
+            "Pinocchio CPI must pass `self.<acct>` not `&self.<acct>`; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("amount:"),
+            "amount scalar must appear as a struct field; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("}.invoke()?;"),
+            "Pinocchio struct must terminate with .invoke()?; got:\n{rendered}"
+        );
+        // Anti-regression: no Anchor / Quasar shape leakage.
+        assert!(
+            !rendered.contains("anchor_spl") && !rendered.contains("CpiContext"),
+            "Pinocchio emission must not leak Anchor shape; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains(".transfer("),
+            "Pinocchio is struct-construction, not method chain; got:\n{rendered}"
+        );
+    }
+
+    /// Slice 2b: Pinocchio SPL `mint_to` constructs the MintTo struct.
+    /// pinocchio-token names the recipient slot `account` (canonical SPL
+    /// `to`) and the signer `mint_authority`.
+    #[test]
+    fn cpi_emits_pinocchio_spl_mint_to() {
+        let spec = parse_mint_to_caller_spec();
+        let handler = spec.handlers.iter().find(|h| h.name == "do_mint").unwrap();
+        let call = handler.calls.first().unwrap();
+        let rendered = try_emit_cpi(call, handler, &spec, Target::Pinocchio)
+            .expect("Pinocchio SPL mint_to must emit");
+        assert!(
+            rendered.contains("pinocchio_token::instructions::MintTo {"),
+            "must construct the MintTo struct; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("mint:") && rendered.contains("self.the_mint"),
+            "mint field; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("account:") && rendered.contains("self.holder_ta"),
+            "recipient maps to pinocchio field `account` ← spec `to`; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("mint_authority:") && rendered.contains("self.minter"),
+            "signer maps to `mint_authority`; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("&self."),
+            "Pinocchio CPI must pass `self.<acct>` not `&self.<acct>`; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("amount:") && rendered.contains("}.invoke()?;"),
+            "amount scalar + .invoke()?; got:\n{rendered}"
+        );
+    }
+
+    /// Slice 2b: Pinocchio SPL `burn` — Burn names the source slot
+    /// `account` (canonical SPL `from`).
+    #[test]
+    fn cpi_emits_pinocchio_spl_burn() {
+        let spec = parse_spl_transfer_caller_spec("burn");
+        let handler = spec.handlers.iter().find(|h| h.name == "send").unwrap();
+        let call = handler.calls.first().unwrap();
+        let rendered = try_emit_cpi(call, handler, &spec, Target::Pinocchio)
+            .expect("Pinocchio SPL burn must emit");
+        assert!(
+            rendered.contains("pinocchio_token::instructions::Burn {"),
+            "must construct the Burn struct; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("account:") && rendered.contains("self.src"),
+            "source maps to pinocchio field `account` ← spec `from`; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("mint:") && rendered.contains("authority:"),
+            "mint + authority fields; got:\n{rendered}"
+        );
+    }
+
+    /// Slice 2b: Pinocchio SPL `initialize_account` — no scalar; rent
+    /// sysvar maps to pinocchio field `rent_sysvar` (canonical SPL `rent`).
+    #[test]
+    fn cpi_emits_pinocchio_spl_initialize_account_no_amount() {
+        let spec = parse_init_account_caller_spec();
+        let handler = spec.handlers.iter().find(|h| h.name == "do_init").unwrap();
+        let call = handler.calls.first().unwrap();
+        let rendered = try_emit_cpi(call, handler, &spec, Target::Pinocchio)
+            .expect("Pinocchio SPL initialize_account must emit");
+        assert!(
+            rendered.contains("pinocchio_token::instructions::InitializeAccount {"),
+            "must construct InitializeAccount; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("rent_sysvar:") && rendered.contains("self.rent_sysvar"),
+            "rent maps to pinocchio field `rent_sysvar`; got:\n{rendered}"
+        );
+        // No scalar — no `amount:` field.
+        assert!(
+            !rendered.contains("amount:") && rendered.contains("}.invoke()?;"),
+            "no-amount handler must not emit an amount field; got:\n{rendered}"
+        );
+    }
+
+    /// Slice 2b: Pinocchio SPL `close_account` — no scalar.
+    #[test]
+    fn cpi_emits_pinocchio_spl_close_account_no_amount() {
+        let spec = parse_close_account_caller_spec();
+        let handler = spec.handlers.iter().find(|h| h.name == "do_close").unwrap();
+        let call = handler.calls.first().unwrap();
+        let rendered = try_emit_cpi(call, handler, &spec, Target::Pinocchio)
+            .expect("Pinocchio SPL close_account must emit");
+        assert!(
+            rendered.contains("pinocchio_token::instructions::CloseAccount {")
+                && rendered.contains("self.target_acct")
+                && rendered.contains("self.sweep_target")
+                && rendered.contains("self.closer"),
+            "close_account must resolve account/destination/authority; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("amount:") && rendered.contains("}.invoke()?;"),
+            "no-amount handler must not emit an amount field; got:\n{rendered}"
+        );
+    }
+
+    /// Pinocchio generic (non-SPL) CPI is unimplemented; the
+    /// `(Target::Pinocchio, false)` branch in `try_emit_cpi` returns
+    /// None (generic non-SPL Pinocchio CPI is a follow-on slice).
+    #[test]
+    fn cpi_pinocchio_non_spl_falls_through_to_none() {
+        // A spec whose called interface is NOT the SPL Token program.
+        let spec = crate::chumsky_adapter::parse_str(
+            r#"spec Caller
+program_id "11111111111111111111111111111111"
+
+interface MyAmm {
+  program_id "MyAmm22222222222222222222222222222222222222"
+  handler swap (amount : U64) {
+    discriminant "0x01"
+    accounts { src : writable }
+  }
+}
+
+type State | Active of { balance : U64 }
+type Error | E
+
+handler send : State.Active -> State.Active {
+  permissionless
+  accounts {
+    src : writable
+  }
+  call MyAmm.swap(src = src, amount = balance)
+}
+"#,
+        )
+        .unwrap();
+        let handler = spec.handlers.iter().find(|h| h.name == "send").unwrap();
+        let call = handler.calls.first().unwrap();
+        assert!(
+            try_emit_cpi(call, handler, &spec, Target::Pinocchio).is_none(),
+            "Pinocchio generic CPI is unimplemented; must fall through to None"
         );
     }
 
@@ -6569,7 +8379,7 @@ handler send : State.Active -> State.Active {
         let handler = spec.handlers.iter().find(|h| h.name == "send").unwrap();
         let call = handler.calls.first().unwrap();
         assert!(
-            try_emit_anchor_cpi(call, handler, &spec).is_none(),
+            try_emit_cpi(call, handler, &spec, Target::Anchor).is_none(),
             "missing program account should defer to comment + todo!()"
         );
     }
@@ -6616,7 +8426,7 @@ handler send : State.Active -> State.Active {
             .find(|h| h.name == "send")
             .expect("send handler");
         let call = handler.calls.first().expect("call site");
-        let rendered = try_emit_anchor_cpi(call, handler, &spec)
+        let rendered = try_emit_cpi(call, handler, &spec, Target::Anchor)
             .expect("must emit a generic CPI shape for non-SPL Anchor programs");
 
         // Sanity-check the emitted shape:
@@ -6678,7 +8488,7 @@ handler liquidate (loss : U64) : State.Active -> State.Active {
             Some("burned"),
             "result_binding should land in ParsedCall"
         );
-        let rendered = try_emit_anchor_cpi(call, handler, &spec)
+        let rendered = try_emit_cpi(call, handler, &spec, Target::Anchor)
             .expect("must emit a generic CPI with let-binding capture");
         // Block opens as a `let burned = { … }` expression.
         assert!(
@@ -6900,7 +8710,7 @@ handler do_mint (n : U64) : State.Active -> State.Active {
         .unwrap();
         let handler = spec.handlers.iter().find(|h| h.name == "do_mint").unwrap();
         let call = handler.calls.first().unwrap();
-        let rendered = try_emit_anchor_cpi(call, handler, &spec).expect("should emit");
+        let rendered = try_emit_cpi(call, handler, &spec, Target::Anchor).expect("should emit");
         assert!(
             rendered.contains("anchor_spl::token::{self, MintTo}"),
             "should use MintTo struct; got:\n{rendered}"
@@ -6962,7 +8772,7 @@ handler do_burn (n : U64) : State.Active -> State.Active {
         .unwrap();
         let handler = spec.handlers.iter().find(|h| h.name == "do_burn").unwrap();
         let call = handler.calls.first().unwrap();
-        let rendered = try_emit_anchor_cpi(call, handler, &spec).expect("should emit");
+        let rendered = try_emit_cpi(call, handler, &spec, Target::Anchor).expect("should emit");
         assert!(rendered.contains("anchor_spl::token::{self, Burn}"));
         assert!(rendered.contains("token::burn(CpiContext::new"));
         // Padding aligns colons across fields; use a substring that's
@@ -7013,7 +8823,7 @@ handler do_init : State.Active -> State.Active {
         .unwrap();
         let handler = spec.handlers.iter().find(|h| h.name == "do_init").unwrap();
         let call = handler.calls.first().unwrap();
-        let rendered = try_emit_anchor_cpi(call, handler, &spec).expect("should emit");
+        let rendered = try_emit_cpi(call, handler, &spec, Target::Anchor).expect("should emit");
         assert!(rendered.contains("InitializeAccount"));
         // No scalar arg — the invocation has no second positional parameter.
         assert!(
@@ -7070,7 +8880,7 @@ handler do_close : State.Active -> State.Active {
         .unwrap();
         let handler = spec.handlers.iter().find(|h| h.name == "do_close").unwrap();
         let call = handler.calls.first().unwrap();
-        let rendered = try_emit_anchor_cpi(call, handler, &spec).expect("should emit");
+        let rendered = try_emit_cpi(call, handler, &spec, Target::Anchor).expect("should emit");
         assert!(rendered.contains("CloseAccount"));
         assert!(
             rendered.contains("token::close_account(CpiContext::new(cpi_program, cpi_accounts))?;")
@@ -7117,7 +8927,7 @@ handler send : State.Active -> State.Active {
         .unwrap();
         let handler = spec.handlers.iter().find(|h| h.name == "send").unwrap();
         let call = handler.calls.first().unwrap();
-        let rendered = try_emit_anchor_cpi(call, handler, &spec).expect("should emit");
+        let rendered = try_emit_cpi(call, handler, &spec, Target::Anchor).expect("should emit");
         assert!(
             rendered.contains("self.state.stash"),
             "state-field amount must resolve to self.<state_acct>.<field>; got:\n{rendered}"

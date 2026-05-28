@@ -101,8 +101,10 @@ pub(crate) enum Target {
     /// ProgramError>`, `#[program] mod`, explicit
     /// `#[instruction(discriminator = N)]` on each handler.
     Quasar,
-    /// Pinocchio (no_std) Rust program. Reserved CLI surface; codegen
-    /// is not yet implemented and selecting it errors.
+    /// Pinocchio (no_std) Rust program. `#![no_std]`,
+    /// `entrypoint!` + byte-discriminant dispatch, `&AccountInfo`
+    /// account structs with `.handler()` methods, `zeropod` zero-copy
+    /// state, `Result<(), ProgramError>`. MIR-native codegen.
     Pinocchio,
 }
 
@@ -1107,6 +1109,26 @@ enum AristotleCommands {
 /// is found before hitting the filesystem root. qedgen refuses to write
 /// scaffolding unless the user has a git repo — the safety net for
 /// regeneration is a clean working tree.
+/// Redirect a `…/tests/kani_impl.rs` path to a sibling `…/src/kani_impl.rs`.
+/// Pinocchio Kani harnesses must live in the lib (`src/`) because
+/// `cargo kani` only discovers `#[kani::proof]` there, not in `tests/`
+/// (M1 smoke-test finding, design doc §11a). Paths whose parent is not
+/// `tests` pass through unchanged so an explicit `--kani-impl-output`
+/// override is respected.
+fn redirect_kani_impl_to_src(path: &std::path::Path) -> PathBuf {
+    let file = path
+        .file_name()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("kani_impl.rs"));
+    match path.parent() {
+        Some(parent) if parent.file_name().and_then(|s| s.to_str()) == Some("tests") => {
+            // …/tests/kani_impl.rs → …/src/kani_impl.rs
+            parent.parent().unwrap_or(parent).join("src").join(&file)
+        }
+        _ => path.to_path_buf(),
+    }
+}
+
 fn has_git_repo(start: &std::path::Path) -> bool {
     let mut cur = match start.canonicalize() {
         Ok(p) => p,
@@ -2225,18 +2247,6 @@ async fn dispatch(cmd: Commands) -> Result<()> {
             target,
             output_dir,
         } => {
-            // Pinocchio reserves the CLI surface but is not yet
-            // implemented. Anchor and Quasar branches are wired
-            // end-to-end below.
-            if matches!(target, Some(Target::Pinocchio)) {
-                anyhow::bail!(
-                    "`--target pinocchio` is not yet implemented. \
-                     `--target anchor` and `--target quasar` are \
-                     supported; omit `--target` to skip program \
-                     scaffolding entirely."
-                );
-            }
-
             // Program scaffolding (codegen + kani harnesses + unit tests)
             // requires the original `.qedspec` — `init` writes a
             // separate `Spec.lean` skeleton, but the codegen path parses
@@ -2282,8 +2292,13 @@ async fn dispatch(cmd: Commands) -> Result<()> {
                 // program_root, which had no Cargo.toml above it.
                 let kani_path = program_dir.join("tests/kani.rs");
 
-                // Generate the framework-flavored Rust program skeleton.
-                codegen::generate(qedspec_path, &program_dir, target)?;
+                // Generate the framework-flavored Rust program skeleton via
+                // the default MIR path (codegen_mir) — same as the `codegen`
+                // command. Routes Pinocchio through its MIR-native emitters
+                // and keeps init consistent with the MIR-is-the-path design.
+                let parsed = check::parse_spec_file(qedspec_path)?;
+                let mir = mir::lower(&parsed);
+                codegen_mir::generate(&mir, &parsed, qedspec_path, &program_dir, target)?;
 
                 // Kani harnesses are framework-neutral (no Anchor/Quasar
                 // types — pure spec-derived state model).
@@ -3098,38 +3113,15 @@ async fn dispatch(cmd: Commands) -> Result<()> {
             fill_tests,
         } => {
             require_git_repo()?;
-            // v2.24.x: Pinocchio reserves the Rust-scaffold CLI surface
-            // but has no scaffold implementation yet. Verification
-            // backends (Kani / proptest / Lean / integration_test /
-            // CI / crucible) are spec-driven and target-agnostic —
-            // they reason about spec semantics, not the runtime
-            // representation — so they run cleanly for Pinocchio
-            // specs even without a Rust scaffold. Skip the
-            // `codegen::generate` step on Pinocchio when the user
-            // asked for at least one backend flag (or `--all`).
-            // Bail loudly only when the user requested the scaffold
-            // alone (no backend flags) and Pinocchio is the chosen
-            // target — that's the unambiguous "I want a Pinocchio
-            // Rust program" case the scaffold can't satisfy.
-            let any_backend =
-                kani || kani_impl || proptest || lean || test || integration || ci || crucible;
-            let pinocchio_no_scaffold = matches!(target, Target::Pinocchio);
-            if pinocchio_no_scaffold && !any_backend && !all {
-                anyhow::bail!(
-                    "`--target pinocchio` is not yet implemented for Rust scaffold codegen. \
-                     `--target anchor` and `--target quasar` are supported for scaffold. \
-                     To generate just the verification backends (Kani / proptest / Lean / etc.) \
-                     for a Pinocchio spec, pass `--kani`, `--proptest`, `--lean`, or `--all` \
-                     alongside `--target pinocchio` — the scaffold step will be skipped and \
-                     the backends will run against the spec directly."
-                );
-            }
+            // Pinocchio is MIR-native (slice 6): the scaffold emits via
+            // `codegen_mir` for all three targets. `is_pinocchio` still
+            // gates the post-regen stamped-drift scan below (the Pinocchio
+            // scaffold carries no `#[qed(verified)]` stamps to drift yet).
+            let is_pinocchio = matches!(target, Target::Pinocchio);
             let cwd = std::env::current_dir()?;
             let spec = init::resolve_spec_path(spec.as_deref(), &cwd)?;
-            // Rust skeleton — Anchor and Quasar emit; Pinocchio skips
-            // (handled above + here so `--all` on Pinocchio still
-            // works for the backend artifacts).
-            if !pinocchio_no_scaffold {
+            // Rust skeleton — all three targets emit via the MIR path.
+            {
                 // v2.30 Phase 4i — MIR is the default Anchor/Quasar
                 // codegen path. 9 of 10 sub-generators
                 // (cargo_toml / math / events / errors / ref_impls /
@@ -3137,11 +3129,10 @@ async fn dispatch(cmd: Commands) -> Result<()> {
                 // MIR-direct; `guards` stays delegated to legacy
                 // pending the typed-Stmt refactor (v3.0).
                 // `QEDGEN_LEGACY_CODEGEN=1` opts back into the
-                // ParsedSpec-direct renderer as an escape hatch.
-                // `QEDGEN_USE_MIR_CODEGEN=1` is no-longer-required
-                // but kept as a no-op alias for shell history / CI
-                // compatibility.
-                if std::env::var("QEDGEN_LEGACY_CODEGEN").is_ok() {
+                // ParsedSpec-direct renderer as an escape hatch — but
+                // only for Anchor/Quasar; the legacy renderer has no
+                // Pinocchio arm, so Pinocchio always takes the MIR path.
+                if std::env::var("QEDGEN_LEGACY_CODEGEN").is_ok() && !is_pinocchio {
                     codegen::generate(&spec, &output_dir, target)?;
                 } else {
                     let parsed = check::parse_spec_file(&spec)?;
@@ -3211,7 +3202,27 @@ async fn dispatch(cmd: Commands) -> Result<()> {
                 if let Err(e) = deps::require_kani() {
                     eprintln!("warning: {e}");
                 }
-                kani_impl::generate(&spec, &kani_impl_output, /*explicit_flag=*/ kani_impl)?;
+                // Pinocchio AND Quasar harnesses must live in the program
+                // crate's `src/` — `cargo kani` only discovers
+                // `#[kani::proof]` in the lib, not in `tests/` (M1
+                // smoke-test finding, design doc §11a), and the harness's
+                // `crate::<Pascal>` references only resolve from inside the
+                // lib crate. Redirect the default Anchor-shaped
+                // `…/tests/kani_impl.rs` path to a sibling `…/src/`.
+                // (Anchor stays in `tests/` — its tests/-placement is the
+                // pre-existing default; revisiting it is out of slice-5
+                // scope.)
+                let kani_impl_path = if matches!(target, Target::Pinocchio | Target::Quasar) {
+                    redirect_kani_impl_to_src(&kani_impl_output)
+                } else {
+                    kani_impl_output.clone()
+                };
+                kani_impl::generate(
+                    &spec,
+                    &kani_impl_path,
+                    /*explicit_flag=*/ kani_impl,
+                    target,
+                )?;
             }
 
             if test || all {
@@ -3327,7 +3338,7 @@ async fn dispatch(cmd: Commands) -> Result<()> {
             // user-owned `#[qed(verified)]` stamps to drift). Also
             // skipped on output_dir miss, since the drift scan only
             // makes sense when the scaffold tree was actually emitted.
-            if !pinocchio_no_scaffold && output_dir.exists() {
+            if !is_pinocchio && output_dir.exists() {
                 match drift::check_stamped_drift(&output_dir) {
                     Ok(stamped) if !stamped.is_empty() => {
                         eprintln!(
@@ -3554,8 +3565,32 @@ async fn dispatch(cmd: Commands) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{expand_ci_template, format_lint_warning};
+    use super::{expand_ci_template, format_lint_warning, redirect_kani_impl_to_src};
     use crate::check::{CompletenessWarning, Severity};
+    use std::path::PathBuf;
+
+    #[test]
+    fn kani_impl_path_redirects_tests_to_src_for_pinocchio() {
+        // Default Anchor-shaped path → sibling src/.
+        assert_eq!(
+            redirect_kani_impl_to_src(&PathBuf::from("./programs/tests/kani_impl.rs")),
+            PathBuf::from("./programs/src/kani_impl.rs"),
+        );
+        // Bare tests/ root → src/.
+        assert_eq!(
+            redirect_kani_impl_to_src(&PathBuf::from("tests/kani_impl.rs")),
+            PathBuf::from("src/kani_impl.rs"),
+        );
+        // Non-tests parent passes through (explicit override respected).
+        assert_eq!(
+            redirect_kani_impl_to_src(&PathBuf::from("./custom/kani_impl.rs")),
+            PathBuf::from("./custom/kani_impl.rs"),
+        );
+        assert_eq!(
+            redirect_kani_impl_to_src(&PathBuf::from("./programs/src/kani_impl.rs")),
+            PathBuf::from("./programs/src/kani_impl.rs"),
+        );
+    }
 
     #[test]
     fn plain_text_lint_output_includes_priority() {
