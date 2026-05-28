@@ -2516,13 +2516,17 @@ fn parse_property_relation<'a>(
         if let Some(pos) = expr.find(op) {
             let lhs = &expr[..pos];
             let rhs = &expr[pos + op.len()..];
-            // Find which prop field is on each side
-            let lhs_field = prop_fields
-                .iter()
-                .find(|f| lhs.contains(&format!("s.{}", f)));
-            let rhs_field = prop_fields
-                .iter()
-                .find(|f| rhs.contains(&format!("s.{}", f)));
+            // Find which prop field is on each side. A transition property
+            // (one referencing `old(...)`) renders the post-state as
+            // `s'.<field>` and the `old(...)` side as `s.<field>`; match
+            // both so the post side isn't misread as a constant.
+            let side_field = |side: &str| {
+                prop_fields.iter().find(|f| {
+                    side.contains(&format!("s.{}", f)) || side.contains(&format!("s'.{}", f))
+                })
+            };
+            let lhs_field = side_field(lhs);
+            let rhs_field = side_field(rhs);
             match (lhs_field, rhs_field) {
                 (Some(lf), Some(rf)) => return Some((lf, op.trim(), rf)),
                 // Single field vs constant (e.g., s.V ≤ 10000000)
@@ -2593,6 +2597,42 @@ fn build_counterexample(
 
     let (lhs, op_sym, rhs) = relation?;
 
+    // Transition property (`<post> op old(<pre>)`): the post side renders
+    // `s'.<field>`, the `old(...)` side `s.<field>` (unprimed). The handler's
+    // effect mutates only the post side; the `old(...)` side is frozen at the
+    // pre-state snapshot. Without this, the effect lands on whichever side's
+    // field name matches first — inverting `counter ≥ old(counter)` into a
+    // bogus `old(counter) ≥ counter` violation. Detect per-side frozen-ness by
+    // re-splitting the raw expr at the operator.
+    let is_transition = expr.contains("s'.");
+    let (lhs_frozen, rhs_frozen) = if is_transition {
+        let mut split = (false, false);
+        for opv in &[" ≤ ", " ≥ ", " < ", " > ", " = "] {
+            if let Some(pos) = expr.find(opv) {
+                let lhs_raw = &expr[..pos];
+                let rhs_raw = &expr[pos + opv.len()..];
+                let frozen = |raw: &str, field: &str| {
+                    field != "__const"
+                        && raw.contains(&format!("s.{}", field))
+                        && !raw.contains(&format!("s'.{}", field))
+                };
+                split = (frozen(lhs_raw, lhs), frozen(rhs_raw, rhs));
+                break;
+            }
+        }
+        split
+    } else {
+        (false, false)
+    };
+    // Display label: a frozen side is the `old(...)` snapshot.
+    let label = |field: &str, frozen: bool| {
+        if frozen {
+            format!("old({})", field)
+        } else {
+            field.to_string()
+        }
+    };
+
     // Build a boundary pre-state where the invariant barely holds
     let (lhs_val, rhs_val): (i64, i64) = match op_sym {
         "≤" | "<=" => (3, 3),
@@ -2604,10 +2644,10 @@ fn build_counterexample(
 
     let mut pre_state = Vec::new();
     if lhs != "__const" {
-        pre_state.push((lhs.to_string(), lhs_val));
+        pre_state.push((label(lhs, lhs_frozen), lhs_val));
     }
     if rhs != "__const" {
-        pre_state.push((rhs.to_string(), rhs_val));
+        pre_state.push((label(rhs, rhs_frozen), rhs_val));
     }
 
     let pre_check = format!("{} {} {}", lhs_val, op_sym, rhs_val);
@@ -2631,7 +2671,9 @@ fn build_counterexample(
             _ => continue,
         };
         effects.push(desc);
-        if *field == lhs {
+        // Effects mutate only the live (non-frozen) side; an `old(...)`
+        // reference stays at its pre-state snapshot.
+        if *field == lhs && !lhs_frozen {
             match *kind {
                 "add" => post_lhs += v,
                 "sub" => post_lhs -= v,
@@ -2639,7 +2681,7 @@ fn build_counterexample(
                 _ => {}
             }
         }
-        if *field == rhs {
+        if *field == rhs && !rhs_frozen {
             match *kind {
                 "add" => post_rhs += v,
                 "sub" => post_rhs -= v,
@@ -2651,10 +2693,10 @@ fn build_counterexample(
 
     let mut post_state = Vec::new();
     if lhs != "__const" {
-        post_state.push((lhs.to_string(), post_lhs));
+        post_state.push((label(lhs, lhs_frozen), post_lhs));
     }
     if rhs != "__const" {
-        post_state.push((rhs.to_string(), post_rhs));
+        post_state.push((label(rhs, rhs_frozen), post_rhs));
     }
 
     let holds = match op_sym {
@@ -2695,8 +2737,11 @@ fn build_fix_suggestions(
 
     let mut fixes = Vec::new();
 
-    // Fix A: add a guard that ensures the invariant holds after the effect
-    if let Some((lhs, op_sym, rhs)) = relation {
+    // Fix A: add a guard that ensures the invariant holds after the effect.
+    // Only meaningful when the two sides are distinct fields — a transition
+    // property (`counter ≥ old(counter)`) has the same field on both sides,
+    // where a `requires state.counter > state.counter` guard is nonsensical.
+    if let Some((lhs, op_sym, rhs)) = relation.filter(|&(l, _, r)| l != r) {
         for (field, kind, _value) in &op.effects {
             if !modified_fields.contains(&field.as_str()) {
                 continue;
@@ -9319,6 +9364,96 @@ handler tick : State.Active -> State.Active {
                 .iter()
                 .any(|w| w.rule == "preserved_by_all_potential_violation"),
             "must warn when preserved_by all handler demonstrably violates the property"
+        );
+    }
+
+    /// Transition property `counter >= old(counter)` preserved by an `add`
+    /// handler must NOT fire. Regression: the counterexample builder used to
+    /// misread the post side (`s'.counter`) as a constant and apply the
+    /// effect to the `old(...)` side, inverting the relation into a bogus
+    /// `old(counter) >= counter` (3 >= 4) violation.
+    #[test]
+    fn preserved_by_transition_property_silent_when_add_preserves_monotonicity() {
+        let spec = crate::chumsky_adapter::parse_str(
+            r#"spec Test
+program_id "11111111111111111111111111111111"
+type State | Active of { counter : U64 }
+type Error | E
+property counter_monotonic :
+  state.counter >= old(state.counter)
+  preserved_by all
+handler grow (delta : U64) : State.Active -> State.Active {
+  permissionless
+  effect { counter += delta }
+}"#,
+        )
+        .unwrap();
+        let warnings = check_completeness(&spec);
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.rule == "preserved_by_all_potential_violation"),
+            "add preserves `counter >= old(counter)` — must not flag a violation"
+        );
+    }
+
+    /// The same transition property `counter >= old(counter)` claimed-
+    /// preserved by a `sub` handler MUST still fire — decreasing the post
+    /// side genuinely breaks monotonicity.
+    #[test]
+    fn preserved_by_transition_property_fires_when_sub_breaks_monotonicity() {
+        let spec = crate::chumsky_adapter::parse_str(
+            r#"spec Test
+program_id "11111111111111111111111111111111"
+type State | Active of { counter : U64 }
+type Error | E
+property counter_monotonic :
+  state.counter >= old(state.counter)
+  preserved_by all
+handler shrink : State.Active -> State.Active {
+  permissionless
+  effect { counter -= 1 }
+}"#,
+        )
+        .unwrap();
+        let warnings = check_completeness(&spec);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.rule == "preserved_by_all_potential_violation"),
+            "sub breaks `counter >= old(counter)` — must flag the violation"
+        );
+    }
+
+    /// `build_fix_suggestions` must not emit a nonsensical
+    /// `requires state.counter > state.counter` guard for a transition
+    /// property (same field on both sides). Fix A is suppressed; Fix B
+    /// (add to preserved_by) still applies.
+    #[test]
+    fn build_fix_suggestions_skips_self_guard_for_transition_property() {
+        let handler = ParsedHandler {
+            name: "shrink".to_string(),
+            effects: vec![("counter".to_string(), "sub".to_string(), "1".to_string())],
+            ..make_handler("shrink")
+        };
+        let fixes = build_fix_suggestions(
+            "s'.counter \u{2265} s.counter",
+            "counter_monotonic",
+            &handler,
+            &["counter"],
+            &["counter"],
+        );
+        assert!(
+            !fixes
+                .iter()
+                .any(|f| f.snippet.contains("state.counter > state.counter")
+                    || f.snippet.contains("state.counter < state.counter")),
+            "must not suggest a self-comparison guard; got: {:?}",
+            fixes.iter().map(|f| &f.snippet).collect::<Vec<_>>()
+        );
+        assert!(
+            fixes.iter().any(|f| f.label == "Add to preserved_by"),
+            "the preserved_by fix should still be offered"
         );
     }
 
