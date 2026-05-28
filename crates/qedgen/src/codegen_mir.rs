@@ -914,7 +914,14 @@ fn emit_imported_mirror(
     let (prelude_import, explicit_account_discriminator): (&str, bool) = match target {
         Target::Anchor => ("use anchor_lang::prelude::*;\n", false),
         Target::Quasar => ("use quasar_lang::prelude::*;\n", true),
-        Target::Pinocchio => unreachable!("Pinocchio is rejected at the init dispatcher"),
+        // Imported account-type mirrors need the zeropod decode shape for
+        // Pinocchio (slice 6 follow-on); not emitted yet. Fail cleanly
+        // instead of panicking. Inline the interface, or use Anchor/Quasar.
+        Target::Pinocchio => anyhow::bail!(
+            "imported account-type mirrors are not yet supported for the \
+             Pinocchio target. Inline the interface's account types into the \
+             spec, or generate this program for the Anchor or Quasar target."
+        ),
     };
 
     let src_dir = output_dir.join("src");
@@ -1337,10 +1344,16 @@ fn emit_events(
     // Per-target framework surface. Hardcoded here for events only
     // (the full `FrameworkSurface` struct stays module-private in
     // `codegen.rs`; Phase 4b ports use the minimal slice they need).
-    let (prelude_import, explicit_discriminator): (&str, bool) = match target {
-        Target::Anchor => ("use anchor_lang::prelude::*;\n", false),
-        Target::Quasar => ("use quasar_lang::prelude::*;\n", true),
-        Target::Pinocchio => unreachable!("Pinocchio is rejected at the init dispatcher"),
+    let prelude_import: &str = match target {
+        Target::Anchor => "use anchor_lang::prelude::*;\n",
+        Target::Quasar => "use quasar_lang::prelude::*;\n",
+        // Pinocchio has no event framework / macro. Events are plain data
+        // structs the program serializes and logs itself (e.g. via the
+        // `sol_log_data` syscall) — no framework prelude to import.
+        Target::Pinocchio => {
+            "// Pinocchio has no event macro — these are plain data structs.\n\
+             // Serialize + emit them yourself (e.g. via the `sol_log_data` syscall).\n"
+        }
     };
 
     let mut out = String::new();
@@ -1363,10 +1376,13 @@ fn emit_events(
                 )
             })?;
 
-        if explicit_discriminator {
-            out.push_str(&format!("#[event(discriminator = {})]\n", i + 1));
-        } else {
-            out.push_str("#[event]\n");
+        // Per-target struct attribute: Anchor/Quasar use the framework
+        // `#[event]` macro (Quasar wants an explicit discriminator);
+        // Pinocchio has none, so emit a plain `#[derive(Clone)]` struct.
+        match target {
+            Target::Anchor => out.push_str("#[event]\n"),
+            Target::Quasar => out.push_str(&format!("#[event(discriminator = {})]\n", i + 1)),
+            Target::Pinocchio => out.push_str("#[derive(Clone)]\n"),
         }
         out.push_str(&format!("pub struct {} {{\n", event.name));
         for (fname, ftype) in &parsed_event.fields {
@@ -1493,5 +1509,42 @@ mod tests {
         let (mir, parsed) = lower_fixture("examples/rust/escrow/escrow.qedspec");
         assert!(!parsed.handlers.is_empty(), "escrow has handlers");
         assert!(!mir.state.variants.is_empty(), "escrow has state variants");
+    }
+
+    /// Pinocchio has no `#[event]` macro — `emit_events` must emit a plain
+    /// `#[derive(Clone)]` data struct, not panic (the slice-6 milestone-2
+    /// `unreachable!()` shipped a crash on any Pinocchio spec with `emits`).
+    #[test]
+    fn pinocchio_events_emit_plain_struct_no_event_macro() {
+        let (mir, parsed) =
+            lower_fixture("examples/pinocchio-fixtures/vault-greenfield/vault.qedspec");
+        assert!(!mir.events.is_empty(), "vault-greenfield declares an event");
+
+        let fp = crate::fingerprint::compute_fingerprint(&parsed);
+        let temp = std::env::temp_dir().join(format!("qedgen-evt-test-{}", std::process::id()));
+        std::fs::create_dir_all(temp.join("src")).expect("mk src");
+
+        emit_events(&mir, &parsed, &fp, &temp, Target::Pinocchio)
+            .expect("Pinocchio events must emit, not panic");
+
+        let rendered = std::fs::read_to_string(temp.join("src/events.rs")).expect("events.rs");
+        std::fs::remove_dir_all(&temp).ok();
+
+        assert!(
+            rendered.contains("pub struct Withdrawn"),
+            "event struct must be emitted; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("#[derive(Clone)]"),
+            "Pinocchio events are plain derive-Clone structs; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("#[event"),
+            "Pinocchio has no #[event] macro; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("anchor_lang") && !rendered.contains("quasar_lang"),
+            "no Anchor/Quasar prelude leakage; got:\n{rendered}"
+        );
     }
 }

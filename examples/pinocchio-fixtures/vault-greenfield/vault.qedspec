@@ -20,6 +20,10 @@ interface Token {
 type State | Active of { total : U64 }
 type Error | InvalidAmount | MathOverflow | MathUnderflow
 
+// Pinocchio has no `#[event]` macro — codegen emits a plain `#[derive(Clone)]`
+// data struct in events.rs that the program serializes + logs itself.
+event Withdrawn { amount : U64 }
+
 /// Pure-state handler: checked add (overflow → MathOverflow), signer
 /// guard, no CPI.
 handler deposit (amount : U64) : State.Active -> State.Active {
@@ -47,4 +51,5 @@ handler withdraw (amount : U64) : State.Active -> State.Active {
   modifies [total]
   effect { total -= amount }
   call Token.transfer(from = vault_ta, to = owner_ta, amount = amount, authority = auth)
+  emits Withdrawn
 }
