@@ -49,15 +49,16 @@ a7f7374  feat(pinocchio): M3 — codegen the impl-targeted Kani harness
 | Quasar/Pinocchio PDA-signed CPI (slice 4) | ⬜ | `invoke_signed` w/ seeds; spec must surface seed/bump fields |
 | Pinocchio scaffold (slice 6) | ✅ done | MIR-native scaffold (lib + entrypoint + byte-dispatch, zeropod state, `&AccountInfo` account structs + `.handler()`, guards, errors, scalar effects). Steps 1–5 + the milestone close (2026-05-28): SPL `call` CPIs wired into the handler body via `try_emit_cpi(_, Pinocchio)`, AND the `codegen` command (not just `init`) now emits the Pinocchio scaffold. A `call Token.transfer(...)` spec `cargo build`s end-to-end from the CLI. |
 | Pinocchio generic CPI (slice 7) | ⬜ | raw `pinocchio::cpi::invoke_signed` + Borsh (non-SPL `call` sites emit a slice-7 breadcrumb today) |
-| Pinocchio events / ref_impls / tests | ⬜ | `emit_events` + `emit_imported_mirror` still `unreachable!()` for Pinocchio (guarded by early-return; only event/import specs hit them). `transfers {}` sugar stays agent-fill on every target. |
-| Pinocchio greenfield fixture + build gate | ✅ done | `examples/pinocchio-fixtures/vault-greenfield/vault.qedspec` (zeropod state + checked effects + guards + errors + SPL transfer CPI) + `codegen_smoke::vault_pinocchio_scaffold_compiles` regenerates from the spec and `cargo build`s it. The existing CI step (`cargo test --test codegen_smoke -- --ignored`) auto-runs it. |
+| Pinocchio events | ✅ done | `emit_events` Pinocchio arm emits plain `#[derive(Clone)]` data structs (no `#[event]` macro). Was a shipped `unreachable!()` panic on any `emits` spec. Covered by the build gate (`vault-greenfield` declares `event Withdrawn`) + unit test. |
+| Pinocchio imported mirrors | ⬜ | `emit_imported_mirror` now `anyhow::bail`s cleanly for Pinocchio (was an `unreachable!()` panic). Real support = emit zeropod mirrors for imported account types — slice-6 follow-on. Only hit by `import X from "…"` specs whose namespace carries account types. |
+| Pinocchio ref_impls / unit+integration tests | ⬜ | not yet exercised for Pinocchio (the build-order step-5 tail). |
+| Pinocchio greenfield fixture + build gate | ✅ done | `examples/pinocchio-fixtures/vault-greenfield/vault.qedspec` (zeropod state + checked effects + guards + errors + SPL transfer CPI + event) + `codegen_smoke::vault_pinocchio_scaffold_compiles` regenerates from the spec and `cargo build`s it. The existing CI step (`cargo test --test codegen_smoke -- --ignored`) auto-runs it. |
 | Pinocchio Kani-impl custom state (slice 8b) | ⬜ | non-SPL accounts need the MemoryLayout pipeline |
 
 Recommended next: **slice 7** (generic non-SPL Pinocchio CPI — raw
 `invoke_signed` + Borsh) or **slice 4** (PDA-signed `invoke_signed` with
-spec-surfaced seed/bump). Pinocchio events / ref_impls / test-gen
-(`emit_events` + `emit_imported_mirror` still `unreachable!()`) is the
-remaining scaffold gap, only hit by event/import specs.
+spec-surfaced seed/bump). Lower-priority scaffold tails: imported-mirror
+zeropod emission (currently a clean bail) and ref_impls / test-gen.
 
 ## Critical gotchas (these cost real time — don't re-discover)
 
