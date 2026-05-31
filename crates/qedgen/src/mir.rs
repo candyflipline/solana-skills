@@ -174,6 +174,17 @@ pub struct Mir {
     /// record. Carried verbatim from `ParsedSpec.records` — the indexed
     /// renderer is the only consumer today.
     pub records: Vec<crate::check::ParsedRecordType>,
+    /// True for sBPF assembly specs (`pragma sbpf { … }`, detected via
+    /// `ParsedSpec::is_assembly_target`). The Lean renderer dispatches on
+    /// this flag to `render_sbpf` (assembly proofs over `Program.lean` +
+    /// `wp_exec`) — a wholly different output shape from the state-machine
+    /// renderers. The Kani/proptest backends skip assembly targets
+    /// entirely (sBPF runtime behavior is exercised by client-side tests),
+    /// so this flag has a single consumer: `lean_gen_mir`. The instruction
+    /// / layout / guard data the renderer needs is read from `ParsedSpec`
+    /// at the codegen call site (it is not lifted into MIR — with only one
+    /// consumer there is no cross-codegen divergence for MIR to prevent).
+    pub is_assembly: bool,
 }
 
 // ----------------------------------------------------------------------
@@ -1064,6 +1075,7 @@ pub fn lower(parsed: &ParsedSpec) -> Mir {
         liveness_props: lower_liveness(parsed),
         environments: lower_environments(parsed),
         records: parsed.records.clone(),
+        is_assembly: parsed.is_assembly_target(),
     }
 }
 
@@ -1738,6 +1750,7 @@ mod tests {
             liveness_props: vec![],
             environments: vec![],
             records: vec![],
+            is_assembly: false,
         };
         assert_eq!(mir.name, "Test");
         assert!(mir.handlers.is_empty());
