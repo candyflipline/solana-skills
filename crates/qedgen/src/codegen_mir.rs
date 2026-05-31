@@ -479,9 +479,12 @@ fn emit_lib(
         if !imports.is_empty() {
             out.push_str(&imports);
         }
+        // Render the `#[derive(Accounts)]` structs first so we can detect
+        // which Anchor wrapper types they reference.
+        let mut structs = String::new();
         for handler in &parsed.handlers {
-            out.push('\n');
-            out.push_str(&crate::codegen::render_handler_accounts_struct(
+            structs.push('\n');
+            structs.push_str(&crate::codegen::render_handler_accounts_struct(
                 handler,
                 parsed,
                 is_multi,
@@ -490,6 +493,53 @@ fn emit_lib(
                 target,
             ));
         }
+        // Disambiguate user state types that collide with an Anchor prelude
+        // wrapper name. A spec may declare e.g. `type Account = { … }`
+        // (percolator), which lands as `pub struct Account` in
+        // `crate::state` and — glob-imported here alongside
+        // `anchor_lang::prelude::*` — makes the `Account<'info, _>` wrapper
+        // an ambiguous name (a hard error under `ambiguous_glob_imports`,
+        // which is deny-by-default on current stable). Re-importing the
+        // colliding wrapper(s) explicitly forces the prelude type to win
+        // (an explicit `use` outranks glob imports). Scoped to actual
+        // collisions so non-colliding specs are unaffected.
+        const ANCHOR_WRAPPERS: &[&str] = &[
+            "Account",
+            "Signer",
+            "Program",
+            "SystemAccount",
+            "UncheckedAccount",
+            "InterfaceAccount",
+            "Interface",
+            "Sysvar",
+            "AccountLoader",
+        ];
+        let user_type_names: std::collections::HashSet<&str> = parsed
+            .records
+            .iter()
+            .map(|r| r.name.as_str())
+            .chain(parsed.account_types.iter().map(|a| a.name.as_str()))
+            .collect();
+        let collisions: Vec<&str> = ANCHOR_WRAPPERS
+            .iter()
+            .copied()
+            .filter(|w| user_type_names.contains(*w) && structs.contains(&format!(": {w}<")))
+            .collect();
+        if !collisions.is_empty() {
+            // Single item: no braces (`use a::B;`), matching rustfmt.
+            let path = if collisions.len() == 1 {
+                collisions[0].to_string()
+            } else {
+                format!("{{{}}}", collisions.join(", "))
+            };
+            out.push_str(&format!(
+                "// Explicit re-imports: these Anchor wrapper names collide with\n\
+                 // same-named `crate::state` types declared in the spec; the\n\
+                 // explicit `use` outranks the globs so the wrapper wins.\n\
+                 use anchor_lang::prelude::{path};\n"
+            ));
+        }
+        out.push_str(&structs);
     }
 
     out.push_str("// ---- END GENERATED ----\n");
@@ -1514,6 +1564,71 @@ mod tests {
     /// Pinocchio has no `#[event]` macro — `emit_events` must emit a plain
     /// `#[derive(Clone)]` data struct, not panic (the slice-6 milestone-2
     /// `unreachable!()` shipped a crash on any Pinocchio spec with `emits`).
+    #[test]
+    /// CI regression: a spec that declares `type Account = { … }`
+    /// (percolator) lands a `pub struct Account` in `crate::state`, which
+    /// — glob-imported alongside `anchor_lang::prelude::*` in the Anchor
+    /// lib.rs — makes the `Account<'info, _>` wrapper an ambiguous name
+    /// (hard error under deny-by-default `ambiguous_glob_imports`).
+    /// `emit_lib` must emit an explicit `use anchor_lang::prelude::Account;`
+    /// to force the wrapper to win. Specs WITHOUT a colliding type get no
+    /// such line (scoped to real collisions).
+    #[test]
+    fn anchor_lib_disambiguates_state_type_colliding_with_prelude_wrapper() {
+        let src = r#"spec Coll
+program_id "11111111111111111111111111111111"
+type Account = { x : U64 }
+type State | Active of { total : U64 }
+handler poke : State.Active -> State.Active {
+  accounts { vault : writable }
+  effect { Active.total += 1 }
+}
+"#;
+        let parsed = crate::chumsky_adapter::parse_str(src).expect("parse");
+        let mir = crate::mir::lower(&parsed);
+        let fp = crate::fingerprint::compute_fingerprint(&parsed);
+        let temp = std::env::temp_dir().join(format!("qedgen-coll-{}", std::process::id()));
+        std::fs::create_dir_all(temp.join("src")).expect("mk src");
+        emit_lib(&mir, &parsed, &fp, &temp, Target::Anchor).expect("emit lib");
+        let lib = std::fs::read_to_string(temp.join("src/lib.rs")).expect("lib.rs");
+        std::fs::remove_dir_all(&temp).ok();
+        assert!(
+            lib.contains(": Account<"),
+            "the state account field should use the Anchor `Account<>` wrapper; got:\n{lib}"
+        );
+        assert!(
+            lib.contains("use anchor_lang::prelude::Account;"),
+            "colliding state type `Account` must force an explicit prelude re-import; got:\n{lib}"
+        );
+    }
+
+    /// The disambiguation is scoped: a spec with no prelude-colliding type
+    /// gets no explicit re-import line.
+    #[test]
+    fn anchor_lib_no_disambiguation_without_collision() {
+        let src = r#"spec NoColl
+program_id "11111111111111111111111111111111"
+type State | Active of { total : U64 }
+handler poke : State.Active -> State.Active {
+  accounts { vault : writable }
+  effect { Active.total += 1 }
+}
+"#;
+        let parsed = crate::chumsky_adapter::parse_str(src).expect("parse");
+        let mir = crate::mir::lower(&parsed);
+        let fp = crate::fingerprint::compute_fingerprint(&parsed);
+        let temp = std::env::temp_dir().join(format!("qedgen-nocoll-{}", std::process::id()));
+        std::fs::create_dir_all(temp.join("src")).expect("mk src");
+        emit_lib(&mir, &parsed, &fp, &temp, Target::Anchor).expect("emit lib");
+        let lib = std::fs::read_to_string(temp.join("src/lib.rs")).expect("lib.rs");
+        std::fs::remove_dir_all(&temp).ok();
+        assert!(
+            !lib.contains("use anchor_lang::prelude::{")
+                && !lib.contains("use anchor_lang::prelude::Account;"),
+            "no collision → no explicit wrapper re-import; got:\n{lib}"
+        );
+    }
+
     #[test]
     fn pinocchio_events_emit_plain_struct_no_event_macro() {
         let (mir, parsed) =

@@ -1,0 +1,42 @@
+spec Config
+program_id "11111111111111111111111111111111"
+
+// Regression fixture for issue #71: `Pubkey` state fields lower to a raw
+// `[u8; 32]` in the zeropod struct (no Pod scalar wrapper). The Pinocchio
+// scaffold must therefore:
+//   - read a Pubkey state field by value (NO `.get()`),
+//   - compare it against a deref'd account key (`*ctx.<acct>.key()`),
+//   - assign it in an effect via the deref'd value (NO `.into()`), and
+//   - bind account refs in the effect body through `self`, not `ctx`.
+// Scalar fields (`nonce`) still read through `.get()` for contrast.
+
+type State | Active of { admin_key : Pubkey, nonce : U64 }
+type Error | NotAdmin | MathOverflow
+
+/// Effect sets a Pubkey field from an account's address + bumps a scalar.
+/// Exercises `self.<acct>.key()` binding + the Pubkey/scalar effect split.
+handler set_admin : State.Active -> State.Active {
+  accounts {
+    config    : writable
+    new_admin : readonly
+  }
+  modifies [admin_key, nonce]
+  effect {
+    Active.admin_key := new_admin.pubkey
+    Active.nonce     += 1
+  }
+}
+
+/// Guard compares an account's address against the stored Pubkey field,
+/// then rotates the admin. Exercises `*ctx.<acct>.key() == __state.<pubkey>`
+/// (no `.get()`) alongside the Pubkey-set effect.
+handler rotate_admin : State.Active -> State.Active {
+  accounts {
+    config    : writable
+    current   : signer
+    next_admin : readonly
+  }
+  requires current.pubkey == state.admin_key else NotAdmin
+  modifies [admin_key]
+  effect { Active.admin_key := next_admin.pubkey }
+}

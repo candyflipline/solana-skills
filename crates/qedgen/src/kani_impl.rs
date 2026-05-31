@@ -937,7 +937,7 @@ fn emit_symbolic_accounts_ctor(
         }
     } else {
         for acct in &handler.accounts {
-            emit_account_field_skeleton(out, acct, spec);
+            emit_account_field_skeleton(out, acct, handler, spec);
         }
         out.push_str("        //\n");
         out.push_str("        // AGENT: assemble the fields above into the concrete\n");
@@ -953,6 +953,15 @@ fn emit_symbolic_accounts_ctor(
     Ok(())
 }
 
+/// `true` for the DSL's integer scalar types — these serialize to a seed
+/// via `to_le_bytes()` rather than `as_ref()`.
+fn is_integer_dsl_type(ty: &str) -> bool {
+    matches!(
+        ty,
+        "U8" | "U16" | "U32" | "U64" | "U128" | "I8" | "I16" | "I32" | "I64" | "I128" | "Nat"
+    )
+}
+
 /// Emit one commented-out line per account field with its derivation rule.
 /// PDA-bound accounts get a `Pubkey::find_program_address` template using
 /// the spec's `pda <name> [seeds]` declaration; non-PDA fields default to
@@ -960,6 +969,7 @@ fn emit_symbolic_accounts_ctor(
 fn emit_account_field_skeleton(
     out: &mut String,
     acct: &crate::check::ParsedHandlerAccount,
+    handler: &ParsedHandler,
     spec: &ParsedSpec,
 ) {
     if acct.is_program {
@@ -986,6 +996,15 @@ fn emit_account_field_skeleton(
                 {
                     let inner = &s[1..s.len() - 1];
                     format!("b\"{}\"", inner)
+                } else if handler
+                    .takes_params
+                    .iter()
+                    .any(|(n, t)| n == s && is_integer_dsl_type(t))
+                {
+                    // An integer handler param used as a seed must be
+                    // serialized to bytes — `u64::as_ref()` doesn't exist.
+                    // (`Pubkey` params / account keys keep `.as_ref()`.)
+                    format!("{}.to_le_bytes().as_ref()", s)
                 } else {
                     format!("{}.as_ref()", s)
                 }
@@ -1592,6 +1611,41 @@ handler open (deposit_amount : U64) {
         assert!(
             body.contains("`initializer`: signer"),
             "signer account must appear in the symbolic builder; got:\n{}",
+            body
+        );
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Issue #71: an integer handler param used as a PDA seed must
+    /// serialize via `to_le_bytes()` — `u64::as_ref()` does not exist.
+    /// Pubkey seeds / account keys keep `.as_ref()`.
+    #[test]
+    fn integer_param_seed_serializes_via_to_le_bytes() {
+        let src = r#"spec Hub
+state { lane_count : U64 }
+pda hub_authority ["hub-authority", lane_id]
+handler swap (lane_id : U64) {
+  accounts {
+    hub_authority : writable, pda ["hub-authority", lane_id]
+    caller        : signer
+  }
+  modifies [lane_count]
+  ensures state.lane_count == lane_id
+  effect { lane_count := lane_id }
+}"#;
+        let spec = parse_str(src).expect("parse");
+        let tmp = std::env::temp_dir().join(format!("kani_impl_intseed_{}.rs", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        generate_from_spec(&spec, &tmp, /*explicit_flag=*/ true, Target::Anchor).expect("generate");
+        let body = std::fs::read_to_string(&tmp).unwrap();
+        assert!(
+            body.contains("lane_id.to_le_bytes().as_ref()"),
+            "integer-param seed must serialize via to_le_bytes; got:\n{}",
+            body
+        );
+        assert!(
+            !body.contains("[b\"hub-authority\", lane_id.as_ref()"),
+            "must not emit bare `lane_id.as_ref()` for a u64 param; got:\n{}",
             body
         );
         let _ = std::fs::remove_file(&tmp);
