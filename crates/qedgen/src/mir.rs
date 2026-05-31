@@ -331,6 +331,15 @@ pub struct HandlerMir {
     /// Pre-conditions. Schema-includes are already expanded in
     /// `chumsky_adapter.rs:3125+`; what arrives here is the flat list.
     pub pre: Vec<Predicate>,
+    /// ALL `requires` predicates in original spec order (both `else
+    /// <Err>` and bare), before the `split_requires` partition into
+    /// `pre` (bare) + body `RequireOrAbort` (with-err). The indexed-state
+    /// Lean renderer emits guard conjuncts from this so its ordering
+    /// matches `lean_gen`'s single-list iteration (the split-then-
+    /// concatenate path reordered an interleaved bare/with-err sequence
+    /// — e.g. percolator's match-arm-abort guards). Same predicate
+    /// construction as `split_requires` (`Predicate(Expr::from_requires)`).
+    pub requires_in_order: Vec<Predicate>,
     /// Pre-conditions with `else <ErrorName>` markers — these lower to
     /// `Stmt::RequireOrAbort` rather than collected `pre`.
     /// Empty after Phase 3 lowering (passes synthesize them into `body`);
@@ -1398,6 +1407,14 @@ fn lower_handler(h: &crate::check::ParsedHandler) -> HandlerMir {
     };
 
     let (pre, requires_or_abort) = split_requires(&h.requires);
+    // Original spec order of all requires (for the indexed renderer's
+    // conjunct ordering — see `HandlerMir.requires_in_order`). Identical
+    // predicate construction to `split_requires`.
+    let requires_in_order: Vec<Predicate> = h
+        .requires
+        .iter()
+        .map(|r| Predicate(Expr::from_requires(r)))
+        .collect();
     let aborts_if: Vec<AbortClause> = h
         .aborts_if
         .iter()
@@ -1428,6 +1445,7 @@ fn lower_handler(h: &crate::check::ParsedHandler) -> HandlerMir {
         transition,
         on_account: h.on_account.clone(),
         pre,
+        requires_in_order,
         requires_or_abort,
         aborts_if,
         body: lower_body(h),

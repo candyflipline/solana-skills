@@ -1172,22 +1172,16 @@ fn emit_indexed_transition(
             conds.push(format!("s.status = .{}", safe_name(pre)));
         }
     }
-    // Requires clauses — both `requires X else Err` (in body as
-    // RequireOrAbort) and bare `requires X` (in `h.pre`). Both
-    // contribute guards; legacy `render_indexed_state` reads them
-    // through the merged `ParsedHandler.requires` list. The two
-    // sources here are disjoint by construction (see `lower_body`
-    // and `split_requires`). Parenthesized as wholes; subscript-
-    // rewritten so `state.members[i]` → `(s.members i)`.
-    for stmt in &h.body.stmts {
-        if let Stmt::RequireOrAbort { pred, .. } = stmt {
-            if mentions_handler_account_pubkey(&pred.0.lean, &h.accounts) {
-                continue;
-            }
-            conds.push(format!("({})", rewrite_subscripts_lean(&pred.0.lean)));
-        }
-    }
-    for pred in &h.pre {
+    // Requires clauses — emitted in ORIGINAL spec order via
+    // `requires_in_order` (both `requires X else Err` and bare
+    // `requires X`), matching legacy `render_indexed_state`'s
+    // single-list iteration of `ParsedHandler.requires`. Iterating the
+    // split `body RequireOrAbort` then `h.pre` instead reorders an
+    // interleaved bare/with-err sequence (e.g. percolator's
+    // match-arm-abort: the arm condition is bare, the abort marker
+    // carries an error). Parenthesized as wholes; subscript-rewritten
+    // so `state.members[i]` → `(s.members i)`.
+    for pred in &h.requires_in_order {
         if mentions_handler_account_pubkey(&pred.0.lean, &h.accounts) {
             continue;
         }
