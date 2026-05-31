@@ -1459,8 +1459,16 @@ fn emit_pinocchio_effect_body(out: &mut String, handler: &ParsedHandler, spec: &
                 prog, acct.name
             ));
             for (field, op, rhs) in &scalar {
-                let r = bind_pinocchio_expr(rhs, handler, "__state");
+                // Effect body lives in the handler method, so account refs
+                // bind through `self` (not the guard fn's `ctx`).
+                let r = bind_pinocchio_expr(rhs, handler, "__state", "self", spec);
                 let line = match *op {
+                    // Pubkey fields are raw `[u8; 32]` (no Pod wrapper), so
+                    // assign the deref'd value directly — `.into()` is for
+                    // the native-int → Pod-scalar conversion only.
+                    "set" if state_field_is_pubkey(spec, field) => {
+                        format!("        __state.{field} = {r};\n")
+                    }
                     "set" => format!("        __state.{field} = ({r}).into();\n"),
                     "add" => format!(
                         "        __state.{field} = __state.{field}.get().checked_add({r}).ok_or({overflow})?.into();\n"
@@ -5830,13 +5838,36 @@ fn references_pinocchio_state(expr: &str) -> bool {
     false
 }
 
+/// `true` iff state field `field` is declared `Pubkey` in any account
+/// variant. Pubkey fields lower to a raw `[u8; 32]` in the zeropod struct
+/// (not a Pod scalar wrapper), so they are read by value — no `.get()` —
+/// and compared against `*<acct>.key()` (also a `[u8; 32]` value).
+fn state_field_is_pubkey(spec: &ParsedSpec, field: &str) -> bool {
+    spec.account_types.iter().any(|a| {
+        a.variants
+            .iter()
+            .any(|v| v.fields.iter().any(|(n, t)| n == field && t == "Pubkey"))
+    })
+}
+
 /// Rewrite a spec-rendered Pod expression (`rust_expr_pod`) for the
 /// Pinocchio guard / handler context: the state binder `s` → `state_var`
 /// (the decoded zeropod `&Zc` view), and bare handler-account idents (or
-/// `<acct>.pubkey`) → `ctx.<acct>.key()`. zeropod field accesses already
-/// carry `.get()` in the Pod form, so the rewritten expression typechecks
-/// against the decoded view.
-fn bind_pinocchio_expr(expr: &str, handler: &ParsedHandler, state_var: &str) -> String {
+/// `<acct>.pubkey`) → `*<acct_prefix>.<acct>.key()` (a `[u8; 32]` value).
+/// `acct_prefix` is `"ctx"` in the per-handler guard fn (its param is
+/// `ctx: &<Pascal>`) and `"self"` in the handler method's effect body
+/// (where the accounts struct is `self`).
+///
+/// Scalar zeropod fields read through `.get()`; `Pubkey` fields are raw
+/// `[u8; 32]` (no Pod wrapper) so they read by value with neither `.get()`
+/// nor `&`, matching the deref'd `key()` form on the other side.
+fn bind_pinocchio_expr(
+    expr: &str,
+    handler: &ParsedHandler,
+    state_var: &str,
+    acct_prefix: &str,
+    spec: &ParsedSpec,
+) -> String {
     let account_names: std::collections::HashSet<&str> =
         handler.accounts.iter().map(|a| a.name.as_str()).collect();
     let bytes = expr.as_bytes();
@@ -5854,9 +5885,11 @@ fn bind_pinocchio_expr(expr: &str, handler: &ParsedHandler, state_var: &str) -> 
             if ident == "s" {
                 // `s.<field>` → `<state_var>.<field>.get()` for a scalar
                 // read (zeropod Pod fields need an explicit `.get()` to
-                // produce the native integer). Complex paths (`s.x.y` /
-                // `s.x[i]`) emit the path head without `.get()` — those
-                // nested/array reads are a follow-on.
+                // produce the native integer). `Pubkey` fields are raw
+                // `[u8; 32]` (no Pod wrapper) so they read by value with
+                // no `.get()`. Complex paths (`s.x.y` / `s.x[i]`) emit the
+                // path head without `.get()` — those nested/array reads
+                // are a follow-on.
                 if j < bytes.len() && bytes[j] == b'.' {
                     let fstart = j + 1;
                     let mut k = fstart;
@@ -5865,7 +5898,7 @@ fn bind_pinocchio_expr(expr: &str, handler: &ParsedHandler, state_var: &str) -> 
                     }
                     let field = &expr[fstart..k];
                     let complex = k < bytes.len() && (bytes[k] == b'.' || bytes[k] == b'[');
-                    if !field.is_empty() && !complex {
+                    if !field.is_empty() && !complex && !state_field_is_pubkey(spec, field) {
                         out.push_str(&format!("{}.{}.get()", state_var, field));
                     } else {
                         out.push_str(&format!("{}.{}", state_var, field));
@@ -5879,17 +5912,19 @@ fn bind_pinocchio_expr(expr: &str, handler: &ParsedHandler, state_var: &str) -> 
             }
             if account_names.contains(ident) {
                 // `<acct>.pubkey` (spec's "this account's address") and a
-                // bare `<acct>` both lower to the runtime key load.
+                // bare `<acct>` both lower to the runtime key load,
+                // deref'd to a `[u8; 32]` value so it compares against /
+                // assigns into a raw-`[u8; 32]` Pubkey state field.
                 let pubkey = b".pubkey";
                 if j + pubkey.len() <= bytes.len()
                     && &bytes[j..j + pubkey.len()] == pubkey
                     && (j + pubkey.len() == bytes.len() || !is_ident_char(bytes[j + pubkey.len()]))
                 {
-                    out.push_str(&format!("ctx.{}.key()", ident));
+                    out.push_str(&format!("*{}.{}.key()", acct_prefix, ident));
                     i = j + pubkey.len();
                     continue;
                 }
-                out.push_str(&format!("ctx.{}.key()", ident));
+                out.push_str(&format!("*{}.{}.key()", acct_prefix, ident));
                 i = j;
                 continue;
             }
@@ -6006,7 +6041,7 @@ fn emit_pinocchio_guards(spec: &ParsedSpec, fp: &SpecFingerprint, output_dir: &P
                 continue;
             }
             out.push_str(&format!("    // requires: {}\n", req.lean_expr.trim()));
-            let rust = bind_pinocchio_expr(raw, handler, "__state");
+            let rust = bind_pinocchio_expr(raw, handler, "__state", "ctx", spec);
             let err = match &req.error_name {
                 Some(e) => format!("ProgramError::from({}::{})", err_enum, e),
                 None => "ProgramError::Custom(0xFF)".to_string(),
@@ -6023,7 +6058,7 @@ fn emit_pinocchio_guards(spec: &ParsedSpec, fp: &SpecFingerprint, output_dir: &P
                 ));
                 continue;
             }
-            let rust = bind_pinocchio_expr(raw, handler, "__state");
+            let rust = bind_pinocchio_expr(raw, handler, "__state", "ctx", spec);
             out.push_str(&format!(
                 "    if ({}) {{ return Err(ProgramError::from({}::{})); }}\n",
                 rust, err_enum, ab.error_name
@@ -6888,6 +6923,68 @@ handler withdraw (amount : U64) {
             guards.contains("__state.balance.get() >= amount")
                 && guards.contains("VaultError::Insufficient"),
             "state requires must read via the decoded __state view; got:\n{guards}"
+        );
+    }
+
+    /// Regression for issue #71: `Pubkey` state fields lower to a raw
+    /// `[u8; 32]` in the zeropod struct (no Pod scalar wrapper), so a
+    /// `state.<pubkey> == <acct>.pubkey` guard must compare the field by
+    /// value (NO `.get()`) against the deref'd account key
+    /// (`*ctx.<acct>.key()`). Scalar fields keep `.get()`. The effect
+    /// body sets a `Pubkey` field via the deref'd value directly (no
+    /// `.into()`) and binds account refs through `self` (the handler
+    /// method), not the guard fn's `ctx`.
+    #[test]
+    fn pinocchio_pubkey_state_field_reads_by_value_not_get() {
+        let src = r#"spec Cfg
+program_id "11111111111111111111111111111111"
+type Error | BadAuth | BadLane
+type State
+  | Active of { admin_key : Pubkey, lane_count : U64 }
+handler set_admin : State.Active -> State.Active {
+  accounts { config : writable, admin : readonly }
+  effect { Active.admin_key := admin.pubkey }
+}
+handler check (lane_id : U64) : State.Active -> State.Active {
+  accounts { config : readonly, caller : readonly }
+  requires caller.pubkey == state.admin_key else BadAuth
+  requires lane_id < state.lane_count else BadLane
+}
+"#;
+        let spec = crate::chumsky_adapter::parse_str(src).unwrap();
+        let fp = crate::fingerprint::compute_fingerprint(&spec);
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path().join("programs");
+        std::fs::create_dir_all(out_dir.join("src")).unwrap();
+        emit_pinocchio_guards(&spec, &fp, &out_dir).unwrap();
+        let guards = std::fs::read_to_string(out_dir.join("src/guards.rs")).unwrap();
+
+        // Pubkey field: by value (no `.get()`), account key deref'd.
+        assert!(
+            guards.contains("*ctx.caller.key() == __state.admin_key"),
+            "Pubkey guard must compare by value with a deref'd key; got:\n{guards}"
+        );
+        assert!(
+            !guards.contains("admin_key.get()"),
+            "Pubkey field must NOT be read through `.get()`; got:\n{guards}"
+        );
+        // Scalar field still reads through `.get()`.
+        assert!(
+            guards.contains("lane_id < __state.lane_count.get()"),
+            "scalar field must keep `.get()`; got:\n{guards}"
+        );
+
+        // Effect body: Pubkey set via deref'd value, bound through `self`.
+        let mut effect = String::new();
+        let h = spec
+            .handlers
+            .iter()
+            .find(|h| h.name == "set_admin")
+            .unwrap();
+        emit_pinocchio_effect_body(&mut effect, h, &spec);
+        assert!(
+            effect.contains("__state.admin_key = *self.admin.key();"),
+            "Pubkey set must assign the deref'd key via `self` (no `.into()`); got:\n{effect}"
         );
     }
 

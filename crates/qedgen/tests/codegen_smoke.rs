@@ -239,3 +239,14 @@ fn escrow_anchor_proptest_runs() {
 fn vault_pinocchio_scaffold_compiles() {
     smoke_pinocchio_scaffold("vault-greenfield", "vault.qedspec");
 }
+
+/// Issue #71 regression: a spec with a `Pubkey` state field (raw `[u8; 32]`,
+/// no Pod wrapper) + an account-key effect/guard must `cargo build`. Pre-fix
+/// this emitted `__state.<pubkey>.get()` (no such method) and `ctx.<acct>` in
+/// the `self`-bound effect body — both compile errors that passed `check` +
+/// proptest. Locking it into the compile gate keeps the Pubkey path covered.
+#[test]
+#[ignore = "runs qedgen codegen + cargo build on a generated Pinocchio crate"]
+fn config_pubkey_pinocchio_scaffold_compiles() {
+    smoke_pinocchio_scaffold("config-pubkey", "config.qedspec");
+}

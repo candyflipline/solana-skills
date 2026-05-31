@@ -18,6 +18,12 @@ const SUPPORT_CPI: &str = include_str!("../../../lean_solana/QEDGen/Solana/Cpi.l
 const SUPPORT_VALID: &str = include_str!("../../../lean_solana/QEDGen/Solana/Valid.lean");
 const SUPPORT_ARITHMETIC: &str = include_str!("../../../lean_solana/QEDGen/Solana/Arithmetic.lean");
 const SUPPORT_SPEC: &str = include_str!("../../../lean_solana/QEDGen/Solana/Spec.lean");
+// `Spec.lean` does `import QEDGen.Solana.CommandBuilders`, so the support
+// module must ship alongside it — otherwise `lake build` in the validation
+// workspace fails to resolve the import (issue #71). CommandBuilders has no
+// further QEDGen.Solana deps, so embedding it closes the import closure.
+const SUPPORT_COMMAND_BUILDERS: &str =
+    include_str!("../../../lean_solana/QEDGen/Solana/CommandBuilders.lean");
 // Trimmed barrel import — only the modules we embed (no SBPF/Bridge/Guards)
 const SUPPORT_SOLANA_BASE: &str = "\
 import QEDGen.Solana.Account\n\
@@ -109,6 +115,10 @@ fn write_lean_solana(output_dir: &Path, mathlib: bool) -> Result<()> {
     std::fs::write(solana_dir.join("Cpi.lean"), SUPPORT_CPI)?;
     std::fs::write(solana_dir.join("Valid.lean"), SUPPORT_VALID)?;
     std::fs::write(solana_dir.join("Spec.lean"), SUPPORT_SPEC)?;
+    std::fs::write(
+        solana_dir.join("CommandBuilders.lean"),
+        SUPPORT_COMMAND_BUILDERS,
+    )?;
 
     // Only deploy Arithmetic.lean when Mathlib is opted in
     if mathlib {
@@ -116,4 +126,74 @@ fn write_lean_solana(output_dir: &Path, mathlib: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The embedded `QEDGen.Solana.*` support modules form a closed
+    /// import graph: every `import QEDGen.Solana.X` inside an embedded
+    /// module must resolve to another embedded module. Issue #71 shipped
+    /// because `Spec.lean` does `import QEDGen.Solana.CommandBuilders`
+    /// but `CommandBuilders.lean` wasn't in the embed list, so
+    /// `lake build` in the setup workspace failed to resolve it. This
+    /// test fails fast if the hand-maintained embed list drifts from the
+    /// modules' actual `import` lines again.
+    fn embedded_module(name: &str, mathlib: bool) -> Option<&'static str> {
+        Some(match name {
+            "Account" => SUPPORT_ACCOUNT,
+            "State" => SUPPORT_STATE,
+            "Cpi" => SUPPORT_CPI,
+            "Valid" => SUPPORT_VALID,
+            "Spec" => SUPPORT_SPEC,
+            "CommandBuilders" => SUPPORT_COMMAND_BUILDERS,
+            "Arithmetic" if mathlib => SUPPORT_ARITHMETIC,
+            _ => return None,
+        })
+    }
+
+    fn assert_import_closure(mathlib: bool) {
+        let names = if mathlib {
+            vec![
+                "Account",
+                "State",
+                "Cpi",
+                "Valid",
+                "Spec",
+                "CommandBuilders",
+                "Arithmetic",
+            ]
+        } else {
+            vec![
+                "Account",
+                "State",
+                "Cpi",
+                "Valid",
+                "Spec",
+                "CommandBuilders",
+            ]
+        };
+        for name in &names {
+            let content = embedded_module(name, mathlib).unwrap();
+            for line in content.lines() {
+                let line = line.trim();
+                if let Some(dep) = line.strip_prefix("import QEDGen.Solana.") {
+                    let dep = dep.split_whitespace().next().unwrap_or(dep);
+                    assert!(
+                        embedded_module(dep, mathlib).is_some(),
+                        "embedded module `{name}.lean` imports `QEDGen.Solana.{dep}`, \
+                         which is NOT embedded (mathlib={mathlib}). Add it to \
+                         `write_lean_solana` or the setup workspace will fail to build."
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn embedded_support_modules_are_import_closed() {
+        assert_import_closure(false);
+        assert_import_closure(true);
+    }
 }
