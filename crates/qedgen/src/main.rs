@@ -3288,7 +3288,7 @@ async fn dispatch(cmd: Commands) -> Result<()> {
                 //     wrapping (`{ acct with active := 1 }`). Affects
                 //     percolator-class fixtures; tracked as a v3.0
                 //     item.
-                let mir_out_of_scope = parsed.is_assembly_target() || !parsed.records.is_empty();
+                let mir_out_of_scope = parsed.is_assembly_target();
                 let use_legacy = std::env::var("QEDGEN_LEGACY_LEAN").is_ok() || mir_out_of_scope;
                 if use_legacy {
                     lean_gen::generate(&parsed, &lean_output)?;

@@ -666,6 +666,30 @@ fn render_sbpf_stub(_mir: &Mir) -> String {
 type IndexedEffectsByRoot =
     std::collections::BTreeMap<(String, String), Vec<(String, String, String)>>;
 
+/// Map a scalar DSL type string to its Lean type. Mirrors
+/// `lean_gen::map_scalar_type` (record fields carry string types, not the
+/// typed `Ty`, so the indexed renderer needs this string-form mapper).
+fn map_scalar_type(t: &str) -> String {
+    match t.trim() {
+        "U8" | "U16" | "U32" | "U64" | "U128" => "Nat".to_string(),
+        "I8" | "I16" | "I32" | "I64" | "I128" => "Int".to_string(),
+        "Bool" => "Bool".to_string(),
+        "Pubkey" => "Pubkey".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Default value for a record field's `Inhabited` instance. Mirrors
+/// `lean_gen::default_value_for`.
+fn default_value_for(t: &str) -> &'static str {
+    match t.trim() {
+        "U8" | "U16" | "U32" | "U64" | "U128" => "0",
+        "I8" | "I16" | "I32" | "I64" | "I128" => "0",
+        "Bool" => "false",
+        _ => "default",
+    }
+}
+
 /// Indexed-state Lean renderer — port of `lean_gen::render_indexed_state`.
 ///
 /// Fires when any state field is `Ty::Map { .. }`. Indexed-state specs
@@ -725,6 +749,44 @@ fn render_indexed_state(mir: &Mir) -> String {
         "abbrev AccountIdx : Type := Fin {}\n\n",
         idx_bound
     ));
+
+    // -- Record structures (e.g. Account) --
+    //
+    // Skip a record literally named "State": v2.26's `type State = { ... }`
+    // record-form lowering deposits the State record into `mir.records`
+    // AND the State variant. The dedicated `structure State where` emission
+    // below is the canonical source; emitting it twice produces a Lean
+    // `redeclaration of State` error. The Account-style records this loop
+    // targets are auxiliary records (Map value types). Mirrors
+    // `lean_gen::render_indexed_state`'s record loop.
+    for rec in &mir.records {
+        if rec.name == "State" {
+            continue;
+        }
+        out.push_str(&format!("structure {} where\n", rec.name));
+        for (fname, ftype) in &rec.fields {
+            out.push_str(&format!(
+                "  {} : {}\n",
+                safe_name(fname),
+                map_scalar_type(ftype)
+            ));
+        }
+        out.push_str("  deriving Repr, DecidableEq, BEq\n\n");
+
+        // Inhabited instance — zero-defaults. Needed for Map.set fallback.
+        out.push_str(&format!(
+            "instance : Inhabited {} := \u{27E8}{{\n",
+            rec.name
+        ));
+        for (fname, ftype) in &rec.fields {
+            out.push_str(&format!(
+                "  {} := {},\n",
+                safe_name(fname),
+                default_value_for(ftype)
+            ));
+        }
+        out.push_str("}\u{27E9}\n\n");
+    }
 
     // -- Status inductive (lifecycle) --
     let lifecycle = &mir.state.lifecycle_states;
@@ -1153,7 +1215,14 @@ fn emit_indexed_transition(
         if op_kind == "set" && is_account_pubkey_ref(val) {
             continue;
         }
-        let lhs = path.segments.first().cloned().unwrap_or_default();
+        // Reconstruct the full dotted LHS: an indexed-record-field write
+        // lowers to a multi-segment path (`accounts[i].active` →
+        // `["accounts[i]", "active"]`). Using only the first segment drops
+        // the `.active` field, so `parse_indexed_lhs` would see an empty
+        // inner-field and emit a whole-entry `Function.update … (val)`
+        // instead of `{ (s.accounts i) with active := val }` (issue: the
+        // record-field write would be silently lost / mis-typed).
+        let lhs = path.segments.join(".");
         if let Some((root, idx, inner_field)) = parse_indexed_lhs(&lhs) {
             if map_roots.contains_key(root) {
                 indexed_by_root
@@ -1755,6 +1824,7 @@ fn scope_mir_to_account(mir: &Mir, acct: &crate::mir::AccountStateMir) -> Mir {
         covers: Vec::new(),                // emit_covers_multi handles
         liveness_props: mir.liveness_props.clone(),
         environments: mir.environments.clone(),
+        records: mir.records.clone(),
     }
 }
 
@@ -5127,6 +5197,7 @@ mod tests {
             covers: vec![],
             liveness_props: vec![],
             environments: vec![],
+            records: vec![],
         };
         let out = render(&mir);
         assert!(
@@ -5166,6 +5237,7 @@ mod tests {
             covers: vec![],
             liveness_props: vec![],
             environments: vec![],
+            records: vec![],
         };
         let out = render(&mir);
         assert!(

@@ -168,6 +168,12 @@ pub struct Mir {
     /// mutations. Each property × environment cross emits a
     /// preservation theorem.
     pub environments: Vec<EnvironmentMir>,
+    /// Top-level `type T = { … }` record declarations (the value types of
+    /// `Map[N] T` fields, e.g. percolator's `Account`). The indexed-state
+    /// Lean renderer emits a `structure T` + `instance Inhabited T` per
+    /// record. Carried verbatim from `ParsedSpec.records` — the indexed
+    /// renderer is the only consumer today.
+    pub records: Vec<crate::check::ParsedRecordType>,
 }
 
 // ----------------------------------------------------------------------
@@ -1048,6 +1054,7 @@ pub fn lower(parsed: &ParsedSpec) -> Mir {
         covers: lower_covers(parsed),
         liveness_props: lower_liveness(parsed),
         environments: lower_environments(parsed),
+        records: parsed.records.clone(),
     }
 }
 
@@ -1712,6 +1719,7 @@ mod tests {
             covers: vec![],
             liveness_props: vec![],
             environments: vec![],
+            records: vec![],
         };
         assert_eq!(mir.name, "Test");
         assert!(mir.handlers.is_empty());
