@@ -945,6 +945,16 @@ fn expr_to_rust(e: &Expr, ctx: Ctx, consts: ConstTable, opts: RustOpts<'_, '_>) 
             format!("{}{}{}", l_str, sym, r_str)
         }
         Expr::Paren(inner) => format!("({})", expr_to_rust(&inner.node, ctx, consts, opts)),
+        // mul_div_{floor,ceil}_u128 are u128-typed helpers (the intermediate
+        // `a * b` can overflow u64 even when both operands are u64-bounded).
+        // Inside arbitrary expression contexts (`requires` / `ensures` /
+        // `effect` RHS) the u128 width is intentional — the spec author
+        // may compare against a u128 literal (e.g. percolator's `…
+        // mul_div_floor(...) <= 100000000000000000000`). The let-binding
+        // emit site (see `HandlerClause::Let` handler below) narrows back
+        // to U64 explicitly when the spec writes `let X = mul_div_*(…)`,
+        // because the binding's spec-declared type is U64 and downstream
+        // U64 uses (e.g. `total - X`) need to typecheck.
         Expr::MulDivFloor { a, b, d } => format!(
             "mul_div_floor_u128({}, {}, {})",
             render_helper_arg(&a.node, ctx, consts, opts),
@@ -1089,6 +1099,21 @@ fn rust_infer_kind(env: &TypeEnv, e: &Expr) -> Kind {
         Expr::Paren(inner) => rust_infer_kind(env, &inner.node),
         Expr::Old(inner) => rust_infer_kind(env, &inner.node),
         _ => env.infer(e),
+    }
+}
+
+/// `true` iff `e` is a `mul_div_floor` / `mul_div_ceil` call, possibly
+/// wrapped in `Paren` and/or `Old`. Mirrors the peel pattern in
+/// `rust_infer_kind` above so the let-binding narrow gate stays in
+/// lock-step — `let X = (mul_div_floor(...))` and `let X =
+/// old(mul_div_floor(...))` both want the same narrowing as the bare
+/// form.
+fn is_mul_div_let_rhs(e: &Expr) -> bool {
+    match e {
+        Expr::MulDivFloor { .. } | Expr::MulDivCeil { .. } => true,
+        Expr::Paren(inner) => is_mul_div_let_rhs(&inner.node),
+        Expr::Old(inner) => is_mul_div_let_rhs(&inner.node),
+        _ => false,
     }
 }
 
@@ -3554,10 +3579,30 @@ fn adapt_handler(h: &a::HandlerDecl, consts: ConstTable, env: &TypeEnv) -> Parse
                 handler.modifies = Some(fs.clone());
             }
             a::HandlerClause::Let { name, value } => {
+                let rust = expr_to_rust(&value.node, Ctx::Guard, consts, opts_native(env));
+                // Narrow `let X = mul_div_*(...)` to U64 at the binding
+                // site — the spec-level operation is U64 → U64 but the
+                // u128 helper is used for intermediate `a * b` width.
+                // Without this, the canonical `let fee =
+                // mul_div_floor(total, fee_bps, BPS); let to_provider =
+                // total - fee` lowers to `u64 - u128`, which `cargo
+                // build` rejects. Wider arbitrary-expression contexts
+                // (`requires X mul_div_floor(...) <= U128_LIT …`) keep
+                // the u128 width via the `expr_to_rust` rendering above.
+                //
+                // `is_mul_div_let_rhs` peels `Paren` / `Old` wrappers so
+                // `let X = (mul_div_floor(...))` and `let X =
+                // old(mul_div_floor(...))` get the same narrowing as the
+                // bare form — matches the precedent in `rust_infer_kind`.
+                let rust = if is_mul_div_let_rhs(&value.node) {
+                    format!("({}) as u64", rust)
+                } else {
+                    rust
+                };
                 handler.let_bindings.push((
                     name.clone(),
                     expr_to_lean(&value.node, Ctx::Guard, consts, env),
-                    expr_to_rust(&value.node, Ctx::Guard, consts, opts_native(env)),
+                    rust,
                 ));
             }
             a::HandlerClause::Effect(blocks) => {
@@ -5240,6 +5285,137 @@ handler noop (amt : U64) {
         assert!(
             h.accounts.is_empty(),
             "noop handler should stay account-less"
+        );
+    }
+
+    /// `expr_to_rust` must render `mul_div_floor` / `mul_div_ceil` with
+    /// an `as u64` narrowing cast — the helpers return `u128` (the
+    /// intermediate `a * b` can overflow u64), but the spec-level
+    /// operation is U64 → U64. Without the cast, the canonical
+    /// `let fee = mul_div_floor(total, fee_bps, BPS); let to_provider =
+    /// total - fee` lowers to `u64 - u128`, which rejects at
+    /// `cargo build`.
+    #[test]
+    fn mul_div_floor_narrows_to_u64_at_call_site() {
+        let src = r#"spec FeeMath
+program_id "11111111111111111111111111111111"
+
+const BPS_DENOMINATOR = 10_000
+
+type State
+  | Active of { total_collected : U64 }
+
+type Error
+  | MathOverflow
+
+handler accept (total : U64) (fee_bps : U64) : State.Active -> State.Active {
+  permissionless
+  let fee = mul_div_floor(total, fee_bps, BPS_DENOMINATOR)
+  let to_provider = total - fee
+  effect { Active.total_collected += fee }
+}
+"#;
+        let spec = parse_str(src).expect("parse");
+        let h = spec
+            .handlers
+            .iter()
+            .find(|h| h.name == "accept")
+            .expect("accept handler");
+
+        // Find the `fee` binding's rendered RHS.
+        let (_, _, fee_rhs) = h
+            .let_bindings
+            .iter()
+            .find(|(name, _, _)| name == "fee")
+            .expect("fee binding");
+
+        assert!(
+            fee_rhs.contains("mul_div_floor_u128"),
+            "rendered RHS should still call the u128 helper for the intermediate width; got: {fee_rhs}"
+        );
+        assert!(
+            fee_rhs.contains("as u64"),
+            "rendered RHS must narrow back to u64 so downstream u64 uses (e.g. `total - fee`) typecheck; got: {fee_rhs}"
+        );
+    }
+
+    /// Same contract for `mul_div_ceil`.
+    #[test]
+    fn mul_div_ceil_narrows_to_u64_at_call_site() {
+        let src = r#"spec FeeMath
+program_id "11111111111111111111111111111111"
+
+const BPS_DENOMINATOR = 10_000
+
+type State
+  | Active of { total_collected : U64 }
+
+type Error
+  | MathOverflow
+
+handler accept (total : U64) (fee_bps : U64) : State.Active -> State.Active {
+  permissionless
+  let fee = mul_div_ceil(total, fee_bps, BPS_DENOMINATOR)
+  let to_provider = total - fee
+  effect { Active.total_collected += fee }
+}
+"#;
+        let spec = parse_str(src).expect("parse");
+        let h = spec
+            .handlers
+            .iter()
+            .find(|h| h.name == "accept")
+            .expect("accept handler");
+        let (_, _, fee_rhs) = h
+            .let_bindings
+            .iter()
+            .find(|(name, _, _)| name == "fee")
+            .expect("fee binding");
+        assert!(
+            fee_rhs.contains("mul_div_ceil_u128") && fee_rhs.contains("as u64"),
+            "ceil variant must narrow too; got: {fee_rhs}"
+        );
+    }
+
+    /// The let-binding narrow gate peels through `Paren` wrappers so the
+    /// author-written `let X = (mul_div_floor(...))` shape gets the same
+    /// narrowing as the bare form. Mirrors the `rust_infer_kind` peel
+    /// precedent — without it, a parenthesised RHS would silently keep
+    /// the u128 width and re-trigger the original `u64 - u128` mismatch.
+    #[test]
+    fn mul_div_in_paren_let_rhs_still_narrows_to_u64() {
+        let src = r#"spec FeeMath
+program_id "11111111111111111111111111111111"
+
+const BPS_DENOMINATOR = 10_000
+
+type State
+  | Active of { total_collected : U64 }
+
+type Error
+  | MathOverflow
+
+handler accept (total : U64) (fee_bps : U64) : State.Active -> State.Active {
+  permissionless
+  let fee = (mul_div_floor(total, fee_bps, BPS_DENOMINATOR))
+  let to_provider = total - fee
+  effect { Active.total_collected += fee }
+}
+"#;
+        let spec = parse_str(src).expect("parse");
+        let h = spec
+            .handlers
+            .iter()
+            .find(|h| h.name == "accept")
+            .expect("accept handler");
+        let (_, _, fee_rhs) = h
+            .let_bindings
+            .iter()
+            .find(|(name, _, _)| name == "fee")
+            .expect("fee binding");
+        assert!(
+            fee_rhs.contains("mul_div_floor_u128") && fee_rhs.contains("as u64"),
+            "parenthesised mul_div RHS must still narrow; got: {fee_rhs}"
         );
     }
 }
