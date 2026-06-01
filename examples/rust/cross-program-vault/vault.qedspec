@@ -21,6 +21,14 @@
 
 spec Vault
 
+// This example's hand-written instruction logic destructures the
+// inner-enum (`VaultAccountInner` / `acct.inner`), so it deliberately
+// uses the inductive multi-variant State representation. Before v2.33
+// that was implied by declaring the `WrongState` error; it is now
+// explicit. Vault is the bundled ADT-representation showcase — every
+// other example lowers to the default flat `structure State`.
+pragma state_repr = adt
+
 program_id "11111111111111111111111111111111"
 
 import AdminConfig from "admin_config"

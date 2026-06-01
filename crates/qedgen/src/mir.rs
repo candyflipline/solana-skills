@@ -185,6 +185,15 @@ pub struct Mir {
     /// at the codegen call site (it is not lifted into MIR — with only one
     /// consumer there is no cross-codegen divergence for MIR to prevent).
     pub is_assembly: bool,
+    /// State-representation opt-in (`pragma state_repr = adt`, via
+    /// `ParsedSpec::state_repr_is_adt`). True → the multi-variant State
+    /// lowers as a real `inductive State` (Lean) / wrapper-struct +
+    /// inner-enum (Anchor Rust); false (default) → flat `structure
+    /// State` + `status` discriminant. Replaces the pre-v2.33 footgun
+    /// that keyed the choice on an incidental `WrongState` error
+    /// variant. `lean_gen_mir::is_multi_variant_adt` reads this; the
+    /// `ParsedSpec`-based codegens read `state_repr_is_adt()` directly.
+    pub adt_state: bool,
 }
 
 // ----------------------------------------------------------------------
@@ -1076,6 +1085,7 @@ pub fn lower(parsed: &ParsedSpec) -> Mir {
         environments: lower_environments(parsed),
         records: parsed.records.clone(),
         is_assembly: parsed.is_assembly_target(),
+        adt_state: parsed.state_repr_is_adt(),
     }
 }
 
@@ -1751,6 +1761,7 @@ mod tests {
             environments: vec![],
             records: vec![],
             is_assembly: false,
+            adt_state: false,
         };
         assert_eq!(mir.name, "Test");
         assert!(mir.handlers.is_empty());

@@ -32,7 +32,6 @@ pub enum EscrowError {
     WrongState = 3,
     InvalidLifecycle = 4,
     MathOverflow = 5,
-    InvalidPda = 6,
 }
 // ---- END GENERATED ----
 
@@ -75,36 +74,24 @@ use crate::*;
 /// Guards for `cancel`.  
 /// Generated from the `requires` clauses of the spec handler block.
 pub fn cancel<'info>(ctx: &mut Cancel<'info>) -> Result<()> {
-    // lifecycle: require inner == Open
-    if !matches!(ctx.escrow.inner, EscrowAccountInner::Open { .. }) { return Err(crate::errors::EscrowError::InvalidLifecycle.into()); }
-    // auth: variant payload Open.initializer == ctx.initializer.key()
-    let EscrowAccountInner::Open { initializer: auth_field, .. } = &ctx.escrow.inner
-    else { return Err(EscrowError::InvalidLifecycle.into()); };
-    if auth_field != &ctx.initializer.key() { return Err(EscrowError::Unauthorized.into()); }
+    // lifecycle: require status == Open
+    if ctx.escrow.status != Status::Open as u8 { return Err(crate::errors::EscrowError::InvalidLifecycle.into()); }
     // authority: ctx.escrow_ta.owner != ctx.escrow.key()
     if ctx.escrow_ta.owner != ctx.escrow.key() { return Err(EscrowError::Unauthorized.into()); }
+    // lifecycle: status := Closed
+    ctx.escrow.status = Status::Closed as u8;
     Ok(())
 }
 
 /// Guards for `exchange`.  
 /// Generated from the `requires` clauses of the spec handler block.
 pub fn exchange<'info>(ctx: &mut Exchange<'info>) -> Result<()> {
-    // lifecycle: require inner == Open
-    if !matches!(ctx.escrow.inner, EscrowAccountInner::Open { .. }) { return Err(crate::errors::EscrowError::InvalidLifecycle.into()); }
-    // auth: variant payload Open.taker == ctx.taker.key()
-    let EscrowAccountInner::Open { taker: auth_field, .. } = &ctx.escrow.inner
-    else { return Err(EscrowError::InvalidLifecycle.into()); };
-    if auth_field != &ctx.taker.key() { return Err(EscrowError::Unauthorized.into()); }
-    // R28 PDA check: ctx.escrow matches its declared seeds (Anchor)
-    {
-        let __seeds: &[&[u8]] = &[b"escrow", ctx.escrow.inner.initializer().as_ref(), &[ctx.escrow.bump]];
-        let __expected = anchor_lang::solana_program::pubkey::Pubkey::create_program_address(__seeds, &crate::ID).map_err(|_| EscrowError::InvalidPda)?;
-        if ctx.escrow.key() != __expected {
-            return Err(EscrowError::InvalidPda.into());
-        }
-    }
+    // lifecycle: require status == Open
+    if ctx.escrow.status != Status::Open as u8 { return Err(crate::errors::EscrowError::InvalidLifecycle.into()); }
     // authority: ctx.escrow_ta.owner != ctx.escrow.key()
     if ctx.escrow_ta.owner != ctx.escrow.key() { return Err(EscrowError::Unauthorized.into()); }
+    // lifecycle: status := Closed
+    ctx.escrow.status = Status::Closed as u8;
     Ok(())
 }
 
@@ -115,6 +102,8 @@ pub fn initialize<'info>(ctx: &mut Initialize<'info>, deposit_amount: u64, recei
     if ctx.escrow_ta.owner != ctx.escrow.key() { return Err(EscrowError::Unauthorized.into()); }
     // requires: deposit_amount > 0 ∧ receive_amount > 0
     if !((deposit_amount > 0) && (receive_amount > 0)) { return Err(EscrowError::InvalidAmount.into()); }
+    // lifecycle: status := Open
+    ctx.escrow.status = Status::Open as u8;
     Ok(())
 }
 
@@ -130,18 +119,14 @@ pub fn initialize<'info>(ctx: &mut Initialize<'info>, deposit_amount: u64, recei
 use anchor_lang::prelude::*;
 use crate::guards;
 use qedgen_macros::qed;
-use crate::errors::*;
-use crate::state::EscrowAccountInner;
 use crate::{Cancel, CancelBumps};
 
 impl<'info> Cancel<'info> {
-    #[qed(verified, spec = "..", handler = "cancel", hash = "3b4dcd18c74f53c1", spec_hash = "030f42b60ac489f1")]
+    #[qed(verified, spec = "..", handler = "cancel", hash = "424451424ac67012", spec_hash = "030f42b60ac489f1")]
     #[inline(always)]
     pub fn handler(&mut self, bumps: &CancelBumps) -> Result<()> {
         guards::cancel(self)?;
         let _ = bumps;
-        if !matches!(self.escrow.inner, EscrowAccountInner::Open { .. }) { return Err(EscrowError::WrongState.into()); }
-        self.escrow.inner = EscrowAccountInner::Closed;
         // Spec: emit!(EscrowCancelled)
         // Spec call: Token.transfer (Anchor CPI emitted by v2.8 G4)
         {
@@ -152,7 +137,7 @@ impl<'info> Cancel<'info> {
                 authority: self.escrow.to_account_info(),
             };
             let cpi_program = self.token_program.to_account_info();
-            token::transfer(CpiContext::new(cpi_program, cpi_accounts), (*self.escrow.inner.initializer_amount()))?;
+            token::transfer(CpiContext::new(cpi_program, cpi_accounts), self.escrow.initializer_amount)?;
         }
         todo!("fill non-mechanical effects, events, transfers, calls")
     }
@@ -168,18 +153,14 @@ impl<'info> Cancel<'info> {
 use anchor_lang::prelude::*;
 use crate::guards;
 use qedgen_macros::qed;
-use crate::errors::*;
-use crate::state::EscrowAccountInner;
 use crate::{Exchange, ExchangeBumps};
 
 impl<'info> Exchange<'info> {
-    #[qed(verified, spec = "..", handler = "exchange", hash = "5c5eee4269d66f4d", spec_hash = "b3781c2e64f2bf85")]
+    #[qed(verified, spec = "..", handler = "exchange", hash = "7d4afdf9da9f4dcb", spec_hash = "b3781c2e64f2bf85")]
     #[inline(always)]
     pub fn handler(&mut self, bumps: &ExchangeBumps) -> Result<()> {
         guards::exchange(self)?;
         let _ = bumps;
-        if !matches!(self.escrow.inner, EscrowAccountInner::Open { .. }) { return Err(EscrowError::WrongState.into()); }
-        self.escrow.inner = EscrowAccountInner::Closed;
         // Spec: emit!(EscrowExchanged)
         // Spec call: Token.transfer (Anchor CPI emitted by v2.8 G4)
         {
@@ -190,7 +171,7 @@ impl<'info> Exchange<'info> {
                 authority: self.taker.to_account_info(),
             };
             let cpi_program = self.token_program.to_account_info();
-            token::transfer(CpiContext::new(cpi_program, cpi_accounts), (*self.escrow.inner.taker_amount()))?;
+            token::transfer(CpiContext::new(cpi_program, cpi_accounts), self.escrow.taker_amount)?;
         }
         // Spec call: Token.transfer (Anchor CPI emitted by v2.8 G4)
         {
@@ -201,7 +182,7 @@ impl<'info> Exchange<'info> {
                 authority: self.escrow.to_account_info(),
             };
             let cpi_program = self.token_program.to_account_info();
-            token::transfer(CpiContext::new(cpi_program, cpi_accounts), (*self.escrow.inner.initializer_amount()))?;
+            token::transfer(CpiContext::new(cpi_program, cpi_accounts), self.escrow.initializer_amount)?;
         }
         todo!("fill non-mechanical effects, events, transfers, calls")
     }
@@ -217,17 +198,16 @@ impl<'info> Exchange<'info> {
 use anchor_lang::prelude::*;
 use crate::guards;
 use qedgen_macros::qed;
-use crate::state::EscrowAccountInner;
 use crate::{Initialize, InitializeBumps};
 
 impl<'info> Initialize<'info> {
-    #[qed(verified, spec = "..", handler = "initialize", hash = "47fbbabe9a8494ba", spec_hash = "467f6506b9a3a3ba")]
+    #[qed(verified, spec = "..", handler = "initialize", hash = "06dc441f4bb69193", spec_hash = "467f6506b9a3a3ba")]
     #[inline(always)]
     pub fn handler(&mut self, deposit_amount: u64, receive_amount: u64, bumps: &InitializeBumps) -> Result<()> {
         guards::initialize(self, deposit_amount, receive_amount)?;
         let _ = bumps;
-        // Spec effect (needs fill): Open.initializer_amount set deposit_amount
-        // Spec effect (needs fill): Open.taker_amount set receive_amount
+        self.escrow.initializer_amount = deposit_amount;
+        self.escrow.taker_amount = receive_amount;
         // Spec: emit!(EscrowInitialized)
         // Spec call: Token.transfer (Anchor CPI emitted by v2.8 G4)
         {
@@ -294,7 +274,7 @@ use anchor_spl::token::{Token, TokenAccount};
 pub struct Cancel<'info> {
     #[account(mut)]
     pub initializer: Signer<'info>,
-    #[account(mut, seeds = [b"escrow", initializer.key().as_ref()], bump)]
+    #[account(mut, seeds = [b"escrow", initializer.key().as_ref()], bump, has_one = initializer)]
     pub escrow: Account<'info, EscrowAccount>,
     #[account(mut)]
     pub escrow_ta: Account<'info, TokenAccount>,
@@ -307,7 +287,7 @@ pub struct Cancel<'info> {
 pub struct Exchange<'info> {
     #[account(mut)]
     pub taker: Signer<'info>,
-    #[account(mut)]
+    #[account(mut, seeds = [b"escrow", escrow.initializer.as_ref()], bump, has_one = taker)]
     pub escrow: Account<'info, EscrowAccount>,
     #[account(mut)]
     pub initializer_ta: Account<'info, TokenAccount>,
@@ -322,7 +302,7 @@ pub struct Exchange<'info> {
 pub struct Initialize<'info> {
     #[account(mut)]
     pub initializer: Signer<'info>,
-    #[account(mut, seeds = [b"escrow", initializer.key().as_ref()], bump)]
+    #[account(mut, seeds = [b"escrow", initializer.key().as_ref()], bump, has_one = initializer)]
     pub escrow: Account<'info, EscrowAccount>,
     pub mint: AccountInfo<'info>,
     #[account(mut)]
@@ -339,79 +319,23 @@ pub struct Initialize<'info> {
 use anchor_lang::prelude::*;
 
 #[account]
-#[derive(InitSpace)]
 pub struct EscrowAccount {
-    pub inner: EscrowAccountInner,
+    pub initializer: Pubkey,
+    pub taker: Pubkey,
+    pub initializer_amount: u64,
+    pub taker_amount: u64,
+    pub escrow_token_account: Pubkey,
     pub bump: u8,
+    pub status: u8,
 }
 
-/// Variant-payload state for EscrowAccount. The Anchor wrapper above
-/// carries the account discriminator; this enum carries the
-/// state-machine variant + per-variant payload fields.
-#[derive(AnchorSerialize, AnchorDeserialize, InitSpace, Clone, Debug, PartialEq)]
-pub enum EscrowAccountInner {
-    Uninitialized,
-    Open {
-        initializer: Pubkey,
-        taker: Pubkey,
-        initializer_amount: u64,
-        taker_amount: u64,
-        escrow_token_account: Pubkey,
-    },
-    Closed,
-}
-
-impl EscrowAccountInner {
-    /// v2.29 Slice B accessor for `escrow_token_account`. Panics on variants
-/// that don't carry the field — guarded against by the
-/// per-handler lifecycle check that fires before any
-/// `requires` emission in `crate::guards`.
-    pub fn escrow_token_account(&self) -> &Pubkey {
-        match self {
-            Self::Open { escrow_token_account, .. } => escrow_token_account,
-            _ => panic!("EscrowAccountInner::escrow_token_account() called on a variant without `escrow_token_account`"),
-        }
-    }
-    /// v2.29 Slice B accessor for `initializer`. Panics on variants
-/// that don't carry the field — guarded against by the
-/// per-handler lifecycle check that fires before any
-/// `requires` emission in `crate::guards`.
-    pub fn initializer(&self) -> &Pubkey {
-        match self {
-            Self::Open { initializer, .. } => initializer,
-            _ => panic!("EscrowAccountInner::initializer() called on a variant without `initializer`"),
-        }
-    }
-    /// v2.29 Slice B accessor for `initializer_amount`. Panics on variants
-/// that don't carry the field — guarded against by the
-/// per-handler lifecycle check that fires before any
-/// `requires` emission in `crate::guards`.
-    pub fn initializer_amount(&self) -> &u64 {
-        match self {
-            Self::Open { initializer_amount, .. } => initializer_amount,
-            _ => panic!("EscrowAccountInner::initializer_amount() called on a variant without `initializer_amount`"),
-        }
-    }
-    /// v2.29 Slice B accessor for `taker`. Panics on variants
-/// that don't carry the field — guarded against by the
-/// per-handler lifecycle check that fires before any
-/// `requires` emission in `crate::guards`.
-    pub fn taker(&self) -> &Pubkey {
-        match self {
-            Self::Open { taker, .. } => taker,
-            _ => panic!("EscrowAccountInner::taker() called on a variant without `taker`"),
-        }
-    }
-    /// v2.29 Slice B accessor for `taker_amount`. Panics on variants
-/// that don't carry the field — guarded against by the
-/// per-handler lifecycle check that fires before any
-/// `requires` emission in `crate::guards`.
-    pub fn taker_amount(&self) -> &u64 {
-        match self {
-            Self::Open { taker_amount, .. } => taker_amount,
-            _ => panic!("EscrowAccountInner::taker_amount() called on a variant without `taker_amount`"),
-        }
-    }
+/// Program lifecycle states.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Status {
+    Uninitialized = 0,
+    Open = 1,
+    Closed = 2,
 }
 // ---- END GENERATED ----
 

@@ -1361,8 +1361,7 @@ pub fn is_multi_variant_adt_state_pub(spec: &ParsedSpec) -> bool {
 }
 
 fn is_multi_variant_adt_state(spec: &ParsedSpec) -> bool {
-    let has_wrong_state = spec.error_codes.iter().any(|c| c == "WrongState");
-    has_wrong_state
+    spec.state_repr_is_adt()
         && spec.account_types.len() == 1
         && spec
             .account_types

@@ -1074,6 +1074,28 @@ Body whitelist for `pragma sbpf`: `const`, `pubkey`, `instruction`, `errors`.
 Core DSL items (`handler`, `type`, `property`, `invariant`, `interface`, …)
 stay at the top level.
 
+### Assignment pragmas — `pragma <key> = <value>`
+
+Scalar codegen directives that tune *how* a spec lowers, without a body:
+
+```fsharp
+pragma checked_overflow_error = MathOverflow   // error returned on a checked-add overflow
+pragma state_repr = adt                        // inductive multi-variant State (see below)
+```
+
+**`pragma state_repr = adt`** — opt a multi-variant `type State | A | B of { … } | C`
+into the inductive representation: Lean lowers it to a real `inductive State` (with
+per-variant payload + match-based transitions) and Anchor Rust to the wrapper-struct +
+inner-enum shape. **Absent (the default), a multi-variant State lowers flat** — a
+`structure State` carrying every variant's fields plus a `status : Status` discriminant.
+The flat form auto-discharges more proof obligations (abort / liveness / overflow), so
+prefer it unless you specifically want the inductive sum-type modeling.
+
+> Before v2.33 this choice was keyed implicitly on whether the spec declared a
+> `WrongState` error variant — so adding or removing a lifecycle error silently flipped
+> the State representation. The pragma makes it explicit. `WrongState` keeps its
+> independent role as the error returned on a variant-mismatch fallthrough.
+
 ## Interface declarations
 
 Contracts for programs you CPI into. Uniform surface across three tiers:

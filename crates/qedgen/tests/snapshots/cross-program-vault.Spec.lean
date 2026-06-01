@@ -66,7 +66,9 @@ def applyOp (s : State) (signer : Pubkey) : Operation → Option State
 -- ============================================================================
 
 theorem deposit_aborts_if_InvalidAmount (s : State) (signer : Pubkey) (amount : Nat)
-    (h : ¬(amount > 0)) : depositTransition s signer amount = none := by sorry
+    (h : ¬(amount > 0)) : depositTransition s signer amount = none := by
+  unfold depositTransition
+  cases s <;> simp_all
 
 -- ============================================================================
 -- Frame conditions (modifies)
@@ -76,8 +78,9 @@ theorem deposit_frame (s s' : State) (signer : Pubkey) (amount : Nat)
     (h : depositTransition s signer amount = some s') :
     -- todo!(): inductive-State frame condition. Statement needs
     -- per-pre-variant case analysis to express which payload
-    -- fields are preserved. Holds trivially for now.
-    True := by sorry
+    -- fields are preserved. Stated as `True` until that lands;
+    -- the honest placeholder proof is `trivial`, not `sorry`.
+    True := trivial
 
 -- ============================================================================
 -- Overflow safety obligations (auto-generated for operations with add effects)

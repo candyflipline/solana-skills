@@ -11,7 +11,7 @@ inductive Status where
   | Uninitialized
   | Open
   | Closed
-  deriving Repr, DecidableEq, BEq
+  deriving Repr, DecidableEq, BEq, Inhabited
 
 structure State where
   initializer : Pubkey
@@ -21,7 +21,7 @@ structure State where
   taker_amount : Nat
   escrow_token_account : Pubkey
   status : Status
-  deriving Repr, DecidableEq, BEq
+  deriving Repr, DecidableEq, BEq, Inhabited
 
 def initializeTransition (s : State) (signer : Pubkey) (deposit_amount : Nat) (receive_amount : Nat) : Option State :=
   if signer = s.initializer ∧ s.status = .Uninitialized ∧ deposit_amount > 0 ∧ receive_amount > 0 then

@@ -762,7 +762,7 @@ pub fn is_multi_variant_adt_with_field_in_variant(spec: &ParsedSpec, field: &str
     if acct.variants.len() <= 1 {
         return false;
     }
-    if !spec.error_codes.iter().any(|c| c == "WrongState") {
+    if !spec.state_repr_is_adt() {
         return false;
     }
     acct.variants
@@ -1305,6 +1305,22 @@ impl ParsedSpec {
     /// Quasar/Anchor (the default). Single source of truth.
     pub fn is_assembly_target(&self) -> bool {
         self.has_pragma("sbpf")
+    }
+
+    /// State-representation opt-in: `pragma state_repr = adt` present → the
+    /// multi-variant State lowers as a real `inductive State` (Lean) /
+    /// wrapper-struct + inner-enum (Anchor Rust); absent → the default
+    /// flat `structure State` + `status` discriminant. Single source of
+    /// truth for the flat-vs-ADT choice across all four backends.
+    ///
+    /// Replaces the pre-v2.33 footgun where the representation was keyed
+    /// on whether the spec happened to declare a `WrongState` error
+    /// variant — an incidental Error-type name silently flipped the
+    /// State shape (and which proofs auto-discharged). `WrongState`
+    /// keeps its *other* role (the error returned on a variant-mismatch
+    /// fallthrough); only the representation signal moved here.
+    pub fn state_repr_is_adt(&self) -> bool {
+        self.pragma_value("state_repr") == Some("adt")
     }
 
     /// v2.24 §S1b — look up a `pragma <key> = <value>` assignment.
@@ -2850,6 +2866,36 @@ pub fn check_completeness(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
         }
         lhs.to_string()
     };
+
+    // v2.33: `pragma state_repr = adt` selects the inductive multi-variant
+    // State representation, whose generated transitions return
+    // `Err(WrongState)` on a variant-mismatch fallthrough. Without that
+    // error variant declared, the emitted Rust references an undeclared
+    // symbol and fails to compile. Before v2.33 the two were coupled —
+    // declaring `WrongState` was *itself* the ADT opt-in — so this gap
+    // could not arise; the explicit pragma makes it possible, hence the
+    // lint. (The failure is loud at `cargo check`, not silent; this just
+    // surfaces it at spec-check time with a clear fix.)
+    if spec.state_repr_is_adt()
+        && spec
+            .account_types
+            .first()
+            .map(|a| a.variants.len() > 1)
+            .unwrap_or(false)
+        && !spec.error_codes.iter().any(|c| c == "WrongState")
+    {
+        warnings.push(CompletenessWarning {
+            rule: "adt_state_missing_wrong_state".to_string(),
+            severity: Severity::Warning,
+            priority: 2,
+            message: "`pragma state_repr = adt` is set but no `WrongState` error is declared — the inductive transitions return `Err(WrongState)` on a variant-mismatch fallthrough, which won't compile".to_string(),
+            subject: None,
+            fix: "Add `WrongState` to `type Error`, or drop `pragma state_repr = adt` to use the flat State representation.".to_string(),
+            example: None,
+            counterexample: None,
+            fix_options: vec![],
+        });
+    }
 
     for op in &spec.handlers {
         // v2.7 G4: `auth X` and `permissionless` are mutually exclusive — one
@@ -7171,6 +7217,63 @@ handler deposit (amount : U64) {
             warnings.is_empty(),
             "lint must stay silent when ensures references the field, got: {:?}",
             warnings.iter().map(|w| &w.rule).collect::<Vec<_>>()
+        );
+    }
+
+    // ========================================================================
+    // v2.33 — adt_state_missing_wrong_state lint
+    // ========================================================================
+
+    /// `pragma state_repr = adt` selects the inductive representation,
+    /// whose variant-mismatch fallthrough returns `Err(WrongState)`.
+    /// Declaring the pragma without the error variant would emit
+    /// non-compiling Rust, so `check` surfaces it. Without the pragma the
+    /// same spec lowers flat and the lint stays silent.
+    #[test]
+    fn adt_state_pragma_without_wrong_state_fires() {
+        let body = r#"
+program_id "11111111111111111111111111111111"
+
+type State
+  | Uninitialized
+  | Active of { balance : U64 }
+  | Closed
+
+type Error
+  | InvalidAmount
+
+handler open (amount : U64) : State.Uninitialized -> State.Active {
+  auth owner
+  accounts { owner : signer, writable }
+  requires amount > 0 else InvalidAmount
+}"#;
+
+        // pragma set, no WrongState → fires
+        let adt = crate::chumsky_adapter::parse_str(&format!(
+            "spec Adt\npragma state_repr = adt\n{body}"
+        ))
+        .expect("parse adt");
+        let w = check_completeness(&adt);
+        let hit = w
+            .iter()
+            .find(|w| w.rule == "adt_state_missing_wrong_state")
+            .unwrap_or_else(|| {
+                panic!(
+                    "lint must fire; got: {:?}",
+                    w.iter().map(|w| &w.rule).collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(hit.severity, Severity::Warning);
+        assert_eq!(hit.priority, 2);
+
+        // no pragma (flat) → silent even without WrongState
+        let flat =
+            crate::chumsky_adapter::parse_str(&format!("spec Flat\n{body}")).expect("parse flat");
+        assert!(
+            !check_completeness(&flat)
+                .iter()
+                .any(|w| w.rule == "adt_state_missing_wrong_state"),
+            "flat specs don't need WrongState; lint must stay silent"
         );
     }
 
