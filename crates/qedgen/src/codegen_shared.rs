@@ -1,3 +1,12 @@
+//! Shared Rust-codegen helper library for `codegen_mir`. Was `codegen.rs`
+//! until v2.32 deleted the legacy `generate()` orchestration and renamed
+//! the remainder. Holds the per-target `FrameworkSurface`, `generate_guards`,
+//! the Pinocchio scaffold emitters, the SPL CPI dispatch (`try_emit_cpi` /
+//! `emit_spl_*`), and helpers (`map_type`, `to_pascal_case`, `mechanize_effect`,
+//! …). These read `ParsedSpec` directly — they emit account-constraint /
+//! guard-predicate / framework-scaffold surface, not effect-body `Stmt` IR,
+//! so they're correctly `ParsedSpec`-based.
+
 use anyhow::Result;
 use std::path::Path;
 

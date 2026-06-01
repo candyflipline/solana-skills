@@ -1,75 +1,18 @@
-// Phase 4 (v2.30) MIR-based Anchor/Quasar codegen. Lives in parallel
-// to `codegen.rs` until snapshot equivalence is validated on every
-// pilot fixture; then `codegen.rs` is retired.
-//
-//! qedgen Anchor/Quasar codegen — MIR consumer.
+//! qedgen Anchor/Quasar/Pinocchio program codegen — the MIR consumer.
+//! Sole Rust-codegen path since v2.32 deleted the legacy
+//! `codegen::generate`. Highest blast radius of any qedgen codegen —
+//! the output (`lib.rs`, `state.rs`, `errors.rs`, `events.rs`,
+//! `instructions/<handler>.rs`, `guards.rs`, `math.rs`, `Cargo.toml`)
+//! is the actual Solana program users compile and deploy.
 //!
-//! Phase 4 of the v2.30 refactor. The existing `codegen.rs` (7,572
-//! LoC, 67 fns) is the user-facing program emitter — it ships the
-//! `lib.rs`, `state.rs`, `errors.rs`, `events.rs`,
-//! `instructions/<handler>.rs`, `guards.rs`, `math.rs`, `Cargo.toml`,
-//! etc. that every `qedgen codegen --target {anchor,quasar}` writes
-//! into `programs/`. Highest blast radius of any qedgen codegen
-//! because the output is the actual Solana program users compile
-//! and deploy.
-//!
-//! ## Dispatch
-//!
-//! `QEDGEN_USE_MIR_CODEGEN=1` switches the `qedgen codegen --target
-//! …` call site to this module; without the flag, legacy
-//! `codegen::generate` runs. Default stays on legacy until
-//! snapshot equivalence ratifies every pilot fixture (mirrors Lean
-//! / Kani Phase 1 / Phase 3 sequencing).
-//!
-//! ## Phase 4a-4b scope
-//!
-//! Phase 4a (prior commit): scaffold + pure-delegation dispatch.
-//! `generate(&Mir, &ParsedSpec, &Path, Target)` calls each promoted-
-//! pub(crate) `codegen::generate_<X>` sub-generator in legacy's order.
-//!
-//! Phase 4b–4c in progress: sub-generators ported one at a time,
-//! smallest + most deterministic first.
-//!   * 4b/1 — `emit_cargo_toml` (Mir.name + needs_spl predicate
-//!     from MIR account kinds / Stmt::TokenTransfer / Stmt::Cpi).
-//!   * 4b/2 — `emit_math` (no spec dependency; pure text emit
-//!     against the fingerprint hash).
-//!   * 4b/3 — `emit_events` (mir.events for structure; falls back
-//!     to parsed.events for field-type strings).
-//!   * 4c/1 — `emit_errors` (mir.errors.variants + mir.name;
-//!     R26/R28 augmentation predicates stay on parsed).
-//!   * 4c/2 — `emit_ref_impls` (mir.ref_impls — shape-identical
-//!     to parsed.ref_impls; same field-type-string fallback as
-//!     events).
-//!
-//! Remaining sub-generators delegate to their legacy
-//! `crate::codegen_shared::generate_<X>` for now.
-//!
-//! Why pure-delegation first instead of porting any sub-generator
-//! immediately: codegen.rs's blast radius (`programs/lib.rs` and
-//! friends are the user's deployed Solana program) means the
-//! refactor must land in slices that each individually pass the
-//! snapshot gate. Phase 4a stands up the structural shell so the
-//! dispatch is in place; Phase 4b+ migrates sub-generators one at a
-//! time, each commit independently verifiable.
-//!
-//! ## Sub-generator porting order (planned)
-//!
-//! Smallest + most deterministic first; per-handler instructions
-//! last (highest cross-helper coupling).
-//!
-//! | Phase | Sub-generator           | Legacy LoC | Notes                          |
-//! |-------|-------------------------|-----------|--------------------------------|
-//! | 4b    | `generate_cargo_toml`   |  16       | Trivial — toml template        |
-//! | 4b    | `generate_math`         |  49       | Fixed inline math fns          |
-//! | 4b    | `generate_events`       |  44       | `#[event]` structs from spec.events |
-//! | 4c    | `generate_errors`       | 113       | `#[error_code]` enum from spec.error_codes |
-//! | 4c    | `generate_ref_impls`    |  50       | `ref_impl` fns                 |
-//! | 4d    | `generate_imported_mirror` | 232    | `src/imported/<ns>.rs` mirrors |
-//! | 4e    | `generate_lib`          | 238       | `#[program] pub mod` entry     |
-//! | 4f    | `generate_state`        | 328       | `#[account]` data struct       |
-//! | 4g    | `generate_guards`       | 636       | Largest — guard fns per handler |
-//! | 4h    | `generate_instructions` |  77 entry | Per-handler files (helpers elsewhere) |
-//! | 4i    | snapshot tests + flip   |   —       | mirrors Lean 1d / Kani 3f      |
+//! Consumes `mir::Mir` + the originating `ParsedSpec` + spec path. The
+//! effect-body emission is MIR-direct; the account-constraint / guard /
+//! framework-scaffold surface (`generate_guards`, `FrameworkSurface`,
+//! the Pinocchio scaffold, SPL CPI dispatch) is read from `ParsedSpec`
+//! via the shared [`crate::codegen_shared`] helpers — that data is
+//! account/predicate surface, not effect-body `Stmt` IR, so it stays
+//! `ParsedSpec`-based by design. Gated by `tests/codegen_snapshot.rs`
+//! (text) + `tests/codegen_smoke.rs` (the generated crates `cargo build`).
 
 use anyhow::Result;
 use std::path::Path;
@@ -78,15 +21,12 @@ use crate::check::ParsedSpec;
 use crate::mir::Mir;
 use crate::Target;
 
-/// Generate the Anchor/Quasar program code under `output_dir`,
-/// consuming MIR. Mirrors `codegen::generate(spec_path, output_dir,
-/// target)` shape but accepts a pre-lowered `Mir` + the originating
-/// `ParsedSpec` + the spec path (needed by `generate_instructions`'s
-/// drift-stamping logic).
-///
-/// Phase 4a body: pure delegation to legacy `codegen::generate_<X>`
-/// sub-generators in the same order as `codegen::generate`. Future
-/// slices replace each delegated call with a MIR-direct port.
+/// Generate the Anchor/Quasar/Pinocchio program code under
+/// `output_dir`, consuming a pre-lowered `Mir` + the originating
+/// `ParsedSpec` + the spec path (the latter needed by the instruction
+/// emitter's drift-stamping logic). Emits each sub-generator MIR-direct,
+/// reading the account-constraint / guard / scaffold surface from the
+/// shared `codegen_shared` helpers.
 pub fn generate(
     mir: &Mir,
     parsed: &ParsedSpec,
@@ -126,17 +66,15 @@ pub fn generate(
     emit_errors(mir, parsed, &fp, output_dir, target)?;
     // Phase 4h — MIR-direct port.
     emit_instructions(mir, parsed, &fp, spec_path, output_dir, target)?;
-    // Phase 4g — deferred. `generate_guards` is 636L of per-handler
-    // `requires` / `effects` / `auth` / `status` emission deeply
-    // coupled to `ParsedHandler` fields with no clean structural
-    // seam. A meaningful MIR port requires lifting requires +
-    // effects into typed `Stmt` nodes first — that's a separate
-    // v3.0-class refactor. Until then, delegate to legacy.
+    // Guards read `ParsedSpec` directly via the shared helper:
+    // `generate_guards` emits per-handler `requires` / `effects` /
+    // `auth` / `status` checks from `ParsedHandler` account-constraint
+    // surface (signer/writable flags, pda_seeds, variant-payload
+    // fields) — that's not effect-body `Stmt` IR, so it stays
+    // ParsedSpec-based by design (see `codegen_shared`).
     crate::codegen_shared::generate_guards(parsed, &fp, output_dir, target)?;
-    // Phase 4b/2 — MIR-direct port. `generate_math` body is
-    // fully deterministic (no spec read at all), so the gate is
-    // still the parsed-side `guards_use_math_helpers` predicate
-    // until that predicate gets its own MIR port.
+    // `generate_math` is fully deterministic (no spec read); the
+    // `guards_use_math_helpers` predicate gates whether to emit it.
     if crate::codegen_shared::guards_use_math_helpers(parsed) {
         emit_math(&fp, output_dir)?;
     }

@@ -574,30 +574,20 @@ parallel `*_mir.rs` modules alongside the legacy `*.rs` modules
 behind escape hatches — but the divergence-prevention payoff lands
 immediately for any new feature added against MIR.
 
-**Escape hatches.** The Rust-skeleton and proptest codegens still
-keep a legacy renderer you can opt back into if the MIR path produces
-unexpected output on your spec:
-
-```bash
-QEDGEN_LEGACY_CODEGEN=1  qedgen codegen --spec my.qedspec  # --target anchor / quasar
-QEDGEN_LEGACY_PROPTEST=1 qedgen codegen --spec my.qedspec --proptest
-```
-
-The Lean and Kani legacy renderers (and their `QEDGEN_LEGACY_LEAN` /
-`QEDGEN_LEGACY_KANI` hatches) were removed in v2.32 — `lean_gen_mir`
-and `kani_mir` are now the sole paths for those backends. (sBPF specs
-emit Lean proofs only; `--kani` / `--proptest` skip assembly targets,
-which are verified via Lean + client-side tests.)
-
-**If you hit a problem.** File a report at
-https://github.com/QEDGen/solana-skills/issues with the spec that
-triggered the escape hatch + the legacy-vs-default diff.
+**No escape hatches.** As of v2.32 the migration is complete: the four
+MIR codegens (`lean_gen_mir` / `kani_mir` / `codegen_mir` /
+`proptest_gen_mir`) are the *sole* paths — there are no `QEDGEN_LEGACY_*`
+env vars and no parallel legacy renderers. (sBPF specs emit Lean proofs
+only; `--kani` / `--proptest` skip assembly targets, which are verified
+via Lean + client-side tests.)
 
 **Roadmap.**
-- **v2.30** — MIR carry-through complete; legacy paths reachable via env vars.
-- **v2.31** — soak. No code change unless escape-hatch reports surface a bug.
-- **v2.32** — **shipped:** deleted `lean_gen.rs` + `kani.rs` (~11K LoC); removed `QEDGEN_LEGACY_LEAN` / `QEDGEN_LEGACY_KANI`. (Records → MIR for Lean; sBPF → MIR for Lean, with Kani/proptest skipping assembly.)
-- **v3.0** — port `generate_guards` (Anchor) + the full proptest body to MIR-direct (currently delegate to legacy); delete `codegen.rs` + `proptest_gen.rs` (~10K more LoC); remove the remaining two env vars.
+- **v2.30** — MIR carry-through complete; legacy paths reachable via env vars during a soak.
+- **v2.31** — soak.
+- **v2.32** — **migration finished:** deleted the legacy `lean_gen.rs`, `kani.rs`,
+  `proptest_gen.rs` and the legacy `codegen::generate`; removed all four
+  `QEDGEN_LEGACY_*` hatches. Records + sBPF ported to MIR for Lean (Kani/proptest
+  skip assembly); `codegen.rs`'s shared helpers live on as `codegen_shared.rs`.
 
 ## Examples
 

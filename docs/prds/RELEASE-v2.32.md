@@ -43,9 +43,20 @@ close the gaps, prove parity, delete last.
    `lean_gen`/`kani` references (`check.rs::proof_pkg_name` → `lean_sidecars`;
    `regen_drift.rs` + `main.rs init` → the MIR generators).
 
-5. **Docs sweep.** Updated CLAUDE.md's MIR section + module list, the
-   `lean_gen_mir` / `kani_mir` / `lean_sidecars` `//!` docstrings, README, and
-   `references/cli.md` to drop the deleted modules + escape-hatch language.
+5. **Deleted `codegen.rs` + `proptest_gen.rs` and the last two hatches.** Removed
+   `QEDGEN_LEGACY_CODEGEN` / `QEDGEN_LEGACY_PROPTEST` + the legacy `codegen::generate`
+   orchestration (999 LoC) + its obsolete unit tests (919 LoC). Merged the entire
+   `proptest_gen.rs` impl into `proptest_gen_mir` (as private `generate_impl`).
+   Renamed the remaining `codegen.rs` shared helpers → `codegen_shared.rs` and
+   repointed ~68 `crate::codegen::` refs across 9 modules. **Finding:** guards +
+   proptest sub-emitters can't go MIR-`Stmt`-native — they emit account-constraint /
+   property surface that isn't in the effect-body IR — so they stay `ParsedSpec`-based;
+   "delete the files" was a relocation, not a rewrite. `codegen_mir` / `proptest_gen_mir`
+   are now the sole Rust + proptest paths. NO `QEDGEN_LEGACY_*` hatches remain.
+
+6. **Docs sweep.** Updated CLAUDE.md's MIR section + module list, the `*_mir` /
+   `lean_sidecars` / `codegen_shared` `//!` docstrings, README, and `references/cli.md`
+   to drop every deleted module + escape-hatch reference.
 
 ## Regression gates
 
@@ -61,8 +72,13 @@ close the gaps, prove parity, delete last.
   migrated sBPF + record proofs still build. **This is the one remaining
   release gate; byte-parity makes it a formality.**
 
+- `tests/{codegen,proptest}_snapshot.rs` green (6/6 each) — the codegen +
+  proptest deletion is a relocation, so byte-parity is the contract; gated
+  alongside `codegen_smoke` (the generated Anchor/Pinocchio crates `cargo build`).
+
 ## Out of scope (stays for v3.0)
 
-- codegen + proptest legacy deletion — `codegen_mir::generate_guards` and the
-  proptest body aren't MIR-direct yet (the typed-`Stmt` lift). The
-  `QEDGEN_LEGACY_CODEGEN` / `QEDGEN_LEGACY_PROPTEST` hatches remain until then.
+- The MIR migration is now complete across all four codegens — no legacy modules
+  or `QEDGEN_LEGACY_*` hatches remain. Future MIR work (e.g. lifting requires/effects
+  into typed `Stmt` so guards could consume the IR) is optional refinement, not
+  legacy removal.
