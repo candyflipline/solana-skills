@@ -143,11 +143,39 @@ else
     fi
 fi
 
+# ── Put qedgen on PATH so `qedgen ...` works without the bin/ prefix ─────────
+# The skill clones to a harness-specific dir; symlink the binary into a
+# conventional PATH location so SKILL.md's bare `qedgen check` resolves.
+# Idempotent (ln -sf), and we warn with the exact export if the dir isn't
+# already on PATH.
+LINK_DIR="$HOME/.local/bin"
+mkdir -p "$LINK_DIR" 2>/dev/null || true
+if ln -sf "$QEDGEN_BIN" "$LINK_DIR/qedgen" 2>/dev/null; then
+    ON_PATH=false
+    case ":$PATH:" in *":$LINK_DIR:"*) ON_PATH=true ;; esac
+    # Rust/Solana devs almost always have ~/.cargo/bin on PATH too — link there
+    # as well so it resolves even if ~/.local/bin isn't wired up.
+    if [ -d "$HOME/.cargo/bin" ]; then
+        ln -sf "$QEDGEN_BIN" "$HOME/.cargo/bin/qedgen" 2>/dev/null || true
+        case ":$PATH:" in *":$HOME/.cargo/bin:"*) ON_PATH=true ;; esac
+    fi
+    PATH_LINKED=true
+else
+    PATH_LINKED=false
+fi
+
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "  qedgen ${VERSION} installed successfully!"
 echo ""
-echo "  Binary: $QEDGEN_BIN"
+if [ "${PATH_LINKED:-false}" = true ] && [ "${ON_PATH:-false}" = true ]; then
+    echo "  qedgen is on your PATH — run \`qedgen --help\` to confirm."
+elif [ "${PATH_LINKED:-false}" = true ]; then
+    echo "  Linked qedgen into $LINK_DIR."
+    echo "  Add it to PATH:  export PATH=\"$LINK_DIR:\$PATH\""
+else
+    echo "  Binary: $QEDGEN_BIN  (add its dir to PATH to call \`qedgen\` directly)"
+fi
 echo ""
 echo "  Next steps:"
 echo "    1. Write a .qedspec for your program (or let your agent generate one)"

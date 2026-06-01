@@ -34,9 +34,9 @@ npx skills add qedgen/solana-skills
 
 **Or just point your agent here.** Paste this to your coding agent and it installs QEDGen and gets to work:
 
-> Set up QEDGen for this program — follow `https://raw.githubusercontent.com/qedgen/solana-skills/main/docs/llms-full.txt`
+> Set up QEDGen for this program — follow `https://qedgen.dev/llms-full.txt`
 
-That file opens with a **Quickstart for agents** (install, then audit your existing program or write a `.qedspec` from scratch), followed by the full reference. The shorter [`docs/llms.txt`](docs/llms.txt) is the index version.
+That page opens with a **Quickstart for agents** (install, then audit your existing program or write a `.qedspec` from scratch), followed by the full reference. The shorter [`qedgen.dev/llms.txt`](https://qedgen.dev/llms.txt) is the index version.
 
 ## How it works
 

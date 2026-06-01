@@ -6,7 +6,7 @@
 
 A developer pointed you to this document to set up QEDGen and use it on their Solana program. Do this, in order:
 
-1. **Install.** Run `npx skills add qedgen/solana-skills`, then confirm with `qedgen --help`. This registers the `qedgen` skill (which drives the full workflow below) and the CLI. No API keys are needed for the core loop. If `qedgen` isn't on `PATH` afterward, the binary ships at `bin/qedgen` in the installed skill directory — add it, or run `bash install.sh` from there.
+1. **Install.** Run `npx skills add qedgen/solana-skills`, then `qedgen --help` to confirm. If `qedgen` isn't found, the skill was cloned into your harness's skills directory but the binary hasn't been fetched yet — run `bash install.sh` from that directory: it downloads the platform binary and links it onto your `PATH` (it prints an `export PATH=…` line if your shell needs it, and is safe to re-run). No API keys are needed for the core loop.
 2. **Find out where the developer is, then act:**
    - **Brownfield** (an existing program, no spec) → *audit first.* Run `qedgen probe --program <path>` (real bugs, each with a Kani/proptest/Mollusk reproducer, plus coverage gaps) and/or `qedgen adapt --program <path>` (draft a `.qedspec` from Anchor source). Report findings, then offer to lock them into a spec so they can't come back.
    - **Greenfield** (defining guarantees for new or evolving code) → write a `.qedspec`, then `qedgen check --spec …` → `qedgen codegen --spec … --all` → `qedgen verify --spec …`.
