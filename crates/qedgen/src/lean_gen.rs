@@ -796,7 +796,10 @@ pub(crate) fn proof_pkg_name(iface_name: &str) -> String {
 /// on the interface, plus the `binary_hash` constant. The axiom's
 /// statement matches the substituted ensures form the caller proves at
 /// the call site.
-fn render_interface_axiom_module(iface: &crate::check::ParsedInterface) -> String {
+// `pub(crate)` so `lean_sidecars`' port can be cross-checked for
+// byte-parity against this legacy renderer (v2.32 WS3 prep). Both die
+// down to one copy when `lean_gen.rs` is deleted in workstream 3.
+pub(crate) fn render_interface_axiom_module(iface: &crate::check::ParsedInterface) -> String {
     let mut out = String::new();
     out.push_str("-- v2.26 Track F: bundled-interface axiom module.\n");
     out.push_str("-- Stance 1 — the upstream binary_hash pin is the contract\n");

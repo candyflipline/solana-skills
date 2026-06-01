@@ -81,11 +81,12 @@ use std::path::Path;
 /// `Spec.lean` body from MIR, then delegates the sidecar work
 /// (import injection, sibling axiom modules, lakefile updates,
 /// verified-callee require directives) to
-/// `lean_gen::write_spec_with_sidecars`. The shared helper guarantees
-/// the same sidecar layout regardless of which renderer produced the
-/// body — Phase 1c-7's port keeps the in-`Spec.lean` half, sidecar
-/// emission still flows through `lean_gen`. Phase 1d's snapshot gate
-/// validates byte-equivalence on every pilot fixture.
+/// `lean_sidecars::write_spec_with_sidecars`. That module is the
+/// renderer-agnostic sidecar writer (v2.32 workstream-3 prep) — the MIR
+/// path no longer depends on `lean_gen` for sidecar emission, so
+/// `lean_gen.rs` can be deleted in workstream 3. The snapshot suites
+/// (`tests/{mir,kani,codegen}_snapshot.rs`) gate byte-equivalence on
+/// every pilot fixture.
 pub fn generate(mir: &Mir, parsed: &crate::check::ParsedSpec, output_path: &Path) -> Result<()> {
     // sBPF assembly specs render a wholly different shape (Program.lean
     // import + per-instruction guard/property theorem stubs over
@@ -99,7 +100,7 @@ pub fn generate(mir: &Mir, parsed: &crate::check::ParsedSpec, output_path: &Path
     } else {
         render(mir)
     };
-    crate::lean_gen::write_spec_with_sidecars(content, parsed, output_path)
+    crate::lean_sidecars::write_spec_with_sidecars(content, parsed, output_path)
 }
 
 /// Pure render. Dispatches based on the MIR shape and emits the full

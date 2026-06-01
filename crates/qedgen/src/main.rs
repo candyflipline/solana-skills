@@ -37,6 +37,7 @@ mod kani_impl;
 mod kani_mir;
 mod lean_gen;
 mod lean_gen_mir;
+mod lean_sidecars;
 mod lifecycle_probe;
 mod mir;
 mod miri_verify;
