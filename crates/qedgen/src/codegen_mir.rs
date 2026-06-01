@@ -1547,11 +1547,11 @@ handler poke : State.Active -> State.Active {
         let parsed = crate::chumsky_adapter::parse_str(src).expect("parse");
         let mir = crate::mir::lower(&parsed);
         let fp = crate::fingerprint::compute_fingerprint(&parsed);
-        let temp = std::env::temp_dir().join(format!("qedgen-coll-{}", std::process::id()));
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let temp = tmp.path();
         std::fs::create_dir_all(temp.join("src")).expect("mk src");
-        emit_lib(&mir, &parsed, &fp, &temp, Target::Anchor).expect("emit lib");
+        emit_lib(&mir, &parsed, &fp, temp, Target::Anchor).expect("emit lib");
         let lib = std::fs::read_to_string(temp.join("src/lib.rs")).expect("lib.rs");
-        std::fs::remove_dir_all(&temp).ok();
         assert!(
             lib.contains(": Account<"),
             "the state account field should use the Anchor `Account<>` wrapper; got:\n{lib}"
@@ -1577,11 +1577,11 @@ handler poke : State.Active -> State.Active {
         let parsed = crate::chumsky_adapter::parse_str(src).expect("parse");
         let mir = crate::mir::lower(&parsed);
         let fp = crate::fingerprint::compute_fingerprint(&parsed);
-        let temp = std::env::temp_dir().join(format!("qedgen-nocoll-{}", std::process::id()));
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let temp = tmp.path();
         std::fs::create_dir_all(temp.join("src")).expect("mk src");
-        emit_lib(&mir, &parsed, &fp, &temp, Target::Anchor).expect("emit lib");
+        emit_lib(&mir, &parsed, &fp, temp, Target::Anchor).expect("emit lib");
         let lib = std::fs::read_to_string(temp.join("src/lib.rs")).expect("lib.rs");
-        std::fs::remove_dir_all(&temp).ok();
         assert!(
             !lib.contains("use anchor_lang::prelude::{")
                 && !lib.contains("use anchor_lang::prelude::Account;"),
@@ -1597,14 +1597,14 @@ handler poke : State.Active -> State.Active {
         assert!(!mir.events.is_empty(), "vault-greenfield declares an event");
 
         let fp = crate::fingerprint::compute_fingerprint(&parsed);
-        let temp = std::env::temp_dir().join(format!("qedgen-evt-test-{}", std::process::id()));
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let temp = tmp.path();
         std::fs::create_dir_all(temp.join("src")).expect("mk src");
 
-        emit_events(&mir, &parsed, &fp, &temp, Target::Pinocchio)
+        emit_events(&mir, &parsed, &fp, temp, Target::Pinocchio)
             .expect("Pinocchio events must emit, not panic");
 
         let rendered = std::fs::read_to_string(temp.join("src/events.rs")).expect("events.rs");
-        std::fs::remove_dir_all(&temp).ok();
 
         assert!(
             rendered.contains("pub struct Withdrawn"),
