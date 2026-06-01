@@ -49,7 +49,6 @@ mod probe_repro;
 mod project;
 mod prompts;
 mod proofs_bootstrap;
-mod proptest_gen;
 mod proptest_gen_mir;
 mod qed_lock;
 mod qed_manifest;

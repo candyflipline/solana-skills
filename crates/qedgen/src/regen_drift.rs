@@ -404,11 +404,25 @@ fn generate_existing_artifacts(root: &Path, temp_root: &Path, spec_path: &Path) 
             crate::Target::Anchor,
         )?;
     }
-    if root.join("tests/proptest.rs").is_file() {
-        crate::proptest_gen::generate(spec_path, &temp_root.join("tests/proptest.rs"))?;
-    }
-    if root.join("programs/tests/proptest.rs").is_file() {
-        crate::proptest_gen::generate(spec_path, &temp_root.join("programs/tests/proptest.rs"))?;
+    {
+        let parsed = crate::check::parse_spec_file(spec_path)?;
+        let mir = crate::mir::lower(&parsed);
+        if root.join("tests/proptest.rs").is_file() {
+            crate::proptest_gen_mir::generate(
+                &mir,
+                &parsed,
+                spec_path,
+                &temp_root.join("tests/proptest.rs"),
+            )?;
+        }
+        if root.join("programs/tests/proptest.rs").is_file() {
+            crate::proptest_gen_mir::generate(
+                &mir,
+                &parsed,
+                spec_path,
+                &temp_root.join("programs/tests/proptest.rs"),
+            )?;
+        }
     }
     if root.join("src/tests.rs").is_file() {
         crate::unit_test::generate(spec_path, &temp_root.join("src/tests.rs"))?;

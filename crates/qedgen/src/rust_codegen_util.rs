@@ -793,7 +793,7 @@ pub fn emit_state_init_zeroed(
 ) {
     out.push_str("    let mut s = State {\n");
     for (fname, ftype) in mutable_fields {
-        if let Some(default) = crate::proptest_gen::default_value_for_field(ftype, spec) {
+        if let Some(default) = crate::proptest_gen_mir::default_value_for_field(ftype, spec) {
             out.push_str(&format!("        {}: {},\n", fname, default));
         }
     }

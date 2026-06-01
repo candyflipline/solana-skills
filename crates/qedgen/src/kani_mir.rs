@@ -810,7 +810,7 @@ fn emit_property_preservation_harnesses(out: &mut String, parsed: &ParsedSpec) -
                 out.push_str("State {\n");
                 for (fname, ftype) in &mutable {
                     if let Some(default) =
-                        crate::proptest_gen::default_value_for_field(ftype, parsed)
+                        crate::proptest_gen_mir::default_value_for_field(ftype, parsed)
                     {
                         out.push_str(&format!("        {}: {},\n", fname, default));
                     }
