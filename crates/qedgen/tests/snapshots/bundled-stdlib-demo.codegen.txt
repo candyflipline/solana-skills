@@ -74,7 +74,6 @@ use anchor_lang::prelude::*;
 use crate::guards;
 use qedgen_macros::qed;
 use crate::errors::*;
-use crate::state::PoolDemoAccountInner;
 use crate::Deposit;
 
 impl Deposit {
@@ -98,7 +97,6 @@ impl Deposit {
 use anchor_lang::prelude::*;
 use crate::guards;
 use qedgen_macros::qed;
-use crate::state::PoolDemoAccountInner;
 use crate::Initialize;
 
 impl Initialize {
@@ -164,33 +162,17 @@ pub struct Deposit {
 use anchor_lang::prelude::*;
 
 #[account]
-#[derive(InitSpace)]
 pub struct PoolDemoAccount {
-    pub inner: PoolDemoAccountInner,
+    pub pool_balance: u64,
+    pub status: u8,
 }
 
-/// Variant-payload state for PoolDemoAccount. The Anchor wrapper above
-/// carries the account discriminator; this enum carries the
-/// state-machine variant + per-variant payload fields.
-#[derive(AnchorSerialize, AnchorDeserialize, InitSpace, Clone, Debug, PartialEq)]
-pub enum PoolDemoAccountInner {
-    Uninitialized,
-    Open {
-        pool_balance: u64,
-    },
-}
-
-impl PoolDemoAccountInner {
-    /// v2.29 Slice B accessor for `pool_balance`. Panics on variants
-/// that don't carry the field — guarded against by the
-/// per-handler lifecycle check that fires before any
-/// `requires` emission in `crate::guards`.
-    pub fn pool_balance(&self) -> &u64 {
-        match self {
-            Self::Open { pool_balance, .. } => pool_balance,
-            _ => panic!("PoolDemoAccountInner::pool_balance() called on a variant without `pool_balance`"),
-        }
-    }
+/// Program lifecycle states.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Status {
+    Uninitialized = 0,
+    Open = 1,
 }
 // ---- END GENERATED ----
 

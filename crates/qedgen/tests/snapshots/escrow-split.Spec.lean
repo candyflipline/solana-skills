@@ -12,66 +12,31 @@ inductive Status where
   | Uninitialized
   | Open
   | Closed
-  deriving Repr, DecidableEq, BEq
+  deriving Repr, DecidableEq, BEq, Inhabited
 
-inductive State where
-  | Uninitialized
-  | Open (initializer : Pubkey) (taker : Pubkey) (initializer_amount : Nat) (taker_amount : Nat) (escrow_token_account : Pubkey)
-  | Closed
-  deriving Repr, DecidableEq, BEq
-
-instance : Inhabited State := ⟨.Uninitialized⟩
-
-def State.status : State → Status
-  | .Uninitialized => .Uninitialized
-  | .Open _ _ _ _ _ => .Open
-  | .Closed => .Closed
-
-def State.initializer : State → Pubkey
-  | .Uninitialized => default
-  | .Open initializer _ _ _ _ => initializer
-  | .Closed => default
-
-def State.taker : State → Pubkey
-  | .Uninitialized => default
-  | .Open _ taker _ _ _ => taker
-  | .Closed => default
-
-def State.initializer_amount : State → Nat
-  | .Uninitialized => 0
-  | .Open _ _ initializer_amount _ _ => initializer_amount
-  | .Closed => 0
-
-def State.taker_amount : State → Nat
-  | .Uninitialized => 0
-  | .Open _ _ _ taker_amount _ => taker_amount
-  | .Closed => 0
-
-def State.escrow_token_account : State → Pubkey
-  | .Uninitialized => default
-  | .Open _ _ _ _ escrow_token_account => escrow_token_account
-  | .Closed => default
+structure State where
+  initializer : Pubkey
+  taker : Pubkey
+  initializer_amount : Nat
+  taker_amount : Nat
+  escrow_token_account : Pubkey
+  status : Status
+  deriving Repr, DecidableEq, BEq, Inhabited
 
 def cancelTransition (s : State) (signer : Pubkey) : Option State :=
-  match s with
-  | .Open initializer taker initializer_amount taker_amount escrow_token_account =>
-    if signer = initializer then some (.Closed) else none
-  | _ => none
+  if signer = s.initializer ∧ s.status = .Open then
+    some { s with status := .Closed }
+  else none
 
 def exchangeTransition (s : State) (signer : Pubkey) : Option State :=
-  match s with
-  | .Open initializer taker initializer_amount taker_amount escrow_token_account =>
-    if signer = taker then some (.Closed) else none
-  | _ => none
+  if signer = s.taker ∧ s.status = .Open then
+    some { s with status := .Closed }
+  else none
 
 def initializeTransition (s : State) (signer : Pubkey) (deposit_amount : Nat) (receive_amount : Nat) : Option State :=
-  -- todo!(): post-variant `Open` has unconstrained field(s) not derivable from spec: taker, escrow_token_account
-  -- Using type defaults; add effects or handler params to constrain these.
-  match s with
-  | .Uninitialized =>
-    let initializer := signer
-    if deposit_amount > 0 ∧ receive_amount > 0 then some (.Open initializer default deposit_amount receive_amount default) else none
-  | _ => none
+  if signer = s.initializer ∧ s.status = .Uninitialized ∧ deposit_amount > 0 ∧ receive_amount > 0 then
+    some { s with initializer_amount := deposit_amount, taker_amount := receive_amount, status := .Open }
+  else none
 
 -- `Token.transfer` ensures #0 (from_balance): caller supplied no `state_binders` for these abstract fields; ensures not pulled into caller proof. Bind via `state_binders { from_balance = state.<field> }` to consume.
 -- `Token.transfer` ensures #1 (to_balance): caller supplied no `state_binders` for these abstract fields; ensures not pulled into caller proof. Bind via `state_binders { to_balance = state.<field> }` to consume.
@@ -105,7 +70,9 @@ def applyOp (s : State) (signer : Pubkey) : Operation → Option State
 -- ============================================================================
 
 theorem initialize_aborts_if_InvalidAmount (s : State) (signer : Pubkey) (deposit_amount : Nat) (receive_amount : Nat)
-    (h : ¬(deposit_amount > 0 ∧ receive_amount > 0)) : initializeTransition s signer deposit_amount receive_amount = none := by sorry
+    (h : ¬(deposit_amount > 0 ∧ receive_amount > 0)) : initializeTransition s signer deposit_amount receive_amount = none := by
+  unfold initializeTransition
+  rw [if_neg (fun hg => h ⟨hg.2.2.1, hg.2.2.2⟩)]
 
 -- ============================================================================
 -- Cover properties — reachability (existential proofs)
@@ -116,8 +83,8 @@ theorem cover_happy_path : ∃ (s0 : State) (signer : Pubkey),
     ∃ (v0_0 : Nat) (v0_1 : Nat), ∃ (s1 : State), initializeTransition s0 signer v0_0 v0_1 = some s1 ∧
 exchangeTransition s1 signer ≠ none := by
   let pk : Pubkey := ⟨0, 0, 0, 0⟩
-  let s0 : State := (.Uninitialized : State)
-  let s1 : State := (.Open pk pk 1 1 pk : State)
+  let s0 : State := ⟨pk, pk, 0, 0, pk, .Uninitialized⟩
+  let s1 : State := ⟨pk, pk, 1, 1, pk, .Open⟩
   exact ⟨s0, pk, 1, 1, s1, by decide, by decide⟩
 
 /-- cancel_path — trace [initialize, cancel] is reachable. -/
@@ -125,8 +92,8 @@ theorem cover_cancel_path : ∃ (s0 : State) (signer : Pubkey),
     ∃ (v0_0 : Nat) (v0_1 : Nat), ∃ (s1 : State), initializeTransition s0 signer v0_0 v0_1 = some s1 ∧
 cancelTransition s1 signer ≠ none := by
   let pk : Pubkey := ⟨0, 0, 0, 0⟩
-  let s0 : State := (.Uninitialized : State)
-  let s1 : State := (.Open pk pk 1 1 pk : State)
+  let s0 : State := ⟨pk, pk, 0, 0, pk, .Uninitialized⟩
+  let s1 : State := ⟨pk, pk, 1, 1, pk, .Open⟩
   exact ⟨s0, pk, 1, 1, s1, by decide, by decide⟩
 
 -- ============================================================================
@@ -142,6 +109,14 @@ def applyOps (s : State) (signer : Pubkey) : List Operation → Option State
 /-- escrow_settles — from Open leads to Closed within 1 steps via [exchange, cancel]. -/
 theorem liveness_escrow_settles (s : State) (signer : Pubkey)
     (h : s.status = .Open) :
-    ∃ ops, ops.length ≤ 1 ∧ ∀ s', applyOps s signer ops = some s' → s'.status = .Closed := by sorry
+    ∃ ops, ops.length ≤ 1 ∧ ∀ s', applyOps s signer ops = some s' → s'.status = .Closed := by
+  refine ⟨[.exchange], by decide, fun s' h_apply => ?_⟩
+  simp only [applyOps, applyOp, exchangeTransition] at h_apply
+  split at h_apply
+  · next heq =>
+    split at heq
+    · next hg => simp at heq h_apply; subst heq; subst h_apply; rfl
+    · simp at heq
+  · simp at h_apply
 
 end Escrow

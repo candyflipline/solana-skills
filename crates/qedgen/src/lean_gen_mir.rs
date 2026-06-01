@@ -105,16 +105,15 @@ fn is_multi_account(mir: &Mir) -> bool {
     mir.account_states.len() > 1
 }
 
-/// v2.24 §S5 — true iff the single-account spec uses the
-/// multi-variant ADT shape (real `inductive State` with per-variant
-/// payload). Mirrors `lean_gen::is_multi_variant_adt_state`:
-///   * declares the `WrongState` error (the migration signal that
-///     pre-v2.24 flat-state specs lack);
+/// True iff the single-account spec opts into the multi-variant ADT
+/// shape (real `inductive State` with per-variant payload):
+///   * declares `pragma state_repr = adt` (lifted to `Mir::adt_state` via
+///     `ParsedSpec::state_repr_is_adt`) — the explicit opt-in that
+///     replaced the pre-v2.33 `WrongState`-error footgun;
 ///   * has ≥ 2 state variants;
 ///   * is not indexed (Map / record fields route elsewhere).
 fn is_multi_variant_adt(mir: &Mir) -> bool {
-    let has_wrong_state = mir.errors.variants.iter().any(|e| e == "WrongState");
-    has_wrong_state && mir.state.variants.len() > 1 && !is_indexed(mir)
+    mir.adt_state && mir.state.variants.len() > 1 && !is_indexed(mir)
 }
 
 // ----------------------------------------------------------------------
@@ -2234,6 +2233,7 @@ fn scope_mir_to_account(mir: &Mir, acct: &crate::mir::AccountStateMir) -> Mir {
         environments: mir.environments.clone(),
         records: mir.records.clone(),
         is_assembly: mir.is_assembly,
+        adt_state: mir.adt_state,
     }
 }
 
@@ -2569,7 +2569,11 @@ fn emit_lifecycle_marker(out: &mut String, mir: &Mir) {
     for s in states {
         out.push_str(&format!("  | {}\n", safe_name(s)));
     }
-    out.push_str("  deriving Repr, DecidableEq, BEq\n\n");
+    // `Inhabited` so the flat `State` (which carries a `status : Status`
+    // field) can itself derive `Inhabited` — required by the polymorphic
+    // CPI ensures-axioms (`{State} [Inhabited State] …`). Harmless for
+    // specs without CPI composition.
+    out.push_str("  deriving Repr, DecidableEq, BEq, Inhabited\n\n");
 }
 
 /// Emit one transition function per handler. Mirrors
@@ -3635,8 +3639,9 @@ fn emit_frame_conditions_adt(out: &mut String, mir: &Mir) {
         ));
         out.push_str("    -- todo!(): inductive-State frame condition. Statement needs\n");
         out.push_str("    -- per-pre-variant case analysis to express which payload\n");
-        out.push_str("    -- fields are preserved. Holds trivially for now.\n");
-        out.push_str("    True := by sorry\n\n");
+        out.push_str("    -- fields are preserved. Stated as `True` until that lands;\n");
+        out.push_str("    -- the honest placeholder proof is `trivial`, not `sorry`.\n");
+        out.push_str("    True := trivial\n\n");
     }
 }
 
@@ -3965,6 +3970,24 @@ fn emit_aborts_if_with_sorry(out: &mut String, mir: &Mir, sorry_form: &str) {
                     ));
                     continue;
                 }
+            } else if req_pos.is_some() {
+                // ADT path: the transition matches on the `State`
+                // variant *before* the guard `if`, so the flat
+                // `rw [if_neg]` script is ill-formed. `cases s <;>
+                // simp_all` discharges every variant uniformly: the
+                // active variant reduces via `h` (¬guard ⇒ else-branch
+                // ⇒ `none`), the other variants hit the catch-all
+                // `_ => none`. Gated on the predicate being an actual
+                // guard conjunct (`req_pos.is_some()`) — otherwise `h`
+                // wouldn't contradict the guard and the goal isn't
+                // provable, so we fall through to the `sorry`
+                // placeholder and keep the obligation honest.
+                let proof = format!(" := by\n  unfold {}\n  cases s <;> simp_all\n", trans_name);
+                out.push_str(&format!(
+                    "    (h : \u{00AC}({})) : {} s signer{} = none{}\n",
+                    r.pred.0.lean, trans_name, param_args, proof
+                ));
+                continue;
             }
             out.push_str(&format!(
                 "    (h : \u{00AC}({})) : {} s signer{} = none := {}\n\n",
@@ -4132,7 +4155,10 @@ fn emit_state_struct(out: &mut String, mir: &Mir) {
     if has_lifecycle {
         out.push_str("  status : Status\n");
     }
-    out.push_str("  deriving Repr, DecidableEq, BEq\n\n");
+    // `Inhabited` enables the polymorphic CPI ensures-axioms
+    // (`{State} [Inhabited State] …`) to apply to this state; all field
+    // types (Pubkey / Nat / Bool / Status) are themselves Inhabited.
+    out.push_str("  deriving Repr, DecidableEq, BEq, Inhabited\n\n");
 }
 
 // ----------------------------------------------------------------------
@@ -5220,6 +5246,23 @@ fn overflow_proof_script(
 
     let has_cond = !build_guard_cond_parts(mir, h).is_empty();
 
+    // With a single numeric field the post-condition is ONE proposition
+    // (`valid_<T> s'.f`), not a `∧`-chain — so `refine ⟨?_⟩` would be
+    // ill-typed (`⟨…⟩` needs an anonymous-constructor target). Emit the
+    // tuple-introducing `refine` only when there are ≥ 2 fields; with one
+    // field discharge the lone goal directly (the `simp/omega` line if it
+    // is the changed field, else `exact h_valid` for an unchanged carry).
+    let emit_body = |proof: &mut String, indent: &str| {
+        if n > 1 {
+            proof.push_str(&format!("{}refine {}\n", indent, refine_str));
+        } else if simp_goals.is_empty() {
+            proof.push_str(&format!("{}exact h_valid\n", indent));
+        }
+        for g in &simp_goals {
+            proof.push_str(&format!("{}\n", g));
+        }
+    };
+
     let mut proof = String::new();
     if has_cond {
         proof.push_str(&format!(
@@ -5227,17 +5270,11 @@ fn overflow_proof_script(
             trans_name
         ));
         proof.push_str("  · next hg =>\n    cases h\n");
-        proof.push_str(&format!("    refine {}\n", refine_str));
-        for g in &simp_goals {
-            proof.push_str(&format!("{}\n", g));
-        }
+        emit_body(&mut proof, "    ");
         proof.push_str("  · contradiction\n\n");
     } else {
         proof.push_str(&format!(" := by\n  unfold {} at h; cases h\n", trans_name));
-        proof.push_str(&format!("  refine {}\n", refine_str));
-        for g in &simp_goals {
-            proof.push_str(&format!("{}\n", g));
-        }
+        emit_body(&mut proof, "  ");
         proof.push('\n');
     }
     proof
@@ -5550,6 +5587,59 @@ mod tests {
         crate::mir::lower(&parsed)
     }
 
+    /// v2.33 — the inductive multi-variant State representation is opted
+    /// into via `pragma state_repr = adt`, decoupled from the incidental
+    /// `WrongState` error variant that keyed it pre-v2.33 (the footgun:
+    /// adding/removing a lifecycle error silently flipped flat↔ADT).
+    /// Same State shape + same `WrongState` error ⇒ flat by default,
+    /// `inductive State` only when the pragma is present.
+    #[test]
+    fn state_repr_pragma_dispatches_inductive_vs_flat() {
+        // No effect bodies → no `Variant.field`-vs-bare effect-syntax
+        // dependence; the dispatch keys only on the pragma + shape.
+        let body = "\n\
+            program_id \"11111111111111111111111111111111\"\n\
+            \n\
+            type State\n\
+            \x20 | Uninitialized\n\
+            \x20 | Active of { balance : U64 }\n\
+            \x20 | Closed\n\
+            \n\
+            type Error\n\
+            \x20 | InvalidAmount\n\
+            \x20 | WrongState\n\
+            \n\
+            handler open (amount : U64) : State.Uninitialized -> State.Active {\n\
+            \x20 auth owner\n\
+            \x20 accounts { owner : signer, writable }\n\
+            \x20 requires amount > 0 else InvalidAmount\n\
+            }\n";
+
+        let flat = crate::chumsky_adapter::parse_str(&format!("spec Flat\n{body}"))
+            .expect("parse flat spec");
+        let flat_lean = render(&crate::mir::lower(&flat));
+        assert!(
+            flat_lean.contains("structure State where"),
+            "default (no pragma) must lower to the flat struct"
+        );
+        assert!(
+            !flat_lean.contains("inductive State where"),
+            "default must NOT take the inductive ADT path"
+        );
+
+        let adt = crate::chumsky_adapter::parse_str(&format!(
+            "spec Adt\npragma state_repr = adt\n{body}"
+        ))
+        .expect("parse adt spec");
+        let adt_mir = crate::mir::lower(&adt);
+        assert!(adt_mir.adt_state, "pragma must lift to Mir::adt_state");
+        let adt_lean = render(&adt_mir);
+        assert!(
+            adt_lean.contains("inductive State where"),
+            "pragma state_repr = adt must route to render_single_account_adt"
+        );
+    }
+
     #[test]
     fn render_emits_header_namespace_state() {
         let mir = lower_fixture("examples/rust/escrow/escrow.qedspec");
@@ -5667,6 +5757,7 @@ mod tests {
             environments: vec![],
             records: vec![],
             is_assembly: false,
+            adt_state: false,
         };
         let out = render(&mir);
         assert!(
@@ -5708,6 +5799,7 @@ mod tests {
             environments: vec![],
             records: vec![],
             is_assembly: false,
+            adt_state: false,
         };
         let out = render(&mir);
         assert!(

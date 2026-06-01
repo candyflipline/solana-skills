@@ -11,7 +11,7 @@ inductive PoolStatus where
   | Uninitialized
   | Active
   | Paused
-  deriving Repr, DecidableEq, BEq
+  deriving Repr, DecidableEq, BEq, Inhabited
 
 structure PoolState where
   authority : Pubkey
@@ -19,7 +19,7 @@ structure PoolState where
   total_borrows : Nat
   interest_rate : Nat
   status : PoolStatus
-  deriving Repr, DecidableEq, BEq
+  deriving Repr, DecidableEq, BEq, Inhabited
 
 def init_poolTransition (s : PoolState) (signer : Pubkey) (rate : Nat) : Option PoolState :=
   if signer = s.authority ∧ s.status = .Uninitialized ∧ rate > 0 then
@@ -67,7 +67,7 @@ inductive LoanStatus where
   | Empty
   | Active
   | Liquidated
-  deriving Repr, DecidableEq, BEq
+  deriving Repr, DecidableEq, BEq, Inhabited
 
 structure LoanState where
   borrower : Pubkey
@@ -75,7 +75,7 @@ structure LoanState where
   amount : Nat
   collateral : Nat
   status : LoanStatus
-  deriving Repr, DecidableEq, BEq
+  deriving Repr, DecidableEq, BEq, Inhabited
 
 def borrowTransition (s : LoanState) (signer : Pubkey) (amount : Nat) (collateral : Nat) : Option LoanState :=
   if signer = s.borrower ∧ s.status = .Empty ∧ amount > 0 ∧ collateral > 0 then

@@ -13,15 +13,19 @@
 //! (`UPDATE_SNAPSHOTS=1 cargo test --test mir_snapshot` writes them
 //! in place).
 //!
-//! These snapshots are NOT a byte-equivalence assertion against the
-//! legacy codegen. The legacy comparison is documented at the
-//! commit-message level:
-//!   * ADT path (bundled-stdlib-demo, cross-program-vault):
-//!     byte-identical to legacy.
-//!   * escrow-split: byte-identical post Phase 1c-9 §15
-//!     `cover_trace_proof` auto-discharge.
-//!   * Flat path (escrow): byte-identical post Phase 1c-10
-//!     flat-path emitter alignment.
+//! Path coverage across fixtures (post-v2.33, when `pragma state_repr =
+//! adt` became the explicit opt-in for the inductive multi-variant
+//! State, replacing the incidental `WrongState`-error footgun):
+//!   * Flat path (escrow, escrow-split, bundled-stdlib-demo, lending):
+//!     the default `structure State` + `status` discriminant. These
+//!     were legacy ADT byte-identity fixtures before the representation
+//!     default flipped to flat.
+//!   * ADT path (cross-program-vault): declares `pragma state_repr =
+//!     adt` — its hand-written instruction logic destructures the
+//!     inner-enum, so it is the bundled `inductive State` /
+//!     `render_single_account_adt` showcase. The dispatch itself (same
+//!     shape ⇒ flat vs ADT by pragma) is additionally unit-tested by
+//!     `lean_gen_mir::tests::state_repr_pragma_dispatches_inductive_vs_flat`.
 //!   * Indexed path (multisig): byte-identical post Phase 1e
 //!     indexed-state lowering (Mathlib + IndexedState imports,
 //!     `Map[N] T` capacity, `Function.update` collapse).
