@@ -63,6 +63,9 @@ pub fn render(mir: &Mir, parsed: &ParsedSpec) -> String {
     let mut out = String::new();
     emit_header(&mut out, parsed);
     emit_math_helpers(&mut out, parsed);
+    if crate::rust_codegen_util::spec_uses_pubkey(parsed) {
+        crate::rust_codegen_util::emit_kani_pubkey_helpers(&mut out);
+    }
     emit_state_model_header(&mut out);
     emit_constants(&mut out, mir);
 
@@ -404,6 +407,7 @@ fn emit_account_section_structural(out: &mut String, parsed: &ParsedSpec) -> Res
         |t| map_type(t, parsed),
         has_lifecycle,
     )?;
+    emit_kani_account_env_structs(out, parsed);
 
     // 5. Property predicates.
     let handlers: Vec<&crate::check::ParsedHandler> = parsed.handlers.iter().collect();
@@ -462,7 +466,7 @@ fn emit_account_section_structural(out: &mut String, parsed: &ParsedSpec) -> Res
         "// ============================================================================\n\n",
     );
     for op in &handlers {
-        util::emit_transition_fn(out, op, parsed, false, |t| map_type(t, parsed))?;
+        util::emit_transition_fn_for_kani(out, op, parsed, false, |t| map_type(t, parsed))?;
     }
 
     // 8. Reference implementations (v2.25 — pure-expression fns
@@ -496,6 +500,75 @@ fn emit_account_section_structural(out: &mut String, parsed: &ParsedSpec) -> Res
     }
 
     Ok(())
+}
+
+fn emit_kani_account_env_structs(out: &mut String, parsed: &ParsedSpec) {
+    use crate::rust_codegen_util as util;
+
+    let handlers: Vec<&crate::check::ParsedHandler> = parsed
+        .handlers
+        .iter()
+        .filter(|op| util::handler_needs_account_env(op))
+        .collect();
+    if handlers.is_empty() {
+        return;
+    }
+
+    out.push_str("#[derive(Clone, Copy)]\n");
+    out.push_str("struct KaniAccount {\n");
+    out.push_str("    pubkey: [u8; 32],\n");
+    out.push_str("}\n\n");
+
+    for op in handlers {
+        out.push_str("#[derive(Clone, Copy)]\n");
+        out.push_str(&format!(
+            "struct {} {{\n",
+            util::handler_account_env_struct_name(&op.name)
+        ));
+        for account in &op.accounts {
+            out.push_str(&format!("    {}: KaniAccount,\n", account.name));
+        }
+        out.push_str("}\n\n");
+    }
+}
+
+fn emit_kani_account_env_binding(
+    out: &mut String,
+    op: &crate::check::ParsedHandler,
+    var_name: &str,
+    indent: &str,
+) {
+    use crate::rust_codegen_util as util;
+
+    if !util::handler_needs_account_env(op) {
+        return;
+    }
+
+    out.push_str(&format!(
+        "{indent}let {var_name} = {} {{\n",
+        util::handler_account_env_struct_name(&op.name)
+    ));
+    for account in &op.accounts {
+        out.push_str(&format!(
+            "{indent}    {}: KaniAccount {{ pubkey: kani::any() }},\n",
+            account.name
+        ));
+    }
+    out.push_str(&format!("{indent}}};\n"));
+}
+
+fn transition_call_args(op: &crate::check::ParsedHandler, account_var: Option<&str>) -> String {
+    use crate::rust_codegen_util as util;
+
+    let mut args = String::new();
+    if util::handler_needs_account_env(op) {
+        let account_var = account_var.expect("account var provided for account-env handler");
+        args.push_str(&format!(", &{}", account_var));
+    }
+    for (n, _) in op.takes_params.iter().chain(op.abstract_binders.iter()) {
+        args.push_str(&format!(", {}", n));
+    }
+    args
 }
 
 // ----------------------------------------------------------------------
@@ -555,7 +628,11 @@ fn emit_guard_enforcement_harnesses(out: &mut String, parsed: &ParsedSpec) -> Re
     );
 
     for op in &guard_ops {
-        let Some(full_guard) = util::collect_full_guard(op, false) else {
+        let Some(full_guard) = util::collect_full_guard_with_account_env(
+            op,
+            false,
+            util::handler_needs_account_env(op).then_some("accounts"),
+        ) else {
             // Handler had `has_guard()` set but no expressible
             // negation — skip to avoid `kani::assume(!(true))`
             // vacuous harnesses (matches legacy kani.rs:515–519).
@@ -589,14 +666,20 @@ fn emit_guard_enforcement_harnesses(out: &mut String, parsed: &ParsedSpec) -> Re
         util::emit_abstract_binders(out, op, "    ", "kani::any()", |t| map_type(t, parsed))?;
         util::emit_abstract_binders(out, op, "    ", "kani::any()", |t| map_type(t, parsed))?;
 
+        emit_kani_account_env_binding(out, op, "accounts", "    ");
+        let full_guard = util::collect_full_guard_with_account_env(
+            op,
+            false,
+            util::handler_needs_account_env(op).then_some("accounts"),
+        )
+        .unwrap_or(full_guard);
+        let full_guard = util::rewrite_kani_pubkey_comparisons(&full_guard, op, parsed);
         out.push_str(&format!("    kani::assume(!({full_guard}));\n"));
 
-        let args: String = op
-            .takes_params
-            .iter()
-            .chain(op.abstract_binders.iter())
-            .map(|(n, _)| format!(", {}", n))
-            .collect();
+        let args = transition_call_args(
+            op,
+            util::handler_needs_account_env(op).then_some("accounts"),
+        );
         out.push_str(&format!("    assert!(!{}(&mut s{}),\n", op.name, args));
         out.push_str(&format!(
             "        \"{} must reject when guard is violated\");\n",
@@ -689,14 +772,16 @@ fn emit_abort_condition_harnesses(out: &mut String, parsed: &ParsedSpec) -> Resu
             util::emit_abstract_binders(out, op, "    ", "kani::any()", |t| map_type(t, parsed))?;
             util::emit_abstract_binders(out, op, "    ", "kani::any()", |t| map_type(t, parsed))?;
 
-            out.push_str(&format!("    kani::assume({});\n", abort.rust_expr));
+            emit_kani_account_env_binding(out, op, "accounts", "    ");
+            let abort_expr =
+                util::rewrite_account_pubkey_refs(&abort.rust_expr, &op.accounts, "accounts");
+            let abort_expr = util::rewrite_kani_pubkey_comparisons(&abort_expr, op, parsed);
+            out.push_str(&format!("    kani::assume({});\n", abort_expr));
 
-            let args: String = op
-                .takes_params
-                .iter()
-                .chain(op.abstract_binders.iter())
-                .map(|(n, _)| format!(", {}", n))
-                .collect();
+            let args = transition_call_args(
+                op,
+                util::handler_needs_account_env(op).then_some("accounts"),
+            );
             out.push_str(&format!("    assert!(!{}(&mut s{}),\n", op.name, args));
             out.push_str(&format!(
                 "        \"{} must abort with {}\");\n",
@@ -920,12 +1005,11 @@ fn emit_property_preservation_harnesses(out: &mut String, parsed: &ParsedSpec) -
             );
 
             // Transition call + dispatch on prop class.
-            let args: String = op
-                .takes_params
-                .iter()
-                .chain(op.abstract_binders.iter())
-                .map(|(n, _)| format!(", {}", n))
-                .collect();
+            emit_kani_account_env_binding(out, op, "accounts", "    ");
+            let args = transition_call_args(
+                op,
+                util::handler_needs_account_env(op).then_some("accounts"),
+            );
             out.push_str(&format!("    if {}(&mut post{}) {{\n", op_name, args));
             let is_binary_prop = prop.class == crate::check::PropertyClass::Binary;
             if is_binary_prop {
@@ -1064,7 +1148,13 @@ fn emit_ensures_preservation_harnesses(out: &mut String, parsed: &ParsedSpec) ->
             util::emit_abstract_binders(out, op, "    ", "kani::any()", |t| map_type(t, parsed))?;
 
             // Assume requires hold pre-state (avoid vacuous pass).
-            if let Some(full_guard) = util::collect_full_guard(op, false) {
+            emit_kani_account_env_binding(out, op, "accounts", "    ");
+            if let Some(full_guard) = util::collect_full_guard_with_account_env(
+                op,
+                false,
+                util::handler_needs_account_env(op).then_some("accounts"),
+            ) {
+                let full_guard = util::rewrite_kani_pubkey_comparisons(&full_guard, op, parsed);
                 out.push_str(&format!("    kani::assume({});\n", full_guard));
             }
 
@@ -1072,12 +1162,10 @@ fn emit_ensures_preservation_harnesses(out: &mut String, parsed: &ParsedSpec) ->
             // constrained pre-state Kani explores.
             out.push_str("    let pre = s.clone();\n");
 
-            let args: String = op
-                .takes_params
-                .iter()
-                .chain(op.abstract_binders.iter())
-                .map(|(n, _)| format!(", {}", n))
-                .collect();
+            let args = transition_call_args(
+                op,
+                util::handler_needs_account_env(op).then_some("accounts"),
+            );
             out.push_str(&format!("    if {}(&mut s{}) {{\n", op.name, args));
             out.push_str("        let post = &s;\n");
 
@@ -1105,17 +1193,37 @@ fn emit_ensures_preservation_harnesses(out: &mut String, parsed: &ParsedSpec) ->
                     call.target_interface, call.target_handler,
                 ));
                 for callee_ens in &callee_handler.ensures {
+                    let abstract_fields = crate::cpi_substitute::scan_rust_abstract_fields(
+                        &callee_ens.rust_expr_binary,
+                    );
+                    let missing = crate::cpi_substitute::missing_state_binders(
+                        &abstract_fields,
+                        &call.state_binders,
+                    );
+                    if !missing.is_empty() {
+                        out.push_str(&format!(
+                            "        // `{}.{}` ensures skipped: missing `state_binders` for {}.\n",
+                            call.target_interface,
+                            call.target_handler,
+                            missing.join(", "),
+                        ));
+                        continue;
+                    }
                     let substituted = crate::cpi_substitute::substitute_callee_ensures_rust_binary(
                         &callee_ens.rust_expr_binary,
                         call,
                         &callee_handler.params,
                         callee_handler.result_binder.as_deref(),
                     );
+                    let substituted =
+                        util::rewrite_kani_pubkey_comparisons(&substituted, op, parsed);
                     out.push_str(&format!("        kani::assume({});\n", substituted));
                 }
             }
 
-            out.push_str(&format!("        assert!({},\n", ensures.rust_expr_binary));
+            let ensures_expr =
+                util::rewrite_kani_pubkey_comparisons(&ensures.rust_expr_binary, op, parsed);
+            out.push_str(&format!("        assert!({},\n", ensures_expr));
             out.push_str(&format!(
                 "            \"ensures clause {} on {} violated by spec-translated transition\");\n",
                 idx, op.name
@@ -1453,20 +1561,30 @@ fn emit_effect_conformance_harnesses(out: &mut String, parsed: &ParsedSpec) -> R
             }
 
             // Call transition + assertion dispatch.
-            let args: String = op
-                .takes_params
-                .iter()
-                .chain(op.abstract_binders.iter())
-                .map(|(n, _)| format!(", {}", n))
-                .collect();
+            emit_kani_account_env_binding(out, op, "accounts", "    ");
+            let args = transition_call_args(
+                op,
+                util::handler_needs_account_env(op).then_some("accounts"),
+            );
             out.push_str(&format!("    if {}(&mut s{}) {{\n", op.name, args));
 
-            let resolved = util::resolve_value(value, op, parsed, Some("pre_"));
+            let resolved = util::resolve_value_with_account_env(
+                value,
+                op,
+                parsed,
+                Some("pre_"),
+                util::handler_needs_account_env(op).then_some("accounts"),
+            );
             match op_kind.as_str() {
                 "set" => {
+                    let assertion = util::rewrite_kani_pubkey_comparisons(
+                        &format!("s.{field} == {resolved}"),
+                        op,
+                        parsed,
+                    );
                     out.push_str(&format!(
-                        "        assert!(s.{} == {}, \"{} must equal {}\");\n",
-                        field, resolved, field, resolved
+                        "        assert!({}, \"{} must equal {}\");\n",
+                        assertion, field, resolved
                     ));
                 }
                 "add" => {
@@ -1493,9 +1611,14 @@ fn emit_effect_conformance_harnesses(out: &mut String, parsed: &ParsedSpec) -> R
                         .iter()
                         .any(|(f, _, _)| f.as_str() == fname.as_str());
                     if !sibling_mutated {
+                        let assertion = util::rewrite_kani_pubkey_comparisons(
+                            &format!("s.{fname} == pre_{fname}"),
+                            op,
+                            parsed,
+                        );
                         out.push_str(&format!(
-                            "        assert!(s.{} == pre_{}, \"{} must not change\");\n",
-                            fname, fname, fname
+                            "        assert!({}, \"{} must not change\");\n",
+                            assertion, fname
                         ));
                     }
                 }
@@ -1580,12 +1703,11 @@ fn emit_overflow_detection_harnesses(out: &mut String, parsed: &ParsedSpec) -> R
         }
         util::emit_abstract_binders(out, op, "    ", "kani::any()", |t| map_type(t, parsed))?;
 
-        let args: String = op
-            .takes_params
-            .iter()
-            .chain(op.abstract_binders.iter())
-            .map(|(n, _)| format!(", {}", n))
-            .collect();
+        emit_kani_account_env_binding(out, op, "accounts", "    ");
+        let args = transition_call_args(
+            op,
+            util::handler_needs_account_env(op).then_some("accounts"),
+        );
         out.push_str(&format!(
             "    {}(&mut s{});  // Kani detects overflow on += internally\n",
             op.name, args
@@ -1684,12 +1806,19 @@ fn emit_file_level_features(out: &mut String, parsed: &ParsedSpec) -> Result<()>
                             ));
                         }
                     }
+                    if let Some(o) = op {
+                        emit_kani_account_env_binding(out, o, &format!("accounts_{}", j), &indent);
+                    }
                     let args: String = op
                         .map(|o| {
-                            o.takes_params
-                                .iter()
-                                .map(|(n, _)| format!(", {}_{}", n, j))
-                                .collect()
+                            let mut args = String::new();
+                            if util::handler_needs_account_env(o) {
+                                args.push_str(&format!(", &accounts_{}", j));
+                            }
+                            for (n, _) in &o.takes_params {
+                                args.push_str(&format!(", {}_{}", n, j));
+                            }
+                            args
                         })
                         .unwrap_or_default();
 
@@ -1768,16 +1897,18 @@ fn emit_file_level_features(out: &mut String, parsed: &ParsedSpec) -> Result<()>
                 };
                 let args: String = op
                     .map(|o| {
-                        o.takes_params
-                            .iter()
-                            .chain(o.abstract_binders.iter())
-                            .map(|(n, _)| format!(", {}", n))
-                            .collect()
+                        transition_call_args(
+                            o,
+                            util::handler_needs_account_env(o).then_some("accounts"),
+                        )
                     })
                     .unwrap_or_default();
 
                 out.push_str(&format!("            {} => {{\n", i));
                 out.push_str(&param_decls);
+                if let Some(o) = op {
+                    emit_kani_account_env_binding(out, o, "accounts", "            ");
+                }
                 out.push_str(&format!("                {}(&mut s{});\n", op_name, args));
                 out.push_str("            }\n");
             }

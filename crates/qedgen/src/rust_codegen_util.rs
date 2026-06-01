@@ -28,6 +28,281 @@ pub fn translate_guard_to_rust(guard: &str, wrapping: bool) -> String {
     }
 }
 
+/// Rewrite handler-account pubkey references into a generated account
+/// environment. `foo.pubkey` becomes `<binder>.foo.pubkey`; `foo.key()` is
+/// normalized to the same pubkey field.
+pub fn rewrite_account_pubkey_refs(
+    expr: &str,
+    accounts: &[crate::check::ParsedHandlerAccount],
+    binder: &str,
+) -> String {
+    let mut out = expr.to_string();
+    for account in accounts {
+        let key_call = format!("{}.key()", account.name);
+        let pubkey_ref = format!("{}.pubkey", account.name);
+        let replacement = format!("{}.{}.pubkey", binder, account.name);
+        out = out.replace(&key_call, &replacement);
+        out = out.replace(&pubkey_ref, &replacement);
+    }
+    out
+}
+
+pub fn emit_kani_pubkey_helpers(out: &mut String) {
+    out.push_str("#[allow(dead_code)]\n");
+    out.push_str("fn pubkey_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {\n");
+    out.push_str("    ");
+    for i in 0..32 {
+        if i > 0 {
+            out.push_str(" && ");
+        }
+        out.push_str(&format!("a[{i}] == b[{i}]"));
+    }
+    out.push_str("\n}\n\n");
+    out.push_str("#[allow(dead_code)]\n");
+    out.push_str("fn pubkey_ne(a: &[u8; 32], b: &[u8; 32]) -> bool {\n");
+    out.push_str("    !pubkey_eq(a, b)\n");
+    out.push_str("}\n\n");
+}
+
+pub fn spec_uses_pubkey(spec: &ParsedSpec) -> bool {
+    spec.state_fields
+        .iter()
+        .any(|(_, ty)| type_is_or_contains_pubkey(ty))
+        || spec.account_types.iter().any(|acct| {
+            acct.fields
+                .iter()
+                .any(|(_, ty)| type_is_or_contains_pubkey(ty))
+                || acct.variants.iter().any(|variant| {
+                    variant
+                        .fields
+                        .iter()
+                        .any(|(_, ty)| type_is_or_contains_pubkey(ty))
+                })
+        })
+        || spec.handlers.iter().any(|op| {
+            op.takes_params
+                .iter()
+                .chain(op.abstract_binders.iter())
+                .any(|(_, ty)| type_is_or_contains_pubkey(ty))
+        })
+}
+
+pub fn rewrite_kani_pubkey_comparisons(
+    expr: &str,
+    op: &ParsedHandler,
+    spec: &ParsedSpec,
+) -> String {
+    let mut out = String::with_capacity(expr.len());
+    let mut cursor = 0;
+
+    while let Some((op_start, cmp)) = find_next_equality_op(expr, cursor) {
+        let op_end = op_start + cmp.len();
+        let lhs_start = find_cmp_lhs_start(expr, op_start);
+        let rhs_end = find_cmp_rhs_end(expr, op_end);
+
+        if lhs_start < cursor || rhs_end <= op_end {
+            out.push_str(&expr[cursor..op_end]);
+            cursor = op_end;
+            continue;
+        }
+
+        let lhs = expr[lhs_start..op_start].trim();
+        let rhs = expr[op_end..rhs_end].trim();
+        if kani_operand_is_pubkey(lhs, op, spec) && kani_operand_is_pubkey(rhs, op, spec) {
+            out.push_str(&expr[cursor..lhs_start]);
+            let helper = if cmp.trim() == "==" {
+                "pubkey_eq"
+            } else {
+                "pubkey_ne"
+            };
+            out.push_str(&format!("{helper}(&{lhs}, &{rhs})"));
+            cursor = rhs_end;
+        } else {
+            out.push_str(&expr[cursor..op_end]);
+            cursor = op_end;
+        }
+    }
+
+    out.push_str(&expr[cursor..]);
+    out
+}
+
+fn find_next_equality_op(expr: &str, from: usize) -> Option<(usize, &'static str)> {
+    let eq = expr[from..].find(" == ").map(|p| (from + p, " == "));
+    let ne = expr[from..].find(" != ").map(|p| (from + p, " != "));
+    match (eq, ne) {
+        (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+fn find_cmp_lhs_start(expr: &str, op_start: usize) -> usize {
+    let bytes = expr.as_bytes();
+    let mut i = op_start;
+    while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+        i -= 1;
+    }
+
+    let mut depth = 0usize;
+    while i > 0 {
+        if depth == 0 && i >= 2 && (&expr[i - 2..i] == "&&" || &expr[i - 2..i] == "||") {
+            break;
+        }
+
+        let b = bytes[i - 1];
+        match b {
+            b')' => {
+                depth += 1;
+                i -= 1;
+            }
+            b'(' => {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+                i -= 1;
+            }
+            b',' if depth == 0 => break,
+            _ => i -= 1,
+        }
+    }
+    i
+}
+
+fn find_cmp_rhs_end(expr: &str, op_end: usize) -> usize {
+    let bytes = expr.as_bytes();
+    let mut i = op_end;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+
+    let mut depth = 0usize;
+    while i < bytes.len() {
+        if depth == 0 && i + 1 < bytes.len() && (&expr[i..i + 2] == "&&" || &expr[i..i + 2] == "||")
+        {
+            break;
+        }
+
+        match bytes[i] {
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+                i += 1;
+            }
+            b',' if depth == 0 => break,
+            _ => i += 1,
+        }
+    }
+    i
+}
+
+fn kani_operand_is_pubkey(operand: &str, op: &ParsedHandler, spec: &ParsedSpec) -> bool {
+    let operand = operand.trim().trim_start_matches('&').trim();
+    if operand.ends_with(".pubkey") || operand.ends_with(".key()") {
+        return true;
+    }
+
+    for prefix in ["s.", "pre.", "post."] {
+        if let Some(field) = operand.strip_prefix(prefix) {
+            return spec_field_is_pubkey(field, spec);
+        }
+    }
+
+    if let Some(field) = operand.strip_prefix("pre_") {
+        return spec_field_is_pubkey(field, spec);
+    }
+
+    if op
+        .takes_params
+        .iter()
+        .chain(op.abstract_binders.iter())
+        .any(|(name, ty)| name == operand && type_is_or_contains_pubkey(ty))
+    {
+        return true;
+    }
+
+    spec_field_is_pubkey(operand, spec)
+}
+
+fn spec_field_is_pubkey(field: &str, spec: &ParsedSpec) -> bool {
+    let field = strip_variant_prefix_for_flat_state(field, spec);
+    let field = effect_target_base(field.as_str());
+    if spec
+        .state_fields
+        .iter()
+        .any(|(name, ty)| name == &field && type_is_or_contains_pubkey(ty))
+    {
+        return true;
+    }
+    spec.account_types.iter().any(|acct| {
+        acct.fields
+            .iter()
+            .any(|(name, ty)| name == &field && type_is_or_contains_pubkey(ty))
+            || acct.variants.iter().any(|variant| {
+                variant
+                    .fields
+                    .iter()
+                    .any(|(name, ty)| name == &field && type_is_or_contains_pubkey(ty))
+            })
+    })
+}
+
+fn type_is_or_contains_pubkey(ty: &str) -> bool {
+    ty.contains("Pubkey")
+}
+
+pub fn is_account_pubkey_ref(expr: &str, accounts: &[crate::check::ParsedHandlerAccount]) -> bool {
+    accounts
+        .iter()
+        .any(|a| expr == format!("{}.pubkey", a.name) || expr == format!("{}.key()", a.name))
+}
+
+pub fn handler_needs_account_env(op: &ParsedHandler) -> bool {
+    op.requires
+        .iter()
+        .any(|r| mentions_handler_account_pubkey(&r.rust_expr, &op.accounts))
+        || op
+            .guard_str
+            .as_ref()
+            .is_some_and(|g| mentions_handler_account_pubkey(g, &op.accounts))
+        || op
+            .effects
+            .iter()
+            .any(|(_, _, value)| is_account_pubkey_ref(value.trim(), &op.accounts))
+        || op.effect_branches.as_ref().is_some_and(|branches| {
+            branches.arms.iter().any(|arm| {
+                arm.effects
+                    .iter()
+                    .any(|(_, _, value)| is_account_pubkey_ref(value.trim(), &op.accounts))
+            })
+        })
+}
+
+pub fn handler_account_env_struct_name(op_name: &str) -> String {
+    let sanitized = crate::codegen_shared::sanitize_ident(op_name);
+    let mut out = String::new();
+    for part in sanitized.split('_').filter(|p| !p.is_empty()) {
+        let mut chars = part.chars();
+        if let Some(first) = chars.next() {
+            out.extend(first.to_uppercase());
+            out.push_str(chars.as_str());
+        }
+    }
+    if out.is_empty() {
+        "Handler".to_string()
+    } else {
+        format!("{}Accounts", out)
+    }
+}
+
 /// Translate a qedspec property expression to Rust.
 pub fn translate_property_to_rust(expr: &str, wrapping: bool) -> String {
     let result = expr
@@ -375,6 +650,22 @@ pub fn resolve_value(
     }
 }
 
+pub fn resolve_value_with_account_env(
+    value: &str,
+    op: &ParsedHandler,
+    spec: &ParsedSpec,
+    state_binder: Option<&str>,
+    account_binder: Option<&str>,
+) -> String {
+    if let Some(binder) = account_binder {
+        let rewritten = rewrite_account_pubkey_refs(value, &op.accounts, binder);
+        if rewritten != value {
+            return rewritten;
+        }
+    }
+    resolve_value(value, op, spec, state_binder)
+}
+
 /// True when the bare identifier names a state field in the flat
 /// `state_fields` list or any `account_types[*].fields` (multi-account).
 fn is_state_field(name: &str, spec: &ParsedSpec) -> bool {
@@ -497,6 +788,21 @@ pub fn emit_one_effect(
     value: &str,
     indent: &str,
 ) {
+    emit_one_effect_inner(out, op, spec, wrapping, field, op_kind, value, indent, None);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_one_effect_inner(
+    out: &mut String,
+    op: &ParsedHandler,
+    spec: &ParsedSpec,
+    wrapping: bool,
+    field: &str,
+    op_kind: &str,
+    value: &str,
+    indent: &str,
+    account_binder: Option<&str>,
+) {
     // v2.24 S5d — proptest / Kani / integration_test all run against a
     // flat `State` struct (the spec's union-of-variant-fields view). A
     // `Variant.field := …` effect from a multi-variant ADT spec must
@@ -511,7 +817,7 @@ pub fn emit_one_effect(
     // bare state-field RHS (e.g. `bid_buyer := state.rfp_buyer` after
     // upstream strips `state.`) renders as `s.rfp_buyer`. (PR #45 fix #2,
     // generalized to all callers via emit_one_effect rather than per-arm.)
-    let rust_value = resolve_value(value, op, spec, Some("s."));
+    let rust_value = resolve_value_with_account_env(value, op, spec, Some("s."), account_binder);
     match op_kind {
         "set" => {
             out.push_str(&format!("{indent}s.{field} = {rust_value};\n"));
@@ -570,6 +876,31 @@ pub fn emit_one_effect(
             ));
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn emit_one_effect_with_account_env(
+    out: &mut String,
+    op: &ParsedHandler,
+    spec: &ParsedSpec,
+    wrapping: bool,
+    field: &str,
+    op_kind: &str,
+    value: &str,
+    indent: &str,
+    account_binder: &str,
+) {
+    emit_one_effect_inner(
+        out,
+        op,
+        spec,
+        wrapping,
+        field,
+        op_kind,
+        value,
+        indent,
+        Some(account_binder),
+    );
 }
 
 /// Verify that every field referenced as an effect target in any handler is
@@ -689,18 +1020,32 @@ pub fn check_effect_targets(spec: &ParsedSpec) -> anyhow::Result<()> {
 /// projection drops it. Same shape as the lean_gen drop for handler-
 /// account pubkey refs.
 pub fn collect_full_guard(op: &ParsedHandler, wrapping: bool) -> Option<String> {
+    collect_full_guard_with_account_env(op, wrapping, None)
+}
+
+pub fn collect_full_guard_with_account_env(
+    op: &ParsedHandler,
+    wrapping: bool,
+    account_binder: Option<&str>,
+) -> Option<String> {
     let mut parts = Vec::new();
     if let Some(ref guard) = op.guard_str {
-        parts.push(format!("({})", translate_guard_to_rust(guard, wrapping)));
+        let translated = translate_guard_to_rust(guard, wrapping);
+        let translated = account_binder
+            .map(|binder| rewrite_account_pubkey_refs(&translated, &op.accounts, binder))
+            .unwrap_or(translated);
+        parts.push(format!("({})", translated));
     }
     for req in &op.requires {
-        if mentions_handler_account_pubkey(&req.rust_expr, &op.accounts) {
+        if account_binder.is_none() && mentions_handler_account_pubkey(&req.rust_expr, &op.accounts)
+        {
             continue;
         }
-        parts.push(format!(
-            "({})",
-            translate_guard_to_rust(&req.rust_expr, wrapping)
-        ));
+        let translated = translate_guard_to_rust(&req.rust_expr, wrapping);
+        let translated = account_binder
+            .map(|binder| rewrite_account_pubkey_refs(&translated, &op.accounts, binder))
+            .unwrap_or(translated);
+        parts.push(format!("({})", translated));
     }
     if parts.is_empty() {
         None
@@ -1107,17 +1452,54 @@ pub fn emit_transition_fn(
     wrapping: bool,
     map_type_fn: impl Fn(&str) -> anyhow::Result<String>,
 ) -> anyhow::Result<()> {
+    emit_transition_fn_inner(out, op, spec, wrapping, None, false, map_type_fn)
+}
+
+pub fn emit_transition_fn_for_kani(
+    out: &mut String,
+    op: &ParsedHandler,
+    spec: &ParsedSpec,
+    wrapping: bool,
+    map_type_fn: impl Fn(&str) -> anyhow::Result<String>,
+) -> anyhow::Result<()> {
+    let account_env =
+        handler_needs_account_env(op).then(|| handler_account_env_struct_name(&op.name));
+    emit_transition_fn_inner(
+        out,
+        op,
+        spec,
+        wrapping,
+        account_env.as_deref(),
+        true,
+        map_type_fn,
+    )
+}
+
+fn emit_transition_fn_inner(
+    out: &mut String,
+    op: &ParsedHandler,
+    spec: &ParsedSpec,
+    wrapping: bool,
+    account_env_struct: Option<&str>,
+    rewrite_pubkey_comparisons: bool,
+    map_type_fn: impl Fn(&str) -> anyhow::Result<String>,
+) -> anyhow::Result<()> {
     if let Some(ref doc) = op.doc {
         out.push_str(&format!("/// {}\n", doc.trim()));
     }
 
-    let params: String = op
-        .takes_params
-        .iter()
-        .chain(op.abstract_binders.iter())
-        .map(|(n, t)| map_type_fn(t).map(|rt| format!(", {}: {}", n, rt)))
-        .collect::<anyhow::Result<Vec<_>>>()?
-        .concat();
+    let mut params = String::new();
+    if let Some(account_env_struct) = account_env_struct {
+        params.push_str(&format!(", accounts: &{}", account_env_struct));
+    }
+    params.push_str(
+        &op.takes_params
+            .iter()
+            .chain(op.abstract_binders.iter())
+            .map(|(n, t)| map_type_fn(t).map(|rt| format!(", {}: {}", n, rt)))
+            .collect::<anyhow::Result<Vec<_>>>()?
+            .concat(),
+    );
     // v2.29 Slice A (#8) — abstract binders ride alongside the
     // real handler params in the spec-model transition signature.
     // Callers (Kani / proptest harnesses, integration tests) pass
@@ -1130,7 +1512,14 @@ pub fn emit_transition_fn(
     ));
 
     // Guard check (merges guard_str + requires clauses)
-    if let Some(guard_expr) = collect_full_guard(op, wrapping) {
+    if let Some(guard_expr) =
+        collect_full_guard_with_account_env(op, wrapping, account_env_struct.map(|_| "accounts"))
+    {
+        let guard_expr = if rewrite_pubkey_comparisons {
+            rewrite_kani_pubkey_comparisons(&guard_expr, op, spec)
+        } else {
+            guard_expr
+        };
         if let Some(ref raw) = op.guard_str {
             out.push_str(&format!("    // guard: {}\n", raw));
         }
@@ -1193,19 +1582,33 @@ pub fn emit_transition_fn(
         for arm in &branches.arms {
             out.push_str(&format!("        {} => {{\n", arm.pattern_rust));
             for (field, op_kind, value) in &arm.effects {
-                if field_type_is_pubkey(field, op, spec) {
+                if account_env_struct.is_none() && field_type_is_pubkey(field, op, spec) {
                     continue;
                 }
-                emit_one_effect(
-                    out,
-                    op,
-                    spec,
-                    wrapping,
-                    field,
-                    op_kind,
-                    value,
-                    "            ",
-                );
+                if account_env_struct.is_some() {
+                    emit_one_effect_with_account_env(
+                        out,
+                        op,
+                        spec,
+                        wrapping,
+                        field,
+                        op_kind,
+                        value,
+                        "            ",
+                        "accounts",
+                    );
+                } else {
+                    emit_one_effect(
+                        out,
+                        op,
+                        spec,
+                        wrapping,
+                        field,
+                        op_kind,
+                        value,
+                        "            ",
+                    );
+                }
             }
             out.push_str("        }\n");
         }
@@ -1224,10 +1627,16 @@ pub fn emit_transition_fn(
         // (e.g. `bid_buyer := state.rfp_buyer` after upstream strips
         // `state.`) renders as `s.rfp_buyer` in the proptest body.
         for (field, op_kind, value) in &op.effects {
-            if field_type_is_pubkey(field, op, spec) {
+            if account_env_struct.is_none() && field_type_is_pubkey(field, op, spec) {
                 continue;
             }
-            emit_one_effect(out, op, spec, wrapping, field, op_kind, value, "    ");
+            if account_env_struct.is_some() {
+                emit_one_effect_with_account_env(
+                    out, op, spec, wrapping, field, op_kind, value, "    ", "accounts",
+                );
+            } else {
+                emit_one_effect(out, op, spec, wrapping, field, op_kind, value, "    ");
+            }
         }
     }
 
@@ -1436,6 +1845,46 @@ handler close : State.Open -> State.Closed { effect { x := 0 } }
         assert!(
             out.contains("status: Status,"),
             "lifecycle spec must inject `status: Status` field:\n{out}"
+        );
+    }
+
+    #[test]
+    fn kani_pubkey_rewrite_handles_account_and_state_fields() {
+        let src = r#"spec T
+type State | Active of { admin_key : Pubkey }
+type Error | Unauthorized
+handler set_admin : State.Active -> State.Active {
+  accounts { admin : signer }
+  requires admin.pubkey == state.admin_key else Unauthorized
+  effect { admin_key := admin.pubkey }
+}
+"#;
+        let spec = parse_str(src).expect("parse");
+        let op = &spec.handlers[0];
+        let expr = "(accounts.admin.pubkey == s.admin_key) && (amount > 0)";
+        let rewritten = rewrite_kani_pubkey_comparisons(expr, op, &spec);
+        assert_eq!(
+            rewritten,
+            "(pubkey_eq(&accounts.admin.pubkey, &s.admin_key)) && (amount > 0)"
+        );
+    }
+
+    #[test]
+    fn kani_pubkey_rewrite_handles_indexed_pubkey_arrays() {
+        let src = r#"spec T
+const MAX_MEMBERS = 32
+type State | Active of { members : Map[MAX_MEMBERS] Pubkey }
+handler approve (member_index : U8) (approver : Pubkey) : State.Active -> State.Active {
+  requires state.members[member_index] == approver
+}
+"#;
+        let spec = parse_str(src).expect("parse");
+        let op = &spec.handlers[0];
+        let expr = "(s.members[(member_index) as usize] == approver) && (member_index < 32)";
+        let rewritten = rewrite_kani_pubkey_comparisons(expr, op, &spec);
+        assert_eq!(
+            rewritten,
+            "(pubkey_eq(&s.members[(member_index) as usize], &approver)) && (member_index < 32)"
         );
     }
 

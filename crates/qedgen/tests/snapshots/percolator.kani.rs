@@ -29,6 +29,16 @@ let prod = a.saturating_mul(b);
 if prod % d == 0 { prod / d } else { (prod / d).saturating_add(1) }
 }
 
+#[allow(dead_code)]
+fn pubkey_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    a[0] == b[0] && a[1] == b[1] && a[2] == b[2] && a[3] == b[3] && a[4] == b[4] && a[5] == b[5] && a[6] == b[6] && a[7] == b[7] && a[8] == b[8] && a[9] == b[9] && a[10] == b[10] && a[11] == b[11] && a[12] == b[12] && a[13] == b[13] && a[14] == b[14] && a[15] == b[15] && a[16] == b[16] && a[17] == b[17] && a[18] == b[18] && a[19] == b[19] && a[20] == b[20] && a[21] == b[21] && a[22] == b[22] && a[23] == b[23] && a[24] == b[24] && a[25] == b[25] && a[26] == b[26] && a[27] == b[27] && a[28] == b[28] && a[29] == b[29] && a[30] == b[30] && a[31] == b[31]
+}
+
+#[allow(dead_code)]
+fn pubkey_ne(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    !pubkey_eq(a, b)
+}
+
 // ============================================================================
 // State model (derived from qedspec — no framework dependencies)
 // ============================================================================
@@ -1722,7 +1732,7 @@ fn verify_add_user_effect_accounts_i_active() {
     let pre_accounts = s.accounts;
     if add_user(&mut s, i) {
         assert!(s.accounts[i].active == 1, "accounts[i].active must equal 1");
-        assert!(s.authority == pre_authority, "authority must not change");
+        assert!(pubkey_eq(&s.authority, &pre_authority), "authority must not change");
         assert!(s.V == pre_V, "V must not change");
         assert!(s.I == pre_I, "I must not change");
         assert!(s.F == pre_F, "F must not change");
@@ -1751,7 +1761,7 @@ fn verify_add_lp_effect_accounts_i_active() {
     let pre_accounts = s.accounts;
     if add_lp(&mut s, i) {
         assert!(s.accounts[i].active == 1, "accounts[i].active must equal 1");
-        assert!(s.authority == pre_authority, "authority must not change");
+        assert!(pubkey_eq(&s.authority, &pre_authority), "authority must not change");
         assert!(s.V == pre_V, "V must not change");
         assert!(s.I == pre_I, "I must not change");
         assert!(s.F == pre_F, "F must not change");
@@ -1780,7 +1790,7 @@ fn verify_reclaim_empty_account_effect_accounts_i_active() {
     let pre_accounts = s.accounts;
     if reclaim_empty_account(&mut s, i) {
         assert!(s.accounts[i].active == 0, "accounts[i].active must equal 0");
-        assert!(s.authority == pre_authority, "authority must not change");
+        assert!(pubkey_eq(&s.authority, &pre_authority), "authority must not change");
         assert!(s.V == pre_V, "V must not change");
         assert!(s.I == pre_I, "I must not change");
         assert!(s.F == pre_F, "F must not change");
@@ -1809,7 +1819,7 @@ fn verify_close_account_effect_V() {
     let pre_accounts = s.accounts;
     if close_account(&mut s, i) {
         assert!(s.V == pre_V.wrapping_sub(accounts[i].capital), "V must decrement by accounts[i].capital");
-        assert!(s.authority == pre_authority, "authority must not change");
+        assert!(pubkey_eq(&s.authority, &pre_authority), "authority must not change");
         assert!(s.I == pre_I, "I must not change");
         assert!(s.F == pre_F, "F must not change");
         assert!(s.accounts == pre_accounts, "accounts must not change");
@@ -1837,7 +1847,7 @@ fn verify_close_account_effect_accounts_i_capital() {
     let pre_accounts = s.accounts;
     if close_account(&mut s, i) {
         assert!(s.accounts[i].capital == 0, "accounts[i].capital must equal 0");
-        assert!(s.authority == pre_authority, "authority must not change");
+        assert!(pubkey_eq(&s.authority, &pre_authority), "authority must not change");
         assert!(s.I == pre_I, "I must not change");
         assert!(s.F == pre_F, "F must not change");
         assert!(s.accounts == pre_accounts, "accounts must not change");
@@ -1865,7 +1875,7 @@ fn verify_close_account_effect_accounts_i_active() {
     let pre_accounts = s.accounts;
     if close_account(&mut s, i) {
         assert!(s.accounts[i].active == 0, "accounts[i].active must equal 0");
-        assert!(s.authority == pre_authority, "authority must not change");
+        assert!(pubkey_eq(&s.authority, &pre_authority), "authority must not change");
         assert!(s.I == pre_I, "I must not change");
         assert!(s.F == pre_F, "F must not change");
         assert!(s.accounts == pre_accounts, "accounts must not change");
@@ -1894,7 +1904,7 @@ fn verify_deposit_effect_V() {
     let pre_accounts = s.accounts;
     if deposit(&mut s, i, amount) {
         assert!(s.V == pre_V.wrapping_add(amount), "V must increment by amount");
-        assert!(s.authority == pre_authority, "authority must not change");
+        assert!(pubkey_eq(&s.authority, &pre_authority), "authority must not change");
         assert!(s.I == pre_I, "I must not change");
         assert!(s.F == pre_F, "F must not change");
         assert!(s.accounts == pre_accounts, "accounts must not change");
@@ -1923,7 +1933,7 @@ fn verify_deposit_effect_accounts_i_capital() {
     let pre_accounts = s.accounts;
     if deposit(&mut s, i, amount) {
         assert!(s.accounts[i].capital == pre_accounts[i].capital.wrapping_add(amount), "accounts[i].capital must increment by amount");
-        assert!(s.authority == pre_authority, "authority must not change");
+        assert!(pubkey_eq(&s.authority, &pre_authority), "authority must not change");
         assert!(s.I == pre_I, "I must not change");
         assert!(s.F == pre_F, "F must not change");
         assert!(s.accounts == pre_accounts, "accounts must not change");
@@ -1952,7 +1962,7 @@ fn verify_withdraw_effect_V() {
     let pre_accounts = s.accounts;
     if withdraw(&mut s, i, amount) {
         assert!(s.V == pre_V.wrapping_sub(amount), "V must decrement by amount");
-        assert!(s.authority == pre_authority, "authority must not change");
+        assert!(pubkey_eq(&s.authority, &pre_authority), "authority must not change");
         assert!(s.I == pre_I, "I must not change");
         assert!(s.F == pre_F, "F must not change");
         assert!(s.accounts == pre_accounts, "accounts must not change");
@@ -1981,7 +1991,7 @@ fn verify_withdraw_effect_accounts_i_capital() {
     let pre_accounts = s.accounts;
     if withdraw(&mut s, i, amount) {
         assert!(s.accounts[i].capital == pre_accounts[i].capital.wrapping_sub(amount), "accounts[i].capital must decrement by amount");
-        assert!(s.authority == pre_authority, "authority must not change");
+        assert!(pubkey_eq(&s.authority, &pre_authority), "authority must not change");
         assert!(s.I == pre_I, "I must not change");
         assert!(s.F == pre_F, "F must not change");
         assert!(s.accounts == pre_accounts, "accounts must not change");
@@ -2009,7 +2019,7 @@ fn verify_top_up_insurance_effect_V() {
     let pre_accounts = s.accounts;
     if top_up_insurance(&mut s, amount) {
         assert!(s.V == pre_V.wrapping_add(amount), "V must increment by amount");
-        assert!(s.authority == pre_authority, "authority must not change");
+        assert!(pubkey_eq(&s.authority, &pre_authority), "authority must not change");
         assert!(s.F == pre_F, "F must not change");
         assert!(s.accounts == pre_accounts, "accounts must not change");
     }
@@ -2036,7 +2046,7 @@ fn verify_top_up_insurance_effect_I() {
     let pre_accounts = s.accounts;
     if top_up_insurance(&mut s, amount) {
         assert!(s.I == pre_I.wrapping_add(amount), "I must increment by amount");
-        assert!(s.authority == pre_authority, "authority must not change");
+        assert!(pubkey_eq(&s.authority, &pre_authority), "authority must not change");
         assert!(s.F == pre_F, "F must not change");
         assert!(s.accounts == pre_accounts, "accounts must not change");
     }
@@ -2064,7 +2074,7 @@ fn verify_deposit_fee_credits_effect_V() {
     let pre_accounts = s.accounts;
     if deposit_fee_credits(&mut s, i, amount) {
         assert!(s.V == pre_V.wrapping_add(amount), "V must increment by amount");
-        assert!(s.authority == pre_authority, "authority must not change");
+        assert!(pubkey_eq(&s.authority, &pre_authority), "authority must not change");
         assert!(s.I == pre_I, "I must not change");
         assert!(s.accounts == pre_accounts, "accounts must not change");
     }
@@ -2092,7 +2102,7 @@ fn verify_deposit_fee_credits_effect_F() {
     let pre_accounts = s.accounts;
     if deposit_fee_credits(&mut s, i, amount) {
         assert!(s.F == pre_F.wrapping_add(amount), "F must increment by amount");
-        assert!(s.authority == pre_authority, "authority must not change");
+        assert!(pubkey_eq(&s.authority, &pre_authority), "authority must not change");
         assert!(s.I == pre_I, "I must not change");
         assert!(s.accounts == pre_accounts, "accounts must not change");
     }
@@ -2120,7 +2130,7 @@ fn verify_deposit_fee_credits_effect_accounts_i_fee_credits() {
     let pre_accounts = s.accounts;
     if deposit_fee_credits(&mut s, i, amount) {
         assert!(s.accounts[i].fee_credits == pre_accounts[i].fee_credits.wrapping_add(amount), "accounts[i].fee_credits must increment by amount");
-        assert!(s.authority == pre_authority, "authority must not change");
+        assert!(pubkey_eq(&s.authority, &pre_authority), "authority must not change");
         assert!(s.I == pre_I, "I must not change");
         assert!(s.accounts == pre_accounts, "accounts must not change");
     }
@@ -2148,7 +2158,7 @@ fn verify_convert_released_pnl_effect_V() {
     let pre_accounts = s.accounts;
     if convert_released_pnl(&mut s, i, x) {
         assert!(s.V == pre_V.wrapping_sub(x), "V must decrement by x");
-        assert!(s.authority == pre_authority, "authority must not change");
+        assert!(pubkey_eq(&s.authority, &pre_authority), "authority must not change");
         assert!(s.I == pre_I, "I must not change");
         assert!(s.F == pre_F, "F must not change");
         assert!(s.accounts == pre_accounts, "accounts must not change");
@@ -2177,7 +2187,7 @@ fn verify_convert_released_pnl_effect_accounts_i_reserved_pnl() {
     let pre_accounts = s.accounts;
     if convert_released_pnl(&mut s, i, x) {
         assert!(s.accounts[i].reserved_pnl == pre_accounts[i].reserved_pnl.wrapping_sub(x), "accounts[i].reserved_pnl must decrement by x");
-        assert!(s.authority == pre_authority, "authority must not change");
+        assert!(pubkey_eq(&s.authority, &pre_authority), "authority must not change");
         assert!(s.I == pre_I, "I must not change");
         assert!(s.F == pre_F, "F must not change");
         assert!(s.accounts == pre_accounts, "accounts must not change");
@@ -2205,7 +2215,7 @@ fn verify_liquidate_case_1_effect_accounts_i_active() {
     let pre_accounts = s.accounts;
     if liquidate_case_1(&mut s, i) {
         assert!(s.accounts[i].active == 0, "accounts[i].active must equal 0");
-        assert!(s.authority == pre_authority, "authority must not change");
+        assert!(pubkey_eq(&s.authority, &pre_authority), "authority must not change");
         assert!(s.V == pre_V, "V must not change");
         assert!(s.I == pre_I, "I must not change");
         assert!(s.F == pre_F, "F must not change");
