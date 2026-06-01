@@ -174,7 +174,9 @@ fn check_example(example: &Example, report: &mut RegenDriftReport, mode: WriteMo
     };
 
     for (rel, target) in program_outputs(&example.root)? {
-        crate::codegen::generate(&spec_path, &temp_root.join(&rel), target)
+        let parsed = crate::check::parse_spec_file(&spec_path)?;
+        let mir = crate::mir::lower(&parsed);
+        crate::codegen_mir::generate(&mir, &parsed, &spec_path, &temp_root.join(&rel), target)
             .with_context(|| format!("regenerating {} for {}", rel.display(), example.name))?;
     }
 

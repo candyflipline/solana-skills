@@ -3121,25 +3121,13 @@ async fn dispatch(cmd: Commands) -> Result<()> {
             let is_pinocchio = matches!(target, Target::Pinocchio);
             let cwd = std::env::current_dir()?;
             let spec = init::resolve_spec_path(spec.as_deref(), &cwd)?;
-            // Rust skeleton — all three targets emit via the MIR path.
+            // Rust skeleton — all three targets emit via the MIR path
+            // (`codegen_mir`, the sole Rust-codegen path since v2.32
+            // deleted the legacy `codegen::generate`).
             {
-                // v2.30 Phase 4i — MIR is the default Anchor/Quasar
-                // codegen path. 9 of 10 sub-generators
-                // (cargo_toml / math / events / errors / ref_impls /
-                // imported_mirror / lib / state / instructions) are
-                // MIR-direct; `guards` stays delegated to legacy
-                // pending the typed-Stmt refactor (v3.0).
-                // `QEDGEN_LEGACY_CODEGEN=1` opts back into the
-                // ParsedSpec-direct renderer as an escape hatch — but
-                // only for Anchor/Quasar; the legacy renderer has no
-                // Pinocchio arm, so Pinocchio always takes the MIR path.
-                if std::env::var("QEDGEN_LEGACY_CODEGEN").is_ok() && !is_pinocchio {
-                    codegen::generate(&spec, &output_dir, target)?;
-                } else {
-                    let parsed = check::parse_spec_file(&spec)?;
-                    let mir = mir::lower(&parsed);
-                    codegen_mir::generate(&mir, &parsed, &spec, &output_dir, target)?;
-                }
+                let parsed = check::parse_spec_file(&spec)?;
+                let mir = mir::lower(&parsed);
+                codegen_mir::generate(&mir, &parsed, &spec, &output_dir, target)?;
             }
 
             if kani || all {
@@ -3246,19 +3234,9 @@ async fn dispatch(cmd: Commands) -> Result<()> {
                              belong in client-side tests."
                         );
                     }
-                } else if std::env::var("QEDGEN_LEGACY_PROPTEST").is_ok() {
-                    // v2.30 Phase 5 — MIR is the default proptest
-                    // codegen path. The scaffold delegates the full emit
-                    // to legacy `proptest_gen::generate` (the per-handler
-                    // arb_state / preservation / invariant / guard /
-                    // overflow / sequence harnesses are tightly coupled
-                    // to `ParsedHandler` fields with no clean structural
-                    // seam; meaningful sub-emitter ports are deferred to
-                    // v3.0, same as Anchor Phase 4g `generate_guards`).
-                    // `QEDGEN_LEGACY_PROPTEST=1` opts back into the
-                    // legacy path as an escape hatch.
-                    proptest_gen::generate(&spec, &proptest_output)?;
                 } else {
+                    // `proptest_gen_mir` is the sole proptest path since
+                    // v2.32 deleted the legacy `proptest_gen`.
                     let mir = mir::lower(&parsed);
                     proptest_gen_mir::generate(&mir, &parsed, &spec, &proptest_output)?;
                 }
