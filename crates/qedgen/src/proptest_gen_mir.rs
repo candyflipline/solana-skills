@@ -36,7 +36,6 @@ pub fn generate(
     generate_impl(spec_path, output_path)
 }
 
-
 /// Return the proptest strategy string for a DSL primitive type. For compound
 /// types (`Map[N] T`, records, sum types) use `strategy_for_field` instead —
 /// it dispatches here once it's unwrapped the compound.
@@ -1693,7 +1692,6 @@ fn emit_sequence_test_for(
     let _ = all_fields; // suppress unused
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests {

@@ -1275,7 +1275,9 @@ mod tests {
     /// Exercises `AccountsMethod` classifier + impl-method resolution.
     #[test]
     fn adapt_matches_marinade_style_snapshot() {
-        assert_snapshot("crates/qedgen/tests/fixtures/regressions/anchor-adapter-shapes/marinade-style");
+        assert_snapshot(
+            "crates/qedgen/tests/fixtures/regressions/anchor-adapter-shapes/marinade-style",
+        );
     }
 
     /// Squads V4 style: `<Type>::<method>(ctx, args)` forwarder.
@@ -1283,7 +1285,9 @@ mod tests {
     /// (impls inline with the program mod, not in a sibling file).
     #[test]
     fn adapt_matches_squads_style_snapshot() {
-        assert_snapshot("crates/qedgen/tests/fixtures/regressions/anchor-adapter-shapes/squads-style");
+        assert_snapshot(
+            "crates/qedgen/tests/fixtures/regressions/anchor-adapter-shapes/squads-style",
+        );
     }
 
     #[test]

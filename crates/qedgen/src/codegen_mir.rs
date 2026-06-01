@@ -265,7 +265,11 @@ fn emit_lib(
         .unwrap_or("11111111111111111111111111111111");
 
     let mut out = String::new();
-    out.push_str(&crate::codegen_shared::marker("DO NOT EDIT", fp, "src/lib.rs"));
+    out.push_str(&crate::codegen_shared::marker(
+        "DO NOT EDIT",
+        fp,
+        "src/lib.rs",
+    ));
     out.push_str(surface.crate_attrs);
     out.push_str(surface.prelude_import);
     out.push('\n');
@@ -644,7 +648,11 @@ fn emit_state(
     let is_multi = mir.account_states.len() > 1;
 
     let mut out = String::new();
-    out.push_str(&crate::codegen_shared::marker("DO NOT EDIT", fp, "src/state.rs"));
+    out.push_str(&crate::codegen_shared::marker(
+        "DO NOT EDIT",
+        fp,
+        "src/state.rs",
+    ));
     out.push_str(surface.prelude_import);
     out.push('\n');
 
@@ -978,7 +986,8 @@ fn emit_imported_mirror(
             if !is_multi_variant {
                 out.push_str(&format!("{}pub struct {} {{\n", account_attr, acct.name));
                 for (fname, ftype) in &acct.fields {
-                    let rust_ty = crate::codegen_shared::map_type_for_target(ftype, parsed, target)?;
+                    let rust_ty =
+                        crate::codegen_shared::map_type_for_target(ftype, parsed, target)?;
                     out.push_str(&format!("    pub {}: {},\n", fname, rust_ty));
                 }
                 if !acct.lifecycle.is_empty() && !acct.fields.iter().any(|(n, _)| n == "status") {
@@ -1052,7 +1061,8 @@ fn emit_imported_mirror(
                     if occurrences.iter().any(|(_, t)| t != first_ty) {
                         continue;
                     }
-                    let rust_ty = crate::codegen_shared::map_type_for_target(first_ty, parsed, target)?;
+                    let rust_ty =
+                        crate::codegen_shared::map_type_for_target(first_ty, parsed, target)?;
                     out.push_str(&format!(
                         "    /// v2.29 Slice H accessor for `{0}`. Panics on variants\n\
                          /// that don't carry the field — the per-handler lifecycle\n\
@@ -1144,7 +1154,11 @@ fn emit_errors(
     let error_name = format!("{}Error", crate::codegen_shared::to_pascal_case(&mir.name));
 
     let mut out = String::new();
-    out.push_str(&crate::codegen_shared::marker("DO NOT EDIT", fp, "src/errors.rs"));
+    out.push_str(&crate::codegen_shared::marker(
+        "DO NOT EDIT",
+        fp,
+        "src/errors.rs",
+    ));
     out.push_str(prelude_import);
     out.push('\n');
 
@@ -1345,7 +1359,11 @@ fn emit_events(
     };
 
     let mut out = String::new();
-    out.push_str(&crate::codegen_shared::marker("DO NOT EDIT", fp, "src/events.rs"));
+    out.push_str(&crate::codegen_shared::marker(
+        "DO NOT EDIT",
+        fp,
+        "src/events.rs",
+    ));
     out.push_str(prelude_import);
     out.push('\n');
 
@@ -1399,7 +1417,11 @@ fn emit_math(fp: &crate::fingerprint::SpecFingerprint, output_dir: &Path) -> Res
     let src_dir = output_dir.join("src");
     std::fs::create_dir_all(&src_dir)?;
     let mut out = String::new();
-    out.push_str(&crate::codegen_shared::marker("DO NOT EDIT", fp, "src/math.rs"));
+    out.push_str(&crate::codegen_shared::marker(
+        "DO NOT EDIT",
+        fp,
+        "src/math.rs",
+    ));
     out.push_str("//! Fixed-point math helpers used by spec-derived guards and properties.\n\n");
     out.push_str("#![allow(dead_code)]\n\n");
     out.push_str(
@@ -1569,8 +1591,9 @@ handler poke : State.Active -> State.Active {
 
     #[test]
     fn pinocchio_events_emit_plain_struct_no_event_macro() {
-        let (mir, parsed) =
-            lower_fixture("crates/qedgen/tests/fixtures/pinocchio-fixtures/vault-greenfield/vault.qedspec");
+        let (mir, parsed) = lower_fixture(
+            "crates/qedgen/tests/fixtures/pinocchio-fixtures/vault-greenfield/vault.qedspec",
+        );
         assert!(!mir.events.is_empty(), "vault-greenfield declares an event");
 
         let fp = crate::fingerprint::compute_fingerprint(&parsed);

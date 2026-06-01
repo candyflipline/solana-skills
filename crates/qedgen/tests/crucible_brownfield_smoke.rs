@@ -183,7 +183,8 @@ fn fixture_buggy_anchor_drives_brownfield_emit() {
     ensure_qedgen_built();
     // Copy the fixture out of the repo into a tempdir so emitted
     // `.qed/fuzz/` doesn't pollute the working tree.
-    let src = repo_root().join("crates/qedgen/tests/fixtures/regressions/v2.21-crucible-crash-first/buggy_anchor");
+    let src = repo_root()
+        .join("crates/qedgen/tests/fixtures/regressions/v2.21-crucible-crash-first/buggy_anchor");
     assert!(
         src.exists(),
         "fixture missing at {} — did the v2.21 commit land?",
@@ -262,8 +263,9 @@ fn copy_dir_recursive(src: &Path, dst: &Path) {
 #[test]
 fn fixture_buggy_pinocchio_drives_brownfield_emit() {
     ensure_qedgen_built();
-    let src =
-        repo_root().join("crates/qedgen/tests/fixtures/regressions/v2.22-pinocchio-brownfield-fuzz/buggy_pinocchio");
+    let src = repo_root().join(
+        "crates/qedgen/tests/fixtures/regressions/v2.22-pinocchio-brownfield-fuzz/buggy_pinocchio",
+    );
     assert!(
         src.exists(),
         "fixture missing at {} — did the v2.22 commit land?",
