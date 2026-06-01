@@ -291,7 +291,7 @@ Total: ~10–13 wks of qedgen-local work. No qedsvm coupling, no qedbridge codeg
 
 ## Open questions
 
-1. **`Stmt::Branch` scrutinee shape.** Today's `ParsedEffectBranches` carries a `match`-on-value scrutinee. MIR's `Branch.scrutinee: Predicate` only models boolean tests; a `Stmt::Match { scrutinee: Expr, arms: Vec<(Pattern, Block)> }` may be needed for the issue #42 corpus. Resolve in Phase 0 against `examples/regressions/issue-42-conditional/fee_router.qedspec`.
+1. **`Stmt::Branch` scrutinee shape.** Today's `ParsedEffectBranches` carries a `match`-on-value scrutinee. MIR's `Branch.scrutinee: Predicate` only models boolean tests; a `Stmt::Match { scrutinee: Expr, arms: Vec<(Pattern, Block)> }` may be needed for the issue #42 corpus. Resolve in Phase 0 against `crates/qedgen/tests/fixtures/regressions/issue-42-conditional/fee_router.qedspec`.
 
 2. **`InterfaceRegistry` shape.** Unified imports (v2.29 Slice F–I) populate `ParsedSpec.imported_namespaces`. MIR's `Mir.interfaces` either mirrors this directly or holds a different shape optimized for `Stmt::Cpi` callee-ensures lookup. Decide once `cpi_substitute` is ported (Phase 3).
 

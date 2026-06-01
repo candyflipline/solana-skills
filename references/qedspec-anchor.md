@@ -69,7 +69,7 @@ qedgen adapt --program <crate> --spec <path>
 
 Re-emits all attribute lines with current hashes. Paste in the changed handlers. Build clears.
 
-For the success path + drift demo end-to-end, see `examples/qed-drift-fixture/`. That fixture is a workspace member exercising all three legs (free-fn body, impl-method body, accounts struct), so workspace `cargo test` proves every leg of the drift loop on every CI run.
+For the success path + drift demo end-to-end, see `crates/qed-drift-fixture/`. That fixture is a workspace member exercising all three legs (free-fn body, impl-method body, accounts struct), so workspace `cargo test` proves every leg of the drift loop on every CI run.
 
 ### Method-shape forwarders
 

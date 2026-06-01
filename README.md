@@ -548,7 +548,7 @@ qedgen check-upgrade --old ratchet.lock --new target/idl/my_program.json \
   --unsafe allow-field-append --migrated-account EscrowState
 ```
 
-Exit codes mirror ratchet's CLI conventions: `0 = additive/safe`, `1 = breaking`, `2 = unsafe`. Under the hood qedgen embeds [ratchet](https://github.com/saicharanpogul/ratchet) as a library, so the rule catalog stays in sync with upstream — run `qedgen readiness --list-rules` (P-rules) or `qedgen check-upgrade --list-rules` (R-rules) to see the full set. Pair with `--json` for a machine-readable dump. A worked Quasar example lives at [`examples/quasar-readiness/`](examples/quasar-readiness/).
+Exit codes mirror ratchet's CLI conventions: `0 = additive/safe`, `1 = breaking`, `2 = unsafe`. Under the hood qedgen embeds [ratchet](https://github.com/saicharanpogul/ratchet) as a library, so the rule catalog stays in sync with upstream — run `qedgen readiness --list-rules` (P-rules) or `qedgen check-upgrade --list-rules` (R-rules) to see the full set. Pair with `--json` for a machine-readable dump. A worked Quasar IDL pair (v1 → v2) lives at [`crates/qedgen/tests/fixtures/quasar-readiness/`](crates/qedgen/tests/fixtures/quasar-readiness/).
 
 **Why both.** qedgen's `#[qed(verified)]` hash-stamps the *function body*, so a rename of an `#[account]` struct compiles with a stale-but-valid proof even though the on-chain discriminator is now different and every existing account of that type is orphaned. `qedgen check-upgrade`'s `R006 account-discriminator-change` catches that class of failure; the proof layer alone doesn't look at it.
 
@@ -608,8 +608,6 @@ via Lean + client-side tests.)
 - **[Slippage](examples/sbpf/slippage/)** — AMM slippage guard
 
 ### Ratchet (Quasar IDL)
-
-- **[Quasar readiness](examples/quasar-readiness/)** — `qedgen readiness` and `qedgen check-upgrade` against a Blueshift Quasar IDL, plus a v1 → v2 diff that exercises the breaking-change rules
 
 ## Requirements
 

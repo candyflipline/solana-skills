@@ -3,7 +3,7 @@ members = [
     "crates/qedgen",
     "crates/qedgen-macros",
     "crates/qedgen-sandbox",
-    "examples/qed-drift-fixture",
+    "crates/qed-drift-fixture",
 ]
 exclude = [
     "examples/rust/escrow",

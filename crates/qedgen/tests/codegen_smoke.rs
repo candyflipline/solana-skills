@@ -150,7 +150,7 @@ fn smoke_anchor_scaffold_with_proptest(example: &str) {
 fn smoke_pinocchio_scaffold(fixture: &str, spec_file: &str) {
     let temp = tempfile::tempdir().expect("tempdir");
     let spec_src = repo_root()
-        .join("examples/pinocchio-fixtures")
+        .join("crates/qedgen/tests/fixtures/pinocchio-fixtures")
         .join(fixture)
         .join(spec_file);
     let spec_path = temp.path().join(spec_file);

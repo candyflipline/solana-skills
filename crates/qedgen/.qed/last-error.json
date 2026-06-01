@@ -1,0 +1,5 @@
+{
+  "command": "probe",
+  "stderr": "No `pub fn <name>(ctx: Context<X>, ...)` handlers found under /tmp/claude-501/.tmpWZdI46. Brownfield mode needs at least one Anchor handler to fuzz; confirm `--root` points at the program crate (e.g. `programs/my_prog/`).",
+  "timestamp": "2026-06-01T06:09:48.091166000Z"
+}

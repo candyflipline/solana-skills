@@ -12,7 +12,7 @@ body:
 
         Before filing: please try to produce a **minimal `.qedspec`** that reproduces the issue — ideally under 30 lines, one handler, one property. The fastest way is to start from your real spec and delete until the bug disappears, then add back the last thing you removed.
 
-        See [`examples/regressions/issue-8/`](https://github.com/QEDGen/solana-skills/tree/main/examples/regressions/issue-8) for the fixture-committing convention (inline header comment: finding number → expected vs actual → suspected fix site).
+        See [`crates/qedgen/tests/fixtures/regressions/issue-8/`](https://github.com/QEDGen/solana-skills/tree/main/crates/qedgen/tests/fixtures/regressions/issue-8) for the fixture-committing convention (inline header comment: finding number → expected vs actual → suspected fix site).
 
   - type: input
     id: qedgen-version
@@ -48,7 +48,7 @@ body:
     id: repro-spec
     attributes:
       label: Minimal .qedspec
-      description: Paste the smallest .qedspec that reproduces the bug. Please include an inline header comment describing the expected vs actual behavior (same convention as `examples/regressions/issue-8/repro-*.qedspec`).
+      description: Paste the smallest .qedspec that reproduces the bug. Please include an inline header comment describing the expected vs actual behavior (same convention as `crates/qedgen/tests/fixtures/regressions/issue-8/repro-*.qedspec`).
       render: rust
       placeholder: |
         // Expected: qedgen check passes, lake build succeeds.
@@ -131,5 +131,5 @@ body:
           required: true
         - label: "I've run `qedgen check --spec <file>` and pasted the output above if it's relevant."
           required: true
-        - label: "I'd be willing to contribute a `repro-*.qedspec` fixture under `examples/regressions/` once the fix lands (optional but appreciated)."
+        - label: "I'd be willing to contribute a `repro-*.qedspec` fixture under `crates/qedgen/tests/fixtures/regressions/` once the fix lands (optional but appreciated)."
           required: false

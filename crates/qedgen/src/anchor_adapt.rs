@@ -1228,8 +1228,8 @@ mod tests {
     /// the four shipped fixtures.
     ///
     /// To regenerate after an intentional renderer change, run e.g.:
-    ///   cargo run -- adapt --program examples/anchor-brownfield-demo \
-    ///     --out examples/anchor-brownfield-demo/before.qedspec
+    ///   cargo run -- adapt --program crates/qedgen/tests/fixtures/anchor-brownfield-demo \
+    ///     --out crates/qedgen/tests/fixtures/anchor-brownfield-demo/before.qedspec
     fn assert_snapshot(demo_rel: &str) {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         let repo_root = Path::new(manifest_dir)
@@ -1268,14 +1268,14 @@ mod tests {
     /// `instructions/<name>.rs`. Exercises `FreeFn` classifier.
     #[test]
     fn adapt_matches_brownfield_demo_snapshot() {
-        assert_snapshot("examples/anchor-brownfield-demo");
+        assert_snapshot("crates/qedgen/tests/fixtures/anchor-brownfield-demo");
     }
 
     /// Marinade style: `ctx.accounts.<method>(...)` forwarder.
     /// Exercises `AccountsMethod` classifier + impl-method resolution.
     #[test]
     fn adapt_matches_marinade_style_snapshot() {
-        assert_snapshot("examples/regressions/anchor-adapter-shapes/marinade-style");
+        assert_snapshot("crates/qedgen/tests/fixtures/regressions/anchor-adapter-shapes/marinade-style");
     }
 
     /// Squads V4 style: `<Type>::<method>(ctx, args)` forwarder.
@@ -1283,7 +1283,7 @@ mod tests {
     /// (impls inline with the program mod, not in a sibling file).
     #[test]
     fn adapt_matches_squads_style_snapshot() {
-        assert_snapshot("examples/regressions/anchor-adapter-shapes/squads-style");
+        assert_snapshot("crates/qedgen/tests/fixtures/regressions/anchor-adapter-shapes/squads-style");
     }
 
     #[test]

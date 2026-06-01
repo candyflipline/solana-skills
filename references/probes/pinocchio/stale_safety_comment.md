@@ -31,7 +31,7 @@ For each `// SAFETY:` clause:
 
 1. **Negate the clause**: pick a negation strategy from the table below.
 2. **Build the adversarial input**: use the
-   `examples/pinocchio-fixtures/_harness/adversarial.rs` builder
+   `crates/qedgen/tests/fixtures/pinocchio-fixtures/_harness/adversarial.rs` builder
    matching the strategy.
 3. **Drive the handler**: call the impl with the adversarial input
    (Miri lane: direct handler call; Mollusk lane: SVM-mediated tx).

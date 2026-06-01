@@ -1570,7 +1570,7 @@ handler poke : State.Active -> State.Active {
     #[test]
     fn pinocchio_events_emit_plain_struct_no_event_macro() {
         let (mir, parsed) =
-            lower_fixture("examples/pinocchio-fixtures/vault-greenfield/vault.qedspec");
+            lower_fixture("crates/qedgen/tests/fixtures/pinocchio-fixtures/vault-greenfield/vault.qedspec");
         assert!(!mir.events.is_empty(), "vault-greenfield declares an event");
 
         let fp = crate::fingerprint::compute_fingerprint(&parsed);

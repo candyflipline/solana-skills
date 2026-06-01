@@ -229,15 +229,11 @@ fn copy_interfaces(repo_root: &Path, temp_repo_root: &Path) -> Result<()> {
     copy_dir_if_exists(
         &repo_root.join("interfaces"),
         &temp_repo_root.join("interfaces"),
-    )?;
-    // v2.29 — also copy `examples/imports/` so bundled examples can
-    // reference per-example data-shape dep specs via relative path
-    // (`path = "../../imports/<name>"` in qed.toml) without the
-    // drift-check temp dir losing the dependency tree.
-    copy_dir_if_exists(
-        &repo_root.join("examples/imports"),
-        &temp_repo_root.join("examples/imports"),
     )
+    // Per-example import targets (e.g. cross-program-vault's `admin_config`
+    // dep) are co-located under the example's own `imports/` subdir, so
+    // `copy_spec_inputs`'s recursive qedspec copy already carries them into
+    // the temp tree — no separate top-level `examples/imports` copy needed.
 }
 
 fn copy_qedspec_tree(base: &Path, current: &Path, dst_root: &Path) -> Result<()> {

@@ -2104,7 +2104,7 @@ mod tests {
         // { ... }` block — it should lower as
         // `Mir.imports["MockEncrypt"]` tagged `ImportOrigin::Inline`
         // with no upstream pin (Tier 0 by construction).
-        let mir = lower_fixture("examples/regressions/issue-8/pool.qedspec");
+        let mir = lower_fixture("crates/qedgen/tests/fixtures/regressions/issue-8/pool.qedspec");
         let mock = mir
             .imports
             .get("MockEncrypt")
