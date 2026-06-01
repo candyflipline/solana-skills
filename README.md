@@ -32,6 +32,12 @@ npx skills add qedgen/solana-skills
 
 > Works with Claude Code, Cursor, Windsurf, GitHub Copilot, and any agent supporting the [Agent Skills](https://agentskills.io) spec.
 
+**Or just point your agent here.** Paste this to your coding agent and it installs QEDGen and gets to work:
+
+> Set up QEDGen for this program — follow `https://raw.githubusercontent.com/qedgen/solana-skills/main/docs/llms-full.txt`
+
+That file opens with a **Quickstart for agents** (install, then audit your existing program or write a `.qedspec` from scratch), followed by the full reference. The shorter [`docs/llms.txt`](docs/llms.txt) is the index version.
+
 ## How it works
 
 ```

@@ -2,6 +2,18 @@
 
 > Describe what your Solana program must guarantee in `.qedspec`. QEDGen finds the bugs your tests miss, then generates the proofs, property tests, and CI to keep them fixed. Supports Anchor, Quasar, Pinocchio, and native sBPF assembly. It also audits existing programs (brownfield) with no spec required.
 
+## Quickstart (for agents)
+
+A developer pointed you to this document to set up QEDGen and use it on their Solana program. Do this, in order:
+
+1. **Install.** Run `npx skills add qedgen/solana-skills`, then confirm with `qedgen --help`. This registers the `qedgen` skill (which drives the full workflow below) and the CLI. No API keys are needed for the core loop. If `qedgen` isn't on `PATH` afterward, the binary ships at `bin/qedgen` in the installed skill directory — add it, or run `bash install.sh` from there.
+2. **Find out where the developer is, then act:**
+   - **Brownfield** (an existing program, no spec) → *audit first.* Run `qedgen probe --program <path>` (real bugs, each with a Kani/proptest/Mollusk reproducer, plus coverage gaps) and/or `qedgen adapt --program <path>` (draft a `.qedspec` from Anchor source). Report findings, then offer to lock them into a spec so they can't come back.
+   - **Greenfield** (defining guarantees for new or evolving code) → write a `.qedspec`, then `qedgen check --spec …` → `qedgen codegen --spec … --all` → `qedgen verify --spec …`.
+3. **The `.qedspec` is the single source of truth.** Refine the spec rather than hand-editing generated artifacts.
+
+The rest of this document is the full reference — every CLI command, the proof-writing workflow, the Lean support-library API, proof patterns, and worked examples.
+
 ## Installation
 
 ```bash
