@@ -1,11 +1,12 @@
 # QEDGen
 
-> Describe what your Solana program must guarantee in `.qedspec`. QEDGen finds the bugs your tests miss, then generates the proofs, property tests, and CI to keep them fixed. Supports Anchor, Quasar, and native sBPF assembly. Install with `npx skills add qedgen/solana-skills`. Works with any coding agent supporting the Agent Skills spec.
+> Describe what your Solana program must guarantee in `.qedspec`. QEDGen finds the bugs your tests miss, then generates the proofs, property tests, and CI to keep them fixed. Supports Anchor, Quasar, Pinocchio, and native sBPF assembly — and audits existing programs without a spec (`qedgen adapt`, `qedgen probe`). Install with `npx skills add qedgen/solana-skills`. Works with any coding agent supporting the Agent Skills spec.
 
 A `.qedspec` is the single source of truth. It can live in one file or span multiple files with upstream spec dependencies. From it, QEDGen generates program code, property tests, Kani harnesses, Lean 4 proofs, and CI workflows.
 
 ## Docs
 
+- [llms-full.txt](https://raw.githubusercontent.com/qedgen/solana-skills/main/docs/llms-full.txt): **Start here if you're an agent** — opens with a Quickstart (install + first action), then the full reference (every CLI command, the workflow, the Lean support-library API, proof patterns, and worked examples)
 - [README](https://raw.githubusercontent.com/qedgen/solana-skills/main/README.md): Installation, usage, CLI commands, and requirements
 - [SKILL.md](https://raw.githubusercontent.com/qedgen/solana-skills/main/SKILL.md): Spec-writing workflow, support library API (including sBPF), proof patterns, tactic rules, and error fixes
 - [CLAUDE.md](https://raw.githubusercontent.com/qedgen/solana-skills/main/CLAUDE.md): Build commands, architecture, crate structure, and development guide

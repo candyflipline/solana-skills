@@ -313,7 +313,7 @@ pub struct AdversarialInput {
     /// Verbatim SAFETY-comment clause this input attacks.
     pub claim_text: String,
     /// Symbolic strategy identifier — keyed to a builder in
-    /// `examples/pinocchio-fixtures/_harness/adversarial.rs`.
+    /// `crates/qedgen/tests/fixtures/pinocchio-fixtures/_harness/adversarial.rs`.
     /// Known strategies: `alias_buffer`, `short_buffer`, `swap_position`,
     /// `uninit_init_flag`, `foreign_owner`, `short_balance`,
     /// `oversized_amount`.
@@ -2315,7 +2315,7 @@ solana-program = "1.18"
         // up with the right intent tag and that the narrowing filter
         // actually narrows where it should.
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../examples/native-fixtures/shank-dispatcher");
+            .join("tests/fixtures/native-fixtures/shank-dispatcher");
         let out = run_bootstrap(&root).expect("bootstrap must succeed");
         let handlers = out.handlers.expect("expected populated handlers list");
         assert_eq!(handlers.len(), 3, "fixture defines three handlers");

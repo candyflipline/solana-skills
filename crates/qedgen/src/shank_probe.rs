@@ -794,7 +794,7 @@ pub fn process_instruction(
         // intent classification is tested via the end-to-end
         // `run_bootstrap` path in `probe`.
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../examples/native-fixtures/shank-dispatcher");
+            .join("tests/fixtures/native-fixtures/shank-dispatcher");
         let cat = detect_shank_dispatcher(&root)
             .expect("fixture must parse")
             .expect("fixture must match Shank shape");

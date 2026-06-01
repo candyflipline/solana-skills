@@ -150,7 +150,7 @@ fn smoke_anchor_scaffold_with_proptest(example: &str) {
 fn smoke_pinocchio_scaffold(fixture: &str, spec_file: &str) {
     let temp = tempfile::tempdir().expect("tempdir");
     let spec_src = repo_root()
-        .join("examples/pinocchio-fixtures")
+        .join("crates/qedgen/tests/fixtures/pinocchio-fixtures")
         .join(fixture)
         .join(spec_file);
     let spec_path = temp.path().join(spec_file);
@@ -208,6 +208,88 @@ fn redirect_macros_to_path(cargo_toml: &std::path::Path) {
         cargo_toml.display()
     );
     std::fs::write(cargo_toml, format!("{rewritten}\n")).expect("rewrite Cargo.toml");
+}
+
+/// sBPF programs are verified by Lean proofs over the assembly; their
+/// runtime behavior is exercised by client-side tests, not generated
+/// Kani/proptest harnesses (which have no sBPF awareness and would emit
+/// meaningless Anchor-shaped output). `codegen --kani` / `--proptest`
+/// must skip harness emission for assembly targets and print a note.
+/// Fast test — no cargo check, just inspects the generated tree.
+fn assert_sbpf_skips(flag: &str) {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let spec_src = repo_root().join("examples/sbpf/counter/counter.qedspec");
+    let spec_path = temp.path().join("counter.qedspec");
+    std::fs::copy(&spec_src, &spec_path).expect("copy counter spec");
+    std::fs::create_dir(temp.path().join(".qed")).expect("create .qed");
+    run(Command::new("git").arg("init").current_dir(temp.path()));
+
+    let output_dir = temp.path().join("programs");
+    let out = Command::new(env!("CARGO_BIN_EXE_qedgen"))
+        .arg("codegen")
+        .arg("--spec")
+        .arg(&spec_path)
+        .arg(flag)
+        .arg("--output-dir")
+        .arg(&output_dir)
+        .current_dir(temp.path())
+        .output()
+        .expect("spawn codegen");
+    assert!(
+        out.status.success(),
+        "codegen {flag} on sBPF spec should succeed, got {}\nstderr:\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("skipping") && stderr.contains("sBPF"),
+        "expected a skip note for {flag} on an sBPF spec, got stderr:\n{stderr}"
+    );
+    // No Kani / proptest harness file may be emitted anywhere in the tree.
+    let banned = if flag == "--kani" {
+        "kani.rs"
+    } else {
+        "proptest.rs"
+    };
+    let found: Vec<PathBuf> = walk_files(temp.path())
+        .into_iter()
+        .filter(|p| p.file_name().and_then(|n| n.to_str()) == Some(banned))
+        .collect();
+    assert!(
+        found.is_empty(),
+        "expected no {banned} for sBPF {flag}, found: {found:?}"
+    );
+}
+
+/// Minimal recursive file walk (avoids a dev-dep on `walkdir`).
+fn walk_files(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn sbpf_codegen_skips_kani_harness() {
+    assert_sbpf_skips("--kani");
+}
+
+#[test]
+fn sbpf_codegen_skips_proptest_harness() {
+    assert_sbpf_skips("--proptest");
 }
 
 #[test]

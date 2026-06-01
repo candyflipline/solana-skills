@@ -40,7 +40,7 @@ amount-bound) lives in that overlap.
 
 ## Reproducer harness
 
-All Miri repros import from `examples/pinocchio-fixtures/_harness/`:
+All Miri repros import from `crates/qedgen/tests/fixtures/pinocchio-fixtures/_harness/`:
 
 - `account.rs` — synthesizes Pinocchio `AccountInfo` from raw bytes.
 - `adversarial.rs` — input-negation primitives keyed to SAFETY-comment

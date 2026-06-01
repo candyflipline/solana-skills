@@ -1,94 +1,61 @@
-// v2.30 MIR-based Lean codegen. This module is the default
-// Lean-codegen path post Phase 2; the legacy ParsedSpec-direct
-// `lean_gen.rs` is reachable via `QEDGEN_LEGACY_LEAN=1` as an
-// escape hatch and stays in-tree until the non-Lean codegens
-// finish their MIR carry-through.
-
-//! qedgen Lean codegen — MIR consumer.
+//! qedgen Lean codegen — the MIR consumer. Sole Lean-codegen path
+//! since v2.32 deleted the legacy `ParsedSpec`-direct `lean_gen.rs`.
+//! Consumes `mir::Mir` and writes `Spec.lean` (plus interface sidecars
+//! via [`crate::lean_sidecars`]). Gated by `tests/mir_snapshot.rs`.
 //!
-//! Default Lean codegen path post v2.30 Phase 2. The existing
-//! `lean_gen.rs` (8,661 LoC) consumes `ParsedSpec` directly; this
-//! module replicates the same emitted output but consumes `mir::Mir`.
-//! Every pilot fixture (escrow, escrow-split, lending, multisig,
-//! bundled-stdlib-demo, cross-program-vault) is byte-identical
-//! MIR ↔ legacy, gated by `cargo test --test mir_snapshot`.
+//! `render` dispatches on spec shape:
+//! - sBPF (`mir.is_assembly`) → `render_sbpf` (handled in `generate`,
+//!   reads `ParsedSpec` directly — assembly proofs over `Program.lean`).
+//! - Indexed (records or `Map[N] T`) → `render_indexed_state`.
+//! - Multi-account (`account_states.len() > 1`) → `render_multi_account`.
+//! - Multi-variant ADT (`type State | A | B of { … }`) →
+//!   `render_single_account_adt`.
+//! - Single-account → `render_single_account`.
 //!
-//! `QEDGEN_LEGACY_LEAN=1` forces the call site back onto `lean_gen`
-//! as an escape hatch for any spec where MIR diverges unexpectedly;
-//! file an issue so the snapshot test can catch the case next regen.
-//!
-//! ## Phase 1a survey — what we must replicate
-//!
-//! `lean_gen::generate(spec, output_path)` does:
-//! 1. Compute `content = render(spec)`.
-//! 2. Inject `import <Iface>` lines for pinned interface modules.
-//! 3. Write `Spec.lean` at `output_path`.
-//! 4. For each pinned-but-unverified interface, write a sibling
-//!    `<Iface>.lean` axiom module under the same dir.
-//! 5. Update `lakefile.lean`'s `roots` array.
-//!
-//! `lean_gen::render(spec) -> String` dispatches based on spec shape:
-//! - sBPF (`pragma sbpf`) → `render_sbpf` — out of v2.30 scope.
-//! - Indexed (records or `Map[N] T`) → `render_indexed_state` — Phase 1
-//!   stretch goal.
-//! - Multi-account (`account_types.len() > 1`) → `render_multi_account` —
-//!   Phase 2.
-//! - Single-account → `render_single_account` (pilot path).
-//!
-//! `render_single_account` emits the following sections in order:
+//! The single-account renderer emits these sections in order:
 //! 1. `import QEDGen.Solana.{Account, Cpi, State, Valid}`.
 //! 2. `namespace <ProgramName>` + `open QEDGen.Solana`.
-//! 3. Uninterpreted helpers + ref-impls (`emit_uninterpreted_helpers`,
-//!    `emit_ref_impls`).
+//! 3. Uninterpreted helpers + ref-impls.
 //! 4. Constants (`abbrev NAME : Nat := VALUE`).
 //! 5. `inductive Status` if ≥2 lifecycle states.
 //! 6. `structure State` with all state fields.
-//! 7. Transition functions (`render_transitions`) — one `def
-//!    <handler>_transition (s : State) ... : Option State` per handler.
-//! 8. CPI theorems (`render_cpi_theorems`) — per-handler `theorem
-//!    <handler>_cpi_correct` for Tier-1/2 callees.
-//! 9. Invariant theorems (`render_invariants_theorem_form`).
-//! 10. `inductive Operation` + `def applyOp` — the union of all
-//!     handlers.
-//! 11. Property theorems (`render_properties`).
-//! 12. Abort theorems (`render_aborts_if`).
-//! 13. Ensures theorems (`render_ensures`).
-//! 14. Frame conditions (`render_frame_conditions`).
+//! 7. Transition functions — one `def <handler>_transition (s : State)
+//!    … : Option State` per handler.
+//! 8. CPI theorems — per-handler `theorem <handler>_cpi_correct` for
+//!    Tier-1/2 callees.
+//! 9. Invariant theorems.
+//! 10. `inductive Operation` + `def applyOp` — union of all handlers.
+//! 11. Property theorems.
+//! 12. Abort theorems.
+//! 13. Ensures theorems.
+//! 14. Frame conditions.
 //! 15. Cover / liveness / environment / overflow theorems.
 //! 16. `end <ProgramName>`.
-//!
-//! Multi-variant ADT specs (`type State | A | B of { ... }`) take a
-//! different branch (`render_single_account_adt`) — those land later in
-//! Phase 1.
-//!
-//! ## Pilot scope for this phase
-//!
-//! Sections 1–6 (file structure, namespace, state struct) +
-//! transitions for the pilot `Stmt` set (RequireOrAbort, Assign,
-//! CheckedAdd/Sub, WrapAdd/Sub, SatAdd/Sub, TokenTransfer →
-//! CPI theorem) + the lifecycle gate from `HandlerMir.transition`.
-//!
-//! Sections 9–16 (invariants, properties, aborts, ensures, frame,
-//! cover, liveness, environments, overflow) are stubbed for the first
-//! sub-pass and filled in iteratively. The snapshot equivalence gate
-//! (Phase 1d) drives which sections must land for which fixtures.
 
 use crate::mir::Mir;
 use anyhow::Result;
 use std::path::Path;
 
-/// Top-level entry — mirrors `lean_gen::generate`. Renders the
-/// `Spec.lean` body from MIR, then delegates the sidecar work
-/// (import injection, sibling axiom modules, lakefile updates,
-/// verified-callee require directives) to
-/// `lean_gen::write_spec_with_sidecars`. The shared helper guarantees
-/// the same sidecar layout regardless of which renderer produced the
-/// body — Phase 1c-7's port keeps the in-`Spec.lean` half, sidecar
-/// emission still flows through `lean_gen`. Phase 1d's snapshot gate
-/// validates byte-equivalence on every pilot fixture.
+/// Top-level entry. Renders the `Spec.lean` body from MIR, then
+/// delegates the sidecar work (import injection, sibling axiom modules,
+/// lakefile updates, verified-callee require directives) to
+/// `lean_sidecars::write_spec_with_sidecars` — the renderer-agnostic
+/// sidecar writer. The snapshot suite (`tests/mir_snapshot.rs`) gates
+/// the emitted `Spec.lean` against checked-in references.
 pub fn generate(mir: &Mir, parsed: &crate::check::ParsedSpec, output_path: &Path) -> Result<()> {
-    let content = render(mir);
-    crate::lean_gen::write_spec_with_sidecars(content, parsed, output_path)
+    // sBPF assembly specs render a wholly different shape (Program.lean
+    // import + per-instruction guard/property theorem stubs over
+    // `executeFn`/`wp_exec`) that has nothing to do with the
+    // state-machine `Stmt` IR. Dispatch on the MIR-lifted `is_assembly`
+    // flag; the renderer reads instruction/layout/guard data straight
+    // from `ParsedSpec` (the single consumer means MIR carries only the
+    // dispatch signal, not the data — see `Mir::is_assembly`).
+    let content = if mir.is_assembly {
+        render_sbpf(parsed)
+    } else {
+        render(mir)
+    };
+    crate::lean_sidecars::write_spec_with_sidecars(content, parsed, output_path)
 }
 
 /// Pure render. Dispatches based on the MIR shape and emits the full
@@ -97,14 +64,10 @@ pub fn generate(mir: &Mir, parsed: &crate::check::ParsedSpec, output_path: &Path
 /// Phase 1 stub: emits header + namespace + state struct only. Other
 /// sections land iteratively as Phase 1c progresses.
 pub fn render(mir: &Mir) -> String {
-    // Dispatch by spec shape — sBPF, indexed, multi-account, single
-    // — mirrors `lean_gen::render`'s top-level branch logic. Phase 1
-    // pilot only implements `render_single_account`; the others
-    // delegate to TODO stubs that emit a marker comment so call sites
-    // are obvious.
-    if is_sbpf(mir) {
-        return render_sbpf_stub(mir);
-    }
+    // Dispatch by spec shape — indexed, multi-account, single. sBPF
+    // assembly specs are dispatched earlier in `generate` (they read
+    // `ParsedSpec` directly via `render_sbpf`), so `render` only sees
+    // state-machine shapes here.
     if is_indexed(mir) {
         return render_indexed_state(mir);
     }
@@ -120,13 +83,6 @@ pub fn render(mir: &Mir) -> String {
 // ----------------------------------------------------------------------
 // Shape detection — mirrors lean_gen.rs predicates
 // ----------------------------------------------------------------------
-
-fn is_sbpf(_mir: &Mir) -> bool {
-    // sBPF specs declare `pragma sbpf { ... }`; the MIR doesn't carry
-    // pragma info yet (Phase 0 didn't lift it). v3.0 will. For now,
-    // assume non-sBPF — sBPF specs aren't in the v2.30 pilot scope.
-    false
-}
 
 fn is_indexed(mir: &Mir) -> bool {
     // Indexed spec: declares records (modeled as `Custom` types in MIR)
@@ -175,12 +131,11 @@ fn render_single_account(mir: &Mir) -> String {
     emit_lifecycle_marker(&mut out, mir);
     emit_state_struct(&mut out, mir);
     emit_transitions(&mut out, mir);
-    // §8 CPI theorems — emitted after transitions to match the legacy
-    // `render_single_account` section order. The returned pinned-set
-    // is currently consumed only by `lean_gen::generate`'s sibling-
-    // module writer; Phase 1c-7's port keeps the in-`Spec.lean` half,
-    // sibling axiom modules + lakefile wiring stay on the legacy
-    // path (invoked by the dispatcher in main.rs).
+    // §8 CPI theorems — emitted after transitions for section ordering.
+    // This emits the in-`Spec.lean` half (per-handler CPI theorems); the
+    // sibling `<Iface>.lean` axiom modules + lakefile wiring are written
+    // separately by `lean_sidecars::write_spec_with_sidecars`, which
+    // recomputes the pinned set, so the returned value is unused here.
     let _pinned = emit_cpi_theorems(&mut out, mir);
     emit_invariants(&mut out, mir);
     emit_operation_inductive(&mut out, mir);
@@ -655,8 +610,467 @@ fn emit_handler_transition_adt(out: &mut String, mir: &Mir, h: &crate::mir::Hand
     out.push_str("  | _ => none\n\n");
 }
 
-fn render_sbpf_stub(_mir: &Mir) -> String {
-    "-- MIR-TODO(phase-?): sBPF codegen not yet ported to MIR\n".to_string()
+// ----------------------------------------------------------------------
+// sBPF assembly renderer — ported verbatim from `lean_gen::render_sbpf`
+// (v2.32 sBPF workstream). Reads `ParsedSpec` directly: the assembly
+// domain (instructions / input_layout / insn_layout / guards over
+// `executeFn`) has no representation in the state-machine `Stmt` IR, and
+// Lean is the only backend that renders sBPF (Kani/proptest skip it), so
+// there is no cross-codegen divergence for MIR to prevent. Output is
+// byte-identical to the legacy renderer (gated by `tests/sbpf_lean_parity.rs`).
+// ----------------------------------------------------------------------
+fn render_sbpf(spec: &crate::check::ParsedSpec) -> String {
+    let mut out = String::new();
+
+    // Derive Prog module name from spec program_name.
+    // E.g., spec Slippage → "SlippageProg", spec Transfer → "TransferProg"
+    let prog_module = format!("{}Prog", spec.program_name);
+
+    // Header
+    out.push_str(&format!(
+        "-- Generated by qedgen lean-gen from {}.qedspec\n\
+         -- Source of truth: the .qedspec file. Regenerate with:\n\
+         --   qedgen lean-gen --spec <spec>.qedspec --output <this-file>\n\n",
+        spec.program_name.to_lowercase()
+    ));
+
+    out.push_str("import QEDGen\n");
+    out.push_str(&format!("import {}\n\n", prog_module));
+
+    out.push_str("open QEDGen.Solana.SBPF\n");
+    out.push_str("open QEDGen.Solana.SBPF.Memory\n\n");
+
+    // ── Global constants ─────────────────────────────────────────────────
+    if !spec.constants.is_empty() {
+        out.push_str("-- Global constants (from prog module, not re-declared):\n");
+        for (name, val) in &spec.constants {
+            let clean_val = val.replace('_', "");
+            out.push_str(&format!("--   {} = {}\n", name, clean_val));
+        }
+        out.push('\n');
+    }
+
+    // ── Pubkey constants ───────────────────────────────────────────────────
+    if !spec.pubkeys.is_empty() {
+        out.push_str("-- Known pubkey constants (from prog module, not re-declared):\n");
+        for pk in &spec.pubkeys {
+            for (i, chunk) in pk.chunks.iter().enumerate() {
+                let clean = chunk.replace('_', "");
+                out.push_str(&format!(
+                    "--   PUBKEY_{}_CHUNK_{} = {}\n",
+                    pk.name.to_ascii_uppercase(),
+                    i,
+                    clean
+                ));
+            }
+        }
+        out.push('\n');
+    }
+
+    // ── Per-instruction blocks ───────────────────────────────────────────
+    for instr in &spec.instructions {
+        let ns = &instr.name;
+        out.push_str(&format!("namespace {}\n\n", ns));
+
+        // Instruction-level constants
+        if !instr.constants.is_empty() {
+            out.push_str("-- Instruction-level constants\n");
+            for (name, val) in &instr.constants {
+                let clean_val = val.replace('_', "");
+                out.push_str(&format!("abbrev {} : Nat := {}\n", name, clean_val));
+            }
+            out.push('\n');
+        }
+
+        // Error constants — use instruction-level if present, else global
+        let errors = if !instr.errors.is_empty() {
+            &instr.errors
+        } else {
+            &spec.valued_errors
+        };
+        if !errors.is_empty() {
+            out.push_str("-- Error constants\n");
+            for err in errors {
+                if let Some(val) = err.value {
+                    let lean_name = error_to_lean_name(&err.name);
+                    out.push_str(&format!("abbrev {} : Nat := {}\n", lean_name, val));
+                }
+            }
+            out.push('\n');
+        }
+
+        // Offset constants (from input_layout + insn_layout)
+        let all_offsets: Vec<(&str, &str, i64, bool)> = instr
+            .input_layout
+            .iter()
+            .map(|f| (f.name.as_str(), f.field_type.as_str(), f.offset, false))
+            .chain(
+                instr
+                    .insn_layout
+                    .iter()
+                    .map(|f| (f.name.as_str(), f.field_type.as_str(), f.offset, true)),
+            )
+            .collect();
+
+        if !all_offsets.is_empty() {
+            out.push_str("-- Offset constants\n");
+            for (name, _ftype, offset, _is_insn) in &all_offsets {
+                let lean_name = offset_to_lean_name(name);
+                out.push_str(&format!("abbrev {} : Int := {}\n", lean_name, offset));
+            }
+            out.push('\n');
+
+            // ea_* lemmas
+            out.push_str("-- Effective address lemmas\n");
+            for (name, _ftype, offset, _is_insn) in &all_offsets {
+                let lean_name = offset_to_lean_name(name);
+                let rhs = if *offset == 0 {
+                    "b".to_string()
+                } else if *offset > 0 {
+                    format!("b + {}", offset)
+                } else {
+                    format!("b - {}", offset.unsigned_abs())
+                };
+                out.push_str(&format!(
+                    "@[simp] theorem ea_{} (b : Nat) : effectiveAddr b {} = {} := by\n  \
+                     unfold effectiveAddr {}; omega\n\n",
+                    lean_name, lean_name, rhs, lean_name
+                ));
+            }
+        }
+
+        // Entry point
+        let entry = instr.entry.unwrap_or(0);
+        let has_insn_reg = !instr.insn_layout.is_empty();
+        let init_expr = if has_insn_reg {
+            format!("initState2 inputAddr insnAddr mem {}", entry)
+        } else {
+            "initState inputAddr mem".to_string()
+        };
+
+        // Guard theorem stubs
+        if !instr.guards.is_empty() {
+            out.push_str("-- Guard theorem stubs\n");
+            out.push_str(
+                "-- Hypotheses derived from checks + layout. Fill proofs with wp_exec.\n\n",
+            );
+
+            let mut accumulated_after: Vec<(String, String)> = Vec::new();
+
+            for guard in &instr.guards {
+                let error_lean = error_to_lean_name(&guard.error);
+                let hyps = derive_guard_hypotheses(guard, &all_offsets, instr, spec);
+
+                if let Some(ref doc) = guard.doc {
+                    out.push_str(&format!("/-- {} -/\n", doc.trim()));
+                }
+
+                out.push_str(&format!("theorem {}\n", guard.name));
+
+                if has_insn_reg {
+                    out.push_str("    (inputAddr insnAddr : Nat) (mem : Mem)\n");
+                } else {
+                    out.push_str("    (inputAddr : Nat) (mem : Mem)\n");
+                }
+
+                for (var_decl, _) in &accumulated_after {
+                    out.push_str(&format!("    {}\n", var_decl));
+                }
+
+                for hyp in &hyps.bindings {
+                    out.push_str(&format!("    {}\n", hyp));
+                }
+
+                let fuel_str = match guard.fuel {
+                    Some(f) => f.to_string(),
+                    None => "FUEL".to_string(),
+                };
+                out.push_str(&format!(
+                    "    :\n    (executeFn {}.progAt ({}) {}).exitCode\n      \
+                     = some {} := sorry\n\n",
+                    prog_module, init_expr, fuel_str, error_lean
+                ));
+
+                if let Some(ref after_hyps) = hyps.after {
+                    for ah in after_hyps {
+                        accumulated_after.push((ah.clone(), String::new()));
+                    }
+                }
+            }
+
+            // Spec completeness structure
+            out.push_str(
+                "-- Completeness structure: fill all fields to prove every guard is covered\n",
+            );
+            out.push_str("structure Spec (progAt : Nat \u{2192} Option Insn) where\n");
+
+            let mut acc_after_for_spec: Vec<String> = Vec::new();
+            for guard in &instr.guards {
+                let error_lean = error_to_lean_name(&guard.error);
+                let hyps = derive_guard_hypotheses(guard, &all_offsets, instr, spec);
+
+                let mut binders = Vec::new();
+                if has_insn_reg {
+                    binders.push("(inputAddr insnAddr : Nat)".to_string());
+                    binders.push("(mem : Mem)".to_string());
+                } else {
+                    binders.push("(inputAddr : Nat)".to_string());
+                    binders.push("(mem : Mem)".to_string());
+                }
+                for ah in &acc_after_for_spec {
+                    binders.push(prefix_unused_binder(ah));
+                }
+                for b in &hyps.bindings {
+                    if !b.starts_with("--") {
+                        binders.push(prefix_unused_binder(b));
+                    }
+                }
+
+                let binder_str = binders.join(" ");
+                let fuel_str = match guard.fuel {
+                    Some(f) => f.to_string(),
+                    None => "FUEL".to_string(),
+                };
+                out.push_str(&format!(
+                    "  {} :\n    \u{2200} {},\n    \
+                     (executeFn progAt ({}) {}).exitCode = some {}\n",
+                    guard.name, binder_str, init_expr, fuel_str, error_lean
+                ));
+
+                if let Some(ref after_hyps) = hyps.after {
+                    for ah in after_hyps {
+                        acc_after_for_spec.push(ah.clone());
+                    }
+                }
+            }
+            out.push('\n');
+        }
+
+        // Property theorem stubs
+        if !instr.properties.is_empty() {
+            out.push_str("-- Property theorem stubs\n\n");
+            for prop in &instr.properties {
+                if let Some(ref doc) = prop.doc {
+                    out.push_str(&format!("/-- {} -/\n", doc.trim()));
+                }
+                out.push_str(&format!("theorem {} : True := trivial\n\n", prop.name));
+            }
+        }
+
+        out.push_str(&format!("end {}\n\n", ns));
+    }
+
+    out
+}
+
+/// Hypotheses derived from a guard's checks expression and the layout.
+struct DerivedHypotheses {
+    /// Lean hypothesis binders (e.g., "(disc : Nat)", "(h_disc_val : readU8 mem insnAddr = disc)")
+    bindings: Vec<String>,
+    /// After-hypotheses for the next guard (what becomes true if this guard passes)
+    after: Option<Vec<String>>,
+}
+
+/// Derive guard hypotheses from checks expression + input/insn layout.
+fn derive_guard_hypotheses(
+    guard: &crate::check::ParsedGuard,
+    all_offsets: &[(&str, &str, i64, bool)],
+    _instr: &crate::check::ParsedInstruction,
+    _spec: &crate::check::ParsedSpec,
+) -> DerivedHypotheses {
+    // Use raw checks (preserves constant names) for Lean output
+    let checks_str = guard.checks_raw.as_ref().or(guard.checks.as_ref());
+    let Some(checks) = checks_str else {
+        // No checks expression — generate minimal placeholder
+        return DerivedHypotheses {
+            bindings: vec!["-- TODO: add guard-specific hypotheses".to_string()],
+            after: None,
+        };
+    };
+
+    // Parse checks expression: "field == CONST" or "field >= CONST"
+    // Support patterns: X == Y, X >= Y, X == Y (pubkey 4-chunk comparison)
+    let parts: Vec<&str> = checks.split_whitespace().collect();
+
+    if parts.len() == 3 {
+        let field_name = parts[0];
+        let op = parts[1];
+        let const_name = parts[2];
+
+        // Look up the field in layouts
+        if let Some((_, ftype, offset, is_insn)) = all_offsets
+            .iter()
+            .find(|(name, _, _, _)| *name == field_name)
+        {
+            let read_fn = match *ftype {
+                "U8" => "readU8",
+                "U64" => "readU64",
+                "Pubkey" => "readU64", // Pubkey fields are 4-chunk comparisons
+                _ => "readU64",
+            };
+
+            let base_reg = if *is_insn { "insnAddr" } else { "inputAddr" };
+            let addr_expr = if *offset == 0 {
+                base_reg.to_string()
+            } else if *offset > 0 {
+                format!("({} + {})", base_reg, offset)
+            } else {
+                format!("({} - {})", base_reg, offset.unsigned_abs())
+            };
+
+            // Variable name: derive from field name
+            let var_name = field_name_to_var(field_name);
+
+            // Check if const_name is also a layout field (field-vs-field comparison)
+            let rhs_is_field = all_offsets
+                .iter()
+                .find(|(name, _, _, _)| *name == const_name);
+
+            // Build RHS: if it's a field, introduce a variable and read hypothesis for it
+            let (rhs_var, rhs_bindings) = if let Some((_, rtype, roffset, r_is_insn)) = rhs_is_field
+            {
+                let rhs_read = match *rtype {
+                    "U8" => "readU8",
+                    _ => "readU64",
+                };
+                let rhs_base = if *r_is_insn { "insnAddr" } else { "inputAddr" };
+                let rhs_addr = if *roffset == 0 {
+                    rhs_base.to_string()
+                } else if *roffset > 0 {
+                    format!("({} + {})", rhs_base, roffset)
+                } else {
+                    format!("({} - {})", rhs_base, roffset.unsigned_abs())
+                };
+                let rhs_vname = field_name_to_var(const_name);
+                let binds = vec![
+                    format!("({} : Nat)", rhs_vname),
+                    format!(
+                        "(h_{}_val : {} mem {} = {})",
+                        rhs_vname, rhs_read, rhs_addr, rhs_vname
+                    ),
+                ];
+                (rhs_vname, binds)
+            } else {
+                // RHS is a constant name (preserve as-is from checks_raw)
+                (const_name.to_string(), vec![])
+            };
+
+            match op {
+                "==" => {
+                    let mut bindings = vec![
+                        format!("({} : Nat)", var_name),
+                        format!(
+                            "(h_{}_val : {} mem {} = {})",
+                            var_name, read_fn, addr_expr, var_name
+                        ),
+                    ];
+                    bindings.extend(rhs_bindings.clone());
+                    bindings.push(format!(
+                        "(h_{}_ne : {} \u{2260} {})",
+                        var_name, var_name, rhs_var
+                    ));
+                    let after = Some(vec![format!(
+                        "(h_{} : {} mem {} = {})",
+                        var_name, read_fn, addr_expr, rhs_var
+                    )]);
+                    DerivedHypotheses { bindings, after }
+                }
+                ">=" => {
+                    let mut bindings = vec![
+                        format!("({} : Nat)", var_name),
+                        format!(
+                            "(h_{}_val : {} mem {} = {})",
+                            var_name, read_fn, addr_expr, var_name
+                        ),
+                    ];
+                    bindings.extend(rhs_bindings.clone());
+                    bindings.push(format!("(h_{}_lt : {} < {})", var_name, var_name, rhs_var));
+                    let mut after_binds = vec![
+                        format!("({} : Nat)", var_name),
+                        format!(
+                            "(h_{}_val : {} mem {} = {})",
+                            var_name, read_fn, addr_expr, var_name
+                        ),
+                    ];
+                    after_binds.extend(rhs_bindings);
+                    after_binds.push(format!(
+                        "(h_{}_ge : \u{00AC}({} < {}))",
+                        var_name, var_name, rhs_var
+                    ));
+                    DerivedHypotheses {
+                        bindings,
+                        after: Some(after_binds),
+                    }
+                }
+                _ => DerivedHypotheses {
+                    bindings: vec![format!("-- TODO: derive hypotheses for checks: {}", checks)],
+                    after: None,
+                },
+            }
+        } else {
+            // Field not found in layout — generate placeholder
+            DerivedHypotheses {
+                bindings: vec![format!("-- TODO: derive hypotheses for checks: {}", checks)],
+                after: None,
+            }
+        }
+    } else {
+        // Complex expression — placeholder
+        DerivedHypotheses {
+            bindings: vec![format!("-- TODO: derive hypotheses for checks: {}", checks)],
+            after: None,
+        }
+    }
+}
+
+/// Prefix hypothesis binder names (starting with `h_`) with `_` to suppress
+/// unused-variable warnings in the Spec structure. Value variables like
+/// `discriminant`, `nAccounts` etc. must keep their names because hypothesis
+/// types reference them (e.g., `readU8 mem addr = discriminant`).
+fn prefix_unused_binder(binder: &str) -> String {
+    if let Some(rest) = binder.strip_prefix("(h_") {
+        return format!("(_h_{}", rest);
+    }
+    binder.to_string()
+}
+
+/// Convert error name from qedspec to Lean constant name.
+/// E.g., "InvalidDiscriminant" → "E_INVALID_DISCRIMINANT"
+fn error_to_lean_name(name: &str) -> String {
+    let mut result = String::from("E_");
+    let mut prev_was_upper = false;
+    for (i, c) in name.chars().enumerate() {
+        if c.is_uppercase() && i > 0 && !prev_was_upper {
+            result.push('_');
+        }
+        result.push(c.to_ascii_uppercase());
+        prev_was_upper = c.is_uppercase();
+    }
+    result
+}
+
+/// Convert layout field name to a Lean variable name.
+fn field_name_to_var(name: &str) -> String {
+    // Convert snake_case to camelCase for variable names
+    let parts: Vec<&str> = name.split('_').collect();
+    if parts.len() <= 1 {
+        return name.to_string();
+    }
+    let mut result = parts[0].to_string();
+    for part in &parts[1..] {
+        let mut chars = part.chars();
+        if let Some(first) = chars.next() {
+            result.push(first.to_ascii_uppercase());
+            result.extend(chars);
+        }
+    }
+    result
+}
+
+/// Convert offset field name to a Lean constant name.
+/// Uses naming convention matching qedguards: uppercase with prefix.
+fn offset_to_lean_name(name: &str) -> String {
+    name.to_ascii_uppercase()
 }
 
 /// `(root_field, idx)` → `Vec<(inner_field, op_kind, value)>`.
@@ -665,6 +1079,30 @@ fn render_sbpf_stub(_mir: &Mir) -> String {
 /// `Function.update` call. Mirrors `lean_gen::IndexedEffectsByRoot`.
 type IndexedEffectsByRoot =
     std::collections::BTreeMap<(String, String), Vec<(String, String, String)>>;
+
+/// Map a scalar DSL type string to its Lean type. Mirrors
+/// `lean_gen::map_scalar_type` (record fields carry string types, not the
+/// typed `Ty`, so the indexed renderer needs this string-form mapper).
+fn map_scalar_type(t: &str) -> String {
+    match t.trim() {
+        "U8" | "U16" | "U32" | "U64" | "U128" => "Nat".to_string(),
+        "I8" | "I16" | "I32" | "I64" | "I128" => "Int".to_string(),
+        "Bool" => "Bool".to_string(),
+        "Pubkey" => "Pubkey".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Default value for a record field's `Inhabited` instance. Mirrors
+/// `lean_gen::default_value_for`.
+fn default_value_for(t: &str) -> &'static str {
+    match t.trim() {
+        "U8" | "U16" | "U32" | "U64" | "U128" => "0",
+        "I8" | "I16" | "I32" | "I64" | "I128" => "0",
+        "Bool" => "false",
+        _ => "default",
+    }
+}
 
 /// Indexed-state Lean renderer — port of `lean_gen::render_indexed_state`.
 ///
@@ -725,6 +1163,44 @@ fn render_indexed_state(mir: &Mir) -> String {
         "abbrev AccountIdx : Type := Fin {}\n\n",
         idx_bound
     ));
+
+    // -- Record structures (e.g. Account) --
+    //
+    // Skip a record literally named "State": v2.26's `type State = { ... }`
+    // record-form lowering deposits the State record into `mir.records`
+    // AND the State variant. The dedicated `structure State where` emission
+    // below is the canonical source; emitting it twice produces a Lean
+    // `redeclaration of State` error. The Account-style records this loop
+    // targets are auxiliary records (Map value types). Mirrors
+    // `lean_gen::render_indexed_state`'s record loop.
+    for rec in &mir.records {
+        if rec.name == "State" {
+            continue;
+        }
+        out.push_str(&format!("structure {} where\n", rec.name));
+        for (fname, ftype) in &rec.fields {
+            out.push_str(&format!(
+                "  {} : {}\n",
+                safe_name(fname),
+                map_scalar_type(ftype)
+            ));
+        }
+        out.push_str("  deriving Repr, DecidableEq, BEq\n\n");
+
+        // Inhabited instance — zero-defaults. Needed for Map.set fallback.
+        out.push_str(&format!(
+            "instance : Inhabited {} := \u{27E8}{{\n",
+            rec.name
+        ));
+        for (fname, ftype) in &rec.fields {
+            out.push_str(&format!(
+                "  {} := {},\n",
+                safe_name(fname),
+                default_value_for(ftype)
+            ));
+        }
+        out.push_str("}\u{27E9}\n\n");
+    }
 
     // -- Status inductive (lifecycle) --
     let lifecycle = &mir.state.lifecycle_states;
@@ -1110,22 +1586,16 @@ fn emit_indexed_transition(
             conds.push(format!("s.status = .{}", safe_name(pre)));
         }
     }
-    // Requires clauses — both `requires X else Err` (in body as
-    // RequireOrAbort) and bare `requires X` (in `h.pre`). Both
-    // contribute guards; legacy `render_indexed_state` reads them
-    // through the merged `ParsedHandler.requires` list. The two
-    // sources here are disjoint by construction (see `lower_body`
-    // and `split_requires`). Parenthesized as wholes; subscript-
-    // rewritten so `state.members[i]` → `(s.members i)`.
-    for stmt in &h.body.stmts {
-        if let Stmt::RequireOrAbort { pred, .. } = stmt {
-            if mentions_handler_account_pubkey(&pred.0.lean, &h.accounts) {
-                continue;
-            }
-            conds.push(format!("({})", rewrite_subscripts_lean(&pred.0.lean)));
-        }
-    }
-    for pred in &h.pre {
+    // Requires clauses — emitted in ORIGINAL spec order via
+    // `requires_in_order` (both `requires X else Err` and bare
+    // `requires X`), matching legacy `render_indexed_state`'s
+    // single-list iteration of `ParsedHandler.requires`. Iterating the
+    // split `body RequireOrAbort` then `h.pre` instead reorders an
+    // interleaved bare/with-err sequence (e.g. percolator's
+    // match-arm-abort: the arm condition is bare, the abort marker
+    // carries an error). Parenthesized as wholes; subscript-rewritten
+    // so `state.members[i]` → `(s.members i)`.
+    for pred in &h.requires_in_order {
         if mentions_handler_account_pubkey(&pred.0.lean, &h.accounts) {
             continue;
         }
@@ -1153,7 +1623,14 @@ fn emit_indexed_transition(
         if op_kind == "set" && is_account_pubkey_ref(val) {
             continue;
         }
-        let lhs = path.segments.first().cloned().unwrap_or_default();
+        // Reconstruct the full dotted LHS: an indexed-record-field write
+        // lowers to a multi-segment path (`accounts[i].active` →
+        // `["accounts[i]", "active"]`). Using only the first segment drops
+        // the `.active` field, so `parse_indexed_lhs` would see an empty
+        // inner-field and emit a whole-entry `Function.update … (val)`
+        // instead of `{ (s.accounts i) with active := val }` (issue: the
+        // record-field write would be silently lost / mis-typed).
+        let lhs = path.segments.join(".");
         if let Some((root, idx, inner_field)) = parse_indexed_lhs(&lhs) {
             if map_roots.contains_key(root) {
                 indexed_by_root
@@ -1755,6 +2232,8 @@ fn scope_mir_to_account(mir: &Mir, acct: &crate::mir::AccountStateMir) -> Mir {
         covers: Vec::new(),                // emit_covers_multi handles
         liveness_props: mir.liveness_props.clone(),
         environments: mir.environments.clone(),
+        records: mir.records.clone(),
+        is_assembly: mir.is_assembly,
     }
 }
 
@@ -5000,6 +5479,65 @@ mod tests {
     use super::*;
     use std::path::Path as FsPath;
 
+    /// sBPF Lean codegen regression gate. The 5 bundled `examples/sbpf/*`
+    /// specs use modern `handler` syntax with no `instruction` blocks, so
+    /// they only exercise `render_sbpf`'s header path. The old-syntax
+    /// `Dropset` fixture exercises the full renderer: per-instruction
+    /// namespaces, offset/`ea_*` lemmas, guard theorem stubs (`==`, `>=`,
+    /// field-vs-field RHS, no-`checks`), the completeness `structure
+    /// Spec`, and property `True := trivial` stubs.
+    ///
+    /// The golden was captured from the v2.32 port, which was proven
+    /// byte-identical to the (now-deleted) legacy `lean_gen::render_sbpf`
+    /// before deletion. Regenerate intentionally if `render_sbpf` changes:
+    /// `UPDATE_SBPF_GOLDEN=1 cargo test sbpf_render_matches_golden`.
+    const DROPSET_SBPF_SPEC: &str = include_str!("../tests/fixtures/dropset_sbpf.qedspec");
+    const DROPSET_SBPF_GOLDEN: &str =
+        include_str!("../tests/fixtures/dropset_sbpf.Spec.lean.golden");
+
+    #[test]
+    fn sbpf_render_matches_golden() {
+        let parsed = crate::chumsky_adapter::parse_str(DROPSET_SBPF_SPEC)
+            .expect("parse dropset sBPF fixture");
+        assert!(
+            parsed.is_assembly_target(),
+            "dropset fixture should be an assembly target"
+        );
+        let ported = render_sbpf(&parsed);
+
+        if std::env::var("UPDATE_SBPF_GOLDEN").is_ok() {
+            std::fs::write(
+                format!(
+                    "{}/tests/fixtures/dropset_sbpf.Spec.lean.golden",
+                    std::env::var("CARGO_MANIFEST_DIR").unwrap()
+                ),
+                &ported,
+            )
+            .unwrap();
+            return;
+        }
+
+        // Guard against a vacuous golden: the full renderer must fire.
+        for marker in [
+            "namespace RegisterMarket",
+            "@[simp] theorem ea_",
+            "theorem rejects_invalid_discriminant",
+            "structure Spec (progAt",
+            "theorem memory_safety : True := trivial",
+        ] {
+            assert!(
+                ported.contains(marker),
+                "ported sBPF output missing `{marker}`:\n{ported}"
+            );
+        }
+
+        assert_eq!(
+            DROPSET_SBPF_GOLDEN, ported,
+            "render_sbpf output drifted from the golden — \
+             regenerate with UPDATE_SBPF_GOLDEN=1 if intentional"
+        );
+    }
+
     fn lower_fixture(rel_path: &str) -> Mir {
         let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
         let workspace_root = FsPath::new(&manifest_dir)
@@ -5127,6 +5665,8 @@ mod tests {
             covers: vec![],
             liveness_props: vec![],
             environments: vec![],
+            records: vec![],
+            is_assembly: false,
         };
         let out = render(&mir);
         assert!(
@@ -5166,6 +5706,8 @@ mod tests {
             covers: vec![],
             liveness_props: vec![],
             environments: vec![],
+            records: vec![],
+            is_assembly: false,
         };
         let out = render(&mir);
         assert!(

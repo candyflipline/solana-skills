@@ -168,6 +168,23 @@ pub struct Mir {
     /// mutations. Each property × environment cross emits a
     /// preservation theorem.
     pub environments: Vec<EnvironmentMir>,
+    /// Top-level `type T = { … }` record declarations (the value types of
+    /// `Map[N] T` fields, e.g. percolator's `Account`). The indexed-state
+    /// Lean renderer emits a `structure T` + `instance Inhabited T` per
+    /// record. Carried verbatim from `ParsedSpec.records` — the indexed
+    /// renderer is the only consumer today.
+    pub records: Vec<crate::check::ParsedRecordType>,
+    /// True for sBPF assembly specs (`pragma sbpf { … }`, detected via
+    /// `ParsedSpec::is_assembly_target`). The Lean renderer dispatches on
+    /// this flag to `render_sbpf` (assembly proofs over `Program.lean` +
+    /// `wp_exec`) — a wholly different output shape from the state-machine
+    /// renderers. The Kani/proptest backends skip assembly targets
+    /// entirely (sBPF runtime behavior is exercised by client-side tests),
+    /// so this flag has a single consumer: `lean_gen_mir`. The instruction
+    /// / layout / guard data the renderer needs is read from `ParsedSpec`
+    /// at the codegen call site (it is not lifted into MIR — with only one
+    /// consumer there is no cross-codegen divergence for MIR to prevent).
+    pub is_assembly: bool,
 }
 
 // ----------------------------------------------------------------------
@@ -325,6 +342,15 @@ pub struct HandlerMir {
     /// Pre-conditions. Schema-includes are already expanded in
     /// `chumsky_adapter.rs:3125+`; what arrives here is the flat list.
     pub pre: Vec<Predicate>,
+    /// ALL `requires` predicates in original spec order (both `else
+    /// <Err>` and bare), before the `split_requires` partition into
+    /// `pre` (bare) + body `RequireOrAbort` (with-err). The indexed-state
+    /// Lean renderer emits guard conjuncts from this so its ordering
+    /// matches `lean_gen`'s single-list iteration (the split-then-
+    /// concatenate path reordered an interleaved bare/with-err sequence
+    /// — e.g. percolator's match-arm-abort guards). Same predicate
+    /// construction as `split_requires` (`Predicate(Expr::from_requires)`).
+    pub requires_in_order: Vec<Predicate>,
     /// Pre-conditions with `else <ErrorName>` markers — these lower to
     /// `Stmt::RequireOrAbort` rather than collected `pre`.
     /// Empty after Phase 3 lowering (passes synthesize them into `body`);
@@ -1048,6 +1074,8 @@ pub fn lower(parsed: &ParsedSpec) -> Mir {
         covers: lower_covers(parsed),
         liveness_props: lower_liveness(parsed),
         environments: lower_environments(parsed),
+        records: parsed.records.clone(),
+        is_assembly: parsed.is_assembly_target(),
     }
 }
 
@@ -1391,6 +1419,14 @@ fn lower_handler(h: &crate::check::ParsedHandler) -> HandlerMir {
     };
 
     let (pre, requires_or_abort) = split_requires(&h.requires);
+    // Original spec order of all requires (for the indexed renderer's
+    // conjunct ordering — see `HandlerMir.requires_in_order`). Identical
+    // predicate construction to `split_requires`.
+    let requires_in_order: Vec<Predicate> = h
+        .requires
+        .iter()
+        .map(|r| Predicate(Expr::from_requires(r)))
+        .collect();
     let aborts_if: Vec<AbortClause> = h
         .aborts_if
         .iter()
@@ -1421,6 +1457,7 @@ fn lower_handler(h: &crate::check::ParsedHandler) -> HandlerMir {
         transition,
         on_account: h.on_account.clone(),
         pre,
+        requires_in_order,
         requires_or_abort,
         aborts_if,
         body: lower_body(h),
@@ -1712,6 +1749,8 @@ mod tests {
             covers: vec![],
             liveness_props: vec![],
             environments: vec![],
+            records: vec![],
+            is_assembly: false,
         };
         assert_eq!(mir.name, "Test");
         assert!(mir.handlers.is_empty());
@@ -2065,7 +2104,7 @@ mod tests {
         // { ... }` block — it should lower as
         // `Mir.imports["MockEncrypt"]` tagged `ImportOrigin::Inline`
         // with no upstream pin (Tier 0 by construction).
-        let mir = lower_fixture("examples/regressions/issue-8/pool.qedspec");
+        let mir = lower_fixture("crates/qedgen/tests/fixtures/regressions/issue-8/pool.qedspec");
         let mock = mir
             .imports
             .get("MockEncrypt")

@@ -71,10 +71,9 @@ fn snapshots_dir() -> PathBuf {
 /// Run `qedgen codegen --spec <spec> --lean` in an isolated tempdir
 /// and return the rendered `Spec.lean` string.
 ///
-/// MIR is the default Lean-codegen path post v2.30 Phase 2; the env
-/// var is no longer required to opt in. `QEDGEN_LEGACY_LEAN` is
-/// explicitly cleared so a parent shell can't accidentally force the
-/// snapshot tests onto the legacy path.
+/// MIR (`lean_gen_mir`) is the sole Lean-codegen path — the legacy
+/// `lean_gen` renderer and its `QEDGEN_LEGACY_LEAN` escape hatch were
+/// deleted in v2.32.
 ///
 /// `qedgen` is git-native by design ([[project-git-native]]); the
 /// tempdir is initialized as an empty git repo so the codegen
@@ -101,7 +100,6 @@ fn render_mir_spec(spec_arg: &str) -> String {
         .arg("--spec")
         .arg(&spec_path)
         .arg("--lean")
-        .env_remove("QEDGEN_LEGACY_LEAN")
         .current_dir(tmp.path())
         .status()
         .expect("spawn qedgen codegen");
@@ -201,6 +199,16 @@ fn snapshot_lending() {
 #[test]
 fn snapshot_multisig() {
     assert_or_update_snapshot("multisig", "examples/rust/multisig/multisig.qedspec");
+}
+
+// Record-bearing fixture (v2.32 records→MIR migration). Verified
+// byte-identical to the legacy `lean_gen` output (the records carve-out
+// in main.rs is removed on this branch). Gates the gap-1/2/3 fixes:
+// record `structure`/`Inhabited` emission, indexed-record-field effect
+// rendering, and requires-conjunct ordering.
+#[test]
+fn snapshot_percolator() {
+    assert_or_update_snapshot("percolator", "examples/rust/percolator/percolator.qedspec");
 }
 
 #[test]

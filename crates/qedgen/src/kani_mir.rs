@@ -1,86 +1,30 @@
-// Phase 3 (v2.30) MIR-based Kani codegen. Lives in parallel to
-// `kani.rs` until snapshot equivalence is validated on every pilot
-// fixture; then `kani.rs` is retired.
-//
-//! qedgen Kani codegen — MIR consumer.
+//! qedgen Kani codegen — the MIR consumer. Sole Kani-codegen path
+//! since v2.32 deleted the legacy `ParsedSpec`-direct `kani.rs`.
+//! Consumes `mir::Mir` + the originating `ParsedSpec` (passed through
+//! to the shared `rust_codegen_util::emit_*` helpers, which still take
+//! `ParsedSpec` fragments). Gated by `tests/kani_snapshot.rs`.
 //!
-//! Phase 3 of the v2.30 refactor. The existing `kani.rs` (2,437 LoC)
-//! consumes `ParsedSpec` directly; this module is being ported to
-//! consume `mir::Mir` instead, mirroring the `lean_gen` →
-//! `lean_gen_mir` carry-through (Phase 1).
-//!
-//! ## Dispatch
-//!
-//! `QEDGEN_USE_MIR_KANI=1` switches the `qedgen codegen --kani` call
-//! site to this module; without the flag, legacy `kani::generate` runs.
-//! Default stays on legacy until snapshot equivalence ratifies every
-//! pilot fixture (per the Phase 1 sequencing).
-//!
-//! ## Phase 3a-3c1 scope
-//!
-//! Phase 3a (prior commit): scaffold + deterministic structural
-//! prefix (file header, math helpers, state-model header, constants).
-//!
-//! Phase 3b (prior commit): per-account section structural body for
-//! single-account specs — records, unit enum sums, `Status` enum,
-//! `State` struct, property predicates, invariant predicates,
-//! transition fns, ref_impls. All delegated to existing
-//! `rust_codegen_util::emit_*` helpers so the output is byte-identical
-//! to legacy.
-//!
-//! Phase 3c1 (this commit): guard enforcement harnesses — one
-//! `verify_<handler>_rejects_invalid()` per handler with a guard or
-//! requires clause. Calls the newly-promoted
-//! `rust_codegen_util::emit_state_init_symbolic` /
-//! `emit_pre_status_assume` (both now `pub fn`, shared with kani.rs)
-//! plus existing helpers (`collect_full_guard`, `emit_abstract_binders`,
-//! `map_type`). Multi-account `mod <name> { ... }` wrapping stays at
-//! `MIR-TODO(phase-3e)` marker. The other harness sections (abort /
-//! property-preservation / invariant-preservation / effect /
-//! overflow + file-level features) stay at `MIR-TODO(phase-3c2+)`.
-//!
-//! ## What we must replicate from `kani.rs`
-//!
-//! - `kani::generate(spec_path, output_path)`:
-//!   - Parses, validates handler set, ensures parent dir
-//!   - Computes fingerprint hash (`tests/kani.rs` slot)
-//!   - Emits banner + file header + math helpers + state-model header
-//!   - Emits constants (file-scoped — referenced from per-ADT modules)
-//!   - Branches on `is_multi = account_types.len() > 1`:
-//!     - Multi: per-account `mod <lowercase> { use super::*; ... }`
-//!     - Single: flat `emit_kani_account_section` at file root
-//!   - Emits file-level features (covers / liveness / env) in single mode
-//!   - Writes the `DO NOT EDIT BELOW` footer
-//!   - Prints summary counts to stderr
+//! `generate` emits, in order:
+//!   - banner + file header + math helpers + state-model header
+//!   - constants (file-scoped — referenced from per-ADT modules)
+//!   - branches on `account_types.len() > 1`:
+//!     - multi: per-account `mod <lowercase> { use super::*; … }`
+//!     - single: flat `emit_kani_account_section` at file root
+//!   - file-level features (covers / liveness / env) in single mode
+//!   - the `DO NOT EDIT BELOW` footer + stderr summary counts
 //!
 //! Per-account section (`emit_kani_account_section`):
-//!   - User-defined records (`emit_record_structs`)
-//!   - Unit enum sums (`emit_unit_enum_sums`)
-//!   - `Status` enum (per-account lifecycle) — kani::Arbitrary
-//!   - `State` struct (per-account fields + optional `status` field)
-//!   - Transition fns — pure mutators returning `bool` (guard outcome)
-//!   - Guard enforcement harnesses (one per handler with a guard)
-//!   - Property preservation harnesses (one per (property, handler) cross
-//!     filtered by `preserved_by`)
-//!   - Invariant preservation harnesses
-//!   - Effect conformance harnesses (per-effect, per-handler)
-//!   - Overflow detection harnesses (auto-add fields)
-//!   - Abort condition harnesses (per `requires X else Err`)
+//!   - user-defined records, unit enum sums, `Status` enum, `State`
+//!     struct, transition fns (pure `bool`-returning mutators)
+//!   - guard enforcement harnesses (one per handler with a guard)
+//!   - property + invariant preservation harnesses
+//!   - effect conformance harnesses (per-effect, per-handler)
+//!   - overflow detection harnesses (auto-add fields)
+//!   - abort condition harnesses (per `requires X else Err`)
 //!
-//! ## Open question: shared `rust_codegen_util` helpers
-//!
-//! `kani.rs` reaches into `crate::rust_codegen_util` for
-//! `mutable_fields`, `resolve_state_fields`, `emit_constants`,
-//! `emit_record_structs`, `emit_unit_enum_sums`, etc. These helpers
-//! consume `ParsedSpec` / `ParsedAccountType` / `&[(String, String)]`
-//! directly. The Phase 3 port has a choice:
-//!   1. Pass `&ParsedSpec` alongside `&Mir` so helpers stay shared.
-//!   2. Port each helper to consume MIR fragments.
-//!
-//! Phase 3a takes (1) — `generate(&Mir, &ParsedSpec, &Path)` — to
-//! match the lean_gen_mir pattern. Future slices may migrate helpers
-//! incrementally; until then this preserves byte-equivalence with the
-//! legacy path on shared codegen primitives.
+//! sBPF specs never reach this module — `qedgen codegen --kani` skips
+//! assembly targets (they are verified via Lean proofs + client-side
+//! tests; see the `main.rs` codegen dispatch).
 
 use anyhow::Result;
 use std::path::Path;
@@ -88,11 +32,10 @@ use std::path::Path;
 use crate::check::ParsedSpec;
 use crate::mir::Mir;
 
-/// Generate the Kani harness file at `output_path`, consuming MIR.
-/// Mirrors `kani::generate(spec_path, output_path)` shape but accepts
-/// a pre-lowered `Mir` + the originating `ParsedSpec` (the latter is
-/// passed through to helpers that haven't been MIR-ported yet — see
-/// the open-question note in this module's header).
+/// Generate the Kani harness file at `output_path`, consuming a
+/// pre-lowered `Mir` + the originating `ParsedSpec` (the latter is
+/// passed through to the shared `rust_codegen_util` helpers, which take
+/// `ParsedSpec` fragments).
 pub fn generate(mir: &Mir, parsed: &ParsedSpec, output_path: &Path) -> Result<()> {
     if mir.handlers.is_empty() {
         anyhow::bail!("No operations found in the spec — is this a valid qedspec file?");
@@ -108,18 +51,14 @@ pub fn generate(mir: &Mir, parsed: &ParsedSpec, output_path: &Path) -> Result<()
     std::fs::write(output_path, &content)?;
 
     // Default Kani-codegen path post v2.30 Phase 3f. The legacy
-    // `kani.rs` is still reachable via `QEDGEN_LEGACY_KANI=1` for
-    // any spec where MIR diverges unexpectedly.
     eprintln!("Generated Kani harnesses in {}", output_path.display());
     Ok(())
 }
 
-/// Pure render. Phase 3a-3b emits the deterministic structural
-/// prefix (banner / math helpers / state-model header / constants),
-/// the per-account structural body (records / enums / Status /
-/// State / property predicates / invariant predicates / transitions),
-/// and a `MIR-TODO` marker where future slices (harness emissions
-/// and multi-account wrapping) pick up.
+/// Pure render. Emits the deterministic structural prefix (banner /
+/// math helpers / state-model header / constants), then the per-account
+/// body (records / enums / Status / State / predicates / transitions /
+/// harnesses), branching on single- vs multi-account.
 pub fn render(mir: &Mir, parsed: &ParsedSpec) -> String {
     let mut out = String::new();
     emit_header(&mut out, parsed);
@@ -351,7 +290,7 @@ fn emit_math_helpers(out: &mut String, parsed: &ParsedSpec) {
     // every committed kani.rs fixture was generated against. Mirror
     // verbatim so Phase 3 stays byte-equivalent until the legacy emit
     // is intentionally re-indented.
-    if crate::codegen::guards_use_math_helpers(parsed) {
+    if crate::codegen_shared::guards_use_math_helpers(parsed) {
         out.push_str(
             "#[allow(dead_code)]\n\
 #[inline]\n\
@@ -410,7 +349,7 @@ fn emit_constants(out: &mut String, mir: &Mir) {
 /// then, multi-account specs emit only the primary account's view
 /// here, prefixed by a `MIR-TODO(phase-3e)` marker in `render()`.
 fn emit_account_section_structural(out: &mut String, parsed: &ParsedSpec) -> Result<()> {
-    use crate::codegen::map_type;
+    use crate::codegen_shared::map_type;
     use crate::rust_codegen_util as util;
 
     // Resolve state-fields + lifecycle view. Mirrors `kani::generate`
@@ -577,7 +516,7 @@ fn emit_account_section_structural(out: &mut String, parsed: &ParsedSpec) -> Res
 ///     is violated
 ///   * `assert!(!<handler>(&mut s, args...))` — handler must reject
 fn emit_guard_enforcement_harnesses(out: &mut String, parsed: &ParsedSpec) -> Result<()> {
-    use crate::codegen::map_type;
+    use crate::codegen_shared::map_type;
     use crate::rust_codegen_util as util;
 
     // Resolve view — same logic as `emit_account_section_structural`.
@@ -684,7 +623,7 @@ fn emit_guard_enforcement_harnesses(out: &mut String, parsed: &ParsedSpec) -> Re
 ///     should trigger abortion
 ///   * `assert!(!<handler>(...))` — handler must reject
 fn emit_abort_condition_harnesses(out: &mut String, parsed: &ParsedSpec) -> Result<()> {
-    use crate::codegen::map_type;
+    use crate::codegen_shared::map_type;
     use crate::rust_codegen_util as util;
 
     // Resolve view — same logic as `emit_account_section_structural`.
@@ -792,7 +731,7 @@ fn emit_abort_condition_harnesses(out: &mut String, parsed: &ParsedSpec) -> Resu
 ///     per-slot Unary → `prop_at(&post, binder)`, plain Unary →
 ///     `prop(&post)`)
 fn emit_property_preservation_harnesses(out: &mut String, parsed: &ParsedSpec) -> Result<()> {
-    use crate::codegen::map_type;
+    use crate::codegen_shared::map_type;
     use crate::rust_codegen_util as util;
 
     if parsed.properties.is_empty() {
@@ -871,7 +810,7 @@ fn emit_property_preservation_harnesses(out: &mut String, parsed: &ParsedSpec) -
                 out.push_str("State {\n");
                 for (fname, ftype) in &mutable {
                     if let Some(default) =
-                        crate::proptest_gen::default_value_for_field(ftype, parsed)
+                        crate::proptest_gen_mir::default_value_for_field(ftype, parsed)
                     {
                         out.push_str(&format!("        {}: {},\n", fname, default));
                     }
@@ -1058,7 +997,7 @@ fn emit_property_preservation_harnesses(out: &mut String, parsed: &ParsedSpec) -
 /// elsewhere breaks byte-equivalence on percolator (which exercises
 /// `ensures` clauses with old(...) bindings).
 fn emit_ensures_preservation_harnesses(out: &mut String, parsed: &ParsedSpec) -> Result<()> {
-    use crate::codegen::map_type;
+    use crate::codegen_shared::map_type;
     use crate::rust_codegen_util as util;
 
     let handlers: Vec<&crate::check::ParsedHandler> = parsed.handlers.iter().collect();
@@ -1225,7 +1164,7 @@ fn pre_unused_workaround_needed(_ensures: &crate::check::ParsedEnsures) -> bool 
 ///     property-preservation, not the double-emit bug of guard/abort)
 ///   * `if <handler>(&mut s, ...) { assert!(<inv>(&s)); }`
 fn emit_invariant_preservation_harnesses(out: &mut String, parsed: &ParsedSpec) -> Result<()> {
-    use crate::codegen::map_type;
+    use crate::codegen_shared::map_type;
     use crate::rust_codegen_util as util;
 
     let handlers: Vec<&crate::check::ParsedHandler> = parsed.handlers.iter().collect();
@@ -1388,7 +1327,7 @@ fn emit_invariant_preservation_harnesses(out: &mut String, parsed: &ParsedSpec) 
 ///   * Sibling fields assert `s.G == pre_G` unless another effect in
 ///     the same handler mutates them.
 fn emit_effect_conformance_harnesses(out: &mut String, parsed: &ParsedSpec) -> Result<()> {
-    use crate::codegen::{map_type, sanitize_ident};
+    use crate::codegen_shared::{map_type, sanitize_ident};
     use crate::rust_codegen_util as util;
 
     let handlers: Vec<&crate::check::ParsedHandler> = parsed.handlers.iter().collect();
@@ -1580,7 +1519,7 @@ fn emit_effect_conformance_harnesses(out: &mut String, parsed: &ParsedSpec) -> R
 /// required; the proof exists to drive BMC across the parameter
 /// space. Mirrors `kani::emit_kani_account_section` lines ~1279–1330.
 fn emit_overflow_detection_harnesses(out: &mut String, parsed: &ParsedSpec) -> Result<()> {
-    use crate::codegen::map_type;
+    use crate::codegen_shared::map_type;
     use crate::rust_codegen_util as util;
 
     let handlers: Vec<&crate::check::ParsedHandler> = parsed.handlers.iter().collect();
@@ -1684,7 +1623,7 @@ fn emit_overflow_detection_harnesses(out: &mut String, parsed: &ParsedSpec) -> R
 ///      mutate `env.mutates` fields to `kani::any()`, assume the
 ///      constraints, then `assert!(<prop>(&s))`.
 fn emit_file_level_features(out: &mut String, parsed: &ParsedSpec) -> Result<()> {
-    use crate::codegen::map_type;
+    use crate::codegen_shared::map_type;
     use crate::rust_codegen_util as util;
 
     // Resolve view — same logic as `emit_account_section_structural`.

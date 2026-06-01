@@ -32,6 +32,12 @@ npx skills add qedgen/solana-skills
 
 > Works with Claude Code, Cursor, Windsurf, GitHub Copilot, and any agent supporting the [Agent Skills](https://agentskills.io) spec.
 
+**Or just point your agent here.** Paste this to your coding agent and it installs QEDGen and gets to work:
+
+> Set up QEDGen for this program — follow `https://qedgen.dev/llms-full.txt`
+
+That page opens with a **Quickstart for agents** (install, then audit your existing program or write a `.qedspec` from scratch), followed by the full reference. The shorter [`qedgen.dev/llms.txt`](https://qedgen.dev/llms.txt) is the index version.
+
 ## How it works
 
 ```
@@ -548,7 +554,7 @@ qedgen check-upgrade --old ratchet.lock --new target/idl/my_program.json \
   --unsafe allow-field-append --migrated-account EscrowState
 ```
 
-Exit codes mirror ratchet's CLI conventions: `0 = additive/safe`, `1 = breaking`, `2 = unsafe`. Under the hood qedgen embeds [ratchet](https://github.com/saicharanpogul/ratchet) as a library, so the rule catalog stays in sync with upstream — run `qedgen readiness --list-rules` (P-rules) or `qedgen check-upgrade --list-rules` (R-rules) to see the full set. Pair with `--json` for a machine-readable dump. A worked Quasar example lives at [`examples/quasar-readiness/`](examples/quasar-readiness/).
+Exit codes mirror ratchet's CLI conventions: `0 = additive/safe`, `1 = breaking`, `2 = unsafe`. Under the hood qedgen embeds [ratchet](https://github.com/saicharanpogul/ratchet) as a library, so the rule catalog stays in sync with upstream — run `qedgen readiness --list-rules` (P-rules) or `qedgen check-upgrade --list-rules` (R-rules) to see the full set. Pair with `--json` for a machine-readable dump. A worked Quasar IDL pair (v1 → v2) lives at [`crates/qedgen/tests/fixtures/quasar-readiness/`](crates/qedgen/tests/fixtures/quasar-readiness/).
 
 **Why both.** qedgen's `#[qed(verified)]` hash-stamps the *function body*, so a rename of an `#[account]` struct compiles with a stale-but-valid proof even though the on-chain discriminator is now different and every existing account of that type is orphaned. `qedgen check-upgrade`'s `R006 account-discriminator-change` catches that class of failure; the proof layer alone doesn't look at it.
 
@@ -574,41 +580,20 @@ parallel `*_mir.rs` modules alongside the legacy `*.rs` modules
 behind escape hatches — but the divergence-prevention payoff lands
 immediately for any new feature added against MIR.
 
-**Escape hatches.** If the new path produces unexpected output on
-your spec, opt back into the previous renderer via an env var:
-
-```bash
-QEDGEN_LEGACY_LEAN=1     qedgen codegen --spec my.qedspec --lean
-QEDGEN_LEGACY_KANI=1     qedgen codegen --spec my.qedspec --kani
-QEDGEN_LEGACY_CODEGEN=1  qedgen codegen --spec my.qedspec  # --target anchor / quasar
-QEDGEN_LEGACY_PROPTEST=1 qedgen codegen --spec my.qedspec --proptest
-```
-
-Two known carve-outs that ALWAYS route to legacy regardless of flag,
-even on the MIR path:
-- **sBPF specs** (`pragma sbpf`) for Lean + Kani — the MIR side
-  doesn't lift pragma info yet (Phase-0 scaffold).
-- **Record-bearing specs** (`type T { … }`) for Lean — Lean MIR's
-  indexed-state path doesn't emit `structure T` + `instance :
-  Inhabited T` yet. The other three backends handle records via
-  shared `rust_codegen_util` helpers and route through MIR
-  normally.
-
-Both are tracked for v3.0 cleanup.
-
-**If you hit a problem.** File a report at
-https://github.com/QEDGen/solana-skills/issues with the spec that
-triggered the escape hatch + the legacy-vs-default diff. We're
-treating "zero `QEDGEN_LEGACY_*` issues filed during the v2.30→v2.31
-soak" as the gate for removing the escape hatches at v2.32. The
-soak is the validation step the snapshot tests can't provide —
-they lock the 6 pilot fixtures but not the long tail of real specs.
+**No escape hatches.** As of v2.32 the migration is complete: the four
+MIR codegens (`lean_gen_mir` / `kani_mir` / `codegen_mir` /
+`proptest_gen_mir`) are the *sole* paths — there are no `QEDGEN_LEGACY_*`
+env vars and no parallel legacy renderers. (sBPF specs emit Lean proofs
+only; `--kani` / `--proptest` skip assembly targets, which are verified
+via Lean + client-side tests.)
 
 **Roadmap.**
-- **v2.30** — MIR carry-through complete; legacy paths reachable via env vars.
-- **v2.31** — soak. No code change unless escape-hatch reports surface a bug.
-- **v2.32** — delete `lean_gen.rs` + `kani.rs` (~11K LoC); remove `QEDGEN_LEGACY_LEAN` / `QEDGEN_LEGACY_KANI` env vars. Conditional on zero escape-hatch reports during the soak.
-- **v3.0** — port `generate_guards` (Anchor) + the full proptest body to MIR-direct (currently delegate to legacy); delete `codegen.rs` + `proptest_gen.rs` (~10K more LoC); remove the remaining two env vars.
+- **v2.30** — MIR carry-through complete; legacy paths reachable via env vars during a soak.
+- **v2.31** — soak.
+- **v2.32** — **migration finished:** deleted the legacy `lean_gen.rs`, `kani.rs`,
+  `proptest_gen.rs` and the legacy `codegen::generate`; removed all four
+  `QEDGEN_LEGACY_*` hatches. Records + sBPF ported to MIR for Lean (Kani/proptest
+  skip assembly); `codegen.rs`'s shared helpers live on as `codegen_shared.rs`.
 
 ## Examples
 
@@ -629,8 +614,6 @@ they lock the 6 pilot fixtures but not the long tail of real specs.
 - **[Slippage](examples/sbpf/slippage/)** — AMM slippage guard
 
 ### Ratchet (Quasar IDL)
-
-- **[Quasar readiness](examples/quasar-readiness/)** — `qedgen readiness` and `qedgen check-upgrade` against a Blueshift Quasar IDL, plus a v1 → v2 diff that exercises the breaking-change rules
 
 ## Requirements
 

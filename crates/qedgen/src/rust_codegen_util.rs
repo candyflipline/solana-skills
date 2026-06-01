@@ -793,7 +793,7 @@ pub fn emit_state_init_zeroed(
 ) {
     out.push_str("    let mut s = State {\n");
     for (fname, ftype) in mutable_fields {
-        if let Some(default) = crate::proptest_gen::default_value_for_field(ftype, spec) {
+        if let Some(default) = crate::proptest_gen_mir::default_value_for_field(ftype, spec) {
             out.push_str(&format!("        {}: {},\n", fname, default));
         }
     }
@@ -1273,7 +1273,7 @@ handler buy (amount : U64) { effect { pool += amount } }
         let op = &spec.handlers[0];
         let mut out = String::new();
         emit_transition_fn(&mut out, op, &spec, false, |t| {
-            crate::codegen::map_type(t, &spec)
+            crate::codegen_shared::map_type(t, &spec)
         })
         .expect("emit");
         assert!(
@@ -1300,7 +1300,7 @@ handler buy (amount : U64) { effect { pool +=! amount } }
         let op = &spec.handlers[0];
         let mut out = String::new();
         emit_transition_fn(&mut out, op, &spec, false, |t| {
-            crate::codegen::map_type(t, &spec)
+            crate::codegen_shared::map_type(t, &spec)
         })
         .expect("emit");
         assert!(
@@ -1323,7 +1323,7 @@ handler buy (amount : U64) { effect { pool +=? amount } }
         let op = &spec.handlers[0];
         let mut out = String::new();
         emit_transition_fn(&mut out, op, &spec, false, |t| {
-            crate::codegen::map_type(t, &spec)
+            crate::codegen_shared::map_type(t, &spec)
         })
         .expect("emit");
         assert!(
@@ -1351,7 +1351,7 @@ handler buy (amount : U64) { effect { pool +=? amount } }
             let op = &spec.handlers[0];
             let mut out = String::new();
             emit_transition_fn(&mut out, op, &spec, false, |t| {
-                crate::codegen::map_type(t, &spec)
+                crate::codegen_shared::map_type(t, &spec)
             })
             .expect("emit");
             assert!(
@@ -1379,7 +1379,7 @@ handler close : State.Open -> State.Closed { effect { x := 0 } }
         let op = &spec.handlers[0];
         let mut out = String::new();
         emit_transition_fn(&mut out, op, &spec, false, |t| {
-            crate::codegen::map_type(t, &spec)
+            crate::codegen_shared::map_type(t, &spec)
         })
         .expect("emit");
         assert!(
@@ -1405,7 +1405,7 @@ handler deposit (amount : U64) { effect { balance += amount } }
         let op = &spec.handlers[0];
         let mut out = String::new();
         emit_transition_fn(&mut out, op, &spec, false, |t| {
-            crate::codegen::map_type(t, &spec)
+            crate::codegen_shared::map_type(t, &spec)
         })
         .expect("emit");
         assert!(

@@ -1,75 +1,18 @@
-// Phase 4 (v2.30) MIR-based Anchor/Quasar codegen. Lives in parallel
-// to `codegen.rs` until snapshot equivalence is validated on every
-// pilot fixture; then `codegen.rs` is retired.
-//
-//! qedgen Anchor/Quasar codegen — MIR consumer.
+//! qedgen Anchor/Quasar/Pinocchio program codegen — the MIR consumer.
+//! Sole Rust-codegen path since v2.32 deleted the legacy
+//! `codegen::generate`. Highest blast radius of any qedgen codegen —
+//! the output (`lib.rs`, `state.rs`, `errors.rs`, `events.rs`,
+//! `instructions/<handler>.rs`, `guards.rs`, `math.rs`, `Cargo.toml`)
+//! is the actual Solana program users compile and deploy.
 //!
-//! Phase 4 of the v2.30 refactor. The existing `codegen.rs` (7,572
-//! LoC, 67 fns) is the user-facing program emitter — it ships the
-//! `lib.rs`, `state.rs`, `errors.rs`, `events.rs`,
-//! `instructions/<handler>.rs`, `guards.rs`, `math.rs`, `Cargo.toml`,
-//! etc. that every `qedgen codegen --target {anchor,quasar}` writes
-//! into `programs/`. Highest blast radius of any qedgen codegen
-//! because the output is the actual Solana program users compile
-//! and deploy.
-//!
-//! ## Dispatch
-//!
-//! `QEDGEN_USE_MIR_CODEGEN=1` switches the `qedgen codegen --target
-//! …` call site to this module; without the flag, legacy
-//! `codegen::generate` runs. Default stays on legacy until
-//! snapshot equivalence ratifies every pilot fixture (mirrors Lean
-//! / Kani Phase 1 / Phase 3 sequencing).
-//!
-//! ## Phase 4a-4b scope
-//!
-//! Phase 4a (prior commit): scaffold + pure-delegation dispatch.
-//! `generate(&Mir, &ParsedSpec, &Path, Target)` calls each promoted-
-//! pub(crate) `codegen::generate_<X>` sub-generator in legacy's order.
-//!
-//! Phase 4b–4c in progress: sub-generators ported one at a time,
-//! smallest + most deterministic first.
-//!   * 4b/1 — `emit_cargo_toml` (Mir.name + needs_spl predicate
-//!     from MIR account kinds / Stmt::TokenTransfer / Stmt::Cpi).
-//!   * 4b/2 — `emit_math` (no spec dependency; pure text emit
-//!     against the fingerprint hash).
-//!   * 4b/3 — `emit_events` (mir.events for structure; falls back
-//!     to parsed.events for field-type strings).
-//!   * 4c/1 — `emit_errors` (mir.errors.variants + mir.name;
-//!     R26/R28 augmentation predicates stay on parsed).
-//!   * 4c/2 — `emit_ref_impls` (mir.ref_impls — shape-identical
-//!     to parsed.ref_impls; same field-type-string fallback as
-//!     events).
-//!
-//! Remaining sub-generators delegate to their legacy
-//! `crate::codegen::generate_<X>` for now.
-//!
-//! Why pure-delegation first instead of porting any sub-generator
-//! immediately: codegen.rs's blast radius (`programs/lib.rs` and
-//! friends are the user's deployed Solana program) means the
-//! refactor must land in slices that each individually pass the
-//! snapshot gate. Phase 4a stands up the structural shell so the
-//! dispatch is in place; Phase 4b+ migrates sub-generators one at a
-//! time, each commit independently verifiable.
-//!
-//! ## Sub-generator porting order (planned)
-//!
-//! Smallest + most deterministic first; per-handler instructions
-//! last (highest cross-helper coupling).
-//!
-//! | Phase | Sub-generator           | Legacy LoC | Notes                          |
-//! |-------|-------------------------|-----------|--------------------------------|
-//! | 4b    | `generate_cargo_toml`   |  16       | Trivial — toml template        |
-//! | 4b    | `generate_math`         |  49       | Fixed inline math fns          |
-//! | 4b    | `generate_events`       |  44       | `#[event]` structs from spec.events |
-//! | 4c    | `generate_errors`       | 113       | `#[error_code]` enum from spec.error_codes |
-//! | 4c    | `generate_ref_impls`    |  50       | `ref_impl` fns                 |
-//! | 4d    | `generate_imported_mirror` | 232    | `src/imported/<ns>.rs` mirrors |
-//! | 4e    | `generate_lib`          | 238       | `#[program] pub mod` entry     |
-//! | 4f    | `generate_state`        | 328       | `#[account]` data struct       |
-//! | 4g    | `generate_guards`       | 636       | Largest — guard fns per handler |
-//! | 4h    | `generate_instructions` |  77 entry | Per-handler files (helpers elsewhere) |
-//! | 4i    | snapshot tests + flip   |   —       | mirrors Lean 1d / Kani 3f      |
+//! Consumes `mir::Mir` + the originating `ParsedSpec` + spec path. The
+//! effect-body emission is MIR-direct; the account-constraint / guard /
+//! framework-scaffold surface (`generate_guards`, `FrameworkSurface`,
+//! the Pinocchio scaffold, SPL CPI dispatch) is read from `ParsedSpec`
+//! via the shared [`crate::codegen_shared`] helpers — that data is
+//! account/predicate surface, not effect-body `Stmt` IR, so it stays
+//! `ParsedSpec`-based by design. Gated by `tests/codegen_snapshot.rs`
+//! (text) + `tests/codegen_smoke.rs` (the generated crates `cargo build`).
 
 use anyhow::Result;
 use std::path::Path;
@@ -78,15 +21,12 @@ use crate::check::ParsedSpec;
 use crate::mir::Mir;
 use crate::Target;
 
-/// Generate the Anchor/Quasar program code under `output_dir`,
-/// consuming MIR. Mirrors `codegen::generate(spec_path, output_dir,
-/// target)` shape but accepts a pre-lowered `Mir` + the originating
-/// `ParsedSpec` + the spec path (needed by `generate_instructions`'s
-/// drift-stamping logic).
-///
-/// Phase 4a body: pure delegation to legacy `codegen::generate_<X>`
-/// sub-generators in the same order as `codegen::generate`. Future
-/// slices replace each delegated call with a MIR-direct port.
+/// Generate the Anchor/Quasar/Pinocchio program code under
+/// `output_dir`, consuming a pre-lowered `Mir` + the originating
+/// `ParsedSpec` + the spec path (the latter needed by the instruction
+/// emitter's drift-stamping logic). Emits each sub-generator MIR-direct,
+/// reading the account-constraint / guard / scaffold surface from the
+/// shared `codegen_shared` helpers.
 pub fn generate(
     mir: &Mir,
     parsed: &ParsedSpec,
@@ -126,18 +66,16 @@ pub fn generate(
     emit_errors(mir, parsed, &fp, output_dir, target)?;
     // Phase 4h — MIR-direct port.
     emit_instructions(mir, parsed, &fp, spec_path, output_dir, target)?;
-    // Phase 4g — deferred. `generate_guards` is 636L of per-handler
-    // `requires` / `effects` / `auth` / `status` emission deeply
-    // coupled to `ParsedHandler` fields with no clean structural
-    // seam. A meaningful MIR port requires lifting requires +
-    // effects into typed `Stmt` nodes first — that's a separate
-    // v3.0-class refactor. Until then, delegate to legacy.
-    crate::codegen::generate_guards(parsed, &fp, output_dir, target)?;
-    // Phase 4b/2 — MIR-direct port. `generate_math` body is
-    // fully deterministic (no spec read at all), so the gate is
-    // still the parsed-side `guards_use_math_helpers` predicate
-    // until that predicate gets its own MIR port.
-    if crate::codegen::guards_use_math_helpers(parsed) {
+    // Guards read `ParsedSpec` directly via the shared helper:
+    // `generate_guards` emits per-handler `requires` / `effects` /
+    // `auth` / `status` checks from `ParsedHandler` account-constraint
+    // surface (signer/writable flags, pda_seeds, variant-payload
+    // fields) — that's not effect-body `Stmt` IR, so it stays
+    // ParsedSpec-based by design (see `codegen_shared`).
+    crate::codegen_shared::generate_guards(parsed, &fp, output_dir, target)?;
+    // `generate_math` is fully deterministic (no spec read); the
+    // `guards_use_math_helpers` predicate gates whether to emit it.
+    if crate::codegen_shared::guards_use_math_helpers(parsed) {
         emit_math(&fp, output_dir)?;
     }
     // Phase 4c/2 — MIR-direct port.
@@ -189,7 +127,7 @@ fn emit_cargo_toml(
     let path = output_dir.join("Cargo.toml");
     let final_toml = match std::fs::read_to_string(&path) {
         Ok(existing) if !existing.trim().is_empty() => {
-            crate::codegen::merge_cargo_toml(&existing, &fresh)
+            crate::codegen_shared::merge_cargo_toml(&existing, &fresh)
         }
         _ => fresh,
     };
@@ -294,14 +232,14 @@ fn emit_lib(
     output_dir: &Path,
     target: Target,
 ) -> Result<()> {
-    use crate::codegen::{to_pascal_case, FrameworkSurface};
+    use crate::codegen_shared::{to_pascal_case, FrameworkSurface};
 
     // Pinocchio is MIR-only: emit via the dedicated shared helper (NOT
     // the legacy generate_lib pipeline, which doesn't route Pinocchio).
     // The helper emits the no_std entrypoint + byte-dispatch from
     // ParsedSpec (slice 6, §12b).
     if matches!(target, Target::Pinocchio) {
-        return crate::codegen::emit_pinocchio_program_lib(parsed, fp, output_dir);
+        return crate::codegen_shared::emit_pinocchio_program_lib(parsed, fp, output_dir);
     }
 
     let surface = FrameworkSurface::for_target(target);
@@ -327,7 +265,11 @@ fn emit_lib(
         .unwrap_or("11111111111111111111111111111111");
 
     let mut out = String::new();
-    out.push_str(&crate::codegen::marker("DO NOT EDIT", fp, "src/lib.rs"));
+    out.push_str(&crate::codegen_shared::marker(
+        "DO NOT EDIT",
+        fp,
+        "src/lib.rs",
+    ));
     out.push_str(surface.crate_attrs);
     out.push_str(surface.prelude_import);
     out.push('\n');
@@ -344,7 +286,7 @@ fn emit_lib(
     }
     out.push_str("pub mod state;\n");
     out.push_str("pub mod guards;\n");
-    if crate::codegen::guards_use_math_helpers(parsed) {
+    if crate::codegen_shared::guards_use_math_helpers(parsed) {
         out.push_str("pub mod math;\n");
     }
     if !mir.ref_impls.is_empty() {
@@ -409,7 +351,7 @@ fn emit_lib(
             let rust_ty = if needs_fin_cast(ptype) {
                 "u32".to_string()
             } else {
-                crate::codegen::map_type_for_target(ptype, parsed, target)?
+                crate::codegen_shared::map_type_for_target(ptype, parsed, target)?
             };
             params.push_str(&format!(", {}: {}", pname, rust_ty));
         }
@@ -484,7 +426,7 @@ fn emit_lib(
         let mut structs = String::new();
         for handler in &parsed.handlers {
             structs.push('\n');
-            structs.push_str(&crate::codegen::render_handler_accounts_struct(
+            structs.push_str(&crate::codegen_shared::render_handler_accounts_struct(
                 handler,
                 parsed,
                 is_multi,
@@ -569,7 +511,7 @@ fn emit_instructions(
     output_dir: &Path,
     target: Target,
 ) -> Result<()> {
-    use crate::codegen::to_pascal_case;
+    use crate::codegen_shared::to_pascal_case;
 
     let instr_dir = output_dir.join("src").join("instructions");
     std::fs::create_dir_all(&instr_dir)?;
@@ -579,7 +521,7 @@ fn emit_instructions(
 
     // mod.rs — always regenerated, pure scaffold.
     let mut mod_out = String::new();
-    mod_out.push_str(&crate::codegen::marker(
+    mod_out.push_str(&crate::codegen_shared::marker(
         "DO NOT EDIT",
         fp,
         "src/instructions/mod.rs",
@@ -604,7 +546,7 @@ fn emit_instructions(
     // Read spec source once for spec_hash attributes (handles both
     // single-file and multi-file specs).
     let spec_src = crate::check::read_spec_source(spec_path).unwrap_or_default();
-    let spec_attr = crate::codegen::relative_spec_path(spec_path, output_dir);
+    let spec_attr = crate::codegen_shared::relative_spec_path(spec_path, output_dir);
 
     // Per-handler scaffold files (user-owned — skipped if existing).
     // Iteration source is `mir.handlers` for the name; the matching
@@ -639,9 +581,9 @@ fn emit_instructions(
         // process_<name> wrapper + .handler()); the Anchor/Quasar
         // Context-based render_handler_scaffold doesn't apply (slice 6 §12b).
         let out = if matches!(target, Target::Pinocchio) {
-            crate::codegen::render_pinocchio_handler_scaffold(handler, parsed)?
+            crate::codegen_shared::render_pinocchio_handler_scaffold(handler, parsed)?
         } else {
-            crate::codegen::render_handler_scaffold(
+            crate::codegen_shared::render_handler_scaffold(
                 handler,
                 parsed,
                 is_multi,
@@ -683,7 +625,7 @@ fn emit_state(
     output_dir: &Path,
     target: Target,
 ) -> Result<()> {
-    use crate::codegen::{
+    use crate::codegen_shared::{
         is_multi_variant_adt_state_pub, map_type_for_target, map_type_pod, to_pascal_case,
         FrameworkSurface,
     };
@@ -694,7 +636,7 @@ fn emit_state(
         let src_dir = output_dir.join("src");
         std::fs::create_dir_all(&src_dir)?;
         let mut out = String::new();
-        crate::codegen::emit_pinocchio_state(parsed, fp, &mut out)?;
+        crate::codegen_shared::emit_pinocchio_state(parsed, fp, &mut out)?;
         std::fs::write(src_dir.join("state.rs"), &out)?;
         return Ok(());
     }
@@ -706,7 +648,11 @@ fn emit_state(
     let is_multi = mir.account_states.len() > 1;
 
     let mut out = String::new();
-    out.push_str(&crate::codegen::marker("DO NOT EDIT", fp, "src/state.rs"));
+    out.push_str(&crate::codegen_shared::marker(
+        "DO NOT EDIT",
+        fp,
+        "src/state.rs",
+    ));
     out.push_str(surface.prelude_import);
     out.push('\n');
 
@@ -997,7 +943,7 @@ fn emit_imported_mirror(
 
         let mut out = String::new();
         let file_rel = format!("src/imported/{}.rs", local_name);
-        out.push_str(&crate::codegen::marker("DO NOT EDIT", fp, &file_rel));
+        out.push_str(&crate::codegen_shared::marker("DO NOT EDIT", fp, &file_rel));
         out.push_str(&format!(
             "//! v2.29 Slice H mirror of `{0}`'s account types\n\
              //! (sourced from dep `{1}`).\n\
@@ -1020,7 +966,7 @@ fn emit_imported_mirror(
             out.push_str(derives);
             out.push_str(&format!("pub struct {} {{\n", record.name));
             for (fname, ftype) in &record.fields {
-                let rust_ty = crate::codegen::map_type_for_target(ftype, parsed, target)?;
+                let rust_ty = crate::codegen_shared::map_type_for_target(ftype, parsed, target)?;
                 out.push_str(&format!("    pub {}: {},\n", fname, rust_ty));
             }
             out.push_str("}\n\n");
@@ -1040,7 +986,8 @@ fn emit_imported_mirror(
             if !is_multi_variant {
                 out.push_str(&format!("{}pub struct {} {{\n", account_attr, acct.name));
                 for (fname, ftype) in &acct.fields {
-                    let rust_ty = crate::codegen::map_type_for_target(ftype, parsed, target)?;
+                    let rust_ty =
+                        crate::codegen_shared::map_type_for_target(ftype, parsed, target)?;
                     out.push_str(&format!("    pub {}: {},\n", fname, rust_ty));
                 }
                 if !acct.lifecycle.is_empty() && !acct.fields.iter().any(|(n, _)| n == "status") {
@@ -1087,7 +1034,7 @@ fn emit_imported_mirror(
                         out.push_str(&format!(
                             "        {}: {},\n",
                             fname,
-                            crate::codegen::map_type_for_target(ftype, parsed, target)?
+                            crate::codegen_shared::map_type_for_target(ftype, parsed, target)?
                         ));
                     }
                     out.push_str("    },\n");
@@ -1114,7 +1061,8 @@ fn emit_imported_mirror(
                     if occurrences.iter().any(|(_, t)| t != first_ty) {
                         continue;
                     }
-                    let rust_ty = crate::codegen::map_type_for_target(first_ty, parsed, target)?;
+                    let rust_ty =
+                        crate::codegen_shared::map_type_for_target(first_ty, parsed, target)?;
                     out.push_str(&format!(
                         "    /// v2.29 Slice H accessor for `{0}`. Panics on variants\n\
                          /// that don't carry the field — the per-handler lifecycle\n\
@@ -1150,7 +1098,7 @@ fn emit_imported_mirror(
 
     // mod.rs re-export aggregator. Mirrors legacy line ~1497–1511.
     let mut mod_out = String::new();
-    mod_out.push_str(&crate::codegen::marker(
+    mod_out.push_str(&crate::codegen_shared::marker(
         "DO NOT EDIT",
         fp,
         "src/imported/mod.rs",
@@ -1203,10 +1151,14 @@ fn emit_errors(
         Target::Pinocchio => "use pinocchio::program_error::ProgramError;\n",
     };
 
-    let error_name = format!("{}Error", crate::codegen::to_pascal_case(&mir.name));
+    let error_name = format!("{}Error", crate::codegen_shared::to_pascal_case(&mir.name));
 
     let mut out = String::new();
-    out.push_str(&crate::codegen::marker("DO NOT EDIT", fp, "src/errors.rs"));
+    out.push_str(&crate::codegen_shared::marker(
+        "DO NOT EDIT",
+        fp,
+        "src/errors.rs",
+    ));
     out.push_str(prelude_import);
     out.push('\n');
 
@@ -1229,7 +1181,7 @@ fn emit_errors(
     // a single-call MIR equivalent. Use the pub(crate) helper.
     let needs_invalid_pda = (matches!(target, Target::Quasar)
         || (matches!(target, Target::Anchor)
-            && crate::codegen::is_multi_variant_adt_state_pub(parsed)))
+            && crate::codegen_shared::is_multi_variant_adt_state_pub(parsed)))
         && parsed.handlers.iter().any(|h| {
             let bound: std::collections::HashSet<&str> =
                 h.accounts.iter().map(|a| a.name.as_str()).collect();
@@ -1328,7 +1280,7 @@ fn emit_ref_impls(
     let src_dir = output_dir.join("src");
     std::fs::create_dir_all(&src_dir)?;
     let mut out = String::new();
-    out.push_str(&crate::codegen::marker(
+    out.push_str(&crate::codegen_shared::marker(
         "DO NOT EDIT",
         fp,
         "src/ref_impls.rs",
@@ -1345,13 +1297,13 @@ fn emit_ref_impls(
             .params
             .iter()
             .map(|(n, t)| {
-                let ty = crate::codegen::map_type_for_target(t, parsed, target)
+                let ty = crate::codegen_shared::map_type_for_target(t, parsed, target)
                     .unwrap_or_else(|_| t.clone());
                 format!("{}: {}", n, ty)
             })
             .collect::<Vec<_>>()
             .join(", ");
-        let ret = crate::codegen::map_type_for_target(&r.return_type, parsed, target)
+        let ret = crate::codegen_shared::map_type_for_target(&r.return_type, parsed, target)
             .unwrap_or_else(|_| r.return_type.clone());
         if let Some(doc) = &r.doc {
             for line in doc.lines() {
@@ -1407,7 +1359,11 @@ fn emit_events(
     };
 
     let mut out = String::new();
-    out.push_str(&crate::codegen::marker("DO NOT EDIT", fp, "src/events.rs"));
+    out.push_str(&crate::codegen_shared::marker(
+        "DO NOT EDIT",
+        fp,
+        "src/events.rs",
+    ));
     out.push_str(prelude_import);
     out.push('\n');
 
@@ -1439,7 +1395,7 @@ fn emit_events(
             out.push_str(&format!(
                 "    pub {}: {},\n",
                 fname,
-                crate::codegen::map_type_for_target(ftype, parsed, target)?
+                crate::codegen_shared::map_type_for_target(ftype, parsed, target)?
             ));
         }
         out.push_str("}\n\n");
@@ -1461,7 +1417,11 @@ fn emit_math(fp: &crate::fingerprint::SpecFingerprint, output_dir: &Path) -> Res
     let src_dir = output_dir.join("src");
     std::fs::create_dir_all(&src_dir)?;
     let mut out = String::new();
-    out.push_str(&crate::codegen::marker("DO NOT EDIT", fp, "src/math.rs"));
+    out.push_str(&crate::codegen_shared::marker(
+        "DO NOT EDIT",
+        fp,
+        "src/math.rs",
+    ));
     out.push_str("//! Fixed-point math helpers used by spec-derived guards and properties.\n\n");
     out.push_str("#![allow(dead_code)]\n\n");
     out.push_str(
@@ -1587,11 +1547,11 @@ handler poke : State.Active -> State.Active {
         let parsed = crate::chumsky_adapter::parse_str(src).expect("parse");
         let mir = crate::mir::lower(&parsed);
         let fp = crate::fingerprint::compute_fingerprint(&parsed);
-        let temp = std::env::temp_dir().join(format!("qedgen-coll-{}", std::process::id()));
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let temp = tmp.path();
         std::fs::create_dir_all(temp.join("src")).expect("mk src");
-        emit_lib(&mir, &parsed, &fp, &temp, Target::Anchor).expect("emit lib");
+        emit_lib(&mir, &parsed, &fp, temp, Target::Anchor).expect("emit lib");
         let lib = std::fs::read_to_string(temp.join("src/lib.rs")).expect("lib.rs");
-        std::fs::remove_dir_all(&temp).ok();
         assert!(
             lib.contains(": Account<"),
             "the state account field should use the Anchor `Account<>` wrapper; got:\n{lib}"
@@ -1617,11 +1577,11 @@ handler poke : State.Active -> State.Active {
         let parsed = crate::chumsky_adapter::parse_str(src).expect("parse");
         let mir = crate::mir::lower(&parsed);
         let fp = crate::fingerprint::compute_fingerprint(&parsed);
-        let temp = std::env::temp_dir().join(format!("qedgen-nocoll-{}", std::process::id()));
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let temp = tmp.path();
         std::fs::create_dir_all(temp.join("src")).expect("mk src");
-        emit_lib(&mir, &parsed, &fp, &temp, Target::Anchor).expect("emit lib");
+        emit_lib(&mir, &parsed, &fp, temp, Target::Anchor).expect("emit lib");
         let lib = std::fs::read_to_string(temp.join("src/lib.rs")).expect("lib.rs");
-        std::fs::remove_dir_all(&temp).ok();
         assert!(
             !lib.contains("use anchor_lang::prelude::{")
                 && !lib.contains("use anchor_lang::prelude::Account;"),
@@ -1631,19 +1591,20 @@ handler poke : State.Active -> State.Active {
 
     #[test]
     fn pinocchio_events_emit_plain_struct_no_event_macro() {
-        let (mir, parsed) =
-            lower_fixture("examples/pinocchio-fixtures/vault-greenfield/vault.qedspec");
+        let (mir, parsed) = lower_fixture(
+            "crates/qedgen/tests/fixtures/pinocchio-fixtures/vault-greenfield/vault.qedspec",
+        );
         assert!(!mir.events.is_empty(), "vault-greenfield declares an event");
 
         let fp = crate::fingerprint::compute_fingerprint(&parsed);
-        let temp = std::env::temp_dir().join(format!("qedgen-evt-test-{}", std::process::id()));
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let temp = tmp.path();
         std::fs::create_dir_all(temp.join("src")).expect("mk src");
 
-        emit_events(&mir, &parsed, &fp, &temp, Target::Pinocchio)
+        emit_events(&mir, &parsed, &fp, temp, Target::Pinocchio)
             .expect("Pinocchio events must emit, not panic");
 
         let rendered = std::fs::read_to_string(temp.join("src/events.rs")).expect("events.rs");
-        std::fs::remove_dir_all(&temp).ok();
 
         assert!(
             rendered.contains("pub struct Withdrawn"),

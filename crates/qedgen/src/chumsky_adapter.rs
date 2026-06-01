@@ -4440,7 +4440,7 @@ property still_unpaused :
     #[test]
     fn handler_invariant_clauses_route_to_invariants_vs_establishes() {
         let src = include_str!(
-            "../../../examples/regressions/invariants/repro-establishes-clause.qedspec"
+            "../tests/fixtures/regressions/invariants/repro-establishes-clause.qedspec"
         );
         let spec = parse_str(src).expect("parse");
         let init = spec
@@ -4465,7 +4465,7 @@ property still_unpaused :
     #[test]
     fn handler_invariant_clause_routes_to_invariants() {
         let src = include_str!(
-            "../../../examples/regressions/invariants/repro-handler-invariant-clause.qedspec"
+            "../tests/fixtures/regressions/invariants/repro-handler-invariant-clause.qedspec"
         );
         let spec = parse_str(src).expect("parse");
         for h in &spec.handlers {
@@ -4501,7 +4501,7 @@ property still_unpaused :
     #[test]
     fn finding_7_pubkey_assign_from_int_rejected() {
         let src = include_str!(
-            "../../../examples/regressions/issue-8/repro-07-pubkey-literal-assign.qedspec"
+            "../tests/fixtures/regressions/issue-8/repro-07-pubkey-literal-assign.qedspec"
         );
         let err = parse_str(src).expect_err("expected Pubkey := 0 to fail");
         let msg = format!("{err:#}");
@@ -4516,7 +4516,7 @@ property still_unpaused :
     #[test]
     fn finding_8_pubkey_compare_with_int_rejected() {
         let src = include_str!(
-            "../../../examples/regressions/issue-8/repro-08-pubkey-literal-compare.qedspec"
+            "../tests/fixtures/regressions/issue-8/repro-08-pubkey-literal-compare.qedspec"
         );
         let err = parse_str(src).expect_err("expected state.key != 0 to fail");
         let msg = format!("{err:#}");
@@ -4598,7 +4598,7 @@ handler h (k : Pubkey) : State.Active -> State.Active {
             include_str!("../../../examples/rust/lending/lending.qedspec"),
             include_str!("../../../examples/rust/multisig/multisig.qedspec"),
             include_str!("../../../examples/rust/percolator/percolator.qedspec"),
-            include_str!("../../../examples/regressions/issue-8/pool.qedspec"),
+            include_str!("../tests/fixtures/regressions/issue-8/pool.qedspec"),
         ] {
             parse_str(src).unwrap();
         }

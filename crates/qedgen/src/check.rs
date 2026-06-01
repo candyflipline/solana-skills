@@ -874,7 +874,7 @@ impl ParsedHandlerAccount {
                 // non-multi branch).
                 (crate::Target::Anchor, None) => format!(
                     "{}Account",
-                    crate::codegen::to_pascal_case(&spec.program_name)
+                    crate::codegen_shared::to_pascal_case(&spec.program_name)
                 ),
                 // Quasar handles space differently — its `init`
                 // analogue takes size from the typed `Account<T>`
@@ -913,7 +913,7 @@ impl ParsedHandlerAccount {
             let anchor_variant_field_seed = matches!(target, crate::Target::Anchor)
                 && !is_init
                 && needs_state_field_seed
-                && crate::codegen::is_multi_variant_adt_state_pub(spec)
+                && crate::codegen_shared::is_multi_variant_adt_state_pub(spec)
                 && seeds.iter().any(|seed| {
                     let is_literal = seed.starts_with('"') && seed.ends_with('"');
                     if is_literal || bound_account_names.contains(seed.as_str()) {
@@ -5055,7 +5055,7 @@ fn check_checked_arith_needs_math_overflow(spec: &ParsedSpec) -> Vec<Completenes
             "handler(s) [{}] use checked-arithmetic effects (`+=` / `-=`), but `type Error` doesn't declare a `{}` variant. The generated Rust references `{}Error::{}` and won't compile without it.",
             names,
             variants,
-            crate::codegen::to_pascal_case(&spec.program_name),
+            crate::codegen_shared::to_pascal_case(&spec.program_name),
             variants,
         ),
         subject: None,
@@ -5090,7 +5090,7 @@ fn check_unknown_error_variant(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
                     "`pragma {} = {}` references a variant absent from `type Error | …`. Generated Rust references `{}Error::{}` and won't compile.",
                     key,
                     value,
-                    crate::codegen::to_pascal_case(&spec.program_name),
+                    crate::codegen_shared::to_pascal_case(&spec.program_name),
                     value,
                 ),
                 subject: Some(value.clone()),
@@ -5117,7 +5117,7 @@ fn check_unknown_error_variant(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
                         "handler '{}' has an effect with `else {}` referencing a variant absent from `type Error | …`. Generated Rust references `{}Error::{}` and won't compile.",
                         h.name,
                         on_error,
-                        crate::codegen::to_pascal_case(&spec.program_name),
+                        crate::codegen_shared::to_pascal_case(&spec.program_name),
                         on_error,
                     ),
                     subject: Some(h.name.clone()),
@@ -5868,7 +5868,7 @@ fn check_cpi_unverified_callee(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
                      `package {}`). The consumer's codegen will auto-detect the package and \
                      swap the caller's theorem from Stance 1 (axiom) to Stance 2 (imported proof).",
                     iface.name,
-                    crate::lean_gen::proof_pkg_name(&iface.name),
+                    crate::lean_sidecars::proof_pkg_name(&iface.name),
                 ),
                 example: None,
                 counterexample: None,
@@ -5946,7 +5946,7 @@ pub fn collect_require_verified_findings(spec: &ParsedSpec) -> Vec<UnverifiedCal
         if !seen.insert(iface.name.clone()) {
             continue;
         }
-        let proof_pkg = crate::lean_gen::proof_pkg_name(&iface.name);
+        let proof_pkg = crate::lean_sidecars::proof_pkg_name(&iface.name);
         results.push(UnverifiedCallee {
             interface_name: iface.name.clone(),
             fix_hint: format!(

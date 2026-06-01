@@ -55,7 +55,7 @@ use anyhow::Result;
 use std::path::Path;
 
 use crate::check::{self, ParsedHandler, ParsedHandlerAccount, ParsedSpec};
-use crate::codegen::{map_type, to_pascal_case, to_snake_case};
+use crate::codegen_shared::{map_type, to_pascal_case, to_snake_case};
 use crate::Target;
 
 /// Predicate: a handler triggers auto-emission of an impl-targeted harness
@@ -148,7 +148,7 @@ pub fn generate_from_spec(
     //     `#[program]` / `Ctx<X>` dispatcher just forwards to that method
     //   - Pinocchio → stack-allocated `AccountInfo` via `#[repr(C)]`
     //     layout mirror + transmute (slice 8 M3; the shape validated
-    //     by examples/pinocchio-fixtures/ptoken-transfer/src/kani_impl.rs)
+    //     by crates/qedgen/tests/fixtures/pinocchio-fixtures/ptoken-transfer/src/kani_impl.rs)
     let auto_handlers = auto_triggered_handlers(spec);
 
     // Skip emission entirely if neither the explicit flag NOR an auto-
@@ -433,7 +433,7 @@ fn emit_kani_impl_quasar(
 /// directly on the stack and transmutes pointers into `AccountInfo`.
 ///
 /// The shape is validated by
-/// `examples/pinocchio-fixtures/ptoken-transfer/src/kani_impl.rs` (M2),
+/// `crates/qedgen/tests/fixtures/pinocchio-fixtures/ptoken-transfer/src/kani_impl.rs` (M2),
 /// which caught a real token-overflow bug in 1.1s. The design pivots to
 /// stack allocation over the wire-format approach that blew BMC budget.
 ///
@@ -1459,7 +1459,7 @@ handler bump (delta : U64) {
     /// Slice 8 M3: Pinocchio emits a stack-allocated `AccountInfo`
     /// harness. Validates the deterministic scaffold + per-handler
     /// proof shape that the M2 reference
-    /// (examples/pinocchio-fixtures/ptoken-transfer/src/kani_impl.rs)
+    /// (crates/qedgen/tests/fixtures/pinocchio-fixtures/ptoken-transfer/src/kani_impl.rs)
     /// proved catches real overflow bugs.
     #[test]
     fn pinocchio_target_emits_stack_harness() {
