@@ -354,11 +354,26 @@ fn target_from_text(body: &str) -> Option<Target> {
 }
 
 fn generate_existing_artifacts(root: &Path, temp_root: &Path, spec_path: &Path) -> Result<()> {
-    if root.join("tests/kani.rs").is_file() {
-        crate::kani::generate(spec_path, &temp_root.join("tests/kani.rs"))?;
-    }
-    if root.join("programs/tests/kani.rs").is_file() {
-        crate::kani::generate(spec_path, &temp_root.join("programs/tests/kani.rs"))?;
+    // Kani + Lean regen go through the MIR path (the sole path after the
+    // v2.32 legacy deletion). Parse + lower once if any such artifact is
+    // present on disk.
+    let kani_lean_present = root.join("tests/kani.rs").is_file()
+        || root.join("programs/tests/kani.rs").is_file()
+        || root.join("formal_verification/Spec.lean").is_file();
+    let mir_ctx = if kani_lean_present {
+        let parsed = crate::check::parse_spec_file(spec_path)?;
+        let mir = crate::mir::lower(&parsed);
+        Some((parsed, mir))
+    } else {
+        None
+    };
+    if let Some((parsed, mir)) = &mir_ctx {
+        if root.join("tests/kani.rs").is_file() {
+            crate::kani_mir::generate(mir, parsed, &temp_root.join("tests/kani.rs"))?;
+        }
+        if root.join("programs/tests/kani.rs").is_file() {
+            crate::kani_mir::generate(mir, parsed, &temp_root.join("programs/tests/kani.rs"))?;
+        }
     }
     // v2.26 — impl-targeted Kani harness. Regenerated against the spec
     // only when the file already exists at that path (i.e. a prior codegen
@@ -408,9 +423,14 @@ fn generate_existing_artifacts(root: &Path, temp_root: &Path, spec_path: &Path) 
             &temp_root.join("programs/src/integration_tests.rs"),
         )?;
     }
-    if root.join("formal_verification/Spec.lean").is_file() {
-        let parsed = crate::check::parse_spec_file(spec_path)?;
-        crate::lean_gen::generate(&parsed, &temp_root.join("formal_verification/Spec.lean"))?;
+    if let Some((parsed, mir)) = &mir_ctx {
+        if root.join("formal_verification/Spec.lean").is_file() {
+            crate::lean_gen_mir::generate(
+                mir,
+                parsed,
+                &temp_root.join("formal_verification/Spec.lean"),
+            )?;
+        }
     }
     Ok(())
 }

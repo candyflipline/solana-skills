@@ -1,23 +1,18 @@
-//! Lean codegen sidecar writer — shared between the legacy
-//! `lean_gen::generate` and the default `lean_gen_mir::generate`.
+//! Lean codegen sidecar writer — the renderer-agnostic half of
+//! `lean_gen_mir::generate`.
 //!
 //! `write_spec_with_sidecars` takes a rendered `Spec.lean` body and emits
 //! it plus every pinned-interface sidecar artifact: the sibling
 //! `<Iface>.lean` axiom modules, the `import <Iface>` lines injected into
 //! the body, and the consumer lakefile's `roots` / verified-callee
-//! `require` directives. The renderer that produced the body (legacy or
-//! MIR) is irrelevant — the sidecar layout is identical either way.
+//! `require` directives.
 //!
-//! This module is the v2.32 workstream-3 prep: it lifts the sidecar
-//! closure out of `lean_gen.rs` so the MIR path (`lean_gen_mir`) no
-//! longer depends on the legacy module. `lean_gen.rs` keeps its own copy
-//! of these helpers (still reached via the `QEDGEN_LEGACY_LEAN` escape
-//! hatch) until it is deleted in workstream 3, at which point this module
-//! is the sole home. The few small leaf helpers shared with the legacy
-//! renderer (`safe_name`, `param_sig_str`, `map_type`, `handler_is_pinned`,
-//! `scan_abstract_fields`, `rewrite_axiom_body_to_accessors`) are carried
-//! here as private copies so the module is self-contained — the legacy
-//! renderer's copies die with `lean_gen.rs`.
+//! Extracted from the former `lean_gen.rs` in v2.32 so the sidecar
+//! closure outlived that module's deletion. Self-contained: it carries
+//! its own private copies of the small leaf helpers (`safe_name`,
+//! `param_sig_str`, `map_type`, `handler_is_pinned`, `scan_abstract_fields`,
+//! `rewrite_axiom_body_to_accessors`) — these and `render_interface_axiom_module`
+//! are gated against drift by the `axiom_module_matches_golden` test below.
 
 use crate::check::ParsedSpec;
 use anyhow::Result;
@@ -319,7 +314,11 @@ fn safe_module_name(name: &str) -> String {
 /// v2.27 Track B — Lake package name convention for a verified-callee's
 /// proof package. Convention: lowercase the interface's first character
 /// + append `Proofs`. `Token` → `tokenProofs`.
-fn proof_pkg_name(iface_name: &str) -> String {
+///
+/// `pub(crate)` — `check.rs` reuses it when surfacing verified-callee
+/// lint diagnostics so the package name it reports matches the one this
+/// module emits into the lakefile.
+pub(crate) fn proof_pkg_name(iface_name: &str) -> String {
     let safe = safe_module_name(iface_name);
     let mut chars = safe.chars();
     match chars.next() {
@@ -690,12 +689,17 @@ handler deposit (amount : U64) {
 }
 "#;
 
-    /// The ported axiom-module renderer must be byte-identical to the
-    /// legacy `lean_gen` original. Guards against transcription error in
-    /// the verbatim copy (this path is otherwise ungated — see the
-    /// fixture doc above).
+    /// Regression gate for the sibling `<Iface>.lean` axiom-module
+    /// renderer. The golden was captured from the v2.32 port, proven
+    /// byte-identical to the (now-deleted) legacy
+    /// `lean_gen::render_interface_axiom_module` before deletion.
+    /// Regenerate intentionally if the renderer changes:
+    /// `UPDATE_AXIOM_GOLDEN=1 cargo test axiom_module_matches_golden`.
+    const TOKEN_AXIOM_GOLDEN: &str =
+        include_str!("../tests/fixtures/token_axiom_module.lean.golden");
+
     #[test]
-    fn axiom_module_matches_legacy_byte_for_byte() {
+    fn axiom_module_matches_golden() {
         let spec = crate::chumsky_adapter::parse_str(LP_POOL_SPEC).expect("parse LpPool spec");
         let iface = spec
             .interfaces
@@ -704,9 +708,20 @@ handler deposit (amount : U64) {
             .expect("Token interface present");
 
         let ported = render_interface_axiom_module(iface);
-        let legacy = crate::lean_gen::render_interface_axiom_module(iface);
 
-        // Guard against a vacuous pass: the Track A path must fire.
+        if std::env::var("UPDATE_AXIOM_GOLDEN").is_ok() {
+            std::fs::write(
+                format!(
+                    "{}/tests/fixtures/token_axiom_module.lean.golden",
+                    std::env::var("CARGO_MANIFEST_DIR").unwrap()
+                ),
+                &ported,
+            )
+            .unwrap();
+            return;
+        }
+
+        // Guard against a vacuous golden: the Track A path must fire.
         for marker in [
             "axiom ensures_axiom_0",
             "{State : Type} [Inhabited State]",
@@ -719,8 +734,9 @@ handler deposit (amount : U64) {
             );
         }
         assert_eq!(
-            legacy, ported,
-            "axiom-module renderer diverged between legacy and lean_sidecars"
+            TOKEN_AXIOM_GOLDEN, ported,
+            "axiom-module renderer drifted from the golden — \
+             regenerate with UPDATE_AXIOM_GOLDEN=1 if intentional"
         );
     }
 }

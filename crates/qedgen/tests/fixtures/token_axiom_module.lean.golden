@@ -1,0 +1,46 @@
+-- v2.26 Track F: bundled-interface axiom module.
+-- Stance 1 — the upstream binary_hash pin is the contract
+-- boundary. Each `axiom ensures_axiom_<idx>` corresponds to one
+-- `ensures` clause on the interface handler; the caller's
+-- Lean proof discharges its CPI post-condition by applying
+-- the relevant axiom, instead of carrying a `sorry`.
+--
+-- Axioms have two shapes:
+--   * v2.26 callee-frame — parameters and predicates only
+--     reference the callee's own ABI, never the caller's
+--     State type. Reusable across every caller.
+--   * v2.27 Track A caller-State-aware — the ensures
+--     references abstract State fields (applied-accessor
+--     form, e.g. `from_balance pre`). The axiom is
+--     polymorphic in `State` and takes pre+post snapshots
+--     plus one `State → T` accessor per abstract
+--     field, where `T` comes from the interface's
+--     `state { name : Type, ... }` declaration (v2.27
+--     Phase 0): `Nat` for the `U*` family, `Int` for
+--     `I*`, `Bool` for `Bool`, `Pubkey` for `Pubkey`.
+--     Fields not declared in the state block default to
+--     `Nat` (back-compat). Callers apply the axiom with
+--     `(·.<caller_field>)` per slot via their per-call
+--     `state_binders { ... }` block.
+
+import QEDGen.Solana.Account
+import QEDGen.Solana.Cpi
+import QEDGen.Solana.Valid
+
+namespace Token
+
+open QEDGen.Solana
+
+/-- Content pin against the deployed program at
+    `TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA`. Callers commit to this hash; if the deployed
+    binary changes, the lock must be regenerated. -/
+def binary_hash : String := "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+namespace transfer
+
+/-- `Token.transfer` post-condition #0 (axiomatized; discharged by binary_hash pin). -/
+axiom ensures_axiom_0 {State : Type} [Inhabited State] (pre post : State) (amount : Nat) (from_balance : State → Nat) : (from_balance post) + amount = (from_balance pre)
+
+end transfer
+
+end Token

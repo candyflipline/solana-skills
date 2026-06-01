@@ -1,92 +1,47 @@
-// v2.30 MIR-based Lean codegen. This module is the default
-// Lean-codegen path post Phase 2; the legacy ParsedSpec-direct
-// `lean_gen.rs` is reachable via `QEDGEN_LEGACY_LEAN=1` as an
-// escape hatch and stays in-tree until the non-Lean codegens
-// finish their MIR carry-through.
-
-//! qedgen Lean codegen — MIR consumer.
+//! qedgen Lean codegen — the MIR consumer. Sole Lean-codegen path
+//! since v2.32 deleted the legacy `ParsedSpec`-direct `lean_gen.rs`.
+//! Consumes `mir::Mir` and writes `Spec.lean` (plus interface sidecars
+//! via [`crate::lean_sidecars`]). Gated by `tests/mir_snapshot.rs`.
 //!
-//! Default Lean codegen path post v2.30 Phase 2. The existing
-//! `lean_gen.rs` (8,661 LoC) consumes `ParsedSpec` directly; this
-//! module replicates the same emitted output but consumes `mir::Mir`.
-//! Every pilot fixture (escrow, escrow-split, lending, multisig,
-//! bundled-stdlib-demo, cross-program-vault) is byte-identical
-//! MIR ↔ legacy, gated by `cargo test --test mir_snapshot`.
+//! `render` dispatches on spec shape:
+//! - sBPF (`mir.is_assembly`) → `render_sbpf` (handled in `generate`,
+//!   reads `ParsedSpec` directly — assembly proofs over `Program.lean`).
+//! - Indexed (records or `Map[N] T`) → `render_indexed_state`.
+//! - Multi-account (`account_states.len() > 1`) → `render_multi_account`.
+//! - Multi-variant ADT (`type State | A | B of { … }`) →
+//!   `render_single_account_adt`.
+//! - Single-account → `render_single_account`.
 //!
-//! `QEDGEN_LEGACY_LEAN=1` forces the call site back onto `lean_gen`
-//! as an escape hatch for any spec where MIR diverges unexpectedly;
-//! file an issue so the snapshot test can catch the case next regen.
-//!
-//! ## Phase 1a survey — what we must replicate
-//!
-//! `lean_gen::generate(spec, output_path)` does:
-//! 1. Compute `content = render(spec)`.
-//! 2. Inject `import <Iface>` lines for pinned interface modules.
-//! 3. Write `Spec.lean` at `output_path`.
-//! 4. For each pinned-but-unverified interface, write a sibling
-//!    `<Iface>.lean` axiom module under the same dir.
-//! 5. Update `lakefile.lean`'s `roots` array.
-//!
-//! `lean_gen::render(spec) -> String` dispatches based on spec shape:
-//! - sBPF (`pragma sbpf`) → `render_sbpf` — out of v2.30 scope.
-//! - Indexed (records or `Map[N] T`) → `render_indexed_state` — Phase 1
-//!   stretch goal.
-//! - Multi-account (`account_types.len() > 1`) → `render_multi_account` —
-//!   Phase 2.
-//! - Single-account → `render_single_account` (pilot path).
-//!
-//! `render_single_account` emits the following sections in order:
+//! The single-account renderer emits these sections in order:
 //! 1. `import QEDGen.Solana.{Account, Cpi, State, Valid}`.
 //! 2. `namespace <ProgramName>` + `open QEDGen.Solana`.
-//! 3. Uninterpreted helpers + ref-impls (`emit_uninterpreted_helpers`,
-//!    `emit_ref_impls`).
+//! 3. Uninterpreted helpers + ref-impls.
 //! 4. Constants (`abbrev NAME : Nat := VALUE`).
 //! 5. `inductive Status` if ≥2 lifecycle states.
 //! 6. `structure State` with all state fields.
-//! 7. Transition functions (`render_transitions`) — one `def
-//!    <handler>_transition (s : State) ... : Option State` per handler.
-//! 8. CPI theorems (`render_cpi_theorems`) — per-handler `theorem
-//!    <handler>_cpi_correct` for Tier-1/2 callees.
-//! 9. Invariant theorems (`render_invariants_theorem_form`).
-//! 10. `inductive Operation` + `def applyOp` — the union of all
-//!     handlers.
-//! 11. Property theorems (`render_properties`).
-//! 12. Abort theorems (`render_aborts_if`).
-//! 13. Ensures theorems (`render_ensures`).
-//! 14. Frame conditions (`render_frame_conditions`).
+//! 7. Transition functions — one `def <handler>_transition (s : State)
+//!    … : Option State` per handler.
+//! 8. CPI theorems — per-handler `theorem <handler>_cpi_correct` for
+//!    Tier-1/2 callees.
+//! 9. Invariant theorems.
+//! 10. `inductive Operation` + `def applyOp` — union of all handlers.
+//! 11. Property theorems.
+//! 12. Abort theorems.
+//! 13. Ensures theorems.
+//! 14. Frame conditions.
 //! 15. Cover / liveness / environment / overflow theorems.
 //! 16. `end <ProgramName>`.
-//!
-//! Multi-variant ADT specs (`type State | A | B of { ... }`) take a
-//! different branch (`render_single_account_adt`) — those land later in
-//! Phase 1.
-//!
-//! ## Pilot scope for this phase
-//!
-//! Sections 1–6 (file structure, namespace, state struct) +
-//! transitions for the pilot `Stmt` set (RequireOrAbort, Assign,
-//! CheckedAdd/Sub, WrapAdd/Sub, SatAdd/Sub, TokenTransfer →
-//! CPI theorem) + the lifecycle gate from `HandlerMir.transition`.
-//!
-//! Sections 9–16 (invariants, properties, aborts, ensures, frame,
-//! cover, liveness, environments, overflow) are stubbed for the first
-//! sub-pass and filled in iteratively. The snapshot equivalence gate
-//! (Phase 1d) drives which sections must land for which fixtures.
 
 use crate::mir::Mir;
 use anyhow::Result;
 use std::path::Path;
 
-/// Top-level entry — mirrors `lean_gen::generate`. Renders the
-/// `Spec.lean` body from MIR, then delegates the sidecar work
-/// (import injection, sibling axiom modules, lakefile updates,
-/// verified-callee require directives) to
-/// `lean_sidecars::write_spec_with_sidecars`. That module is the
-/// renderer-agnostic sidecar writer (v2.32 workstream-3 prep) — the MIR
-/// path no longer depends on `lean_gen` for sidecar emission, so
-/// `lean_gen.rs` can be deleted in workstream 3. The snapshot suites
-/// (`tests/{mir,kani,codegen}_snapshot.rs`) gate byte-equivalence on
-/// every pilot fixture.
+/// Top-level entry. Renders the `Spec.lean` body from MIR, then
+/// delegates the sidecar work (import injection, sibling axiom modules,
+/// lakefile updates, verified-callee require directives) to
+/// `lean_sidecars::write_spec_with_sidecars` — the renderer-agnostic
+/// sidecar writer. The snapshot suite (`tests/mir_snapshot.rs`) gates
+/// the emitted `Spec.lean` against checked-in references.
 pub fn generate(mir: &Mir, parsed: &crate::check::ParsedSpec, output_path: &Path) -> Result<()> {
     // sBPF assembly specs render a wholly different shape (Program.lean
     // import + per-instruction guard/property theorem stubs over
@@ -176,12 +131,11 @@ fn render_single_account(mir: &Mir) -> String {
     emit_lifecycle_marker(&mut out, mir);
     emit_state_struct(&mut out, mir);
     emit_transitions(&mut out, mir);
-    // §8 CPI theorems — emitted after transitions to match the legacy
-    // `render_single_account` section order. The returned pinned-set
-    // is currently consumed only by `lean_gen::generate`'s sibling-
-    // module writer; Phase 1c-7's port keeps the in-`Spec.lean` half,
-    // sibling axiom modules + lakefile wiring stay on the legacy
-    // path (invoked by the dispatcher in main.rs).
+    // §8 CPI theorems — emitted after transitions for section ordering.
+    // This emits the in-`Spec.lean` half (per-handler CPI theorems); the
+    // sibling `<Iface>.lean` axiom modules + lakefile wiring are written
+    // separately by `lean_sidecars::write_spec_with_sidecars`, which
+    // recomputes the pinned set, so the returned value is unused here.
     let _pinned = emit_cpi_theorems(&mut out, mir);
     emit_invariants(&mut out, mir);
     emit_operation_inductive(&mut out, mir);
@@ -5525,29 +5479,45 @@ mod tests {
     use super::*;
     use std::path::Path as FsPath;
 
-    /// v2.32 sBPF → MIR port: the MIR-path `render_sbpf` must be
-    /// byte-identical to the legacy `lean_gen::render` (which dispatches to
-    /// the legacy `render_sbpf` for assembly specs). The 5 bundled
-    /// `examples/sbpf/*` specs use modern `handler` syntax with no
-    /// `instruction` blocks, so they only exercise the header path. The
-    /// old-syntax `Dropset` fixture exercises the full renderer:
-    /// per-instruction namespaces, offset/`ea_*` lemmas, guard theorem
-    /// stubs (`==`, `>=`, field-vs-field RHS, no-`checks`), the
-    /// completeness `structure Spec`, and property `True := trivial` stubs.
+    /// sBPF Lean codegen regression gate. The 5 bundled `examples/sbpf/*`
+    /// specs use modern `handler` syntax with no `instruction` blocks, so
+    /// they only exercise `render_sbpf`'s header path. The old-syntax
+    /// `Dropset` fixture exercises the full renderer: per-instruction
+    /// namespaces, offset/`ea_*` lemmas, guard theorem stubs (`==`, `>=`,
+    /// field-vs-field RHS, no-`checks`), the completeness `structure
+    /// Spec`, and property `True := trivial` stubs.
+    ///
+    /// The golden was captured from the v2.32 port, which was proven
+    /// byte-identical to the (now-deleted) legacy `lean_gen::render_sbpf`
+    /// before deletion. Regenerate intentionally if `render_sbpf` changes:
+    /// `UPDATE_SBPF_GOLDEN=1 cargo test sbpf_render_matches_golden`.
     const DROPSET_SBPF_SPEC: &str = include_str!("../tests/fixtures/dropset_sbpf.qedspec");
+    const DROPSET_SBPF_GOLDEN: &str =
+        include_str!("../tests/fixtures/dropset_sbpf.Spec.lean.golden");
 
     #[test]
-    fn sbpf_render_matches_legacy_byte_for_byte() {
+    fn sbpf_render_matches_golden() {
         let parsed = crate::chumsky_adapter::parse_str(DROPSET_SBPF_SPEC)
             .expect("parse dropset sBPF fixture");
         assert!(
             parsed.is_assembly_target(),
             "dropset fixture should be an assembly target"
         );
-        let legacy = crate::lean_gen::render(&parsed);
         let ported = render_sbpf(&parsed);
 
-        // Guard against a vacuous pass: the full renderer must fire.
+        if std::env::var("UPDATE_SBPF_GOLDEN").is_ok() {
+            std::fs::write(
+                format!(
+                    "{}/tests/fixtures/dropset_sbpf.Spec.lean.golden",
+                    std::env::var("CARGO_MANIFEST_DIR").unwrap()
+                ),
+                &ported,
+            )
+            .unwrap();
+            return;
+        }
+
+        // Guard against a vacuous golden: the full renderer must fire.
         for marker in [
             "namespace RegisterMarket",
             "@[simp] theorem ea_",
@@ -5562,8 +5532,9 @@ mod tests {
         }
 
         assert_eq!(
-            legacy, ported,
-            "sBPF Lean render diverged between legacy and MIR-path render_sbpf"
+            DROPSET_SBPF_GOLDEN, ported,
+            "render_sbpf output drifted from the golden — \
+             regenerate with UPDATE_SBPF_GOLDEN=1 if intentional"
         );
     }
 

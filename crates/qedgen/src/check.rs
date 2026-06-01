@@ -5868,7 +5868,7 @@ fn check_cpi_unverified_callee(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
                      `package {}`). The consumer's codegen will auto-detect the package and \
                      swap the caller's theorem from Stance 1 (axiom) to Stance 2 (imported proof).",
                     iface.name,
-                    crate::lean_gen::proof_pkg_name(&iface.name),
+                    crate::lean_sidecars::proof_pkg_name(&iface.name),
                 ),
                 example: None,
                 counterexample: None,
@@ -5946,7 +5946,7 @@ pub fn collect_require_verified_findings(spec: &ParsedSpec) -> Vec<UnverifiedCal
         if !seen.insert(iface.name.clone()) {
             continue;
         }
-        let proof_pkg = crate::lean_gen::proof_pkg_name(&iface.name);
+        let proof_pkg = crate::lean_sidecars::proof_pkg_name(&iface.name);
         results.push(UnverifiedCallee {
             interface_name: iface.name.clone(),
             fix_hint: format!(

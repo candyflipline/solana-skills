@@ -32,10 +32,8 @@ mod import_resolver;
 mod init;
 mod integration_test;
 mod interface_gen;
-mod kani;
 mod kani_impl;
 mod kani_mir;
-mod lean_gen;
 mod lean_gen_mir;
 mod lean_sidecars;
 mod lifecycle_probe;
@@ -2302,8 +2300,10 @@ async fn dispatch(cmd: Commands) -> Result<()> {
                 codegen_mir::generate(&mir, &parsed, qedspec_path, &program_dir, target)?;
 
                 // Kani harnesses are framework-neutral (no Anchor/Quasar
-                // types — pure spec-derived state model).
-                kani::generate(qedspec_path, &kani_path)?;
+                // types — pure spec-derived state model). Emitted via the
+                // MIR path; `parsed`/`mir` are already in scope from the
+                // scaffold step above.
+                kani_mir::generate(&mir, &parsed, &kani_path)?;
 
                 // Unit tests are framework-neutral too — plain `cargo
                 // test` over the spec-derived state struct.
@@ -3168,26 +3168,11 @@ async fn dispatch(cmd: Commands) -> Result<()> {
                     if let Err(e) = deps::require_kani() {
                         eprintln!("warning: {e}");
                     }
-                    // v2.30 Phase 3f — MIR is the default Kani-codegen
-                    // path. All 6 pilot fixtures are full-file byte-
-                    // identical between MIR and legacy through Phase 3e
-                    // (escrow / escrow-split / bundled-stdlib-demo /
-                    // multisig / percolator / lending — including
-                    // multi-account `mod` wrapping). `QEDGEN_LEGACY_KANI=1`
-                    // opts back into the ParsedSpec-direct renderer as
-                    // an escape hatch.
-                    //
-                    // Records (`type T { … }`) work correctly on the
-                    // Kani-MIR path — `emit_record_structs` ships via
-                    // the shared `rust_codegen_util` helper, so
-                    // percolator-class fixtures stay on MIR.
-                    let use_legacy = std::env::var("QEDGEN_LEGACY_KANI").is_ok();
-                    if use_legacy {
-                        kani::generate(&spec, &kani_output)?;
-                    } else {
-                        let mir = mir::lower(&parsed);
-                        kani_mir::generate(&mir, &parsed, &kani_output)?;
-                    }
+                    // MIR is the sole Kani-codegen path (v2.32 deleted the
+                    // legacy `kani.rs` after byte-parity was proven across
+                    // every pilot fixture — gated by `tests/kani_snapshot.rs`).
+                    let mir = mir::lower(&parsed);
+                    kani_mir::generate(&mir, &parsed, &kani_output)?;
                 }
             }
 
@@ -3290,8 +3275,8 @@ async fn dispatch(cmd: Commands) -> Result<()> {
                 integration_test::generate(&spec, &integration_output)?;
             }
             if lean || all {
-                // Same rationale as the Kani branch: `lean_gen::generate` and
-                // `proofs_bootstrap::bootstrap_if_missing` are pure text
+                // Same rationale as the Kani branch: `lean_gen_mir::generate`
+                // and `proofs_bootstrap::bootstrap_if_missing` are pure text
                 // writers. `lake` is only required to *build* the generated
                 // proofs, which `qedgen verify --lean` (and Aristotle) gate
                 // separately. Warn here without blocking codegen.
@@ -3299,25 +3284,15 @@ async fn dispatch(cmd: Commands) -> Result<()> {
                     eprintln!("warning: {e}");
                 }
                 let parsed = check::parse_spec_file(&spec)?;
-                // v2.30: MIR is the default Lean-codegen path after
-                // Phase 2 closed the last pilot-fixture parity gap
-                // (lending). `QEDGEN_LEGACY_LEAN=1` opts back into the
-                // ParsedSpec-direct renderer as an escape hatch.
-                //
-                // No pilot-scope guard remains. v2.32 workstream 1
-                // ported record-bearing specs (`type T { … }`) and
-                // workstream 2 ported sBPF (`pragma sbpf`) onto
-                // `lean_gen_mir` — both byte-identical to legacy
-                // (gated by `tests/mir_snapshot.rs::snapshot_percolator`
-                // and `tests/sbpf_lean_parity.rs`). `lean_gen_mir::generate`
-                // dispatches sBPF internally via the MIR `is_assembly` flag.
-                let use_legacy = std::env::var("QEDGEN_LEGACY_LEAN").is_ok();
-                if use_legacy {
-                    lean_gen::generate(&parsed, &lean_output)?;
-                } else {
-                    let mir = mir::lower(&parsed);
-                    lean_gen_mir::generate(&mir, &parsed, &lean_output)?;
-                }
+                // MIR is the sole Lean-codegen path (v2.32 deleted the
+                // legacy `lean_gen.rs`). `lean_gen_mir` handles every spec
+                // shape — single/multi-account, indexed records, ADTs, and
+                // sBPF (dispatched internally via the MIR `is_assembly`
+                // flag). All were proven byte-identical to the former
+                // legacy renderer before deletion (gated by the
+                // `lean_gen_mir` snapshot + parity unit tests).
+                let mir = mir::lower(&parsed);
+                lean_gen_mir::generate(&mir, &parsed, &lean_output)?;
                 // Bootstrap Proofs.lean alongside Spec.lean. Never overwrites
                 // an existing file — the user-owned theorems survive regen.
                 if let Some(proofs_dir) = lean_output.parent() {

@@ -521,34 +521,28 @@ is transparent — no flag to enable, no behavior change for any
 existing spec. Byte-equivalence to the legacy renderers is gated by
 checked-in snapshot suites (`tests/{mir,kani,codegen,proptest}_snapshot.rs`).
 
-If the MIR path produces unexpected output, opt back into the
-ParsedSpec-direct renderer via an env var:
+The Rust-skeleton and proptest codegens still keep a legacy
+ParsedSpec-direct renderer you can opt back into if the MIR path
+produces unexpected output:
 
 | Env var | Affects | Falls back to |
 |---|---|---|
-| `QEDGEN_LEGACY_LEAN=1` | `--lean` | `lean_gen::generate` |
-| `QEDGEN_LEGACY_KANI=1` | `--kani` | `kani::generate` |
 | `QEDGEN_LEGACY_CODEGEN=1` | `--target anchor` / `--target quasar` | `codegen::generate` |
 | `QEDGEN_LEGACY_PROPTEST=1` | `--proptest` | `proptest_gen::generate` |
 
-Two carve-outs that always route to legacy regardless of env var:
+The Lean and Kani legacy renderers were removed in v2.32 —
+`lean_gen_mir` and `kani_mir` are the sole paths for those backends,
+and the `QEDGEN_LEGACY_LEAN` / `QEDGEN_LEGACY_KANI` hatches no longer
+exist. `lean_gen_mir` handles every spec shape, including sBPF
+(`mir.is_assembly` → `render_sbpf`). `--kani` and `--proptest` skip
+sBPF specs entirely — assembly is verified via Lean proofs +
+client-side tests, not generated harnesses.
 
-- **sBPF specs** (`pragma sbpf`) for `--lean` + `--kani` — MIR
-  doesn't lift pragmas yet (Phase-0 scaffold). The dispatch
-  gate checks `parsed.is_assembly_target()` and routes to legacy
-  unconditionally.
-- **Record-bearing specs** (`type T { … }`) for `--lean` only —
-  the Lean MIR's indexed-state path doesn't emit `structure T` +
-  `instance : Inhabited T` yet. Other three backends handle
-  records via shared `rust_codegen_util` helpers and route
-  through MIR normally.
-
-Removal roadmap: `QEDGEN_LEGACY_LEAN` / `QEDGEN_LEGACY_KANI` go away
-at v2.32 after one minor cycle of soak. `QEDGEN_LEGACY_CODEGEN` /
-`QEDGEN_LEGACY_PROPTEST` go away at v3.0 after the deferred sub-
-emitter ports land (`generate_guards` + the full proptest body).
-Report escape-hatch usage at https://github.com/QEDGen/solana-skills/issues
-so we can confirm the soak before deletion.
+Removal roadmap: `QEDGEN_LEGACY_CODEGEN` / `QEDGEN_LEGACY_PROPTEST` go
+away at v3.0 after the deferred sub-emitter ports land
+(`generate_guards` + the full proptest body). Report escape-hatch
+usage at https://github.com/QEDGen/solana-skills/issues so we can
+confirm the soak before deletion.
 
 #### Scaffold-once vs. always-regenerate
 

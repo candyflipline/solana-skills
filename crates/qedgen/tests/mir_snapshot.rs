@@ -71,10 +71,9 @@ fn snapshots_dir() -> PathBuf {
 /// Run `qedgen codegen --spec <spec> --lean` in an isolated tempdir
 /// and return the rendered `Spec.lean` string.
 ///
-/// MIR is the default Lean-codegen path post v2.30 Phase 2; the env
-/// var is no longer required to opt in. `QEDGEN_LEGACY_LEAN` is
-/// explicitly cleared so a parent shell can't accidentally force the
-/// snapshot tests onto the legacy path.
+/// MIR (`lean_gen_mir`) is the sole Lean-codegen path — the legacy
+/// `lean_gen` renderer and its `QEDGEN_LEGACY_LEAN` escape hatch were
+/// deleted in v2.32.
 ///
 /// `qedgen` is git-native by design ([[project-git-native]]); the
 /// tempdir is initialized as an empty git repo so the codegen
@@ -101,7 +100,6 @@ fn render_mir_spec(spec_arg: &str) -> String {
         .arg("--spec")
         .arg(&spec_path)
         .arg("--lean")
-        .env_remove("QEDGEN_LEGACY_LEAN")
         .current_dir(tmp.path())
         .status()
         .expect("spawn qedgen codegen");

@@ -574,40 +574,29 @@ parallel `*_mir.rs` modules alongside the legacy `*.rs` modules
 behind escape hatches — but the divergence-prevention payoff lands
 immediately for any new feature added against MIR.
 
-**Escape hatches.** If the new path produces unexpected output on
-your spec, opt back into the previous renderer via an env var:
+**Escape hatches.** The Rust-skeleton and proptest codegens still
+keep a legacy renderer you can opt back into if the MIR path produces
+unexpected output on your spec:
 
 ```bash
-QEDGEN_LEGACY_LEAN=1     qedgen codegen --spec my.qedspec --lean
-QEDGEN_LEGACY_KANI=1     qedgen codegen --spec my.qedspec --kani
 QEDGEN_LEGACY_CODEGEN=1  qedgen codegen --spec my.qedspec  # --target anchor / quasar
 QEDGEN_LEGACY_PROPTEST=1 qedgen codegen --spec my.qedspec --proptest
 ```
 
-Two known carve-outs that ALWAYS route to legacy regardless of flag,
-even on the MIR path:
-- **sBPF specs** (`pragma sbpf`) for Lean + Kani — the MIR side
-  doesn't lift pragma info yet (Phase-0 scaffold).
-- **Record-bearing specs** (`type T { … }`) for Lean — Lean MIR's
-  indexed-state path doesn't emit `structure T` + `instance :
-  Inhabited T` yet. The other three backends handle records via
-  shared `rust_codegen_util` helpers and route through MIR
-  normally.
-
-Both are tracked for v3.0 cleanup.
+The Lean and Kani legacy renderers (and their `QEDGEN_LEGACY_LEAN` /
+`QEDGEN_LEGACY_KANI` hatches) were removed in v2.32 — `lean_gen_mir`
+and `kani_mir` are now the sole paths for those backends. (sBPF specs
+emit Lean proofs only; `--kani` / `--proptest` skip assembly targets,
+which are verified via Lean + client-side tests.)
 
 **If you hit a problem.** File a report at
 https://github.com/QEDGen/solana-skills/issues with the spec that
-triggered the escape hatch + the legacy-vs-default diff. We're
-treating "zero `QEDGEN_LEGACY_*` issues filed during the v2.30→v2.31
-soak" as the gate for removing the escape hatches at v2.32. The
-soak is the validation step the snapshot tests can't provide —
-they lock the 6 pilot fixtures but not the long tail of real specs.
+triggered the escape hatch + the legacy-vs-default diff.
 
 **Roadmap.**
 - **v2.30** — MIR carry-through complete; legacy paths reachable via env vars.
 - **v2.31** — soak. No code change unless escape-hatch reports surface a bug.
-- **v2.32** — delete `lean_gen.rs` + `kani.rs` (~11K LoC); remove `QEDGEN_LEGACY_LEAN` / `QEDGEN_LEGACY_KANI` env vars. Conditional on zero escape-hatch reports during the soak.
+- **v2.32** — **shipped:** deleted `lean_gen.rs` + `kani.rs` (~11K LoC); removed `QEDGEN_LEGACY_LEAN` / `QEDGEN_LEGACY_KANI`. (Records → MIR for Lean; sBPF → MIR for Lean, with Kani/proptest skipping assembly.)
 - **v3.0** — port `generate_guards` (Anchor) + the full proptest body to MIR-direct (currently delegate to legacy); delete `codegen.rs` + `proptest_gen.rs` (~10K more LoC); remove the remaining two env vars.
 
 ## Examples

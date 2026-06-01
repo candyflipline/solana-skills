@@ -14,16 +14,13 @@
 //! file (`UPDATE_SNAPSHOTS=1 cargo test --test kani_snapshot` writes
 //! them in place).
 //!
-//! These snapshots are byte-equivalent to legacy `kani::generate`
-//! output (verified at the Phase 3e commit). The snapshot lock-in is
-//! against the MIR output, so a failing snapshot signals "MIR
-//! changed" rather than "MIR drifted from legacy" — but they're the
-//! same shape today.
+//! These snapshots were byte-equivalent to the legacy `kani::generate`
+//! output (verified before that renderer was deleted in v2.32). The
+//! snapshot lock-in is against the MIR output, so a failing snapshot
+//! signals "MIR Kani codegen changed".
 //!
-//! Parallel structure with `tests/mir_snapshot.rs` (Lean side):
-//! same per-fixture harness shape, same `UPDATE_SNAPSHOTS=1`
-//! workflow, same `env_remove("QEDGEN_LEGACY_KANI")` so a parent
-//! shell can't force the snapshot tests onto the legacy path.
+//! Parallel structure with `tests/mir_snapshot.rs` (Lean side): same
+//! per-fixture harness shape, same `UPDATE_SNAPSHOTS=1` workflow.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -70,9 +67,9 @@ fn snapshots_dir() -> PathBuf {
 /// `qedgen codegen --kani` rewrites `programs/` too; the copy
 /// isolates the workspace from those rewrites.
 ///
-/// MIR is the default Kani-codegen path post v2.30 Phase 3f.
-/// `QEDGEN_LEGACY_KANI` is explicitly cleared so a parent shell
-/// can't accidentally force the snapshot tests onto the legacy path.
+/// MIR (`kani_mir`) is the sole Kani-codegen path — the legacy
+/// `kani` renderer and its `QEDGEN_LEGACY_KANI` escape hatch were
+/// deleted in v2.32.
 fn render_mir_kani(fixture_dir: &str, spec_arg: &str) -> String {
     ensure_qedgen_built();
     let tmp = tempfile::tempdir().expect("create tempdir");
@@ -112,7 +109,6 @@ fn render_mir_kani(fixture_dir: &str, spec_arg: &str) -> String {
         .arg("--spec")
         .arg(spec_arg)
         .arg("--kani")
-        .env_remove("QEDGEN_LEGACY_KANI")
         .current_dir(tmp.path())
         .status()
         .expect("spawn qedgen codegen");
