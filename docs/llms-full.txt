@@ -1,6 +1,6 @@
 # QEDGen
 
-> Describe what your Solana program must guarantee in `.qedspec`. QEDGen finds the bugs your tests miss, then generates the proofs, property tests, and CI to keep them fixed. Supports Anchor, Quasar, and native sBPF assembly.
+> Describe what your Solana program must guarantee in `.qedspec`. QEDGen finds the bugs your tests miss, then generates the proofs, property tests, and CI to keep them fixed. Supports Anchor, Quasar, Pinocchio, and native sBPF assembly. It also audits existing programs (brownfield) with no spec required.
 
 ## Installation
 
@@ -18,7 +18,7 @@ A `.qedspec` is the single source of truth. It can live in one file or span mult
 
 1. **Write the spec.** The agent writes a `.qedspec` describing your program's types, state machines, handlers, guards, effects, and properties. Use one file, split across handler/interface files, or extend an upstream spec.
 2. **Validate the spec.** `qedgen check --spec program.qedspec` runs lint, coverage, and drift. Add `--explain` for a Markdown report.
-3. **Generate artifacts.** `qedgen codegen --spec program.qedspec --all` produces Quasar Rust skeletons, proptest harnesses, Kani BMC harnesses, Lean 4 proofs, unit tests, and integration tests.
+3. **Generate artifacts.** `qedgen codegen --spec program.qedspec --all` produces the program skeleton for your `--target` (Anchor / Quasar / Pinocchio), proptest harnesses, Kani BMC harnesses, Lean 4 proofs, unit tests, and integration tests. (sBPF specs emit Lean proofs only — assembly is verified via Lean + client-side tests, so `--kani` / `--proptest` skip them.)
 4. **Verify the implementation.** `qedgen verify --spec program.qedspec` runs every generated harness on disk (proptest, Kani, Lean). Use `--proptest`, `--kani`, or `--lean` to target one backend.
 5. **Escalate hard proofs.** Leanstral (`qedgen fill-sorry`) handles routine sub-goals in seconds. Aristotle (`qedgen aristotle submit`) runs agentic proof search for the hardest goals, measured in minutes to hours.
 
@@ -43,13 +43,14 @@ qedgen check --spec program.qedspec --drift src/ --deep # transitive drift
 ### Generate artifacts from a spec
 
 ```bash
-qedgen codegen --spec program.qedspec --all             # everything
-qedgen codegen --spec program.qedspec --lean            # Lean proofs only
-qedgen codegen --spec program.qedspec --kani            # Kani harnesses
-qedgen codegen --spec program.qedspec --proptest        # proptest harnesses
-qedgen codegen --spec program.qedspec --fill            # agent-fill prompts for unfilled handlers
-qedgen codegen --spec program.qedspec --fill-tests      # agent-fill prompts for integration test sites
+qedgen codegen --spec program.qedspec --all                 # everything
+qedgen codegen --spec program.qedspec --target pinocchio    # program skeleton (anchor | quasar | pinocchio)
+qedgen codegen --spec program.qedspec --lean                # Lean proofs only
+qedgen codegen --spec program.qedspec --kani                # Kani harnesses
+qedgen codegen --spec program.qedspec --proptest            # proptest harnesses
 ```
+
+For handlers codegen can't fully mechanize, the agent fills the `todo!()` body directly in-session (no `--fill` verb needed). If it can't, the spec is under-specified — refine and regenerate.
 
 ### Run the generated harnesses
 
@@ -73,6 +74,23 @@ qedgen spec --idl target/idl/program.json \
 
 ```bash
 qedgen reconcile --spec program.qedspec                 # unified drift report across Rust + Lean
+```
+
+### Brownfield: audit and adapt an existing program (no spec required)
+
+```bash
+qedgen probe --program ./src                            # find category-coverage gaps + reproducible bugs (JSON for the auditor)
+qedgen adapt --program ./my-anchor-program              # draft a .qedspec from an existing Anchor program
+qedgen interface --idl target/idl/dep.json              # generate a Tier-0 interface block for a CPI dependency
+```
+
+`probe` powers the harness-native auditor subagent: it surfaces real vulnerabilities first (each paired with a Kani/proptest/Mollusk reproducer), spec-coverage gaps second. Works on Anchor, native Rust, sBPF, and Pinocchio.
+
+### Mainnet-readiness (Anchor IDL lint + upgrade-safety diff)
+
+```bash
+qedgen readiness --idl target/idl/program.json         # lint one IDL for upgrade-unsafe shapes before first deploy
+qedgen check-upgrade --old old.json --new new.json     # flag every upgrade-unsafe change between two IDLs
 ```
 
 ### Fill sorry markers with Leanstral (fast, seconds)
@@ -145,16 +163,16 @@ Run `qedgen check --spec program.qedspec`. The lint + coverage + drift report te
 ### Step 4: Generate artifacts
 
 Run `qedgen codegen --spec program.qedspec --all`. This produces:
-- Quasar Rust program skeleton
+- Program skeleton for the chosen `--target` (Anchor / Quasar / Pinocchio; default Anchor)
 - `tests/proptest.rs` proptest harness
 - `tests/kani.rs` Kani BMC harness
 - `formal_verification/Spec.lean` (generated, regenerated on every codegen)
 - `formal_verification/Proofs.lean` (user-owned preservation proofs, bootstrapped once)
 - `.github/workflows/verify.yml` CI
 
-### Step 5: Fill agent prompts (if any)
+### Step 5: Fill remaining handler bodies (if any)
 
-For handlers where codegen could not fully mechanize the effect, `qedgen codegen --fill` emits one structured prompt per `todo!()` site. The agent writes the body in-session. If a prompt cannot be filled, the spec is under-specified: refine it and re-generate.
+For handlers where codegen could not fully mechanize the effect (events, token transfers, complex effect RHS), the generated handler carries a `todo!()`. The agent fills the body directly in-session from the spec's declared schema — no separate `--fill` verb. If a body can't be filled, the spec is under-specified: refine it and re-generate.
 
 ### Step 6: Verify
 
