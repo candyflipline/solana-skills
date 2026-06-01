@@ -16,7 +16,7 @@ use anyhow::Result;
 use std::path::Path;
 
 use crate::check::{self, ParsedHandler, ParsedInvariant, ParsedProperty, ParsedSpec};
-use crate::codegen::map_type;
+use crate::codegen_shared::map_type;
 use crate::mir::Mir;
 use crate::rust_codegen_util;
 
@@ -485,7 +485,7 @@ fn generate_impl(spec_path: &Path, output_path: &Path) -> Result<()> {
     //
     // Detection reuses `codegen::guards_use_math_helpers` so this gate
     // tracks the same predicate as the `--all` math.rs emission.
-    if crate::codegen::guards_use_math_helpers(&spec) {
+    if crate::codegen_shared::guards_use_math_helpers(&spec) {
         out.push_str(
             "#[allow(dead_code)]\n\
 #[inline]\n\
@@ -1435,12 +1435,12 @@ fn emit_sequence_test_for(
         if params.is_empty() {
             out.push_str(&format!(
                 "    {},\n",
-                crate::codegen::to_pascal_case(&op.name)
+                crate::codegen_shared::to_pascal_case(&op.name)
             ));
         } else {
             out.push_str(&format!(
                 "    {}({}),\n",
-                crate::codegen::to_pascal_case(&op.name),
+                crate::codegen_shared::to_pascal_case(&op.name),
                 params
             ));
         }
@@ -1451,7 +1451,7 @@ fn emit_sequence_test_for(
     out.push_str("fn arb_op() -> impl Strategy<Value = Op> {\n");
     out.push_str("    prop_oneof![\n");
     for op in handlers {
-        let pascal = crate::codegen::to_pascal_case(&op.name);
+        let pascal = crate::codegen_shared::to_pascal_case(&op.name);
         if op.takes_params.is_empty() {
             out.push_str(&format!("        Just(Op::{}),\n", pascal));
         } else {
@@ -1511,7 +1511,7 @@ fn emit_sequence_test_for(
     out.push_str("fn apply_op(s: &mut State, op: &Op) -> bool {\n");
     out.push_str("    match op {\n");
     for op in handlers {
-        let pascal = crate::codegen::to_pascal_case(&op.name);
+        let pascal = crate::codegen_shared::to_pascal_case(&op.name);
         if op.takes_params.is_empty() {
             out.push_str(&format!("        Op::{} => {}(s),\n", pascal, op.name));
         } else {
@@ -1579,7 +1579,7 @@ fn emit_sequence_test_for(
         out.push_str("    match (current, op) {\n");
         for op in handlers {
             if let (Some(ref pre), Some(ref post)) = (&op.pre_status, &op.post_status) {
-                let pascal = crate::codegen::to_pascal_case(&op.name);
+                let pascal = crate::codegen_shared::to_pascal_case(&op.name);
                 if op.takes_params.is_empty() {
                     out.push_str(&format!(
                         "        (Lifecycle::{}, Op::{}) => Some(Lifecycle::{}),\n",

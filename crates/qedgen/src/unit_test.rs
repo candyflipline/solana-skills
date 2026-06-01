@@ -2,7 +2,7 @@ use anyhow::Result;
 use std::path::Path;
 
 use crate::check::{self, ParsedHandler, ParsedSpec};
-use crate::codegen::map_type;
+use crate::codegen_shared::map_type;
 
 /// Generate unit tests from a spec file (.lean or .qedspec).
 /// Tests exercise effects, guards, and properties directly on a plain state
@@ -89,7 +89,7 @@ pub fn generate(spec_path: &Path, output_path: &Path) -> Result<()> {
     } else {
         let state_name = format!(
             "{}State",
-            crate::codegen::to_pascal_case(&spec.program_name)
+            crate::codegen_shared::to_pascal_case(&spec.program_name)
         );
         emit_state_struct(&mut out, &state_name, &spec.state_fields, &spec)?;
 
@@ -396,7 +396,7 @@ fn resolve_state_for_op<'a>(
         (
             format!(
                 "{}State",
-                crate::codegen::to_pascal_case(&spec.program_name)
+                crate::codegen_shared::to_pascal_case(&spec.program_name)
             ),
             &spec.state_fields,
         )
@@ -413,7 +413,7 @@ fn resolve_state_for_property<'a>(
         return (
             format!(
                 "{}State",
-                crate::codegen::to_pascal_case(&spec.program_name)
+                crate::codegen_shared::to_pascal_case(&spec.program_name)
             ),
             &spec.state_fields,
         );

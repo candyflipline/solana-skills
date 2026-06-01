@@ -55,7 +55,7 @@ use anyhow::Result;
 use std::path::Path;
 
 use crate::check::{self, ParsedHandler, ParsedHandlerAccount, ParsedSpec};
-use crate::codegen::{map_type, to_pascal_case, to_snake_case};
+use crate::codegen_shared::{map_type, to_pascal_case, to_snake_case};
 use crate::Target;
 
 /// Predicate: a handler triggers auto-emission of an impl-targeted harness

@@ -13,7 +13,7 @@ mod check;
 mod chumsky_adapter;
 mod chumsky_parser;
 mod cluster;
-mod codegen;
+mod codegen_shared;
 mod codegen_mir;
 mod consolidate;
 mod cpi_substitute;

@@ -290,7 +290,7 @@ fn emit_math_helpers(out: &mut String, parsed: &ParsedSpec) {
     // every committed kani.rs fixture was generated against. Mirror
     // verbatim so Phase 3 stays byte-equivalent until the legacy emit
     // is intentionally re-indented.
-    if crate::codegen::guards_use_math_helpers(parsed) {
+    if crate::codegen_shared::guards_use_math_helpers(parsed) {
         out.push_str(
             "#[allow(dead_code)]\n\
 #[inline]\n\
@@ -349,7 +349,7 @@ fn emit_constants(out: &mut String, mir: &Mir) {
 /// then, multi-account specs emit only the primary account's view
 /// here, prefixed by a `MIR-TODO(phase-3e)` marker in `render()`.
 fn emit_account_section_structural(out: &mut String, parsed: &ParsedSpec) -> Result<()> {
-    use crate::codegen::map_type;
+    use crate::codegen_shared::map_type;
     use crate::rust_codegen_util as util;
 
     // Resolve state-fields + lifecycle view. Mirrors `kani::generate`
@@ -516,7 +516,7 @@ fn emit_account_section_structural(out: &mut String, parsed: &ParsedSpec) -> Res
 ///     is violated
 ///   * `assert!(!<handler>(&mut s, args...))` — handler must reject
 fn emit_guard_enforcement_harnesses(out: &mut String, parsed: &ParsedSpec) -> Result<()> {
-    use crate::codegen::map_type;
+    use crate::codegen_shared::map_type;
     use crate::rust_codegen_util as util;
 
     // Resolve view — same logic as `emit_account_section_structural`.
@@ -623,7 +623,7 @@ fn emit_guard_enforcement_harnesses(out: &mut String, parsed: &ParsedSpec) -> Re
 ///     should trigger abortion
 ///   * `assert!(!<handler>(...))` — handler must reject
 fn emit_abort_condition_harnesses(out: &mut String, parsed: &ParsedSpec) -> Result<()> {
-    use crate::codegen::map_type;
+    use crate::codegen_shared::map_type;
     use crate::rust_codegen_util as util;
 
     // Resolve view — same logic as `emit_account_section_structural`.
@@ -731,7 +731,7 @@ fn emit_abort_condition_harnesses(out: &mut String, parsed: &ParsedSpec) -> Resu
 ///     per-slot Unary → `prop_at(&post, binder)`, plain Unary →
 ///     `prop(&post)`)
 fn emit_property_preservation_harnesses(out: &mut String, parsed: &ParsedSpec) -> Result<()> {
-    use crate::codegen::map_type;
+    use crate::codegen_shared::map_type;
     use crate::rust_codegen_util as util;
 
     if parsed.properties.is_empty() {
@@ -997,7 +997,7 @@ fn emit_property_preservation_harnesses(out: &mut String, parsed: &ParsedSpec) -
 /// elsewhere breaks byte-equivalence on percolator (which exercises
 /// `ensures` clauses with old(...) bindings).
 fn emit_ensures_preservation_harnesses(out: &mut String, parsed: &ParsedSpec) -> Result<()> {
-    use crate::codegen::map_type;
+    use crate::codegen_shared::map_type;
     use crate::rust_codegen_util as util;
 
     let handlers: Vec<&crate::check::ParsedHandler> = parsed.handlers.iter().collect();
@@ -1164,7 +1164,7 @@ fn pre_unused_workaround_needed(_ensures: &crate::check::ParsedEnsures) -> bool 
 ///     property-preservation, not the double-emit bug of guard/abort)
 ///   * `if <handler>(&mut s, ...) { assert!(<inv>(&s)); }`
 fn emit_invariant_preservation_harnesses(out: &mut String, parsed: &ParsedSpec) -> Result<()> {
-    use crate::codegen::map_type;
+    use crate::codegen_shared::map_type;
     use crate::rust_codegen_util as util;
 
     let handlers: Vec<&crate::check::ParsedHandler> = parsed.handlers.iter().collect();
@@ -1327,7 +1327,7 @@ fn emit_invariant_preservation_harnesses(out: &mut String, parsed: &ParsedSpec) 
 ///   * Sibling fields assert `s.G == pre_G` unless another effect in
 ///     the same handler mutates them.
 fn emit_effect_conformance_harnesses(out: &mut String, parsed: &ParsedSpec) -> Result<()> {
-    use crate::codegen::{map_type, sanitize_ident};
+    use crate::codegen_shared::{map_type, sanitize_ident};
     use crate::rust_codegen_util as util;
 
     let handlers: Vec<&crate::check::ParsedHandler> = parsed.handlers.iter().collect();
@@ -1519,7 +1519,7 @@ fn emit_effect_conformance_harnesses(out: &mut String, parsed: &ParsedSpec) -> R
 /// required; the proof exists to drive BMC across the parameter
 /// space. Mirrors `kani::emit_kani_account_section` lines ~1279–1330.
 fn emit_overflow_detection_harnesses(out: &mut String, parsed: &ParsedSpec) -> Result<()> {
-    use crate::codegen::map_type;
+    use crate::codegen_shared::map_type;
     use crate::rust_codegen_util as util;
 
     let handlers: Vec<&crate::check::ParsedHandler> = parsed.handlers.iter().collect();
@@ -1623,7 +1623,7 @@ fn emit_overflow_detection_harnesses(out: &mut String, parsed: &ParsedSpec) -> R
 ///      mutate `env.mutates` fields to `kani::any()`, assume the
 ///      constraints, then `assert!(<prop>(&s))`.
 fn emit_file_level_features(out: &mut String, parsed: &ParsedSpec) -> Result<()> {
-    use crate::codegen::map_type;
+    use crate::codegen_shared::map_type;
     use crate::rust_codegen_util as util;
 
     // Resolve view — same logic as `emit_account_section_structural`.

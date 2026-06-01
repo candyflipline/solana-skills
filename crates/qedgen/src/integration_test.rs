@@ -2,7 +2,7 @@ use anyhow::Result;
 use std::path::Path;
 
 use crate::check::{self, ParsedHandler, ParsedHandlerAccount, ParsedSpec};
-use crate::codegen::{map_type, to_pascal_case};
+use crate::codegen_shared::{map_type, to_pascal_case};
 
 /// Generate QuasarSVM integration test scaffolds from a spec file (.qedspec).
 ///

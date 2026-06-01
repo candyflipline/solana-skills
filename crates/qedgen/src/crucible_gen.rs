@@ -429,7 +429,7 @@ fn fixture_name(spec: &ParsedSpec) -> String {
     // PascalCase converter — `to_pascal_case` only splits on `_`, so a
     // raw kebab name would yield `Multi-delegator` (invalid Rust).
     let normalised = spec_program_name(spec);
-    let pascal = crate::codegen::to_pascal_case(&normalised);
+    let pascal = crate::codegen_shared::to_pascal_case(&normalised);
     let head: &str = if pascal.is_empty() {
         "Program"
     } else {
