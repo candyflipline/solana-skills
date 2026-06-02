@@ -2070,6 +2070,54 @@ fn ghost_decl<'a>() -> impl Parser<'a, &'a str, TopItem, Err<'a>> + Clone {
         })
 }
 
+/// Issue #67 item 4 — `hook after_store(<field>) { assert <expr> … }` /
+/// `hook before_cpi[(<Iface>)] { assert <expr> … }`. Cross-cutting
+/// assertion(s) checked at a MIR-statement boundary.
+fn hook_decl<'a>() -> impl Parser<'a, &'a str, TopItem, Err<'a>> + Clone {
+    let assert_clause = kw("assert")
+        .ignore_then(expr())
+        .then_ignore(wsc())
+        .then_ignore(just(';').or_not());
+    let asserts = assert_clause
+        .then_ignore(wsc())
+        .repeated()
+        .collect::<Vec<Node<Expr>>>();
+
+    let after_store = kw("after_store")
+        .then_ignore(wsc())
+        .then_ignore(just('('))
+        .then_ignore(wsc())
+        .ignore_then(non_keyword_ident())
+        .then_ignore(wsc())
+        .then_ignore(just(')'))
+        .map(HookKind::AfterStore);
+
+    let before_cpi = kw("before_cpi")
+        .then_ignore(wsc())
+        .ignore_then(
+            just('(')
+                .then_ignore(wsc())
+                .ignore_then(non_keyword_ident())
+                .then_ignore(wsc())
+                .then_ignore(just(')'))
+                .or_not(),
+        )
+        .map(HookKind::BeforeCpi);
+
+    let kind = choice((after_store, before_cpi));
+
+    doc_comments()
+        .then_ignore(kw("hook"))
+        .then(kind)
+        .then_ignore(wsc())
+        .then_ignore(just('{'))
+        .then_ignore(wsc())
+        .then(asserts)
+        .then_ignore(wsc())
+        .then_ignore(just('}'))
+        .map(|((doc, kind), asserts)| TopItem::Hook(HookDecl { doc, kind, asserts }))
+}
+
 // invariant name : expr  OR  invariant name "description"
 /// v2.24 #1 — top-level `schema name { requires expr else Err … }`.
 /// Reusable cross-cutting guard set. Pre-fix the parser rejected the
@@ -3050,6 +3098,7 @@ fn top_item<'a>() -> impl Parser<'a, &'a str, Node<TopItem>, Err<'a>> + Clone {
         event_decl(),
         environment_decl(),
         ghost_decl(),
+        hook_decl(),
         program_id_decl(),
     ));
     // Note: `pubkey`, `instruction`, `assembly`, and the `errors [...]`
@@ -3590,6 +3639,7 @@ property conservation :
                 TopItem::Schema(_) => "schema",
                 TopItem::RefImpl(_) => "ref_impl",
                 TopItem::Ghost(_) => "ghost",
+                TopItem::Hook(_) => "hook",
             })
             .fold(
                 std::collections::BTreeMap::<&str, usize>::new(),

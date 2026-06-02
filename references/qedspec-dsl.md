@@ -446,6 +446,46 @@ fires `ghost_update_unknown_handler`.
 pure function the real Rust impl is checked against; a `ghost` is
 *stateful* spec-only state with no on-chain counterpart.
 
+### `hook`
+
+A cross-cutting **assertion fired at a statement boundary** inside any
+handler — for checking a condition at an *intermediate* point, not just at
+handler exit (which is what `property` covers).
+
+```
+hook after_store(balance) {
+  assert state.balance <= state.cap
+}
+```
+
+- **`after_store(<field>)`** — fires immediately after any store to
+  `<field>`, in every handler that writes it. The assertion sees the
+  post-store state. The RHS may read state and handler params.
+- One or more `assert <expr>` per hook (optional trailing `;`).
+
+**Enforcement.** Hooks are checked in the **runtime backends** (Kani +
+proptest): the assertion is injected into the spec-model transition right
+after the field's effect, so a violation surfaces as a verification
+failure / failing test. The `state_machine_sequence` proptest harness is
+emitted whenever a spec declares hooks, so the assertions are actually
+exercised across random handler sequences. Hooks are **omitted from the
+on-chain program codegen** entirely.
+
+**Lean.** Lean enforcement is deferred (it lands with qedsvm); a spec with
+hooks fires the informational `hook_lean_unsupported` lint. Use
+`qedgen verify --kani` / `--proptest` to exercise them today.
+
+**`before_cpi`.** `hook before_cpi { … }` / `hook before_cpi(<Iface>) { … }`
+parses, but enforcement is deferred (`hook_before_cpi_unsupported` lint):
+the runtime state model has no CPI to anchor to, and the natural home —
+the Lean CPI-theorem precondition — is on the deferred Lean path. Encode
+the precondition as a `requires` on the calling handler for now.
+
+**Scope / lints.** `after_store` is wired into the **flat single-account**
+transition; indexed/multi-account shapes fire
+`hook_unsupported_state_shape`. `after_store(<field>)` naming a non-state
+field fires `hook_unknown_field`; an empty hook body fires `hook_no_assert`.
+
 ## PDA and events
 
 ### `pda`

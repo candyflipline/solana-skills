@@ -837,8 +837,13 @@ fn emit_account_section(
         )?;
     }
 
-    // Sequence test
-    if !owned_props.is_empty() && handlers.len() > 1 {
+    // Sequence test. Emitted when there are properties to check across a
+    // multi-handler state machine, OR when the spec declares hooks (issue
+    // #67 item 4) — the sequence harness drives random op sequences from
+    // `init`, which is what exercises the `after_store` assertions injected
+    // into the transitions (without a driver the hooks would never fire).
+    let want_sequence = (!owned_props.is_empty() && handlers.len() > 1) || !spec.hooks.is_empty();
+    if want_sequence && !handlers.is_empty() {
         emit_sequence_test_for(
             out,
             handlers,

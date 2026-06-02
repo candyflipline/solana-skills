@@ -1224,6 +1224,12 @@ pub struct ParsedSpec {
     /// omitted from the on-chain program codegen entirely.
     pub ghosts: Vec<ParsedGhost>,
 
+    /// Issue #67 item 4 — `hook <kind> { assert … }` cross-cutting
+    /// assertions. Enforced in the Kani / proptest transitions at the
+    /// matching MIR-statement boundary; ignored by Lean (deferred) and the
+    /// on-chain codegen.
+    pub hooks: Vec<ParsedHook>,
+
     /// v2.27 Track B — verified-callee composition (Stance 2).
     ///
     /// For each imported interface whose provider shipped a
@@ -1324,6 +1330,31 @@ pub struct ParsedGhostUpdate {
     pub handler: String,
     pub value_lean: String,
     pub value_rust: String,
+}
+
+/// Issue #67 item 4 — lowered `hook` declaration. Pre-rendered per backend.
+#[derive(Debug, Clone)]
+pub struct ParsedHook {
+    pub kind: ParsedHookKind,
+    pub asserts: Vec<ParsedHookAssert>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParsedHookKind {
+    /// Fires after any store to the named state field.
+    AfterStore(String),
+    /// Fires before a CPI (optionally only to the named callee namespace).
+    BeforeCpi(Option<String>),
+}
+
+/// One `assert <expr>` in a hook body, rendered per backend.
+#[derive(Debug, Clone)]
+pub struct ParsedHookAssert {
+    /// Lean rendering, retained for the deferred Lean enforcement path
+    /// (qedsvm). Not consumed today — Lean ignores hooks.
+    #[allow(dead_code)]
+    pub lean: String,
+    pub rust: String,
 }
 
 impl ParsedSpec {
@@ -3005,6 +3036,95 @@ pub fn check_completeness(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
                     ),
                     subject: Some(g.name.clone()),
                     fix: "Move the ghost to a flat single-account spec, or track the quantity in a `property` (e.g. `sum i : Idx, accounts[i].x`) until ghost support lands for this shape.".to_string(),
+                    example: None,
+                    counterexample: None,
+                    fix_options: vec![],
+                });
+            }
+        }
+    }
+
+    // Issue #67 item 4 — hook validation.
+    if !spec.hooks.is_empty() {
+        // Lean enforcement is deferred (lands with qedsvm); hooks are
+        // currently checked only in the Kani / proptest harnesses.
+        warnings.push(CompletenessWarning {
+            rule: "hook_lean_unsupported".to_string(),
+            severity: Severity::Info,
+            priority: 3,
+            message: "hooks are enforced in the Kani / proptest harnesses; Lean enforcement is deferred (lands with qedsvm)".to_string(),
+            subject: None,
+            fix: "No action needed — `qedgen verify --kani` / `--proptest` exercise the hook assertions.".to_string(),
+            example: None,
+            counterexample: None,
+            fix_options: vec![],
+        });
+        let state_field_names: std::collections::BTreeSet<&str> =
+            spec.state_fields.iter().map(|(n, _)| n.as_str()).collect();
+        let is_indexed = spec
+            .state_fields
+            .iter()
+            .any(|(_, t)| t.trim_start().starts_with("Map"));
+        let unsupported_shape = is_indexed || spec.account_types.len() > 1;
+        for hook in &spec.hooks {
+            match &hook.kind {
+                ParsedHookKind::AfterStore(field) => {
+                    if !state_field_names.contains(field.as_str()) {
+                        warnings.push(CompletenessWarning {
+                            rule: "hook_unknown_field".to_string(),
+                            severity: Severity::Warning,
+                            priority: 2,
+                            message: format!(
+                                "hook `after_store({})` names '{}', which is not a state field",
+                                field, field
+                            ),
+                            subject: None,
+                            fix: "Name a declared state field in `after_store(<field>)`."
+                                .to_string(),
+                            example: None,
+                            counterexample: None,
+                            fix_options: vec![],
+                        });
+                    }
+                    if unsupported_shape {
+                        warnings.push(CompletenessWarning {
+                            rule: "hook_unsupported_state_shape".to_string(),
+                            severity: Severity::Warning,
+                            priority: 2,
+                            message: format!(
+                                "hook `after_store({})` is declared with an indexed / multi-account state — `after_store` is wired into the flat single-account transition only",
+                                field
+                            ),
+                            subject: None,
+                            fix: "Use a flat single-account spec, or assert the post-store condition in a `property`.".to_string(),
+                            example: None,
+                            counterexample: None,
+                            fix_options: vec![],
+                        });
+                    }
+                }
+                ParsedHookKind::BeforeCpi(_) => {
+                    warnings.push(CompletenessWarning {
+                        rule: "hook_before_cpi_unsupported".to_string(),
+                        severity: Severity::Warning,
+                        priority: 2,
+                        message: "`hook before_cpi` enforcement is deferred — the runtime state model has no CPI to anchor to, and the Lean CPI-theorem precondition path lands with qedsvm".to_string(),
+                        subject: None,
+                        fix: "Encode the precondition as a `requires` on the calling handler for now, or assert it via `after_store` on the field the CPI consumes.".to_string(),
+                        example: None,
+                        counterexample: None,
+                        fix_options: vec![],
+                    });
+                }
+            }
+            if hook.asserts.is_empty() {
+                warnings.push(CompletenessWarning {
+                    rule: "hook_no_assert".to_string(),
+                    severity: Severity::Info,
+                    priority: 3,
+                    message: "hook has no `assert` clause — it checks nothing".to_string(),
+                    subject: None,
+                    fix: "Add at least one `assert <expr>` to the hook body.".to_string(),
                     example: None,
                     counterexample: None,
                     fix_options: vec![],
