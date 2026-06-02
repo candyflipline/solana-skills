@@ -2277,7 +2277,7 @@ fn emit_handler_harness(
     // ── CPI ensures-as-fact (Track I) ──────────────────────────────────
     // For every `call Iface.foo(args)` site whose callee declares its own
     // `ensures`, splice a `kani::assume(<callee_ensures, substituted>)`
-    // line so the caller's downstream assert! can rely on the CPI's
+    // line so the caller's later assert! can rely on the CPI's
     // contract. Tier-0 callees (no ensures declared) emit nothing —
     // matching the spec-model harness behavior in `kani.rs` and the
     // `lean_gen.rs::render_cpi_theorems` `:= by sorry` fallback.
