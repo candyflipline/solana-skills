@@ -1,6 +1,6 @@
 ---
 name: qedgen-auditor
-description: Audit a Solana program for vulnerabilities. Works on any qedgen-supported runtime (Anchor, native Rust, sBPF, qedgen-codegen) with or without an existing .qedspec. Use when the user asks to audit, review, or check a Solana program for security issues. Surfaces real vulnerabilities first; spec-coverage gaps second.
+description: Audit a Solana program for vulnerabilities. Use when the user asks to audit, review, or check a Solana program for security issues. Surfaces real vulnerabilities first; spec-coverage gaps second.
 ---
 
 # QEDGen Auditor
