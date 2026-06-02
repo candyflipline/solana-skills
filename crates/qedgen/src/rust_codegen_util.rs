@@ -104,16 +104,50 @@ fn wrap_arithmetic_atom(atom: &str) -> String {
 }
 
 fn wrap_arith_expr(expr: &str) -> String {
-    if let Some(pos) = expr.rfind(" + ") {
-        let lhs = &expr[..pos];
-        let rhs = &expr[pos + 3..];
-        format!("{}.wrapping_add({})", lhs.trim(), rhs.trim())
-    } else if let Some(pos) = expr.rfind(" - ") {
-        let lhs = &expr[..pos];
-        let rhs = &expr[pos + 3..];
-        format!("{}.wrapping_sub({})", lhs.trim(), rhs.trim())
-    } else {
-        expr.to_string()
+    // Split on the RIGHTMOST top-level (paren-depth-0) ` + ` / ` - ` and
+    // recurse on the LHS, so a chained expression lowers left-associatively:
+    //   `cap - used - reserved`
+    //     → `cap.saturating_sub(used).saturating_sub(reserved)`
+    // This matches Lean's left-associative `Nat` subtraction. The previous
+    // `rfind` form was both non-recursive (it left the inner operator as a
+    // bare infix, e.g. `cap - used.wrapping_sub(reserved)`, mis-grouping the
+    // expression) and used `wrapping_sub`, which diverged from the Lean tier
+    // on underflow — issue #79 Bug B. Subtraction lowers to `saturating_sub`
+    // because Lean models guard/property arithmetic over `Nat`, whose `-`
+    // truncates at 0; the proptest predicate must test the same relation the
+    // Lean proof discharges. Addition keeps `wrapping_add` (grouping fixed).
+    let bytes = expr.as_bytes();
+    let mut depth: i32 = 0;
+    let mut split: Option<(usize, u8)> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            op @ (b'+' | b'-')
+                if depth == 0
+                    && i > 0
+                    && bytes[i - 1] == b' '
+                    && i + 1 < bytes.len()
+                    && bytes[i + 1] == b' ' =>
+            {
+                split = Some((i, op));
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    match split {
+        Some((pos, op)) => {
+            let lhs = wrap_arith_expr(expr[..pos].trim());
+            let rhs = expr[pos + 1..].trim();
+            if op == b'+' {
+                format!("{}.wrapping_add({})", lhs, rhs)
+            } else {
+                format!("{}.saturating_sub({})", lhs, rhs)
+            }
+        }
+        None => expr.to_string(),
     }
 }
 
@@ -1305,6 +1339,27 @@ mod tests {
         assert_eq!(effect_target_base("s.foo"), "s");
         assert_eq!(effect_target_base("map[0]"), "map");
         assert_eq!(effect_target_base("  padded  "), "padded");
+    }
+
+    #[test]
+    fn chained_subtraction_lowers_left_assoc_saturating() {
+        // Issue #79 Bug B: `cap - used - reserved` is left-associative
+        // `Nat` subtraction in the Lean tier. The proptest guard must
+        // lower it as `cap.saturating_sub(used).saturating_sub(reserved)`
+        // — recursive, correctly grouped, and saturating (not the old
+        // `cap - used.wrapping_sub(reserved)`, which both mis-grouped and
+        // diverged from Lean on underflow).
+        let got =
+            translate_guard_to_rust("amount <= state.cap - state.used - state.reserved", true);
+        assert_eq!(
+            got,
+            "amount <= s.cap.saturating_sub(s.used).saturating_sub(s.reserved)"
+        );
+        // Addition keeps left-assoc grouping (wrapping unchanged).
+        assert_eq!(
+            translate_guard_to_rust("state.a + state.b + state.c <= state.d", true),
+            "s.a.wrapping_add(s.b).wrapping_add(s.c) <= s.d"
+        );
     }
 
     #[test]

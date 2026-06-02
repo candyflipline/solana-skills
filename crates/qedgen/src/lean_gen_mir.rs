@@ -2636,23 +2636,32 @@ fn emit_handler_transition(out: &mut String, mir: &Mir, h: &crate::mir::HandlerM
                 if is_account_pubkey_ref(&rhs.rust) {
                     continue;
                 }
+                // Re-qualify the RHS: a bare state-field ref (e.g.
+                // `reserved := state.cap`, which upstream strips to `cap`)
+                // must render as `s.cap`, while handler params and literals
+                // pass through unchanged. The indexed-state path already
+                // routes through this helper; the flat path used to emit
+                // `rhs.lean` verbatim, producing `reserved := cap`
+                // (unknown identifier `cap`) — issue #79 Bug A.
                 with_parts.push(format!(
                     "{} := {}",
                     safe_name(&path_field_name(path)),
-                    rhs.lean
+                    effect_value_to_lean_mir(&rhs.lean, &h.params)
                 ));
             }
             Stmt::CheckedAdd { path, delta, .. }
             | Stmt::WrapAdd { path, delta }
             | Stmt::SatAdd { path, delta } => {
                 let f = safe_name(&path_field_name(path));
-                with_parts.push(format!("{} := s.{} + {}", f, f, delta.lean));
+                let d = effect_value_to_lean_mir(&delta.lean, &h.params);
+                with_parts.push(format!("{} := s.{} + {}", f, f, d));
             }
             Stmt::CheckedSub { path, delta, .. }
             | Stmt::WrapSub { path, delta }
             | Stmt::SatSub { path, delta } => {
                 let f = safe_name(&path_field_name(path));
-                with_parts.push(format!("{} := s.{} - {}", f, f, delta.lean));
+                let d = effect_value_to_lean_mir(&delta.lean, &h.params);
+                with_parts.push(format!("{} := s.{} - {}", f, f, d));
             }
             _ => {}
         }
@@ -2751,7 +2760,8 @@ fn build_guard_cond_parts(mir: &Mir, h: &crate::mir::HandlerMir) -> Vec<String> 
             .map(|(_, t)| t.clone())
         {
             if ty_max_const(&ty).is_some() {
-                conds.push(format!("{} \u{2264} s.{}", delta.lean, safe_name(&field)));
+                let d = effect_value_to_lean_mir(&delta.lean, &h.params);
+                conds.push(format!("{} \u{2264} s.{}", d, safe_name(&field)));
             }
         }
     }
@@ -5658,6 +5668,51 @@ mod tests {
         assert!(
             adt_lean.contains("inductive State where"),
             "pragma state_repr = adt must route to render_single_account_adt"
+        );
+    }
+
+    #[test]
+    fn flat_effect_rhs_field_ref_is_qualified() {
+        // Issue #79 Bug A: a `set` effect copying one state field into
+        // another (`reserved := state.cap`) is stored bare (`cap`) by the
+        // adapter. The flat-state transition emitter used to emit it
+        // verbatim — `reserved := cap` — which is an unknown identifier in
+        // Lean. It must re-qualify to `s.cap` (as the indexed path and the
+        // proptest backend already do), while a handler param stays bare.
+        let src = "spec BudgetRepro\n\
+            type State\n\
+            \x20 | Uninitialized\n\
+            \x20 | Active of { cap : U64, used : U64, reserved : U64 }\n\
+            type Error\n\
+            \x20 | Zero\n\
+            handler open (c : U64) : State.Uninitialized -> State.Active {\n\
+            \x20 permissionless\n\
+            \x20 accounts { payer : signer, writable }\n\
+            \x20 requires c > 0 else Zero\n\
+            \x20 effect { cap := c\n\
+            \x20          used := 0\n\
+            \x20          reserved := 0 }\n\
+            }\n\
+            handler reset : State.Active -> State.Active {\n\
+            \x20 permissionless\n\
+            \x20 accounts { caller : signer }\n\
+            \x20 effect { used := 0\n\
+            \x20          reserved := state.cap }\n\
+            }\n";
+        let parsed = crate::chumsky_adapter::parse_str(src).expect("parse budget spec");
+        let out = render(&crate::mir::lower(&parsed));
+        assert!(
+            out.contains("reserved := s.cap"),
+            "state-field RHS must render qualified `s.cap`:\n{out}"
+        );
+        assert!(
+            !out.contains("reserved := cap,") && !out.contains("reserved := cap "),
+            "bare `cap` (unknown identifier) must not appear:\n{out}"
+        );
+        // A handler param assigned to a field stays bare (it IS in scope).
+        assert!(
+            out.contains("cap := c"),
+            "handler-param RHS must stay bare `c`:\n{out}"
         );
     }
 
