@@ -1969,11 +1969,8 @@ fn try_emit_cpi(
 
     match (target, is_spl_token, is_system) {
         (Target::Anchor, true, _) => emit_spl_token_cpi_anchor(call, handler, spec),
-        // System Program on Anchor keeps the existing generic invoke shape
-        // (idiomatic `anchor_lang::system_program::*` is a follow-on); the
-        // mechanized win this slice targets is Pinocchio, where System
-        // calls previously fell through to a `todo!()` breadcrumb.
-        (Target::Anchor, false, _) => emit_generic_cpi_anchor(call, handler, iface, spec),
+        (Target::Anchor, false, true) => emit_system_cpi_anchor(call, handler, iface, spec),
+        (Target::Anchor, false, false) => emit_generic_cpi_anchor(call, handler, iface, spec),
         (Target::Quasar, true, _) => emit_spl_token_cpi_quasar(call, handler, spec),
         // Quasar generic / System CPI — follow-on slice (uses `BufCpiCall`).
         (Target::Quasar, false, _) => None,
@@ -2395,6 +2392,110 @@ fn emit_spl_anchor(
         ),
         None => format!(
             "            token::{}(CpiContext::new(cpi_program, cpi_accounts))?;\n",
+            fn_name
+        ),
+    };
+    out.push_str(&invocation);
+    out.push_str("        }\n");
+    Some(out)
+}
+
+/// Anchor System Program dispatcher. `transfer` gets the idiomatic
+/// `anchor_lang::system_program::transfer(CpiContext::new(...), lamports)`
+/// shape (mirroring the SPL Token path); `create_account` / `assign`
+/// fall back to the generic `solana_program::program::invoke` builder —
+/// PDA creation needs `invoke_signed` + seed assembly, which is CPI
+/// authority business logic the agent fills, not deterministic codegen
+/// (the same boundary that keeps `transfers {}` agent-filled).
+fn emit_system_cpi_anchor(
+    call: &crate::check::ParsedCall,
+    handler: &ParsedHandler,
+    iface: &crate::check::ParsedInterface,
+    spec: &ParsedSpec,
+) -> Option<String> {
+    if call.target_handler == "transfer" {
+        // The CpiContext needs the System program account info; resolve it
+        // by the `system_program` convention. If it isn't reachable, fall
+        // through to the generic invoke shape (which builds the program id
+        // inline) rather than fail.
+        if let Some(sp) = find_program_account_for_interface(handler, &call.target_interface) {
+            let name = sp.name.clone();
+            return emit_system_anchor(
+                call,
+                handler,
+                spec,
+                &name,
+                "Transfer",
+                &[("from", "from"), ("to", "to")],
+                Some("amount"),
+                "transfer",
+            );
+        }
+    }
+    emit_generic_cpi_anchor(call, handler, iface, spec)
+}
+
+/// Emit an idiomatic `anchor_lang::system_program::<fn>(CpiContext::new(
+/// cpi_program, <Struct> { … }), <scalar>)?` CPI. Sibling to
+/// `emit_spl_anchor` — identical context-builder shape, but the `use`
+/// path is `anchor_lang::system_program` and the program account is the
+/// System program (`system_program`), not `anchor_spl::token` /
+/// `token_program`.
+#[allow(clippy::too_many_arguments)]
+fn emit_system_anchor(
+    call: &crate::check::ParsedCall,
+    handler: &ParsedHandler,
+    spec: &ParsedSpec,
+    system_program: &str,
+    accounts_struct: &str,
+    field_to_arg: &[(&str, &str)],
+    scalar_arg: Option<&str>,
+    fn_name: &str,
+) -> Option<String> {
+    let mut acct_lines: Vec<String> = Vec::with_capacity(field_to_arg.len());
+    let max_field = field_to_arg.iter().map(|(f, _)| f.len()).max().unwrap_or(0);
+    for (anchor_field, call_arg) in field_to_arg {
+        let arg = call.args.iter().find(|a| a.name == *call_arg)?;
+        let pad = " ".repeat(max_field - anchor_field.len());
+        acct_lines.push(format!(
+            "                {}:{} self.{}.to_account_info(),\n",
+            anchor_field, pad, arg.rust_expr
+        ));
+    }
+
+    let scalar_rhs = match scalar_arg {
+        Some(name) => {
+            let arg = call.args.iter().find(|a| a.name == name)?;
+            Some(resolve_call_arg_for_amount(&arg.rust_expr, handler, spec))
+        }
+        None => None,
+    };
+
+    let mut out = String::new();
+    out.push_str("        {\n");
+    out.push_str(&format!(
+        "            use anchor_lang::system_program::{{self, {}}};\n",
+        accounts_struct
+    ));
+    out.push_str(&format!(
+        "            let cpi_accounts = {} {{\n",
+        accounts_struct
+    ));
+    for line in &acct_lines {
+        out.push_str(line);
+    }
+    out.push_str("            };\n");
+    out.push_str(&format!(
+        "            let cpi_program = self.{}.to_account_info();\n",
+        system_program
+    ));
+    let invocation = match scalar_rhs {
+        Some(rhs) => format!(
+            "            system_program::{}(CpiContext::new(cpi_program, cpi_accounts), {})?;\n",
+            fn_name, rhs
+        ),
+        None => format!(
+            "            system_program::{}(CpiContext::new(cpi_program, cpi_accounts))?;\n",
             fn_name
         ),
     };
@@ -6611,6 +6712,76 @@ handler make (l : U64) (s : U64) (o : Pubkey) : State.Active -> State.Active {
         assert!(
             try_emit_cpi(call, handler, &spec, Target::Pinocchio).is_none(),
             "create_account must stay a breadcrumb (None) this slice"
+        );
+    }
+
+    /// Anchor System Program `transfer` CPI. `call System.transfer(...)`
+    /// must lower to the idiomatic `anchor_lang::system_program::transfer(
+    /// CpiContext::new(cpi_program, Transfer { from, to }), amount)?` shape
+    /// rather than the generic `solana_program::program::invoke` builder
+    /// (which is what System fell through to on Anchor before this slice).
+    #[test]
+    fn cpi_emits_anchor_system_transfer() {
+        let spec = crate::chumsky_adapter::parse_str(
+            r#"spec Caller
+program_id "11111111111111111111111111111111"
+
+interface System {
+  program_id "11111111111111111111111111111111"
+  handler transfer (amount : U64) {
+    discriminant "0x02000000"
+    accounts {
+      from : signer, writable
+      to   : writable
+    }
+    requires amount > 0
+  }
+}
+
+type State | Active of { balance : U64 }
+type Error | E
+
+handler topup (n : U64) : State.Active -> State.Active {
+  permissionless
+  accounts {
+    state          : writable
+    payer          : signer, writable
+    pda            : writable
+    system_program : program
+  }
+  call System.transfer(from = payer, to = pda, amount = n)
+}
+"#,
+        )
+        .unwrap();
+        let handler = spec.handlers.iter().find(|h| h.name == "topup").unwrap();
+        let call = handler.calls.first().unwrap();
+        let rendered = try_emit_cpi(call, handler, &spec, Target::Anchor)
+            .expect("Anchor System transfer must emit");
+        assert!(
+            rendered.contains("use anchor_lang::system_program::{self, Transfer};"),
+            "must use anchor_lang::system_program::Transfer; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("from:") && rendered.contains("self.payer.to_account_info()"),
+            "from must resolve to self.payer.to_account_info(); got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("let cpi_program = self.system_program.to_account_info();"),
+            "cpi_program must be the system_program account; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "system_program::transfer(CpiContext::new(cpi_program, cpi_accounts), n)?;"
+            ),
+            "amount param `n` passes through bare to system_program::transfer; got:\n{rendered}"
+        );
+        // Anti-regression: must NOT fall back to the generic invoke builder
+        // or leak the SPL token path.
+        assert!(
+            !rendered.contains("solana_program::program::invoke")
+                && !rendered.contains("anchor_spl"),
+            "System transfer must be idiomatic, not generic invoke / SPL; got:\n{rendered}"
         );
     }
 
