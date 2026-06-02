@@ -71,3 +71,23 @@ handler bound_transfer (amount : U64) : State.Active -> State.Active {
     },
   )
 }
+
+handler loyal_swap_large_guard (amount_in : U128) (min_out : U128) (fee_bps : U128) (lane : U8) (input_mint : Pubkey) (output_mint : Pubkey) : State.Active -> State.Active {
+  accounts {
+    admin         : signer
+    pool_ta       : writable, type token
+    user_ta       : writable, type token
+    token_program : program, type token
+  }
+  requires admin.pubkey == state.admin_key else Unauthorized
+  requires amount_in > 0 else InvalidAmount
+  requires min_out > 0 else InvalidAmount
+  requires fee_bps <= 10000 else InvalidAmount
+  requires lane < 32 else InvalidAmount
+  requires input_mint != output_mint else InvalidAmount
+  requires (input_mint == output_mint or amount_in >= min_out) else InvalidAmount
+  requires amount_in * fee_bps / 10000 <= amount_in else InvalidAmount
+  requires amount_in >= min_out else InvalidAmount
+  requires amount_in <= 1000000000000000 else InvalidAmount
+  ensures state.pool_balance == old(state.pool_balance)
+}

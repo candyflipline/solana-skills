@@ -4,6 +4,18 @@
 /// the qedspec-to-Rust translation logic.
 use crate::check::{ParsedHandler, ParsedProperty, ParsedSpec};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GuardTermSource {
+    Guard,
+    Requires { error_name: Option<String> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuardTerm {
+    pub source: GuardTermSource,
+    pub rust_expr: String,
+}
+
 /// Translate a qedspec guard expression to Rust syntax.
 ///
 /// Handles: state.field → s.field, Unicode operators → ASCII,
@@ -124,7 +136,219 @@ pub fn rewrite_kani_pubkey_comparisons(
     }
 
     out.push_str(&expr[cursor..]);
-    out
+    rewrite_kani_guard_arithmetic(&out)
+}
+
+pub fn rewrite_kani_guard_arithmetic(expr: &str) -> String {
+    let expr = rewrite_kani_bps_mul_div(expr);
+    rewrite_kani_checked_add_equality(&expr)
+}
+
+pub fn rewrite_kani_bps_mul_div(expr: &str) -> String {
+    let parenthesized = regex::Regex::new(
+        r"\((?P<a>[A-Za-z_][A-Za-z0-9_\.]*)\s*\*\s*(?P<b>[A-Za-z_][A-Za-z0-9_\.]*)\)\s*/\s*10000\b",
+    )
+    .expect("valid bps mul/div regex");
+    let rewritten = parenthesized
+        .replace_all(expr, "mul_bps_floor_u128($a, $b)")
+        .to_string();
+
+    let bare = regex::Regex::new(
+        r"\b(?P<a>[A-Za-z_][A-Za-z0-9_\.]*)\s*\*\s*(?P<b>[A-Za-z_][A-Za-z0-9_\.]*)\s*/\s*10000\b",
+    )
+    .expect("valid bare bps mul/div regex");
+    bare.replace_all(&rewritten, "mul_bps_floor_u128($a, $b)")
+        .to_string()
+}
+
+pub fn rewrite_kani_checked_add_equality(expr: &str) -> String {
+    let add_eq = regex::Regex::new(
+        r"\b(?P<a>[A-Za-z_][A-Za-z0-9_\.]*)\s*\+\s*(?P<b>[A-Za-z_][A-Za-z0-9_\.]*)\s*(?P<op>==|!=)\s*(?P<c>[A-Za-z_][A-Za-z0-9_\.]*|\d+)\b",
+    )
+    .expect("valid checked add equality regex");
+    add_eq
+        .replace_all(expr, "$a.checked_add($b) $op Some($c)")
+        .to_string()
+}
+
+pub fn spec_uses_kani_bps_mul_div_helper(spec: &ParsedSpec) -> bool {
+    let uses_helper = |expr: &str| rewrite_kani_bps_mul_div(expr) != expr;
+    spec.handlers.iter().any(|op| {
+        op.guard_str
+            .as_deref()
+            .map(|guard| uses_helper(&translate_guard_to_rust(guard, false)))
+            .unwrap_or(false)
+            || op.requires.iter().any(|req| uses_helper(&req.rust_expr))
+            || op
+                .aborts_if
+                .iter()
+                .any(|abort| uses_helper(&abort.rust_expr))
+            || op
+                .ensures
+                .iter()
+                .any(|ensures| uses_helper(&ensures.rust_expr_binary))
+            || op
+                .let_bindings
+                .iter()
+                .any(|(_, _, rust_expr)| uses_helper(rust_expr))
+    }) || spec
+        .properties
+        .iter()
+        .any(|property| property.rust_expression.as_deref().is_some_and(uses_helper))
+}
+
+pub fn negate_simple_top_level_comparison(expr: &str) -> Option<String> {
+    let trimmed = strip_balanced_outer_parens(expr.trim());
+    if contains_top_level_logical_op(trimmed) {
+        return None;
+    }
+    let bytes = trimmed.as_bytes();
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        match b {
+            b'"' => in_string = true,
+            b'(' => paren_depth += 1,
+            b')' => paren_depth = paren_depth.saturating_sub(1),
+            b'[' => bracket_depth += 1,
+            b']' => bracket_depth = bracket_depth.saturating_sub(1),
+            b'{' => brace_depth += 1,
+            b'}' => brace_depth = brace_depth.saturating_sub(1),
+            _ => {}
+        }
+
+        if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 {
+            for (op, negated) in [
+                ("==", "!="),
+                ("!=", "=="),
+                (">=", "<"),
+                ("<=", ">"),
+                (">", "<="),
+                ("<", ">="),
+            ] {
+                if trimmed[i..].starts_with(op) {
+                    let lhs = trimmed[..i].trim();
+                    let rhs = trimmed[i + op.len()..].trim();
+                    if !lhs.is_empty() && !rhs.is_empty() {
+                        return Some(format!("{lhs} {negated} {rhs}"));
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn contains_top_level_logical_op(expr: &str) -> bool {
+    let bytes = expr.as_bytes();
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        match b {
+            b'"' => in_string = true,
+            b'(' => paren_depth += 1,
+            b')' => paren_depth = paren_depth.saturating_sub(1),
+            b'[' => bracket_depth += 1,
+            b']' => bracket_depth = bracket_depth.saturating_sub(1),
+            b'{' => brace_depth += 1,
+            b'}' => brace_depth = brace_depth.saturating_sub(1),
+            b'&' | b'|'
+                if i + 1 < bytes.len()
+                    && bytes[i + 1] == b
+                    && paren_depth == 0
+                    && bracket_depth == 0
+                    && brace_depth == 0 =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+fn strip_balanced_outer_parens(mut expr: &str) -> &str {
+    loop {
+        let trimmed = expr.trim();
+        if !(trimmed.starts_with('(') && trimmed.ends_with(')')) {
+            return trimmed;
+        }
+        let inner = &trimmed[1..trimmed.len() - 1];
+        if split_top_level_and(inner).len() == 1 && outer_parens_are_balanced(trimmed) {
+            expr = inner;
+        } else {
+            return trimmed;
+        }
+    }
+}
+
+fn outer_parens_are_balanced(expr: &str) -> bool {
+    let bytes = expr.as_bytes();
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (idx, b) in bytes.iter().copied().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'(' => depth += 1,
+            b')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 && idx + 1 < bytes.len() {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    depth == 0
 }
 
 fn find_next_equality_op(expr: &str, from: usize) -> Option<(usize, &'static str)> {
@@ -1054,6 +1278,107 @@ pub fn collect_full_guard_with_account_env(
     }
 }
 
+pub fn collect_guard_terms_with_account_env(
+    op: &ParsedHandler,
+    wrapping: bool,
+    account_binder: Option<&str>,
+) -> Vec<GuardTerm> {
+    let mut terms = Vec::new();
+    if let Some(ref guard) = op.guard_str {
+        let translated = translate_guard_to_rust(guard, wrapping);
+        let translated = account_binder
+            .map(|binder| rewrite_account_pubkey_refs(&translated, &op.accounts, binder))
+            .unwrap_or(translated);
+        push_split_guard_terms(&mut terms, GuardTermSource::Guard, &translated);
+    }
+    for req in &op.requires {
+        if account_binder.is_none() && mentions_handler_account_pubkey(&req.rust_expr, &op.accounts)
+        {
+            continue;
+        }
+        let translated = translate_guard_to_rust(&req.rust_expr, wrapping);
+        let translated = account_binder
+            .map(|binder| rewrite_account_pubkey_refs(&translated, &op.accounts, binder))
+            .unwrap_or(translated);
+        push_split_guard_terms(
+            &mut terms,
+            GuardTermSource::Requires {
+                error_name: req.error_name.clone(),
+            },
+            &translated,
+        );
+    }
+    terms
+}
+
+fn push_split_guard_terms(terms: &mut Vec<GuardTerm>, source: GuardTermSource, expr: &str) {
+    for term in split_top_level_and(expr) {
+        terms.push(GuardTerm {
+            source: source.clone(),
+            rust_expr: term,
+        });
+    }
+}
+
+pub fn split_top_level_and(expr: &str) -> Vec<String> {
+    let bytes = expr.as_bytes();
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        match b {
+            b'"' => in_string = true,
+            b'(' => paren_depth += 1,
+            b')' => paren_depth = paren_depth.saturating_sub(1),
+            b'[' => bracket_depth += 1,
+            b']' => bracket_depth = bracket_depth.saturating_sub(1),
+            b'{' => brace_depth += 1,
+            b'}' => brace_depth = brace_depth.saturating_sub(1),
+            b'&' if i + 1 < bytes.len()
+                && bytes[i + 1] == b'&'
+                && paren_depth == 0
+                && bracket_depth == 0
+                && brace_depth == 0 =>
+            {
+                let part = expr[start..i].trim();
+                if !part.is_empty() {
+                    parts.push(part.to_string());
+                }
+                i += 2;
+                start = i;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    let tail = expr[start..].trim();
+    if !tail.is_empty() {
+        parts.push(tail.to_string());
+    }
+    parts
+}
+
 /// True when `expr` mentions `<handler_account>.pubkey` (or `.key()`)
 /// anywhere in its body — used to suppress `requires` clauses from
 /// property-test guard collection when they reference a handler account
@@ -1545,17 +1870,36 @@ fn emit_transition_fn_inner(
     if let Some(guard_expr) =
         collect_full_guard_with_account_env(op, wrapping, account_env_struct.map(|_| "accounts"))
     {
-        let guard_expr = if rewrite_pubkey_comparisons {
-            rewrite_kani_pubkey_comparisons(&guard_expr, op, spec)
-        } else {
-            guard_expr
-        };
         if let Some(ref raw) = op.guard_str {
             out.push_str(&format!("    // guard: {}\n", raw));
         }
-        out.push_str(&format!("    if !({}) {{\n", guard_expr));
-        out.push_str("        return false;\n");
-        out.push_str("    }\n");
+
+        let guard_terms = collect_guard_terms_with_account_env(
+            op,
+            wrapping,
+            account_env_struct.map(|_| "accounts"),
+        );
+        if rewrite_pubkey_comparisons && guard_terms.len() > 8 {
+            for term in guard_terms {
+                let term_expr = rewrite_kani_pubkey_comparisons(&term.rust_expr, op, spec);
+                if let Some(negated) = negate_simple_top_level_comparison(&term_expr) {
+                    out.push_str(&format!("    if {} {{\n", negated));
+                } else {
+                    out.push_str(&format!("    if !({}) {{\n", term_expr));
+                }
+                out.push_str("        return false;\n");
+                out.push_str("    }\n");
+            }
+        } else {
+            let guard_expr = if rewrite_pubkey_comparisons {
+                rewrite_kani_pubkey_comparisons(&guard_expr, op, spec)
+            } else {
+                guard_expr
+            };
+            out.push_str(&format!("    if !({}) {{\n", guard_expr));
+            out.push_str("        return false;\n");
+            out.push_str("    }\n");
+        }
     }
 
     // Pre-status check — handlers declared `State.X -> State.Y` must reject
@@ -1932,6 +2276,115 @@ handler approve (member_index : U8) (approver : Pubkey) : State.Active -> State.
         assert_eq!(
             rewritten,
             "(pubkey_eq(&s.members[(member_index) as usize], &approver)) && (member_index < 32)"
+        );
+    }
+
+    #[test]
+    fn split_top_level_and_splits_only_balanced_top_level_terms() {
+        assert_eq!(
+            split_top_level_and("amount > 0 && fee_bps <= 100 && min_out > 0"),
+            vec!["amount > 0", "fee_bps <= 100", "min_out > 0"]
+        );
+        assert_eq!(
+            split_top_level_and("(amount > 0 && fee_bps <= 100) && min_out > 0"),
+            vec!["(amount > 0 && fee_bps <= 100)", "min_out > 0"]
+        );
+        assert_eq!(
+            split_top_level_and(
+                "is_allowed(mints[(lane) as usize] == mint && lane < 32) && amount > 0"
+            ),
+            vec![
+                "is_allowed(mints[(lane) as usize] == mint && lane < 32)",
+                "amount > 0"
+            ]
+        );
+    }
+
+    #[test]
+    fn collect_guard_terms_splits_guard_and_requires_without_nested_or_splits() {
+        let src = r#"spec T
+type State | Active of { admin_key : Pubkey, allowed : Bool }
+type Error | Unauthorized | InvalidAmount
+handler swap (amount : U64) (min_out : U64) : State.Active -> State.Active {
+  accounts { admin : signer }
+  requires admin.pubkey == state.admin_key else Unauthorized
+  requires amount >= min_out and min_out > 0 else InvalidAmount
+}
+"#;
+        let mut spec = parse_str(src).expect("parse");
+        spec.handlers[0].guard_str = Some("state.allowed && (amount > 0 || min_out > 0)".into());
+        let op = &spec.handlers[0];
+        let terms = collect_guard_terms_with_account_env(op, false, Some("accounts"));
+        let exprs = terms
+            .into_iter()
+            .map(|term| term.rust_expr)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            exprs,
+            vec![
+                "s.allowed",
+                "(amount > 0 || min_out > 0)",
+                "accounts.admin.pubkey == s.admin_key",
+                "(amount >= min_out)",
+                "(min_out > 0)",
+            ]
+        );
+    }
+
+    #[test]
+    fn rewrite_kani_bps_mul_div_uses_solver_friendly_helper() {
+        assert_eq!(
+            rewrite_kani_bps_mul_div(
+                "fee_output_normalized >= (fee_input_normalized * retained_value_bps) / 10000"
+            ),
+            "fee_output_normalized >= mul_bps_floor_u128(fee_input_normalized, retained_value_bps)"
+        );
+        assert_eq!(
+            rewrite_kani_bps_mul_div("amount_in * fee_bps / 10000 <= amount_in"),
+            "mul_bps_floor_u128(amount_in, fee_bps) <= amount_in"
+        );
+        assert_eq!(
+            rewrite_kani_bps_mul_div("(a + b) * fee_bps / 10000 <= a"),
+            "(a + b) * fee_bps / 10000 <= a"
+        );
+    }
+
+    #[test]
+    fn rewrite_kani_checked_add_equality_avoids_overflow_checks() {
+        assert_eq!(
+            rewrite_kani_guard_arithmetic("max_fee_bps + retained_value_bps == 10000"),
+            "max_fee_bps.checked_add(retained_value_bps) == Some(10000)"
+        );
+        assert_eq!(
+            rewrite_kani_guard_arithmetic(
+                "fee_output_normalized >= (fee_input_normalized * retained_value_bps) / 10000 && max_fee_bps + retained_value_bps == 10000"
+            ),
+            "fee_output_normalized >= mul_bps_floor_u128(fee_input_normalized, retained_value_bps) && max_fee_bps.checked_add(retained_value_bps) == Some(10000)"
+        );
+    }
+
+    #[test]
+    fn negate_simple_top_level_comparison_flips_only_outer_operator() {
+        assert_eq!(
+            negate_simple_top_level_comparison(
+                "fee_output_normalized >= mul_bps_floor_u128(fee_input_normalized, retained_value_bps)"
+            ),
+            Some(
+                "fee_output_normalized < mul_bps_floor_u128(fee_input_normalized, retained_value_bps)"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            negate_simple_top_level_comparison(
+                "(mul_bps_floor_u128(amount_in, fee_bps) <= amount_in)"
+            ),
+            Some("mul_bps_floor_u128(amount_in, fee_bps) > amount_in".to_string())
+        );
+        assert_eq!(
+            negate_simple_top_level_comparison(
+                "pubkey_eq(&accounts.input_mint.pubkey, &s.allowed_mint_0) || amount > 0"
+            ),
+            None
         );
     }
 

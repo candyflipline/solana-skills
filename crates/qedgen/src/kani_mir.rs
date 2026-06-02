@@ -310,6 +310,20 @@ fn mul_div_ceil_u128(a: u128, b: u128, d: u128) -> u128 {\n\
 }\n\n",
         );
     }
+
+    if crate::rust_codegen_util::spec_uses_kani_bps_mul_div_helper(parsed) {
+        out.push_str(
+            "#[allow(dead_code)]\n\
+#[inline]\n\
+fn mul_bps_floor_u128(a: u128, bps: u128) -> u128 {\n\
+    if bps > 10000 { return u128::MAX; }\n\
+    let b = (bps as u16) as u128;\n\
+    let q = a / 10000;\n\
+    let r = a % 10000;\n\
+    q.wrapping_mul(b).wrapping_add(r.wrapping_mul(b) / 10000)\n\
+}\n\n",
+        );
+    }
 }
 
 /// State model header banner. Always emitted, even when the spec
@@ -591,7 +605,8 @@ fn transition_call_args(op: &crate::check::ParsedHandler, account_var: Option<&s
 /// `kani::emit_kani_account_section` lines ~493–568 (single-account
 /// path; multi-account `mod <name>` wrapping is Phase 3e).
 ///
-/// One harness per handler:
+/// One monolithic harness per handler up to the split threshold, then one
+/// harness per guard term:
 ///   * Initialize state symbolically (`emit_state_init_symbolic`)
 ///   * `kani::assume(s.status == Status::<pre>)` if the handler is
 ///     lifecycle-gated
@@ -600,8 +615,9 @@ fn transition_call_args(op: &crate::check::ParsedHandler, account_var: Option<&s
 ///     is violated
 ///   * `assert!(!<handler>(&mut s, args...))` — handler must reject
 fn emit_guard_enforcement_harnesses(out: &mut String, parsed: &ParsedSpec) -> Result<()> {
-    use crate::codegen_shared::map_type;
     use crate::rust_codegen_util as util;
+
+    const GUARD_REJECTION_SPLIT_THRESHOLD: usize = 8;
 
     // Resolve view — same logic as `emit_account_section_structural`.
     let (state_fields, lifecycle): (&[(String, String)], &[String]) =
@@ -639,67 +655,187 @@ fn emit_guard_enforcement_harnesses(out: &mut String, parsed: &ParsedSpec) -> Re
     );
 
     for op in &guard_ops {
-        let Some(full_guard) = util::collect_full_guard_with_account_env(
+        let guard_terms = util::collect_guard_terms_with_account_env(
             op,
             false,
             util::handler_needs_account_env(op).then_some("accounts"),
-        ) else {
+        );
+        if guard_terms.is_empty() {
             // Handler had `has_guard()` set but no expressible
             // negation — skip to avoid `kani::assume(!(true))`
             // vacuous harnesses (matches legacy kani.rs:515–519).
             continue;
-        };
-
-        out.push_str("#[kani::proof]\n");
-        out.push_str("#[kani::unwind(2)]\n");
-        out.push_str("#[kani::solver(cadical)]\n");
-        out.push_str(&format!("fn verify_{}_rejects_invalid() {{\n", op.name));
-
-        util::emit_state_init_symbolic(out, &mutable, lifecycle);
-        util::emit_pre_status_assume(out, op, lifecycle);
-
-        // Symbolic params.
-        for (pname, ptype) in &op.takes_params {
-            out.push_str(&format!(
-                "    let {}: {} = kani::any();\n",
-                pname,
-                map_type(ptype, parsed)?
-            ));
         }
 
-        // v2.29 Slice A (#8) — abstract binders. Legacy kani.rs:537–546
-        // calls `emit_abstract_binders` TWICE in a row with identical
-        // args (looks like a copy-paste accident; surfaces only for
-        // specs that declare abstract binders, where it would emit
-        // duplicate `let X: T = kani::any();` lines). Per
-        // [[feedback-cleanup-v3]] preserve the bug here for byte-
-        // equivalence; cleanup deferred to v3.0 alongside the legacy.
-        util::emit_abstract_binders(out, op, "    ", "kani::any()", |t| map_type(t, parsed))?;
-        util::emit_abstract_binders(out, op, "    ", "kani::any()", |t| map_type(t, parsed))?;
+        if guard_terms.len() <= GUARD_REJECTION_SPLIT_THRESHOLD {
+            let full_guard = util::collect_full_guard_with_account_env(
+                op,
+                false,
+                util::handler_needs_account_env(op).then_some("accounts"),
+            )
+            .expect("guard terms came from an expressible full guard");
+            let full_guard = util::rewrite_kani_pubkey_comparisons(&full_guard, op, parsed);
+            emit_guard_rejection_harness(
+                out,
+                parsed,
+                op,
+                &mutable,
+                lifecycle,
+                &format!("verify_{}_rejects_invalid", op.name),
+                &[],
+                &full_guard,
+                &format!("{} must reject when guard is violated", op.name),
+                false,
+            )?;
+        } else {
+            for (idx, term) in guard_terms.iter().enumerate() {
+                let term_expr = util::rewrite_kani_pubkey_comparisons(&term.rust_expr, op, parsed);
+                let prefix_terms = guard_terms[..idx]
+                    .iter()
+                    .map(|prefix| {
+                        util::rewrite_kani_pubkey_comparisons(&prefix.rust_expr, op, parsed)
+                    })
+                    .collect::<Vec<_>>();
+                let slug = guard_term_slug(&term_expr);
+                emit_guard_rejection_harness(
+                    out,
+                    parsed,
+                    op,
+                    &mutable,
+                    lifecycle,
+                    &format!("verify_{}_rejects_invalid_{}_{}", op.name, idx + 1, slug),
+                    &prefix_terms,
+                    &term_expr,
+                    &format!("{} must reject when guard term is violated", op.name),
+                    true,
+                )?;
+            }
+        }
+    }
 
-        emit_kani_account_env_binding(out, op, "accounts", "    ");
-        let full_guard = util::collect_full_guard_with_account_env(
-            op,
-            false,
-            util::handler_needs_account_env(op).then_some("accounts"),
-        )
-        .unwrap_or(full_guard);
-        let full_guard = util::rewrite_kani_pubkey_comparisons(&full_guard, op, parsed);
-        out.push_str(&format!("    kani::assume(!({full_guard}));\n"));
+    Ok(())
+}
+
+fn emit_guard_rejection_harness(
+    out: &mut String,
+    parsed: &ParsedSpec,
+    op: &crate::check::ParsedHandler,
+    mutable: &[&(String, String)],
+    lifecycle: &[String],
+    harness_name: &str,
+    prefix_terms: &[String],
+    violated_expr: &str,
+    assert_message: &str,
+    direct_negated_assume: bool,
+) -> Result<()> {
+    use crate::codegen_shared::map_type;
+    use crate::rust_codegen_util as util;
+
+    out.push_str("#[kani::proof]\n");
+    out.push_str("#[kani::unwind(2)]\n");
+    out.push_str("#[kani::solver(cadical)]\n");
+    out.push_str(&format!("fn {harness_name}() {{\n"));
+
+    util::emit_state_init_symbolic(out, mutable, lifecycle);
+    util::emit_pre_status_assume(out, op, lifecycle);
+
+    for (pname, ptype) in &op.takes_params {
+        out.push_str(&format!(
+            "    let {}: {} = kani::any();\n",
+            pname,
+            map_type(ptype, parsed)?
+        ));
+    }
+
+    // v2.29 Slice A (#8) — abstract binders. Legacy kani.rs:537–546
+    // calls `emit_abstract_binders` TWICE in a row with identical args.
+    // Preserve that parity here; cleanup stays deferred to v3.0.
+    util::emit_abstract_binders(out, op, "    ", "kani::any()", |t| map_type(t, parsed))?;
+    util::emit_abstract_binders(out, op, "    ", "kani::any()", |t| map_type(t, parsed))?;
+
+    emit_kani_account_env_binding(out, op, "accounts", "    ");
+    let mut helper_binding_counter = 0usize;
+    for prefix in prefix_terms {
+        let (prefix, bindings) = bind_kani_bps_floor_calls(prefix, &mut helper_binding_counter);
+        for binding in bindings {
+            out.push_str(&format!("    {binding}\n"));
+        }
+        out.push_str(&format!("    kani::assume({prefix});\n"));
+    }
+    let (violated_expr, bindings) =
+        bind_kani_bps_floor_calls(violated_expr, &mut helper_binding_counter);
+    for binding in bindings {
+        out.push_str(&format!("    {binding}\n"));
+    }
+    if direct_negated_assume {
+        if let Some(negated) = util::negate_simple_top_level_comparison(&violated_expr) {
+            out.push_str(&format!("    kani::assume({negated});\n"));
+        } else {
+            out.push_str(&format!("    kani::assume(!({violated_expr}));\n"));
+        }
+        out.push_str(&format!("    assert!(!({violated_expr}),\n"));
+        out.push_str(&format!(
+            "        \"{} guard term must be false when violated\");\n",
+            op.name
+        ));
+    } else {
+        out.push_str(&format!("    kani::assume(!({violated_expr}));\n"));
 
         let args = transition_call_args(
             op,
             util::handler_needs_account_env(op).then_some("accounts"),
         );
         out.push_str(&format!("    assert!(!{}(&mut s{}),\n", op.name, args));
-        out.push_str(&format!(
-            "        \"{} must reject when guard is violated\");\n",
-            op.name
-        ));
-        out.push_str("}\n\n");
+        out.push_str(&format!("        \"{assert_message}\");\n"));
     }
+    out.push_str("}\n\n");
 
     Ok(())
+}
+
+fn bind_kani_bps_floor_calls(expr: &str, counter: &mut usize) -> (String, Vec<String>) {
+    let helper_call = regex::Regex::new(
+        r"mul_bps_floor_u128\((?P<a>[A-Za-z_][A-Za-z0-9_\.]*),\s*(?P<b>[A-Za-z_][A-Za-z0-9_\.]*)\)",
+    )
+    .expect("valid mul_bps_floor_u128 call regex");
+    let mut rewritten = String::with_capacity(expr.len());
+    let mut bindings = Vec::new();
+    let mut cursor = 0usize;
+
+    for captures in helper_call.captures_iter(expr) {
+        let Some(call) = captures.get(0) else {
+            continue;
+        };
+        rewritten.push_str(&expr[cursor..call.start()]);
+        *counter += 1;
+        let binding_name = format!("__qed_bps_floor_{counter}");
+        let a = captures.name("a").expect("a capture").as_str();
+        let b = captures.name("b").expect("b capture").as_str();
+        bindings.push(format!(
+            "let {binding_name} = mul_bps_floor_u128({a}, {b});"
+        ));
+        rewritten.push_str(&binding_name);
+        cursor = call.end();
+    }
+
+    rewritten.push_str(&expr[cursor..]);
+    (rewritten, bindings)
+}
+
+fn guard_term_slug(expr: &str) -> String {
+    let mut slug = crate::codegen_shared::sanitize_ident(expr)
+        .trim_matches('_')
+        .to_ascii_lowercase();
+    const MAX_SLUG_LEN: usize = 56;
+    if slug.len() > MAX_SLUG_LEN {
+        slug.truncate(MAX_SLUG_LEN);
+        slug = slug.trim_end_matches('_').to_string();
+    }
+    if slug.is_empty() {
+        "term".to_string()
+    } else {
+        slug
+    }
 }
 
 // ----------------------------------------------------------------------
@@ -2239,6 +2375,54 @@ mod tests {
         assert!(
             out.contains("\"initialize must reject when guard is violated\""),
             "expected assert message"
+        );
+    }
+
+    #[test]
+    fn render_splits_large_guard_rejection_harnesses() {
+        let (mir, parsed) = lower_fixture("examples/rust/kani-cpi-account-bindings/config.qedspec");
+        let out = render(&mir, &parsed);
+        assert!(
+            !out.contains("fn verify_loyal_swap_large_guard_rejects_invalid()"),
+            "large guard should omit the monolithic rejects_invalid harness"
+        );
+        assert!(
+            out.contains("fn verify_loyal_swap_large_guard_rejects_invalid_1_pubkey_eq_accounts_admin_pubkey_s_admin_key()"),
+            "expected deterministic pubkey split harness name:\n{out}"
+        );
+        assert!(
+            out.contains("fn verify_loyal_swap_large_guard_rejects_invalid_8_mul_bps_floor_u128_amount_in_fee_bps_amount_in()"),
+            "expected deterministic fee arithmetic split harness name:\n{out}"
+        );
+        assert!(
+            out.contains("kani::assume(!(pubkey_eq(&accounts.admin.pubkey, &s.admin_key)));"),
+            "split term should be individually negated after pubkey rewrite:\n{out}"
+        );
+        assert!(
+            out.contains("let __qed_bps_floor_1 = mul_bps_floor_u128(amount_in, fee_bps);\n    kani::assume(__qed_bps_floor_1 > amount_in);"),
+            "split term should bind and negate fee arithmetic by itself:\n{out}"
+        );
+        assert!(
+            out.contains(
+                "assert!(!(__qed_bps_floor_1 <= amount_in),\n        \"loyal_swap_large_guard guard term must be false when violated\");"
+            ),
+            "split term should prove the violated guard term directly:\n{out}"
+        );
+        assert!(
+            out.contains("kani::assume(pubkey_eq(&accounts.admin.pubkey, &s.admin_key));\n    kani::assume(amount_in > 0);"),
+            "later split terms should assume earlier terms true, partitioning by first failed guard:\n{out}"
+        );
+    }
+
+    #[test]
+    fn guard_term_slug_is_deterministic_and_sanitized() {
+        assert_eq!(
+            guard_term_slug("pubkey_eq(&accounts.admin.pubkey, &s.admin_key)"),
+            "pubkey_eq_accounts_admin_pubkey_s_admin_key"
+        );
+        assert_eq!(
+            guard_term_slug("mul_bps_floor_u128(amount_in, fee_bps) <= amount_in"),
+            "mul_bps_floor_u128_amount_in_fee_bps_amount_in"
         );
     }
 
