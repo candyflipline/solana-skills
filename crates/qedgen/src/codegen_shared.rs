@@ -1921,6 +1921,14 @@ fn find_state_account_filtered(
 /// `solana_program::program::invoke` builder.
 const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 
+/// Canonical System Program ID (all-ones base58 → the all-zero pubkey).
+/// Calls into the bundled `System` interface (`import System from "system"`)
+/// match this constant and get the `pinocchio_system::instructions::*` CPI
+/// shape on the Pinocchio target. The System Program is a native built-in,
+/// so unlike SPL Token there is no deployed binary to hash — the upstream
+/// pin's `binary_hash` stays all-zero (see `data/interfaces/system.qedspec`).
+const SYSTEM_PROGRAM_ID: &str = "11111111111111111111111111111111";
+
 /// Try to emit a real Anchor CPI invocation for one `call Interface.handler(...)`
 /// site. Returns `None` when the interface isn't recognized OR when the
 /// target framework isn't Anchor (caller falls back to a comment +
@@ -1957,16 +1965,23 @@ fn try_emit_cpi(
         .iter()
         .find(|i| i.name == call.target_interface)?;
     let is_spl_token = iface.program_id.as_deref() == Some(SPL_TOKEN_PROGRAM_ID);
+    let is_system = iface.program_id.as_deref() == Some(SYSTEM_PROGRAM_ID);
 
-    match (target, is_spl_token) {
-        (Target::Anchor, true) => emit_spl_token_cpi_anchor(call, handler, spec),
-        (Target::Anchor, false) => emit_generic_cpi_anchor(call, handler, iface, spec),
-        (Target::Quasar, true) => emit_spl_token_cpi_quasar(call, handler, spec),
-        // Quasar generic CPI — follow-on slice (uses `BufCpiCall`).
-        (Target::Quasar, false) => None,
-        (Target::Pinocchio, true) => emit_spl_token_cpi_pinocchio(call, handler, spec),
-        // Pinocchio generic CPI — follow-on slice (raw invoke_signed).
-        (Target::Pinocchio, false) => None,
+    match (target, is_spl_token, is_system) {
+        (Target::Anchor, true, _) => emit_spl_token_cpi_anchor(call, handler, spec),
+        // System Program on Anchor keeps the existing generic invoke shape
+        // (idiomatic `anchor_lang::system_program::*` is a follow-on); the
+        // mechanized win this slice targets is Pinocchio, where System
+        // calls previously fell through to a `todo!()` breadcrumb.
+        (Target::Anchor, false, _) => emit_generic_cpi_anchor(call, handler, iface, spec),
+        (Target::Quasar, true, _) => emit_spl_token_cpi_quasar(call, handler, spec),
+        // Quasar generic / System CPI — follow-on slice (uses `BufCpiCall`).
+        (Target::Quasar, false, _) => None,
+        (Target::Pinocchio, true, _) => emit_spl_token_cpi_pinocchio(call, handler, spec),
+        (Target::Pinocchio, false, true) => emit_system_cpi_pinocchio(call, handler, spec),
+        // Pinocchio generic (non-SPL, non-System) CPI — follow-on slice
+        // (raw invoke_signed).
+        (Target::Pinocchio, false, false) => None,
     }
 }
 
@@ -2635,6 +2650,88 @@ fn emit_spl_pinocchio(
         let rhs = resolve_call_arg_for_amount(&arg.rust_expr, handler, spec);
         let pad = " ".repeat(max_field - name.len());
         out.push_str(&format!("            {}:{} {},\n", name, pad, rhs));
+    }
+    out.push_str("        }.invoke()?;\n");
+    Some(out)
+}
+
+/// Dispatch a `call System.<handler>(...)` site to its
+/// `pinocchio_system::instructions::*` shape. Only `transfer` is
+/// mechanized this slice — it covers the lamport-movement path that the
+/// generic CPI breadcrumb previously left as a `todo!()` on Pinocchio
+/// (the System Program's lamport `Transfer` is the code class behind the
+/// over-funded-PDA / lamport-transfer-DoS findings the bench corpus
+/// surfaced). `create_account` and `assign` take a `&Pubkey` `owner`,
+/// whose resolution from a spec `Pubkey` arg (e.g. the program's own ID)
+/// is a follow-on; they return `None` so the caller keeps the existing
+/// breadcrumb rather than emit code that may not type-check.
+fn emit_system_cpi_pinocchio(
+    call: &crate::check::ParsedCall,
+    handler: &ParsedHandler,
+    spec: &ParsedSpec,
+) -> Option<String> {
+    match call.target_handler.as_str() {
+        "transfer" => emit_system_pinocchio(
+            call,
+            handler,
+            spec,
+            "Transfer",
+            // (pinocchio_system struct field, spec call-site arg)
+            &[("from", "from"), ("to", "to")],
+            &[("lamports", "amount")],
+        ),
+        // create_account / assign: see doc comment — `owner: &Pubkey`
+        // resolution is a follow-on.
+        _ => None,
+    }
+}
+
+/// Emit one `pinocchio_system::instructions::<Struct> { … }.invoke()?;`
+/// CPI for a `call System.<handler>(...)` site. Mirrors
+/// `emit_spl_pinocchio` but targets the System Program crate and lets the
+/// struct field name differ from the call-site arg name (System's
+/// `Transfer.lamports` binds the spec's `amount` arg).
+///
+/// `account_fields` map `pinocchio_system` struct fields holding
+/// `&AccountInfo` to call args (emitted as `self.<arg>`); `scalar_fields`
+/// map `u64` struct fields to call args (resolved through
+/// `resolve_call_arg_for_amount`, the same path the SPL scalar uses).
+fn emit_system_pinocchio(
+    call: &crate::check::ParsedCall,
+    handler: &ParsedHandler,
+    spec: &ParsedSpec,
+    struct_name: &str,
+    account_fields: &[(&str, &str)],
+    scalar_fields: &[(&str, &str)],
+) -> Option<String> {
+    let max_field = account_fields
+        .iter()
+        .chain(scalar_fields.iter())
+        .map(|(f, _)| f.len())
+        .max()
+        .unwrap_or(0);
+
+    let mut out = String::new();
+    out.push_str("        pinocchio_system::instructions::");
+    out.push_str(struct_name);
+    out.push_str(" {\n");
+    for (struct_field, call_arg) in account_fields {
+        let arg = call.args.iter().find(|a| a.name == *call_arg)?;
+        let pad = " ".repeat(max_field - struct_field.len());
+        // `pinocchio_system` CPI structs take `&AccountInfo` fields and the
+        // generated Pinocchio handler stores each account as
+        // `&'a AccountInfo`, so `self.<acct>` is already the right type
+        // (a leading `&` would yield `&&AccountInfo`).
+        out.push_str(&format!(
+            "            {}:{} self.{},\n",
+            struct_field, pad, arg.rust_expr
+        ));
+    }
+    for (struct_field, call_arg) in scalar_fields {
+        let arg = call.args.iter().find(|a| a.name == *call_arg)?;
+        let rhs = resolve_call_arg_for_amount(&arg.rust_expr, handler, spec);
+        let pad = " ".repeat(max_field - struct_field.len());
+        out.push_str(&format!("            {}:{} {},\n", struct_field, pad, rhs));
     }
     out.push_str("        }.invoke()?;\n");
     Some(out)
@@ -6387,6 +6484,133 @@ handler do_init : State.Active -> State.Active {
         assert!(
             !rendered.contains(".transfer("),
             "Pinocchio is struct-construction, not method chain; got:\n{rendered}"
+        );
+    }
+
+    /// Pinocchio System Program `transfer` CPI. `call System.transfer(...)`
+    /// must lower to `pinocchio_system::instructions::Transfer { from, to,
+    /// lamports }.invoke()?` — the spec's `amount` arg binds the struct's
+    /// `lamports` field. Before this slice, System calls fell through to a
+    /// `todo!()` breadcrumb on Pinocchio (only SPL Token was mechanized).
+    #[test]
+    fn cpi_emits_pinocchio_system_transfer() {
+        let spec = crate::chumsky_adapter::parse_str(
+            r#"spec Caller
+program_id "11111111111111111111111111111111"
+
+interface System {
+  program_id "11111111111111111111111111111111"
+  handler transfer (amount : U64) {
+    discriminant "0x02000000"
+    accounts {
+      from : signer, writable
+      to   : writable
+    }
+    requires amount > 0
+  }
+}
+
+type State | Active of { balance : U64 }
+type Error | E
+
+handler topup (n : U64) : State.Active -> State.Active {
+  permissionless
+  accounts {
+    state          : writable
+    payer          : signer, writable
+    pda            : writable
+    system_program : program
+  }
+  call System.transfer(from = payer, to = pda, amount = n)
+}
+"#,
+        )
+        .unwrap();
+        let handler = spec.handlers.iter().find(|h| h.name == "topup").unwrap();
+        let call = handler.calls.first().unwrap();
+        let rendered = try_emit_cpi(call, handler, &spec, Target::Pinocchio)
+            .expect("Pinocchio System transfer must emit");
+        assert!(
+            rendered.contains("pinocchio_system::instructions::Transfer {"),
+            "must construct the qualified System Transfer struct; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("from:") && rendered.contains("self.payer"),
+            "from field must resolve to self.payer; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("to:") && rendered.contains("self.pda"),
+            "to field must resolve to self.pda; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("lamports:"),
+            "the spec `amount` arg must bind the `lamports` struct field; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("amount:"),
+            "System Transfer has no `amount` field — it is `lamports`; got:\n{rendered}"
+        );
+        // Struct fields are `&AccountInfo`; no `&self.` double-ref.
+        assert!(
+            !rendered.contains("&self."),
+            "Pinocchio CPI passes `self.<acct>`, not `&self.<acct>`; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("}.invoke()?;"),
+            "must terminate with .invoke()?; got:\n{rendered}"
+        );
+        // Anti-regression: no SPL-token / Anchor / Quasar shape leakage.
+        assert!(
+            !rendered.contains("pinocchio_token")
+                && !rendered.contains("anchor")
+                && !rendered.contains("CpiContext"),
+            "System emission must not leak token / Anchor shape; got:\n{rendered}"
+        );
+    }
+
+    /// System `create_account` / `assign` are not mechanized this slice
+    /// (their `owner: &Pubkey` resolution from a spec `Pubkey` arg is a
+    /// follow-on). `try_emit_cpi` must return `None` so the caller keeps
+    /// the breadcrumb rather than emit code that may not type-check.
+    #[test]
+    fn cpi_pinocchio_system_create_account_is_breadcrumb() {
+        let spec = crate::chumsky_adapter::parse_str(
+            r#"spec Caller
+program_id "11111111111111111111111111111111"
+
+interface System {
+  program_id "11111111111111111111111111111111"
+  handler create_account (lamports : U64) (space : U64) (owner : Pubkey) {
+    discriminant "0x00000000"
+    accounts {
+      payer       : signer, writable
+      new_account : signer, writable
+    }
+    requires lamports > 0
+  }
+}
+
+type State | Active of { balance : U64 }
+type Error | E
+
+handler make (l : U64) (s : U64) (o : Pubkey) : State.Active -> State.Active {
+  permissionless
+  accounts {
+    state          : writable
+    payer          : signer, writable
+    pda            : signer, writable
+    system_program : program
+  }
+  call System.create_account(payer = payer, new_account = pda, lamports = l, space = s, owner = o)
+}
+"#,
+        )
+        .unwrap();
+        let handler = spec.handlers.iter().find(|h| h.name == "make").unwrap();
+        let call = handler.calls.first().unwrap();
+        assert!(
+            try_emit_cpi(call, handler, &spec, Target::Pinocchio).is_none(),
+            "create_account must stay a breadcrumb (None) this slice"
         );
     }
 
