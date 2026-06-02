@@ -8,9 +8,11 @@
 //! teaching the Kani backend about any specific program.
 
 use anyhow::Result;
+use quote::ToTokens;
 use regex::Regex;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use syn::{Expr, Item, ItemFn, Pat, Stmt};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PinocchioProofProfile {
@@ -364,52 +366,91 @@ fn infer_single_src_dir(src_dir: &Path, include_siblings: bool) -> Result<Pinocc
         let Ok(source) = std::fs::read_to_string(&path) else {
             continue;
         };
-        for (name, body) in process_fn_bodies(&source) {
-            let entry = handlers
-                .entry(name.clone())
-                .or_insert_with(|| PinocchioHandlerProfile {
-                    name,
-                    instruction_tag: None,
-                    accounts: Vec::new(),
-                    account_roles: BTreeMap::new(),
-                    token_account_bindings: BTreeMap::new(),
-                    account_key_derivations: BTreeMap::new(),
-                    source_expr_aliases: BTreeMap::new(),
-                    params: Vec::new(),
-                    repeats: Vec::new(),
-                });
-            if entry.accounts.is_empty() {
-                entry.accounts = infer_accounts(&body);
+        if let Ok(syntax) = syn::parse_file(&source) {
+            let fns = collect_item_fns(&syntax.items);
+            for item_fn in &fns {
+                let Some(name) = process_handler_name(item_fn) else {
+                    continue;
+                };
+                let entry = handlers
+                    .entry(name.clone())
+                    .or_insert_with(|| empty_handler_profile(name));
+                if entry.accounts.is_empty() {
+                    entry.accounts = infer_accounts_from_block(&item_fn.block);
+                }
+                let role_accounts = if entry.accounts.is_empty() {
+                    infer_accounts_from_block(&item_fn.block)
+                } else {
+                    entry.accounts.clone()
+                };
+                for (account, role) in
+                    infer_account_roles_from_block(&item_fn.block, &role_accounts)
+                {
+                    entry.account_roles.entry(account).or_default().merge(role);
+                }
+                let key_account_aliases = infer_key_account_aliases_from_block(&item_fn.block);
+                let local_key_derivations = infer_local_key_derivations_from_block(&item_fn.block);
+                for (account, binding) in infer_token_account_bindings_from_block(
+                    &item_fn.block,
+                    &key_account_aliases,
+                    &local_key_derivations,
+                ) {
+                    entry.token_account_bindings.insert(account, binding);
+                }
+                for (account, derivation) in
+                    infer_account_key_derivations_from_block(&item_fn.block, &local_key_derivations)
+                {
+                    entry.account_key_derivations.insert(account, derivation);
+                }
+                for (expr, alias) in infer_source_expr_aliases_from_block(&item_fn.block) {
+                    entry.source_expr_aliases.insert(expr, alias);
+                }
+                if entry.params.is_empty() {
+                    entry.params = infer_params_from_block(&item_fn.block);
+                }
             }
-            let role_accounts = if entry.accounts.is_empty() {
-                infer_accounts(&body)
-            } else {
-                entry.accounts.clone()
-            };
-            for (account, role) in infer_account_roles(&body, &role_accounts) {
-                entry.account_roles.entry(account).or_default().merge(role);
+            infer_dispatch_tags_from_items(&syntax.items, &mut handlers);
+            infer_pda_derivations_from_fns(&fns, &mut pda_derivations);
+        } else {
+            for (name, body) in process_fn_bodies(&source) {
+                let entry = handlers
+                    .entry(name.clone())
+                    .or_insert_with(|| empty_handler_profile(name));
+                if entry.accounts.is_empty() {
+                    entry.accounts = infer_accounts(&body);
+                }
+                let role_accounts = if entry.accounts.is_empty() {
+                    infer_accounts(&body)
+                } else {
+                    entry.accounts.clone()
+                };
+                for (account, role) in infer_account_roles(&body, &role_accounts) {
+                    entry.account_roles.entry(account).or_default().merge(role);
+                }
+                let key_account_aliases = infer_key_account_aliases(&body);
+                let local_key_derivations = infer_local_key_derivations(&body);
+                for (account, binding) in infer_token_account_bindings(
+                    &body,
+                    &key_account_aliases,
+                    &local_key_derivations,
+                ) {
+                    entry.token_account_bindings.insert(account, binding);
+                }
+                for (account, derivation) in
+                    infer_account_key_derivations(&body, &local_key_derivations)
+                {
+                    entry.account_key_derivations.insert(account, derivation);
+                }
+                for (expr, alias) in infer_source_expr_aliases(&body) {
+                    entry.source_expr_aliases.insert(expr, alias);
+                }
+                if entry.params.is_empty() {
+                    entry.params = infer_params(&body);
+                }
             }
-            let key_account_aliases = infer_key_account_aliases(&body);
-            let local_key_derivations = infer_local_key_derivations(&body);
-            for (account, binding) in
-                infer_token_account_bindings(&body, &key_account_aliases, &local_key_derivations)
-            {
-                entry.token_account_bindings.insert(account, binding);
-            }
-            for (account, derivation) in
-                infer_account_key_derivations(&body, &local_key_derivations)
-            {
-                entry.account_key_derivations.insert(account, derivation);
-            }
-            for (expr, alias) in infer_source_expr_aliases(&body) {
-                entry.source_expr_aliases.insert(expr, alias);
-            }
-            if entry.params.is_empty() {
-                entry.params = infer_params(&body);
-            }
+            infer_dispatch_tags(&source, &mut handlers);
+            infer_pda_derivations(&source, &mut pda_derivations);
         }
-        infer_dispatch_tags(&source, &mut handlers);
-        infer_pda_derivations(&source, &mut pda_derivations);
     }
 
     let mut profile = PinocchioProofProfile {
@@ -422,6 +463,20 @@ fn infer_single_src_dir(src_dir: &Path, include_siblings: bool) -> Result<Pinocc
         profile.merge_abi_schema(schema);
     }
     Ok(profile)
+}
+
+fn empty_handler_profile(name: String) -> PinocchioHandlerProfile {
+    PinocchioHandlerProfile {
+        name,
+        instruction_tag: None,
+        accounts: Vec::new(),
+        account_roles: BTreeMap::new(),
+        token_account_bindings: BTreeMap::new(),
+        account_key_derivations: BTreeMap::new(),
+        source_expr_aliases: BTreeMap::new(),
+        params: Vec::new(),
+        repeats: Vec::new(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -858,6 +913,906 @@ fn collect_rust_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn collect_item_fns(items: &[Item]) -> Vec<&ItemFn> {
+    let mut out = Vec::new();
+    for item in items {
+        match item {
+            Item::Fn(item_fn) => out.push(item_fn),
+            Item::Mod(item_mod) => {
+                if let Some((_brace, items)) = &item_mod.content {
+                    out.extend(collect_item_fns(items));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn process_handler_name(item_fn: &ItemFn) -> Option<String> {
+    let name = item_fn.sig.ident.to_string();
+    name.strip_prefix("process_")
+        .filter(|handler| *handler != "instruction")
+        .map(ToOwned::to_owned)
+}
+
+fn infer_accounts_from_block(block: &syn::Block) -> Vec<String> {
+    let mut accounts = Vec::new();
+    collect_accounts_from_stmts(&block.stmts, &mut accounts);
+    accounts
+}
+
+fn collect_accounts_from_stmts(stmts: &[Stmt], accounts: &mut Vec<String>) {
+    for stmt in stmts {
+        if let Stmt::Local(local) = stmt {
+            if let Some(from_destructure) = accounts_from_destructure_pat(&local.pat) {
+                if !from_destructure.is_empty() {
+                    *accounts = from_destructure;
+                    return;
+                }
+            }
+            if local_init_calls(&local.init, "next_account_info") {
+                if let Some(name) = simple_pat_ident(&local.pat) {
+                    accounts.push(name);
+                }
+            }
+        }
+        if let Some(expr) = stmt_expr(stmt) {
+            collect_accounts_from_expr(expr, accounts);
+        }
+    }
+}
+
+fn collect_accounts_from_expr(expr: &Expr, accounts: &mut Vec<String>) {
+    match expr {
+        Expr::Block(block) => collect_accounts_from_stmts(&block.block.stmts, accounts),
+        Expr::If(expr_if) => {
+            collect_accounts_from_stmts(&expr_if.then_branch.stmts, accounts);
+            if let Some((_else, else_expr)) = &expr_if.else_branch {
+                collect_accounts_from_expr(else_expr, accounts);
+            }
+        }
+        Expr::Match(expr_match) => {
+            for arm in &expr_match.arms {
+                collect_accounts_from_expr(&arm.body, accounts);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn accounts_from_destructure_pat(pat: &Pat) -> Option<Vec<String>> {
+    let Pat::Slice(slice) = pat else {
+        return None;
+    };
+    let mut accounts = Vec::new();
+    for elem in &slice.elems {
+        match elem {
+            Pat::Ident(ident) => accounts.push(normalize_schema_name(&ident.ident.to_string())),
+            Pat::Rest(_) => break,
+            _ => return None,
+        }
+    }
+    Some(accounts)
+}
+
+fn infer_account_roles_from_block(
+    block: &syn::Block,
+    accounts: &[String],
+) -> BTreeMap<String, PinocchioAccountRole> {
+    let mut roles = BTreeMap::<String, PinocchioAccountRole>::new();
+    walk_exprs_in_stmts(&block.stmts, &mut |expr| {
+        infer_role_from_expr(expr, accounts, &mut roles);
+    });
+    roles.retain(|_, role| !role.is_empty());
+    roles
+}
+
+fn infer_role_from_expr(
+    expr: &Expr,
+    accounts: &[String],
+    roles: &mut BTreeMap<String, PinocchioAccountRole>,
+) {
+    match expr {
+        Expr::MethodCall(call) => {
+            let receiver = normalize_expr_tokens(&call.receiver);
+            let account = normalize_schema_name(&receiver);
+            if accounts.iter().any(|candidate| candidate == &account) {
+                let role = roles.entry(account).or_default();
+                match call.method.to_string().as_str() {
+                    "is_signer" => role.is_signer = Some(true),
+                    "is_writable" => role.is_writable = Some(true),
+                    "is_executable" | "executable" => role.is_program = Some(true),
+                    _ => {}
+                }
+            }
+        }
+        Expr::Call(call) => {
+            let Some(fn_name) = call_name(&call.func) else {
+                return;
+            };
+            let args: Vec<_> = call.args.iter().collect();
+            match fn_name.as_str() {
+                "require_key" if args.len() >= 2 => {
+                    if let Some(account) = expr_ident(args[0]) {
+                        if accounts.iter().any(|candidate| candidate == &account)
+                            && expr_mentions_token_program(args[1])
+                        {
+                            let role = roles.entry(account).or_default();
+                            role.is_program = Some(true);
+                            role.account_type = Some("token".to_string());
+                        }
+                    }
+                }
+                "read_mint_decimals" | "from_mint_account" => {
+                    if let Some(account) = args.first().and_then(|arg| expr_ident(arg)) {
+                        let role = roles.entry(account).or_default();
+                        role.account_type = Some("mint".to_string());
+                    }
+                }
+                "require_token_account" | "read_token_amount" | "write_token_amount" => {
+                    if let Some(account) = args.first().and_then(|arg| expr_ident(arg)) {
+                        let role = roles.entry(account).or_default();
+                        role.account_type = Some("token".to_string());
+                    }
+                }
+                "from_account_info" => {
+                    if let Some(account) = args.first().and_then(|arg| expr_ident(arg)) {
+                        let rendered = normalize_expr_tokens(expr);
+                        let role = roles.entry(account).or_default();
+                        if rendered.contains("Mint") {
+                            role.account_type = Some("mint".to_string());
+                        } else if rendered.contains("TokenAccount") {
+                            role.account_type = Some("token".to_string());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+}
+
+fn infer_key_account_aliases_from_block(block: &syn::Block) -> BTreeMap<String, String> {
+    let mut aliases = BTreeMap::new();
+    walk_exprs_in_stmts(&block.stmts, &mut |expr| {
+        if let Expr::Call(call) = expr {
+            if call_name(&call.func).as_deref() == Some("require_key") && call.args.len() == 2 {
+                let args: Vec<_> = call.args.iter().collect();
+                if let (Some(account), Some(key)) = (expr_ident(args[0]), expr_ref_ident(args[1])) {
+                    aliases.insert(normalize_schema_name(&key), normalize_schema_name(&account));
+                }
+            }
+        }
+    });
+    aliases
+}
+
+fn infer_local_key_derivations_from_block(
+    block: &syn::Block,
+) -> BTreeMap<String, PinocchioLocalKeyDerivation> {
+    let mut derivations = BTreeMap::new();
+    collect_local_key_derivations_from_stmts(&block.stmts, &mut derivations);
+    derivations
+}
+
+fn collect_local_key_derivations_from_stmts(
+    stmts: &[Stmt],
+    out: &mut BTreeMap<String, PinocchioLocalKeyDerivation>,
+) {
+    for stmt in stmts {
+        if let Stmt::Local(local) = stmt {
+            if let (Some(name), Some(init)) = (simple_pat_ident(&local.pat), local.init.as_ref()) {
+                if let Some(derivation) = derive_call_from_expr(&init.expr) {
+                    out.insert(name, derivation);
+                }
+            }
+        }
+        if let Some(expr) = stmt_expr(stmt) {
+            match expr {
+                Expr::Block(block) => {
+                    collect_local_key_derivations_from_stmts(&block.block.stmts, out)
+                }
+                Expr::If(expr_if) => {
+                    collect_local_key_derivations_from_stmts(&expr_if.then_branch.stmts, out);
+                    if let Some((_else, else_expr)) = &expr_if.else_branch {
+                        if let Expr::Block(block) = &**else_expr {
+                            collect_local_key_derivations_from_stmts(&block.block.stmts, out);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn infer_account_key_derivations_from_block(
+    block: &syn::Block,
+    local_key_derivations: &BTreeMap<String, PinocchioLocalKeyDerivation>,
+) -> BTreeMap<String, PinocchioLocalKeyDerivation> {
+    let mut derivations = BTreeMap::new();
+    walk_exprs_in_stmts(&block.stmts, &mut |expr| {
+        let Expr::Call(call) = expr else {
+            return;
+        };
+        if call_name(&call.func).as_deref() != Some("require_key") || call.args.len() != 2 {
+            return;
+        }
+        let args: Vec<_> = call.args.iter().collect();
+        let Some(account) = expr_ident(args[0]) else {
+            return;
+        };
+        if let Some(derivation) = derive_call_from_expr(args[1]) {
+            derivations.insert(account, derivation);
+        } else if let Some(key_name) = expr_ref_ident(args[1]) {
+            if let Some(local) = local_key_derivations.get(&key_name) {
+                derivations.insert(account, local.clone());
+            }
+        }
+    });
+    derivations
+}
+
+fn infer_token_account_bindings_from_block(
+    block: &syn::Block,
+    key_account_aliases: &BTreeMap<String, String>,
+    local_key_derivations: &BTreeMap<String, PinocchioLocalKeyDerivation>,
+) -> BTreeMap<String, PinocchioTokenAccountBinding> {
+    let mut bindings = BTreeMap::new();
+    walk_exprs_in_stmts(&block.stmts, &mut |expr| {
+        let Expr::Call(call) = expr else {
+            return;
+        };
+        let Some(fn_name) = call_name(&call.func) else {
+            return;
+        };
+        let args: Vec<_> = call.args.iter().collect();
+        match fn_name.as_str() {
+            "require_token_account" if args.len() == 3 => {
+                let Some(account) = expr_ident(args[0]) else {
+                    return;
+                };
+                let mint_account =
+                    expr_key_receiver(args[1]).map(|name| normalize_schema_name(&name));
+                let owner_account = expr_key_receiver(args[2])
+                    .map(|name| normalize_schema_name(&name))
+                    .or_else(|| {
+                        expr_ref_ident(args[2])
+                            .and_then(|var| key_account_aliases.get(&var).cloned())
+                    });
+                let owner_key_derivation = expr_ref_ident(args[2])
+                    .and_then(|var| local_key_derivations.get(&var).cloned());
+                bindings.insert(
+                    account,
+                    PinocchioTokenAccountBinding {
+                        mint_account,
+                        owner_account,
+                        owner_key_derivation,
+                    },
+                );
+            }
+            "require_matching_token_mint" if args.len() == 2 => {
+                let (Some(account), Some(mint)) = (expr_ident(args[0]), expr_key_receiver(args[1]))
+                else {
+                    return;
+                };
+                bindings
+                    .entry(account)
+                    .or_insert_with(|| PinocchioTokenAccountBinding {
+                        mint_account: None,
+                        owner_account: None,
+                        owner_key_derivation: None,
+                    })
+                    .mint_account = Some(normalize_schema_name(&mint));
+            }
+            _ => {}
+        }
+    });
+    bindings
+}
+
+fn infer_source_expr_aliases_from_block(block: &syn::Block) -> BTreeMap<String, String> {
+    let mut aliases = BTreeMap::new();
+    collect_source_expr_aliases_from_stmts(&block.stmts, &mut aliases);
+    aliases
+}
+
+fn collect_source_expr_aliases_from_stmts(stmts: &[Stmt], aliases: &mut BTreeMap<String, String>) {
+    for stmt in stmts {
+        if let Stmt::Local(local) = stmt {
+            let Some(name) = simple_pat_ident(&local.pat) else {
+                continue;
+            };
+            let Some(init) = &local.init else {
+                continue;
+            };
+            if let Some(value) = wrapper_ctor_arg(&init.expr) {
+                aliases.insert(format!("{name}.0"), value);
+            }
+            if let Expr::Struct(expr_struct) = &*init.expr {
+                for field in &expr_struct.fields {
+                    let field_name = field.member.to_token_stream().to_string();
+                    let value = normalize_ast_expr_alias(&field.expr);
+                    if !value.is_empty() {
+                        aliases.insert(
+                            format!("{name}.{}", normalize_schema_name(&field_name)),
+                            value.clone(),
+                        );
+                        aliases.insert(
+                            format!("{name}.{}.0", normalize_schema_name(&field_name)),
+                            value,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn infer_params_from_block(block: &syn::Block) -> Vec<PinocchioParamField> {
+    let mut params = Vec::new();
+    collect_params_from_stmts(&block.stmts, &mut params);
+    params.sort_by_key(|p| p.start);
+    params
+}
+
+fn collect_params_from_stmts(stmts: &[Stmt], params: &mut Vec<PinocchioParamField>) {
+    for stmt in stmts {
+        if let Stmt::Local(local) = stmt {
+            if let (Some(name), Some(init)) = (simple_pat_ident(&local.pat), local.init.as_ref()) {
+                if let Some((rust_type, start, end)) = from_le_bytes_instruction_slice(&init.expr) {
+                    params.push(PinocchioParamField {
+                        name,
+                        rust_type,
+                        start,
+                        end,
+                    });
+                }
+            }
+        }
+        if let Some(expr) = stmt_expr(stmt) {
+            match expr {
+                Expr::Block(block) => collect_params_from_stmts(&block.block.stmts, params),
+                Expr::If(expr_if) => {
+                    collect_params_from_stmts(&expr_if.then_branch.stmts, params);
+                    if let Some((_else, else_expr)) = &expr_if.else_branch {
+                        if let Expr::Block(block) = &**else_expr {
+                            collect_params_from_stmts(&block.block.stmts, params);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn infer_dispatch_tags_from_items(
+    items: &[Item],
+    handlers: &mut BTreeMap<String, PinocchioHandlerProfile>,
+) {
+    for item in items {
+        match item {
+            Item::Fn(item_fn) if item_fn.sig.ident == "process_instruction" => {
+                walk_exprs_in_stmts(&item_fn.block.stmts, &mut |expr| {
+                    let Expr::Match(expr_match) = expr else {
+                        return;
+                    };
+                    for arm in &expr_match.arms {
+                        let Some(tag) = pat_u8_literal(&arm.pat) else {
+                            continue;
+                        };
+                        let Some(name) = first_process_callee(&arm.body) else {
+                            continue;
+                        };
+                        let entry = handlers
+                            .entry(name.clone())
+                            .or_insert_with(|| empty_handler_profile(name));
+                        entry.instruction_tag = Some(tag);
+                    }
+                });
+            }
+            Item::Mod(item_mod) => {
+                if let Some((_brace, items)) = &item_mod.content {
+                    infer_dispatch_tags_from_items(items, handlers);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn infer_pda_derivations_from_fns(
+    item_fns: &[&ItemFn],
+    derivations: &mut BTreeMap<String, PinocchioPdaDerivation>,
+) {
+    for item_fn in item_fns {
+        let fn_name = item_fn.sig.ident.to_string();
+        let Some(name) = fn_name.strip_prefix("derive_").map(normalize_schema_name) else {
+            continue;
+        };
+        let Some((seeds, program_id)) = first_find_program_address_call_from_block(&item_fn.block)
+        else {
+            continue;
+        };
+        let params = parse_syn_fn_params(&item_fn.sig);
+        let param_names = params.iter().map(|(name, _ty)| name.clone()).collect();
+        let param_types = params.into_iter().collect();
+        derivations.insert(
+            name.clone(),
+            PinocchioPdaDerivation {
+                name,
+                params: param_names,
+                param_types,
+                local_key_derivations: infer_local_key_derivations_from_block(&item_fn.block),
+                seeds: seeds
+                    .into_iter()
+                    .map(|expr| PinocchioPdaSeed {
+                        expr,
+                        literal: None,
+                    })
+                    .collect(),
+                program_id,
+            },
+        );
+    }
+}
+
+fn stmt_expr(stmt: &Stmt) -> Option<&Expr> {
+    match stmt {
+        Stmt::Expr(expr, _) => Some(expr),
+        Stmt::Local(local) => local.init.as_ref().map(|init| init.expr.as_ref()),
+        _ => None,
+    }
+}
+
+fn walk_exprs_in_stmts<'a>(stmts: &'a [Stmt], visit: &mut impl FnMut(&'a Expr)) {
+    for stmt in stmts {
+        if let Some(expr) = stmt_expr(stmt) {
+            walk_expr(expr, visit);
+        }
+    }
+}
+
+fn walk_expr<'a>(expr: &'a Expr, visit: &mut impl FnMut(&'a Expr)) {
+    visit(expr);
+    match expr {
+        Expr::Array(array) => {
+            for elem in &array.elems {
+                walk_expr(elem, visit);
+            }
+        }
+        Expr::Assign(assign) => {
+            walk_expr(&assign.left, visit);
+            walk_expr(&assign.right, visit);
+        }
+        Expr::Async(expr_async) => walk_exprs_in_stmts(&expr_async.block.stmts, visit),
+        Expr::Await(await_expr) => walk_expr(&await_expr.base, visit),
+        Expr::Binary(binary) => {
+            walk_expr(&binary.left, visit);
+            walk_expr(&binary.right, visit);
+        }
+        Expr::Block(block) => walk_exprs_in_stmts(&block.block.stmts, visit),
+        Expr::Break(expr_break) => {
+            if let Some(value) = &expr_break.expr {
+                walk_expr(value, visit);
+            }
+        }
+        Expr::Call(call) => {
+            walk_expr(&call.func, visit);
+            for arg in &call.args {
+                walk_expr(arg, visit);
+            }
+        }
+        Expr::Cast(cast) => walk_expr(&cast.expr, visit),
+        Expr::Closure(closure) => walk_expr(&closure.body, visit),
+        Expr::Field(field) => walk_expr(&field.base, visit),
+        Expr::ForLoop(loop_expr) => walk_exprs_in_stmts(&loop_expr.body.stmts, visit),
+        Expr::Group(group) => walk_expr(&group.expr, visit),
+        Expr::If(expr_if) => {
+            walk_expr(&expr_if.cond, visit);
+            walk_exprs_in_stmts(&expr_if.then_branch.stmts, visit);
+            if let Some((_else, else_expr)) = &expr_if.else_branch {
+                walk_expr(else_expr, visit);
+            }
+        }
+        Expr::Index(index) => {
+            walk_expr(&index.expr, visit);
+            walk_expr(&index.index, visit);
+        }
+        Expr::Let(expr_let) => walk_expr(&expr_let.expr, visit),
+        Expr::Loop(loop_expr) => walk_exprs_in_stmts(&loop_expr.body.stmts, visit),
+        Expr::Match(expr_match) => {
+            walk_expr(&expr_match.expr, visit);
+            for arm in &expr_match.arms {
+                walk_expr(&arm.body, visit);
+            }
+        }
+        Expr::MethodCall(call) => {
+            walk_expr(&call.receiver, visit);
+            for arg in &call.args {
+                walk_expr(arg, visit);
+            }
+        }
+        Expr::Paren(paren) => walk_expr(&paren.expr, visit),
+        Expr::Range(range) => {
+            if let Some(start) = &range.start {
+                walk_expr(start, visit);
+            }
+            if let Some(end) = &range.end {
+                walk_expr(end, visit);
+            }
+        }
+        Expr::Reference(reference) => walk_expr(&reference.expr, visit),
+        Expr::Repeat(repeat) => {
+            walk_expr(&repeat.expr, visit);
+            walk_expr(&repeat.len, visit);
+        }
+        Expr::Return(ret) => {
+            if let Some(value) = &ret.expr {
+                walk_expr(value, visit);
+            }
+        }
+        Expr::Struct(expr_struct) => {
+            for field in &expr_struct.fields {
+                walk_expr(&field.expr, visit);
+            }
+            if let Some(rest) = &expr_struct.rest {
+                walk_expr(rest, visit);
+            }
+        }
+        Expr::Try(expr_try) => walk_expr(&expr_try.expr, visit),
+        Expr::TryBlock(try_block) => walk_exprs_in_stmts(&try_block.block.stmts, visit),
+        Expr::Tuple(tuple) => {
+            for elem in &tuple.elems {
+                walk_expr(elem, visit);
+            }
+        }
+        Expr::Unary(unary) => walk_expr(&unary.expr, visit),
+        Expr::Unsafe(unsafe_expr) => walk_exprs_in_stmts(&unsafe_expr.block.stmts, visit),
+        Expr::While(while_expr) => {
+            walk_expr(&while_expr.cond, visit);
+            walk_exprs_in_stmts(&while_expr.body.stmts, visit);
+        }
+        Expr::Yield(yield_expr) => {
+            if let Some(value) = &yield_expr.expr {
+                walk_expr(value, visit);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn simple_pat_ident(pat: &Pat) -> Option<String> {
+    match pat {
+        Pat::Ident(ident) => Some(normalize_schema_name(&ident.ident.to_string())),
+        Pat::Type(typed) => simple_pat_ident(&typed.pat),
+        _ => None,
+    }
+}
+
+fn local_init_calls(init: &Option<syn::LocalInit>, name: &str) -> bool {
+    init.as_ref()
+        .is_some_and(|init| expr_contains_call_name(&init.expr, name))
+}
+
+fn expr_contains_call_name(expr: &Expr, name: &str) -> bool {
+    let mut found = false;
+    walk_expr(expr, &mut |expr| {
+        if let Expr::Call(call) = expr {
+            if call_name(&call.func).as_deref() == Some(name) {
+                found = true;
+            }
+        }
+    });
+    found
+}
+
+fn call_name(func: &Expr) -> Option<String> {
+    match func {
+        Expr::Path(path) => path
+            .path
+            .segments
+            .last()
+            .map(|segment| segment.ident.to_string()),
+        Expr::MethodCall(call) => Some(call.method.to_string()),
+        _ => None,
+    }
+}
+
+fn expr_ident(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Path(path) if path.path.segments.len() == 1 => Some(normalize_schema_name(
+            &path.path.segments.first()?.ident.to_string(),
+        )),
+        Expr::Reference(reference) => expr_ident(&reference.expr),
+        Expr::Paren(paren) => expr_ident(&paren.expr),
+        _ => None,
+    }
+}
+
+fn expr_ref_ident(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Reference(reference) => expr_ident(&reference.expr),
+        Expr::Paren(paren) => expr_ref_ident(&paren.expr),
+        _ => None,
+    }
+}
+
+fn expr_key_receiver(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::MethodCall(call) if call.method == "key" && call.args.is_empty() => {
+            expr_ident(&call.receiver)
+        }
+        Expr::Reference(reference) => expr_key_receiver(&reference.expr),
+        Expr::Paren(paren) => expr_key_receiver(&paren.expr),
+        _ => None,
+    }
+}
+
+fn expr_mentions_token_program(expr: &Expr) -> bool {
+    let rendered = normalize_expr_tokens(expr);
+    rendered.contains("SPL_TOKEN_ID")
+        || rendered.contains("TOKEN_PROGRAM_ID")
+        || rendered.contains("pinocchio_tkn")
+}
+
+fn derive_call_from_expr(expr: &Expr) -> Option<PinocchioLocalKeyDerivation> {
+    match expr {
+        Expr::Reference(reference) => derive_call_from_expr(&reference.expr),
+        Expr::Paren(paren) => derive_call_from_expr(&paren.expr),
+        Expr::Try(expr_try) => derive_call_from_expr(&expr_try.expr),
+        Expr::Field(field) => {
+            if matches!(&field.member, syn::Member::Unnamed(index) if index.index == 0) {
+                derive_call_from_expr(&field.base)
+            } else {
+                None
+            }
+        }
+        Expr::Call(call) => {
+            let fn_name = call_name(&call.func)?;
+            let derivation = fn_name.strip_prefix("derive_")?;
+            Some(PinocchioLocalKeyDerivation {
+                derivation: normalize_schema_name(derivation),
+                args: call.args.iter().map(normalize_expr_tokens).collect(),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn wrapper_ctor_arg(expr: &Expr) -> Option<String> {
+    let Expr::Call(call) = expr else {
+        return None;
+    };
+    let Expr::Path(path) = &*call.func else {
+        return None;
+    };
+    if path.path.segments.len() != 1 || call.args.len() != 1 {
+        return None;
+    }
+    Some(normalize_ast_expr_alias(call.args.first()?))
+}
+
+fn normalize_ast_expr_alias(expr: &Expr) -> String {
+    match expr {
+        Expr::Reference(reference) => normalize_ast_expr_alias(&reference.expr),
+        Expr::Unary(unary) => normalize_ast_expr_alias(&unary.expr),
+        Expr::Paren(paren) => normalize_ast_expr_alias(&paren.expr),
+        Expr::Call(call) if call.args.len() == 1 => normalize_ast_expr_alias(&call.args[0]),
+        _ => normalize_expr_tokens(expr),
+    }
+}
+
+fn from_le_bytes_instruction_slice(expr: &Expr) -> Option<(String, usize, usize)> {
+    let Expr::Call(call) = peel_expr(expr) else {
+        return None;
+    };
+    let Expr::Path(path) = &*call.func else {
+        return None;
+    };
+    if path.path.segments.last()?.ident != "from_le_bytes" {
+        return None;
+    }
+    let rust_type = path.path.segments.iter().rev().nth(1)?.ident.to_string();
+    if integer_rust_type(&rust_type).is_none() {
+        return None;
+    }
+    let arg = call.args.first()?;
+    let (start, end) = instruction_data_range(arg)?;
+    Some((rust_type, start, end))
+}
+
+fn peel_expr(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Try(expr_try) => peel_expr(&expr_try.expr),
+        Expr::Paren(paren) => peel_expr(&paren.expr),
+        Expr::Reference(reference) => peel_expr(&reference.expr),
+        _ => expr,
+    }
+}
+
+fn instruction_data_range(expr: &Expr) -> Option<(usize, usize)> {
+    match peel_expr(expr) {
+        Expr::MethodCall(call) => {
+            if call.method == "get" && normalize_expr_tokens(&call.receiver) == "instruction_data" {
+                let range = call.args.first()?;
+                return literal_range(range);
+            }
+            if matches!(
+                call.method.to_string().as_str(),
+                "ok_or" | "map_err" | "try_into"
+            ) {
+                return instruction_data_range(&call.receiver);
+            }
+            None
+        }
+        Expr::Call(call) => call.args.iter().find_map(instruction_data_range),
+        _ => None,
+    }
+}
+
+fn literal_range(expr: &Expr) -> Option<(usize, usize)> {
+    let Expr::Range(range) = expr else {
+        return None;
+    };
+    Some((
+        usize_lit(range.start.as_deref()?)?,
+        usize_lit(range.end.as_deref()?)?,
+    ))
+}
+
+fn usize_lit(expr: &Expr) -> Option<usize> {
+    match expr {
+        Expr::Lit(lit) => {
+            if let syn::Lit::Int(int) = &lit.lit {
+                int.base10_parse::<usize>().ok()
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn pat_u8_literal(pat: &Pat) -> Option<u8> {
+    match pat {
+        Pat::Lit(lit) => {
+            if let syn::Lit::Int(int) = &lit.lit {
+                return int.base10_parse::<u8>().ok();
+            }
+            None
+        }
+        Pat::Or(or) => or.cases.iter().find_map(pat_u8_literal),
+        _ => None,
+    }
+}
+
+fn first_process_callee(expr: &Expr) -> Option<String> {
+    let mut found = None;
+    walk_expr(expr, &mut |expr| {
+        if found.is_some() {
+            return;
+        }
+        let Expr::Call(call) = expr else {
+            return;
+        };
+        let Some(fn_name) = call_name(&call.func) else {
+            return;
+        };
+        if let Some(handler) = fn_name.strip_prefix("process_") {
+            found = Some(normalize_schema_name(handler));
+        }
+    });
+    found
+}
+
+fn first_find_program_address_call_from_block(block: &syn::Block) -> Option<(Vec<String>, String)> {
+    let mut found = None;
+    walk_exprs_in_stmts(&block.stmts, &mut |expr| {
+        if found.is_some() {
+            return;
+        }
+        let Expr::Call(call) = expr else {
+            return;
+        };
+        let Some(fn_name) = call_name(&call.func) else {
+            return;
+        };
+        if !matches!(
+            fn_name.as_str(),
+            "find_program_address" | "try_find_program_address"
+        ) {
+            return;
+        }
+        if call.args.len() < 2 {
+            return;
+        }
+        let Some(seeds) = seed_exprs_from_arg(&call.args[0]) else {
+            return;
+        };
+        let program_id = normalize_program_id_arg(&call.args[1]);
+        if !seeds.is_empty() && !program_id.is_empty() {
+            found = Some((seeds, program_id));
+        }
+    });
+    found
+}
+
+fn seed_exprs_from_arg(expr: &Expr) -> Option<Vec<String>> {
+    let expr = match expr {
+        Expr::Reference(reference) => reference.expr.as_ref(),
+        _ => expr,
+    };
+    let Expr::Array(array) = expr else {
+        return None;
+    };
+    Some(array.elems.iter().map(normalize_seed_ast_expr).collect())
+}
+
+fn normalize_seed_ast_expr(expr: &Expr) -> String {
+    match expr {
+        Expr::Reference(reference) => normalize_seed_ast_expr(&reference.expr),
+        Expr::Path(path) => normalize_schema_path(&path.path),
+        Expr::Array(array) => {
+            let inner = array
+                .elems
+                .iter()
+                .map(normalize_expr_tokens)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("[{inner}]")
+        }
+        Expr::MethodCall(call) if call.method == "as_ref" => {
+            format!("{}.as_ref()", normalize_seed_ast_expr(&call.receiver))
+        }
+        _ => normalize_expr_tokens(expr)
+            .trim_start_matches("crate::")
+            .to_string(),
+    }
+}
+
+fn normalize_program_id_arg(expr: &Expr) -> String {
+    normalize_expr_tokens(expr)
+        .trim_start_matches('&')
+        .trim()
+        .trim_start_matches("crate::")
+        .to_string()
+}
+
+fn parse_syn_fn_params(sig: &syn::Signature) -> Vec<(String, String)> {
+    sig.inputs
+        .iter()
+        .filter_map(|arg| {
+            let syn::FnArg::Typed(pat_type) = arg else {
+                return None;
+            };
+            let name = simple_pat_ident(&pat_type.pat)?;
+            Some((name, normalize_type_tokens(&pat_type.ty)))
+        })
+        .collect()
+}
+
+fn normalize_type_tokens(ty: &syn::Type) -> String {
+    ty.to_token_stream().to_string().replace(' ', "")
+}
+
+fn normalize_expr_tokens(expr: &Expr) -> String {
+    expr.to_token_stream().to_string().replace(' ', "")
+}
+
+fn normalize_schema_path(path: &syn::Path) -> String {
+    path.segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect::<Vec<_>>()
+        .join("::")
+        .trim_start_matches("crate::")
+        .to_string()
 }
 
 fn process_fn_bodies(source: &str) -> Vec<(String, String)> {
@@ -1849,6 +2804,103 @@ seed VAULT_AUTHORITY_SEED vault-authority
                 program_id: "program_id".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn infers_account_key_derivation_from_syn_require_key_direct_call() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("lib.rs"),
+            r#"
+pub fn derive_token_vault(authority: &Pubkey, mint: &Pubkey) -> (Pubkey, u8) {
+    pinocchio::pubkey::find_program_address(
+        &[authority.as_ref(), mint.as_ref()],
+        &ASSOCIATED_TOKEN_PROGRAM_ID,
+    )
+}
+
+fn process_route(accounts: &[AccountInfo]) -> ProgramResult {
+    let [authority, mint, vault, ..] = accounts else {
+        return Ok(());
+    };
+    require_key(vault, &derive_token_vault(authority.key(), mint.key()).0)?;
+    Ok(())
+}
+"#,
+        )
+        .unwrap();
+
+        let profile = infer_from_src_dir(&src).expect("profile");
+        let route = profile.handler("route").expect("route profile");
+        assert_eq!(route.accounts, ["authority", "mint", "vault"]);
+        assert_eq!(
+            route.account_key_derivations.get("vault"),
+            Some(&PinocchioLocalKeyDerivation {
+                derivation: "token_vault".to_string(),
+                args: vec!["authority.key()".to_string(), "mint.key()".to_string()],
+            })
+        );
+        assert_eq!(
+            profile.pda_derivations.get("token_vault"),
+            Some(&PinocchioPdaDerivation {
+                name: "token_vault".to_string(),
+                params: vec!["authority".to_string(), "mint".to_string()],
+                param_types: BTreeMap::from([
+                    ("authority".to_string(), "&Pubkey".to_string()),
+                    ("mint".to_string(), "&Pubkey".to_string()),
+                ]),
+                local_key_derivations: BTreeMap::new(),
+                seeds: vec![
+                    PinocchioPdaSeed {
+                        expr: "authority.as_ref()".to_string(),
+                        literal: None,
+                    },
+                    PinocchioPdaSeed {
+                        expr: "mint.as_ref()".to_string(),
+                        literal: None,
+                    },
+                ],
+                program_id: "ASSOCIATED_TOKEN_PROGRAM_ID".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn context_inference_keeps_source_account_key_derivations() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let program_root = workspace.path().join("program");
+        std::fs::create_dir_all(program_root.join("src")).unwrap();
+        std::fs::create_dir_all(program_root.join("verification")).unwrap();
+        std::fs::write(
+            program_root.join("src/lib.rs"),
+            r#"
+pub fn derive_token_vault(authority: &Pubkey, mint: &Pubkey) -> (Pubkey, u8) {
+    pinocchio::pubkey::find_program_address(
+        &[authority.as_ref(), mint.as_ref()],
+        &ASSOCIATED_TOKEN_PROGRAM_ID,
+    )
+}
+
+fn process_route(accounts: &[AccountInfo]) -> ProgramResult {
+    let [authority, mint, vault, ..] = accounts else {
+        return Ok(());
+    };
+    require_key(vault, &derive_token_vault(authority.key(), mint.key()).0)?;
+    Ok(())
+}
+"#,
+        )
+        .unwrap();
+        let spec_path = program_root.join("verification/program.qedspec");
+        std::fs::write(&spec_path, "spec Program\n").unwrap();
+        let output_src = program_root.join("src");
+
+        let profile = infer_from_context(&output_src, Some(&spec_path)).expect("profile");
+        let route = profile.handler("route").expect("route profile");
+        assert!(route.account_key_derivations.contains_key("vault"));
+        assert!(profile.pda_derivations.contains_key("token_vault"));
     }
 
     #[test]
