@@ -145,10 +145,15 @@ pub enum TopItem {
     /// `ensures` clauses can call. Lowers to a Lean `def` and inlines
     /// at Kani-harness assertion sites; Rust codegen skips it entirely
     /// (it's a verification-only construct, not part of the impl
-    /// contract). Replaces the original `ghost` proposal — the user
-    /// preferred the more honest naming, since the construct *is*
-    /// a reference implementation the real Rust impl is checked against.
+    /// contract). Distinct from `Ghost`: `ref_impl` is a *stateless* pure
+    /// function the real Rust impl is checked against, whereas a `ghost`
+    /// is *stateful* spec-only auxiliary state updated per-handler.
     RefImpl(RefImplDecl),
+    /// Issue #67 item 3 — `ghost <name> : <Ty> { init {…} on H(…) {…} }`.
+    /// Spec-only auxiliary state field: participates in invariants /
+    /// properties / `requires` / `ensures` (as `state.<name>`), updated
+    /// per-handler, omitted from the on-chain program codegen.
+    Ghost(GhostDecl),
 }
 
 /// v2.24 #1 — top-level `schema` block. Body carries a list of
@@ -334,6 +339,37 @@ pub struct RefImplDecl {
     pub params: Vec<TypedField>,
     pub return_type: TypeRef,
     pub body: Node<Expr>,
+}
+
+/// Issue #67 item 3 — `ghost <name> : <Ty> { init { <expr> } on
+/// <handler>(<params>) { <name> := <expr> } … }`. A spec-only auxiliary
+/// state field: it participates in invariants, properties and `requires`/
+/// `ensures` (referenced as `state.<name>`), is updated per-handler by its
+/// `on` clauses, but never appears in the on-chain program codegen. Scalar
+/// types only (`U64`/`U128`/`I64`/`I128`/`Bool`); a ghost over a `Map`/
+/// record is rejected at lint time.
+#[derive(Debug, Clone)]
+pub struct GhostDecl {
+    pub name: String,
+    pub doc: Option<String>,
+    pub ty: TypeRef,
+    /// Initial value — a constant expression evaluated when the State is
+    /// first constructed.
+    pub init: Node<Expr>,
+    /// Per-handler update clauses. A handler with no clause leaves the
+    /// ghost unchanged (frame condition).
+    pub updates: Vec<GhostUpdate>,
+}
+
+/// One `on <handler> { <name> := <expr> }` clause of a ghost. The named
+/// handler's parameters are in scope in the update RHS (resolved by the
+/// adapter from the handler's signature, so there's no type redeclaration
+/// to drift). `stmt` is a single assignment whose `lhs` is the ghost name
+/// and whose `rhs` may reference `state.<ghost>` and the handler params.
+#[derive(Debug, Clone)]
+pub struct GhostUpdate {
+    pub handler: String,
+    pub stmt: EffectStmt,
 }
 
 /// A type reference in the source language.

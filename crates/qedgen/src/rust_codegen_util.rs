@@ -855,6 +855,14 @@ pub fn emit_record_structs(
         if rec.fields.is_empty() {
             continue;
         }
+        // The `state { … }` / `type State = { … }` flat forms produce a
+        // record literally named `State`, which the adapter keeps in
+        // `records` for other consumers. The state-machine `struct State`
+        // is emitted separately (with lifecycle + ghost fields), so skip
+        // the value-record here to avoid a duplicate `struct State`.
+        if rec.name == "State" {
+            continue;
+        }
         out.push_str(&format!("#[derive({})]\n", derives));
         out.push_str(&format!("struct {} {{\n", rec.name));
         for (fname, ftype) in &rec.fields {
@@ -1238,6 +1246,21 @@ pub fn emit_transition_fn(
     if has_lifecycle(spec) {
         if let Some(ref post) = op.post_status {
             out.push_str(&format!("    s.status = Status::{};\n", post));
+        }
+    }
+
+    // Issue #67 item 3 — ghost (spec-only) field updates. A ghost with an
+    // `on <this handler>` clause assigns its new value after the normal
+    // effects; ghosts without a clause are left unchanged (frame). The
+    // value reads `s.<ghost>` + handler params, matching the Lean
+    // transition. Arithmetic wraps under `cargo test --release` (the
+    // `verify --proptest` path), so an arbitrary-state aggregate never
+    // panics on model overflow.
+    for ghost in &spec.ghosts {
+        for u in &ghost.updates {
+            if u.handler == op.name {
+                out.push_str(&format!("    s.{} = {};\n", ghost.name, u.value_rust));
+            }
         }
     }
 

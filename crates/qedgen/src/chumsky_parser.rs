@@ -2014,6 +2014,62 @@ fn ref_impl_decl<'a>() -> impl Parser<'a, &'a str, TopItem, Err<'a>> + Clone {
         })
 }
 
+/// Issue #67 item 3 — `ghost <name> : <Ty> { init { <expr> } on <handler>
+/// { <name> := <expr> } … }`. Spec-only auxiliary state. The block holds a
+/// single `init` clause followed by zero or more `on <handler>` update
+/// clauses. Each update reuses `effect_stmt()`, so the same `:=` / `+=` /
+/// `-=` operators (and `state.<ghost>` RHS references) work as in a real
+/// handler effect.
+fn ghost_decl<'a>() -> impl Parser<'a, &'a str, TopItem, Err<'a>> + Clone {
+    let init_clause = kw("init")
+        .then_ignore(wsc())
+        .then_ignore(just('{'))
+        .then_ignore(wsc())
+        .ignore_then(expr())
+        .then_ignore(wsc())
+        .then_ignore(just('}'));
+
+    let on_clause = kw("on")
+        .ignore_then(non_keyword_ident())
+        .then_ignore(wsc())
+        .then_ignore(just('{'))
+        .then_ignore(wsc())
+        .then(effect_stmt())
+        .then_ignore(wsc())
+        .then_ignore(just('}'))
+        .map(|(handler, stmt)| GhostUpdate { handler, stmt });
+
+    doc_comments()
+        .then_ignore(kw("ghost"))
+        .then(non_keyword_ident())
+        .then_ignore(wsc())
+        .then_ignore(just(':'))
+        .then_ignore(wsc())
+        .then(type_ref())
+        .then_ignore(wsc())
+        .then_ignore(just('{'))
+        .then_ignore(wsc())
+        .then(init_clause)
+        .then_ignore(wsc())
+        .then(
+            on_clause
+                .then_ignore(wsc())
+                .repeated()
+                .collect::<Vec<GhostUpdate>>(),
+        )
+        .then_ignore(wsc())
+        .then_ignore(just('}'))
+        .map(|((((doc, name), ty), init), updates)| {
+            TopItem::Ghost(GhostDecl {
+                name,
+                doc,
+                ty,
+                init,
+                updates,
+            })
+        })
+}
+
 // invariant name : expr  OR  invariant name "description"
 /// v2.24 #1 — top-level `schema name { requires expr else Err … }`.
 /// Reusable cross-cutting guard set. Pre-fix the parser rejected the
@@ -2993,6 +3049,7 @@ fn top_item<'a>() -> impl Parser<'a, &'a str, Node<TopItem>, Err<'a>> + Clone {
         pda_decl(),
         event_decl(),
         environment_decl(),
+        ghost_decl(),
         program_id_decl(),
     ));
     // Note: `pubkey`, `instruction`, `assembly`, and the `errors [...]`
@@ -3532,6 +3589,7 @@ property conservation :
                 TopItem::Import { .. } => "import",
                 TopItem::Schema(_) => "schema",
                 TopItem::RefImpl(_) => "ref_impl",
+                TopItem::Ghost(_) => "ghost",
             })
             .fold(
                 std::collections::BTreeMap::<&str, usize>::new(),

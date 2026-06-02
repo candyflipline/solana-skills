@@ -2231,6 +2231,7 @@ fn scope_mir_to_account(mir: &Mir, acct: &crate::mir::AccountStateMir) -> Mir {
         covers: Vec::new(),                // emit_covers_multi handles
         liveness_props: mir.liveness_props.clone(),
         environments: mir.environments.clone(),
+        ghosts: mir.ghosts.clone(),
         records: mir.records.clone(),
         is_assembly: mir.is_assembly,
         adt_state: mir.adt_state,
@@ -2667,6 +2668,16 @@ fn emit_handler_transition(out: &mut String, mir: &Mir, h: &crate::mir::HandlerM
         // issue #43.
         if mir.state.lifecycle_states.len() >= 2 {
             with_parts.push(format!("status := .{}", safe_name(post)));
+        }
+    }
+
+    // Issue #67 item 3 — ghost field updates. A ghost with an `on <this
+    // handler>` clause assigns its new value alongside the normal effects;
+    // ghosts without a clause are left unchanged (the `{ s with … }`
+    // record update preserves unmentioned fields — the frame condition).
+    for ghost in &mir.ghosts {
+        if let Some(val) = ghost.updates.get(&h.name) {
+            with_parts.push(format!("{} := {}", safe_name(&ghost.name), val.lean));
         }
     }
 
@@ -4154,6 +4165,16 @@ fn emit_state_struct(out: &mut String, mir: &Mir) {
     }
     if has_lifecycle {
         out.push_str("  status : Status\n");
+    }
+    // Issue #67 item 3 — ghost (spec-only) fields, appended LAST so the
+    // non-ghost field prefix keeps a stable order for any positional
+    // `⟨…⟩` State construction (e.g. cover witnesses).
+    for ghost in &mir.ghosts {
+        out.push_str(&format!(
+            "  {} : {}\n",
+            safe_name(&ghost.name),
+            render_ty(&ghost.ty)
+        ));
     }
     // `Inhabited` enables the polymorphic CPI ensures-axioms
     // (`{State} [Inhabited State] …`) to apply to this state; all field
@@ -5755,6 +5776,7 @@ mod tests {
             covers: vec![],
             liveness_props: vec![],
             environments: vec![],
+            ghosts: vec![],
             records: vec![],
             is_assembly: false,
             adt_state: false,
@@ -5797,6 +5819,7 @@ mod tests {
             covers: vec![],
             liveness_props: vec![],
             environments: vec![],
+            ghosts: vec![],
             records: vec![],
             is_assembly: false,
             adt_state: false,

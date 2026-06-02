@@ -378,6 +378,17 @@ fn emit_account_section_structural(out: &mut String, parsed: &ParsedSpec) -> Res
             )
         };
 
+    // Issue #67 item 3 — ghosts are spec-only verification-State fields:
+    // present in the Kani State struct + symbolic init + transitions (so the
+    // BMC harness can read them and `emit_transition_fn` can assign them), but
+    // never in the on-chain program. Mirrors the proptest single-account path.
+    let state_fields_with_ghosts: Vec<(String, String)> = state_fields
+        .iter()
+        .cloned()
+        .chain(parsed.ghosts.iter().map(|g| (g.name.clone(), g.ty.clone())))
+        .collect();
+    let state_fields: &[(String, String)] = &state_fields_with_ghosts;
+
     let mutable = util::mutable_fields(state_fields);
     let has_lifecycle = lifecycle.len() >= 2;
 

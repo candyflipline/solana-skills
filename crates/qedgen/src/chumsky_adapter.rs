@@ -61,11 +61,16 @@ enum Kind {
 ///   - `state_fields`: bare field name → TypeRef (top-level state fields like V, I)
 ///   - `records`: record name → field name → TypeRef (e.g. Account.capital → U128)
 ///   - `params`: current handler's params, for bare-ident lookups
-#[derive(Default)]
+///   - `aliases`: type-alias name → its target rendered as a source-DSL string
+///     (e.g. `AccountIdx` → `Fin[MAX_ACCOUNTS]`). Lets the quantifier renderer
+///     resolve a binder type written as an alias down to the underlying
+///     `Fin[N]` so it can emit a bounded `(0..N).all/.any(…)` iteration.
+#[derive(Default, Clone)]
 struct TypeEnv<'a> {
     state_fields: std::collections::BTreeMap<String, &'a a::TypeRef>,
     records: std::collections::BTreeMap<String, std::collections::BTreeMap<String, &'a a::TypeRef>>,
     params: Vec<(String, &'a a::TypeRef)>,
+    aliases: std::collections::BTreeMap<String, String>,
 }
 
 impl<'a> TypeEnv<'a> {
@@ -89,10 +94,39 @@ impl<'a> TypeEnv<'a> {
                         }
                     }
                 }
+                TopItem::TypeAlias(ta) => {
+                    env.aliases
+                        .insert(ta.name.clone(), type_ref_to_string(&ta.target));
+                }
+                // Ghosts render as state fields: `state.<ghost>` must resolve
+                // in properties / invariants / `requires` / `ensures` and in
+                // other ghosts' update RHS. They are rendering-only here — the
+                // on-chain codegen reads `ParsedSpec.state_fields`, which never
+                // includes ghosts.
+                TopItem::Ghost(g) => {
+                    env.state_fields.entry(g.name.clone()).or_insert(&g.ty);
+                }
                 _ => {}
             }
         }
         env
+    }
+
+    /// If `binder_ty` is a bounded index domain — either `Fin[N]` written
+    /// directly or an alias resolving to one (e.g. `AccountIdx`) — return
+    /// the bound symbol `N` (a numeric literal or a `const` name). Returns
+    /// `None` for any non-`Fin` binder type. The bound is emitted verbatim
+    /// by callers: a numeric literal renders as-is, a const name renders as
+    /// the Rust `const` the codegen already emits.
+    fn fin_bound(&self, binder_ty: &str) -> Option<String> {
+        let resolved = self
+            .aliases
+            .get(binder_ty.trim())
+            .map(String::as_str)
+            .unwrap_or(binder_ty)
+            .trim();
+        let inner = resolved.strip_prefix("Fin[")?.strip_suffix(']')?;
+        Some(inner.trim().to_string())
     }
 
     fn with_params(mut self, params: &'a [a::TypedField]) -> Self {
@@ -878,12 +912,35 @@ fn expr_to_rust(e: &Expr, ctx: Ctx, consts: ConstTable, opts: RustOpts<'_, '_>) 
             binder_ty,
             body,
         } => {
-            // Small integer types (U8, I8) can be exhaustively iterated inside
-            // a property predicate using Rust's RangeInclusive::all / any. This
-            // is correct and cheap enough for test suites (256 iterations max).
-            //
-            // Larger types (U16+) cannot be exhausted in a test loop; surface
-            // the sentinel so the caller knows to skip or escalate.
+            // A quantifier over a bounded domain lowers to an exhaustive
+            // `RangeInclusive::all` (forall) / `any` (exists) — correct and
+            // cheap for test suites. `Fin[N]` index domains iterate `0..N`;
+            // small integers (U8/I8) exhaust their full range. Wider integer
+            // domains can't be exhausted in a test loop, so the sentinel
+            // tells the caller to skip or escalate to harness-level lowering.
+            let method = match kind {
+                a::Quantifier::Forall => "all",
+                a::Quantifier::Exists => "any",
+            };
+            let body_rust = expr_to_rust(&body.node, ctx, consts, opts);
+            // `exists` over a bounded index domain (`Fin[N]`, directly or via
+            // an alias such as `AccountIdx`): iterate `0..N` with `.any(…)`.
+            // This is the collection-existence case — `exists i : AccountIdx,
+            // accounts[i]…` — and lowers to a real, non-vacuous predicate
+            // usable anywhere a bool is expected (requires / ensures /
+            // property body). `forall` over `Fin[N]` deliberately does NOT
+            // take this path: it keeps the v2.20 per-slot lowering
+            // (`{prop}_at`) so a preserved-property assertion checks the one
+            // modified slot rather than unwinding a whole-array loop in Kani.
+            // Existence has no per-slot analogue, so the bounded `.any`
+            // iteration is the correct and only mechanical lowering.
+            if matches!(kind, a::Quantifier::Exists) {
+                if let Some(bound) = opts.env.fin_bound(binder_ty) {
+                    return format!("(0..({} as usize)).any(|{}| {})", bound, binder, body_rust);
+                }
+            }
+            // Small integer domains (U8, I8) can be exhausted directly (256
+            // iterations max).
             let rust_ty = match binder_ty.as_str() {
                 "U8" => Some("u8"),
                 "I8" => Some("i8"),
@@ -899,11 +956,6 @@ fn expr_to_rust(e: &Expr, ctx: Ctx, consts: ConstTable, opts: RustOpts<'_, '_>) 
                     kind_name, binder, binder_ty
                 );
             };
-            let method = match kind {
-                a::Quantifier::Forall => "all",
-                a::Quantifier::Exists => "any",
-            };
-            let body_rust = expr_to_rust(&body.node, ctx, consts, opts);
             format!(
                 "({}::MIN..={}::MAX).{}(|{}| {})",
                 rust_ty, rust_ty, method, binder, body_rust
@@ -2701,6 +2753,20 @@ pub fn adapt(spec: &a::Spec) -> ParsedSpec {
                 // codegen needs for the lowered harness.
                 let quantifier_lint = match crate::quantifier::supported_shape(p) {
                     Ok(_) => None,
+                    // A bounded `exists` (over `Fin[N]`, directly or via an
+                    // alias such as `AccountIdx`) now lowers to a real
+                    // `(0..N).any(…)` harness predicate — see the `expr_to_rust`
+                    // quantifier arm. `supported_shape` rejects every `exists`
+                    // because it can't resolve aliases to decide boundedness;
+                    // the rendered Rust body is the ground truth, so when the
+                    // body lowered cleanly (no `QEDGEN_UNSUPPORTED` sentinel)
+                    // suppress the spurious P5. Unbounded `exists` (e.g. over
+                    // `U64`) still emits the sentinel and keeps the lint.
+                    Err(crate::quantifier::Reason::ExistsQuantifier { .. })
+                        if !crate::check::rust_expr_is_unsupported(&rust) =>
+                    {
+                        None
+                    }
                     Err(reason) => {
                         let kind = match &reason {
                             crate::quantifier::Reason::NestedQuantifier { .. } => {
@@ -2944,6 +3010,54 @@ pub fn adapt(spec: &a::Spec) -> ParsedSpec {
                     return_type: type_ref_to_string(&r.return_type),
                     lean_body,
                     rust_body,
+                });
+            }
+            TopItem::Ghost(g) => {
+                // Init value — a constant expression in single-state context.
+                let init_lean = expr_to_lean(&g.init.node, Ctx::Guard, consts, &env);
+                let init_rust = expr_to_rust(&g.init.node, Ctx::Guard, consts, opts_native(&env));
+                let mut updates = Vec::new();
+                for u in &g.updates {
+                    // Resolve the named handler's params so the update RHS can
+                    // reference them; ghost names already resolve via `env`.
+                    let handler_params: &[a::TypedField] = spec
+                        .items
+                        .iter()
+                        .find_map(|it| match &it.node {
+                            TopItem::Handler(h) if h.name == u.handler => Some(h.params.as_slice()),
+                            _ => None,
+                        })
+                        .unwrap_or(&[]);
+                    let uenv = env.clone().with_params(handler_params);
+                    let rhs_lean = expr_to_lean(&u.stmt.rhs.node, Ctx::Guard, consts, &uenv);
+                    let rhs_rust =
+                        expr_to_rust(&u.stmt.rhs.node, Ctx::Guard, consts, opts_native(&uenv));
+                    // Fold the assignment operator into a complete new-value
+                    // expression so each backend just emits `<ghost> := value`.
+                    let (value_lean, value_rust) = match u.stmt.op {
+                        a::EffectOp::Set => (rhs_lean, rhs_rust),
+                        a::EffectOp::Add | a::EffectOp::AddSat | a::EffectOp::AddWrap => (
+                            format!("s.{} + ({})", g.name, rhs_lean),
+                            format!("s.{} + ({})", g.name, rhs_rust),
+                        ),
+                        a::EffectOp::Sub | a::EffectOp::SubSat | a::EffectOp::SubWrap => (
+                            format!("s.{} - ({})", g.name, rhs_lean),
+                            format!("s.{} - ({})", g.name, rhs_rust),
+                        ),
+                    };
+                    updates.push(crate::check::ParsedGhostUpdate {
+                        handler: u.handler.clone(),
+                        value_lean,
+                        value_rust,
+                    });
+                }
+                out.ghosts.push(crate::check::ParsedGhost {
+                    name: g.name.clone(),
+                    doc: g.doc.clone(),
+                    ty: type_ref_to_string(&g.ty),
+                    init_lean,
+                    init_rust,
+                    updates,
                 });
             }
             TopItem::Pragma(p) => {
@@ -3242,6 +3356,7 @@ fn expand_handler(
         state_fields: base_env.state_fields.clone(),
         records: base_env.records.clone(),
         params: h.params.iter().map(|f| (f.name.clone(), &f.ty)).collect(),
+        aliases: base_env.aliases.clone(),
     };
     let env = &env;
     // Detect a single branch clause (phase 1: at most one branch per handler).
@@ -5121,6 +5236,108 @@ handler bump (delta : U64) : State.Active -> State.Active {
             "binary mode without old() must use post., not s. or pre.; got: {}",
             rendered
         );
+    }
+
+    // ========================================================================
+    // Issue #67 item 2 — bounded `exists` over a `Fin[N]` index domain
+    // lowers to a real `(0..N).any(…)` predicate; unbounded `exists` keeps
+    // the harness-level sentinel.
+    // ========================================================================
+
+    const EXISTS_SPEC_HEAD: &str = r#"
+spec ExistsTest
+const MAX = 8
+type Idx = Fin[MAX]
+type Member = { active : U64 }
+type State = { members : Map[MAX] Member, count : U64 }
+type Error
+  | E
+handler tick { effect { count := state.count + 1 } }
+"#;
+
+    #[test]
+    fn render_bounded_exists_over_fin_alias_lowers_to_any() {
+        let src = format!(
+            "{}{}",
+            EXISTS_SPEC_HEAD,
+            r#"property bounded_ex : exists i : Idx, state.members[i].active == 1 preserved_by [tick]"#
+        );
+        let rendered = render_property_body(&src, "bounded_ex", StateMode::Unary);
+        assert!(
+            rendered.contains("(0..(MAX as usize)).any(|i|"),
+            "bounded exists over a Fin[N] alias must iterate 0..N with .any(); got: {}",
+            rendered
+        );
+        assert!(
+            !rendered.contains(crate::check::QEDGEN_UNSUPPORTED_MARKER),
+            "bounded exists must not emit the unsupported sentinel; got: {}",
+            rendered
+        );
+    }
+
+    #[test]
+    fn render_unbounded_exists_keeps_sentinel() {
+        let src = format!(
+            "{}{}",
+            EXISTS_SPEC_HEAD,
+            r#"property unbounded_ex : exists v : U64, state.count == v preserved_by [tick]"#
+        );
+        let rendered = render_property_body(&src, "unbounded_ex", StateMode::Unary);
+        assert!(
+            rendered.contains(crate::check::QEDGEN_UNSUPPORTED_MARKER),
+            "exists over an unbounded U64 domain must keep the sentinel; got: {}",
+            rendered
+        );
+    }
+
+    // ========================================================================
+    // Issue #67 item 3 — `ghost` lowers to a State field + per-handler update.
+    // ========================================================================
+
+    #[test]
+    fn ghost_lowers_to_state_field_and_per_handler_update() {
+        let src = r#"
+spec G
+state { balance : U64 }
+type Error
+  | E
+ghost total : U64 {
+  init { 0 }
+  on mint { total := state.total + amount }
+}
+handler mint (amount : U64) {
+  effect { balance := state.balance + amount }
+}
+property p : state.total == state.balance preserved_by all
+"#;
+        let typed = crate::chumsky_parser::parse(src).expect("parse");
+        let spec = adapt(&typed);
+        assert_eq!(spec.ghosts.len(), 1, "one ghost expected");
+        let g = &spec.ghosts[0];
+        assert_eq!(g.name, "total");
+        assert_eq!(g.ty, "U64");
+        assert_eq!(g.init_rust.trim(), "0");
+        assert_eq!(g.updates.len(), 1);
+        assert_eq!(g.updates[0].handler, "mint");
+        // `state.total` resolves to `s.total` (ghost registered as a state
+        // field) and the handler param `amount` is in scope.
+        assert!(
+            g.updates[0].value_rust.contains("s.total")
+                && g.updates[0].value_rust.contains("amount"),
+            "update value_rust should read the ghost + param; got {}",
+            g.updates[0].value_rust
+        );
+        assert!(
+            g.updates[0].value_lean.contains("s.total"),
+            "update value_lean should read the ghost; got {}",
+            g.updates[0].value_lean
+        );
+        // The property references the ghost as a state field.
+        let prop = spec.properties.iter().find(|p| p.name == "p").unwrap();
+        assert!(prop
+            .rust_expression
+            .as_deref()
+            .is_some_and(|r| r.contains("s.total")));
     }
 
     #[test]
