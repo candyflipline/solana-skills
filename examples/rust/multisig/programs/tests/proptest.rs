@@ -159,7 +159,7 @@ fn execute(s: &mut State, member_index: u8) -> bool {
 }
 
 fn cancel_proposal(s: &mut State) -> bool {
-    if !((s.member_count.wrapping_sub(s.rejection_count) < s.threshold)) {
+    if !((s.member_count.saturating_sub(s.rejection_count) < s.threshold)) {
         return false;
     }
     if s.status != Status::HasProposal {
@@ -454,7 +454,7 @@ proptest! {
     #[test]
     fn cancel_proposal_rejects_invalid(s in arb_boundary_state()) {
         let mut s = s;
-        prop_assume!(!((s.member_count.wrapping_sub(s.rejection_count) < s.threshold)));
+        prop_assume!(!((s.member_count.saturating_sub(s.rejection_count) < s.threshold)));
         prop_assert!(!cancel_proposal(&mut s),
             "cancel_proposal must reject when guard is violated");
     }
