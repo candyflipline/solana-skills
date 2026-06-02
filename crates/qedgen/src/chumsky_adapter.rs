@@ -3060,6 +3060,25 @@ pub fn adapt(spec: &a::Spec) -> ParsedSpec {
                     updates,
                 });
             }
+            TopItem::Hook(h) => {
+                let kind = match &h.kind {
+                    a::HookKind::AfterStore(field) => {
+                        crate::check::ParsedHookKind::AfterStore(field.clone())
+                    }
+                    a::HookKind::BeforeCpi(iface) => {
+                        crate::check::ParsedHookKind::BeforeCpi(iface.clone())
+                    }
+                };
+                let asserts = h
+                    .asserts
+                    .iter()
+                    .map(|e| crate::check::ParsedHookAssert {
+                        lean: expr_to_lean(&e.node, Ctx::Guard, consts, &env),
+                        rust: expr_to_rust(&e.node, Ctx::Guard, consts, opts_native(&env)),
+                    })
+                    .collect();
+                out.hooks.push(crate::check::ParsedHook { kind, asserts });
+            }
             TopItem::Pragma(p) => {
                 // Record the pragma name for target inference. Any given
                 // pragma may appear at most once per spec; duplicates are
@@ -5338,6 +5357,61 @@ property p : state.total == state.balance preserved_by all
             .rust_expression
             .as_deref()
             .is_some_and(|r| r.contains("s.total")));
+    }
+
+    // ========================================================================
+    // Issue #67 item 4 — `hook` lowers to a per-field assertion set.
+    // ========================================================================
+
+    #[test]
+    fn hook_after_store_lowers_to_field_assertion() {
+        let src = r#"
+spec H
+state { balance : U64, cap : U64 }
+type Error
+  | E
+hook after_store(balance) {
+  assert state.balance <= state.cap
+}
+handler deposit (amount : U64) {
+  effect { balance := state.balance + amount }
+}
+"#;
+        let typed = crate::chumsky_parser::parse(src).expect("parse");
+        let spec = adapt(&typed);
+        assert_eq!(spec.hooks.len(), 1);
+        let h = &spec.hooks[0];
+        assert!(matches!(
+            &h.kind,
+            crate::check::ParsedHookKind::AfterStore(f) if f == "balance"
+        ));
+        assert_eq!(h.asserts.len(), 1);
+        assert!(
+            h.asserts[0].rust.contains("s.balance") && h.asserts[0].rust.contains("s.cap"),
+            "assert rust should read the state fields; got {}",
+            h.asserts[0].rust
+        );
+    }
+
+    #[test]
+    fn hook_before_cpi_parses_with_optional_callee() {
+        let src = r#"
+spec H2
+state { x : U64 }
+type Error
+  | E
+hook before_cpi(Token) {
+  assert state.x > 0
+}
+handler bump { effect { x := state.x + 1 } }
+"#;
+        let typed = crate::chumsky_parser::parse(src).expect("parse");
+        let spec = adapt(&typed);
+        assert_eq!(spec.hooks.len(), 1);
+        assert!(matches!(
+            &spec.hooks[0].kind,
+            crate::check::ParsedHookKind::BeforeCpi(Some(c)) if c == "Token"
+        ));
     }
 
     #[test]

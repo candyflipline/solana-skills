@@ -1108,6 +1108,28 @@ pub fn emit_property_predicates_with(
 
 /// Emit transition functions for handlers. Each returns true if guard passes.
 /// `wrapping` controls whether add/sub effects use wrapping arithmetic.
+/// Issue #67 item 4 — emit any `hook after_store(<field>)` assertions that
+/// fire after a store to `field`. Anchored right after the field's effect in
+/// the runtime transition, so the assertion sees the post-store state. A
+/// failed assertion panics, which both the proptest and Kani harnesses
+/// surface as a failure / verification violation. On-chain codegen doesn't
+/// use this transition emitter, so hooks never reach the program.
+fn emit_after_store_hooks(out: &mut String, spec: &ParsedSpec, field: &str, indent: &str) {
+    let base = effect_target_base(field);
+    for hook in &spec.hooks {
+        if let crate::check::ParsedHookKind::AfterStore(f) = &hook.kind {
+            if f == base {
+                for a in &hook.asserts {
+                    out.push_str(&format!(
+                        "{}assert!({}, \"hook after_store({}) violated\");\n",
+                        indent, a.rust, base
+                    ));
+                }
+            }
+        }
+    }
+}
+
 pub fn emit_transition_fn(
     out: &mut String,
     op: &ParsedHandler,
@@ -1214,6 +1236,7 @@ pub fn emit_transition_fn(
                     value,
                     "            ",
                 );
+                emit_after_store_hooks(out, spec, field, "            ");
             }
             out.push_str("        }\n");
         }
@@ -1236,6 +1259,7 @@ pub fn emit_transition_fn(
                 continue;
             }
             emit_one_effect(out, op, spec, wrapping, field, op_kind, value, "    ");
+            emit_after_store_hooks(out, spec, field, "    ");
         }
     }
 

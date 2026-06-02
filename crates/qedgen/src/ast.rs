@@ -154,6 +154,10 @@ pub enum TopItem {
     /// properties / `requires` / `ensures` (as `state.<name>`), updated
     /// per-handler, omitted from the on-chain program codegen.
     Ghost(GhostDecl),
+    /// Issue #67 item 4 — `hook <kind> { assert … }`. Cross-cutting
+    /// assertion fired at a MIR-statement boundary; enforced in the
+    /// Kani / proptest harnesses.
+    Hook(HookDecl),
 }
 
 /// v2.24 #1 — top-level `schema` block. Body carries a list of
@@ -370,6 +374,32 @@ pub struct GhostDecl {
 pub struct GhostUpdate {
     pub handler: String,
     pub stmt: EffectStmt,
+}
+
+/// Issue #67 item 4 — `hook <kind> { assert <expr> … }`. A cross-cutting
+/// instrumentation point: its assertions fire wherever a matching MIR
+/// statement occurs in any handler. v1 enforces hooks in the runtime
+/// backends (Kani / proptest); the Lean enforcement path lands with qedsvm.
+#[derive(Debug, Clone)]
+pub struct HookDecl {
+    pub doc: Option<String>,
+    pub kind: HookKind,
+    /// One or more `assert <expr>` predicates checked at the firing point.
+    pub asserts: Vec<Node<Expr>>,
+}
+
+/// Which MIR-statement boundary a hook fires at.
+#[derive(Debug, Clone)]
+pub enum HookKind {
+    /// `after_store(<field>)` — fires immediately after any assignment to
+    /// the named state field. Anchored in the runtime transition right
+    /// after that field's effect.
+    AfterStore(String),
+    /// `before_cpi` / `before_cpi(<Iface>)` — fires before a CPI (optionally
+    /// only to the named callee). Enforcement is the Lean CPI-theorem
+    /// precondition path (deferred); the runtime state model has no CPI to
+    /// anchor to, so this currently lints as enforcement-deferred.
+    BeforeCpi(Option<String>),
 }
 
 /// A type reference in the source language.
