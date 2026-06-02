@@ -43,6 +43,7 @@ mod native_extractor;
 mod paired_validator_probe;
 mod pinocchio_extractor;
 mod pinocchio_probe;
+mod pinocchio_profile;
 mod pinocchio_to_spec;
 mod probe;
 mod probe_repro;

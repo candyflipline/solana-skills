@@ -52,10 +52,16 @@
 //!   `generate_from_spec` is the seam a future arm plugs into.
 
 use anyhow::Result;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use crate::check::{self, ParsedHandler, ParsedHandlerAccount, ParsedSpec};
 use crate::codegen_shared::{map_type, to_pascal_case, to_snake_case};
+use crate::pinocchio_profile::{
+    PinocchioAccountRole, PinocchioHandlerProfile, PinocchioLocalKeyDerivation,
+    PinocchioParamField, PinocchioPdaDerivation, PinocchioPdaSeed, PinocchioProofProfile,
+    PinocchioRecordLayout, PinocchioRepeatField, PinocchioTokenAccountBinding,
+};
 use crate::Target;
 
 /// Predicate: a handler triggers auto-emission of an impl-targeted harness
@@ -128,16 +134,27 @@ pub fn generate(
     target: Target,
 ) -> Result<()> {
     let spec = check::parse_spec_file(spec_path)?;
-    generate_from_spec(&spec, output_path, explicit_flag, target)
+    generate_from_spec_with_context(&spec, output_path, explicit_flag, target, Some(spec_path))
 }
 
 /// Same as `generate` but takes a pre-parsed spec. Used by the CLI when
 /// it already has a `ParsedSpec` in hand (avoids the second parse).
+#[cfg(test)]
 pub fn generate_from_spec(
     spec: &ParsedSpec,
     output_path: &Path,
     explicit_flag: bool,
     target: Target,
+) -> Result<()> {
+    generate_from_spec_with_context(spec, output_path, explicit_flag, target, None)
+}
+
+fn generate_from_spec_with_context(
+    spec: &ParsedSpec,
+    output_path: &Path,
+    explicit_flag: bool,
+    target: Target,
+    spec_path: Option<&Path>,
 ) -> Result<()> {
     // Target gate. All three
     // targets now emit; only the harness body shape differs per framework
@@ -163,7 +180,7 @@ pub fn generate_from_spec(
     let handlers_with_ensures: Vec<&ParsedHandler> = spec
         .handlers
         .iter()
-        .filter(|h| !h.ensures.is_empty() || loyal_hub_forces_pinocchio_impl_handler(spec, h))
+        .filter(|h| !h.ensures.is_empty())
         .collect();
 
     // No ensures anywhere → nothing to assert. Auto-trigger could still
@@ -209,6 +226,7 @@ pub fn generate_from_spec(
             &emit_targets,
             &auto_handlers,
             explicit_flag,
+            spec_path,
         ),
         Target::Quasar => emit_kani_impl_quasar(
             spec,
@@ -450,6 +468,7 @@ fn emit_kani_impl_pinocchio(
     emit_targets: &[&ParsedHandler],
     auto_handlers: &[&str],
     explicit_flag: bool,
+    spec_path: Option<&Path>,
 ) -> Result<()> {
     let fp = crate::fingerprint::compute_fingerprint(spec);
     let hash = fp
@@ -492,9 +511,6 @@ fn emit_kani_impl_pinocchio(
     out.push_str("#![allow(dead_code, unused_imports, unused_variables)]\n\n");
 
     emit_pinocchio_scaffold(&mut out);
-    if spec.program_name == "LoyalHubSwap" {
-        emit_loyal_hub_pinocchio_scaffold(&mut out);
-    }
 
     out.push_str(
         "// ============================================================================\n",
@@ -504,9 +520,14 @@ fn emit_kani_impl_pinocchio(
         "// ============================================================================\n\n",
     );
 
+    let profile = output_path
+        .parent()
+        .and_then(|src_dir| crate::pinocchio_profile::infer_from_context(src_dir, spec_path).ok());
+
     let mut emitted_count = 0;
     for handler in emit_targets {
-        emit_pinocchio_handler_harness(&mut out, handler, spec)?;
+        let handler_profile = profile.as_ref().and_then(|p| p.handler(&handler.name));
+        emit_pinocchio_handler_harness(&mut out, handler, spec, profile.as_ref(), handler_profile)?;
         emitted_count += 1;
     }
 
@@ -521,27 +542,12 @@ fn emit_kani_impl_pinocchio(
     Ok(())
 }
 
-fn loyal_hub_forces_pinocchio_impl_handler(spec: &ParsedSpec, handler: &ParsedHandler) -> bool {
-    if spec.program_name != "LoyalHubSwap" {
-        return false;
-    }
-    matches!(
-        to_snake_case(&handler.name).as_str(),
-        "initialize_config" | "set_max_fee" | "set_paused"
-    )
-}
-
 /// Emit the deterministic shared scaffold: the `Account`-layout mirror,
 /// the stack-account container, the SPL Token layout constants, and the
 /// build / transmute / read helpers. Byte-for-byte the same regardless
 /// of the spec (the per-handler harnesses below reference these).
 fn emit_pinocchio_scaffold(out: &mut String) {
     out.push_str(PINOCCHIO_SCAFFOLD);
-    out.push('\n');
-}
-
-fn emit_loyal_hub_pinocchio_scaffold(out: &mut String) {
-    out.push_str(LOYAL_HUB_PINOCCHIO_SCAFFOLD);
     out.push('\n');
 }
 
@@ -576,10 +582,14 @@ struct StackAccount<const DATA_LEN: usize> {
 }
 
 // SPL Token `TokenAccount` data-region offsets (pinocchio-token 0.3.0).
+const TOKEN_MINT_OFF: usize = 0;
 const TOKEN_OWNER_OFF: usize = 32;
 const TOKEN_AMOUNT_OFF: usize = 64;
 const TOKEN_STATE_OFF: usize = 108;
 const TOKEN_DATA_LEN: usize = 165;
+const MINT_DECIMALS_OFF: usize = 44;
+const MINT_STATE_OFF: usize = 45;
+const MINT_DATA_LEN: usize = 82;
 
 /// SPL Token program ID — the `from_account_info` owner check target.
 const SPL_TOKEN_PROGRAM_ID: [u8; 32] = [
@@ -596,6 +606,7 @@ fn build_token_account(
     key: [u8; 32],
     is_writable: bool,
     is_signer: bool,
+    mint_in_data: [u8; 32],
     owner_in_data: [u8; 32],
     amount: u64,
 ) -> StackAccount<TOKEN_DATA_LEN> {
@@ -613,9 +624,32 @@ fn build_token_account(
         },
         data: [0u8; TOKEN_DATA_LEN],
     };
+    acct.data[TOKEN_MINT_OFF..TOKEN_MINT_OFF + 32].copy_from_slice(&mint_in_data);
     acct.data[TOKEN_OWNER_OFF..TOKEN_OWNER_OFF + 32].copy_from_slice(&owner_in_data);
     acct.data[TOKEN_AMOUNT_OFF..TOKEN_AMOUNT_OFF + 8].copy_from_slice(&amount.to_le_bytes());
     acct.data[TOKEN_STATE_OFF] = STATE_INITIALIZED;
+    acct
+}
+
+/// Build a stack-resident SPL Token mint. This is enough for
+/// `Mint::from_account_info(..)?.decimals()` and initialized-state checks.
+fn build_mint_account(key: [u8; 32], is_signer: bool, is_writable: bool, decimals: u8) -> StackAccount<MINT_DATA_LEN> {
+    let mut acct = StackAccount {
+        hdr: AccountLayout {
+            borrow_state: BORROW_STATE_CLEAR,
+            is_signer: is_signer as u8,
+            is_writable: is_writable as u8,
+            executable: 0,
+            original_data_len: 0,
+            key,
+            owner: SPL_TOKEN_PROGRAM_ID,
+            lamports: 0,
+            data_len: MINT_DATA_LEN as u64,
+        },
+        data: [0u8; MINT_DATA_LEN],
+    };
+    acct.data[MINT_DECIMALS_OFF] = decimals;
+    acct.data[MINT_STATE_OFF] = STATE_INITIALIZED;
     acct
 }
 
@@ -635,6 +669,30 @@ fn build_minimal_account(key: [u8; 32], is_signer: bool, is_writable: bool) -> S
             data_len: 0,
         },
         data: [],
+    }
+}
+
+/// Build a non-token account with an ABI-profiled data region. The data is
+/// symbolic in generated harnesses; ABI layout facts only fix the byte length.
+fn build_data_account<const DATA_LEN: usize>(
+    key: [u8; 32],
+    is_signer: bool,
+    is_writable: bool,
+    data: [u8; DATA_LEN],
+) -> StackAccount<DATA_LEN> {
+    StackAccount {
+        hdr: AccountLayout {
+            borrow_state: BORROW_STATE_CLEAR,
+            is_signer: is_signer as u8,
+            is_writable: is_writable as u8,
+            executable: 0,
+            original_data_len: 0,
+            key,
+            owner: [0u8; 32],
+            lamports: 0,
+            data_len: DATA_LEN as u64,
+        },
+        data,
     }
 }
 
@@ -659,125 +717,6 @@ fn read_token_amount<const N: usize>(stack: &StackAccount<N>) -> u64 {
 }
 "#;
 
-const LOYAL_HUB_PINOCCHIO_SCAFFOLD: &str = r#"const LOYAL_MINT_DECIMALS_OFFSET: usize = 44;
-const LOYAL_MINT_INITIALIZED_OFFSET: usize = 45;
-const LOYAL_MINT_DATA_LEN: usize = 82;
-const LOYAL_TOKEN_MINT_OFFSET: usize = 0;
-
-fn loyal_build_account<const DATA_LEN: usize>(
-    key: [u8; 32],
-    owner: [u8; 32],
-    is_signer: bool,
-    is_writable: bool,
-    data: [u8; DATA_LEN],
-) -> StackAccount<DATA_LEN> {
-    StackAccount {
-        hdr: AccountLayout {
-            borrow_state: BORROW_STATE_CLEAR,
-            is_signer: is_signer as u8,
-            is_writable: is_writable as u8,
-            executable: 0,
-            original_data_len: 0,
-            key,
-            owner,
-            lamports: 0,
-            data_len: DATA_LEN as u64,
-        },
-        data,
-    }
-}
-
-fn loyal_build_uninitialized_config_account(key: [u8; 32]) -> StackAccount<{ crate::HUB_CONFIG_SPACE }> {
-    let mut acct = loyal_build_account(
-        key,
-        crate::SYSTEM_PROGRAM_ID,
-        false,
-        true,
-        [0u8; crate::HUB_CONFIG_SPACE],
-    );
-    acct.hdr.data_len = 0;
-    acct
-}
-
-fn loyal_write_pubkey(data: &mut [u8], offset: usize, key: &[u8; 32]) {
-    data[offset..offset + 32].copy_from_slice(key);
-}
-
-fn loyal_config_data(
-    admin: [u8; 32],
-    hub_authorizer: [u8; 32],
-    inventory_rebalancer: [u8; 32],
-    max_fee_bps: u16,
-    paused: bool,
-    lane_count: u8,
-    allowed_mints: &[[u8; 32]],
-) -> [u8; crate::HUB_CONFIG_SPACE] {
-    kani::assume(lane_count > 0);
-    kani::assume(!allowed_mints.is_empty());
-    kani::assume(allowed_mints.len() <= crate::MAX_ALLOWED_MINTS);
-
-    let mut data = [0u8; crate::HUB_CONFIG_SPACE];
-    data[loyal_hub_abi::config_account::MAGIC_OFFSET
-        ..loyal_hub_abi::config_account::MAGIC_OFFSET + loyal_hub_abi::config_account::MAGIC_LEN]
-        .copy_from_slice(crate::CONFIG_MAGIC);
-    loyal_write_pubkey(
-        &mut data,
-        loyal_hub_abi::config_account::ADMIN_OFFSET,
-        &admin,
-    );
-    loyal_write_pubkey(
-        &mut data,
-        loyal_hub_abi::config_account::HUB_AUTHORIZER_OFFSET,
-        &hub_authorizer,
-    );
-    loyal_write_pubkey(
-        &mut data,
-        loyal_hub_abi::config_account::INVENTORY_REBALANCER_OFFSET,
-        &inventory_rebalancer,
-    );
-    data[loyal_hub_abi::config_account::MAX_FEE_BPS_OFFSET
-        ..loyal_hub_abi::config_account::MAX_FEE_BPS_OFFSET + 2]
-        .copy_from_slice(&max_fee_bps.to_le_bytes());
-    data[loyal_hub_abi::config_account::PAUSED_OFFSET] = paused as u8;
-    data[loyal_hub_abi::config_account::LANE_COUNT_OFFSET] = lane_count;
-    data[loyal_hub_abi::config_account::MINT_COUNT_OFFSET] = allowed_mints.len() as u8;
-    for (index, mint) in allowed_mints.iter().enumerate() {
-        let offset = loyal_hub_abi::config_account::ALLOWED_MINT_OFFSET
-            + (index * loyal_hub_abi::config_account::ALLOWED_MINT_ITEM_LEN);
-        loyal_write_pubkey(&mut data, offset, mint);
-    }
-    data
-}
-
-fn loyal_mint_data(decimals: u8) -> [u8; LOYAL_MINT_DATA_LEN] {
-    let mut data = [0u8; LOYAL_MINT_DATA_LEN];
-    data[LOYAL_MINT_DECIMALS_OFFSET] = decimals;
-    data[LOYAL_MINT_INITIALIZED_OFFSET] = 1;
-    data
-}
-
-fn loyal_read_u16(data: &[u8], offset: usize) -> u16 {
-    u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap())
-}
-
-fn loyal_token_account_data(mint: [u8; 32], owner: [u8; 32], amount: u64) -> [u8; TOKEN_DATA_LEN] {
-    let mut data = [0u8; TOKEN_DATA_LEN];
-    loyal_write_pubkey(&mut data, LOYAL_TOKEN_MINT_OFFSET, &mint);
-    loyal_write_pubkey(&mut data, TOKEN_OWNER_OFF, &owner);
-    data[TOKEN_AMOUNT_OFF..TOKEN_AMOUNT_OFF + 8].copy_from_slice(&amount.to_le_bytes());
-    data[TOKEN_STATE_OFF] = STATE_INITIALIZED;
-    data
-}
-
-fn loyal_assume_distinct_pubkeys(keys: &[[u8; 32]]) {
-    for (index, left) in keys.iter().enumerate() {
-        for right in keys.iter().skip(index + 1) {
-            kani::assume(left != right);
-        }
-    }
-}
-"#;
-
 /// Normalize a spec handler name into `(module, fn_name)`.
 ///
 /// Kept for generated-scaffold compatibility docs and tests: older
@@ -793,9 +732,9 @@ fn _pinocchio_call_path(handler_name: &str) -> (String, String) {
 
 /// Instruction tag constant expected in the committed Pinocchio crate.
 ///
-/// For arity-specialized spec models such as `rebalance_inventory_16`, strip
-/// the numeric suffix so all arities dispatch through the same runtime
-/// instruction tag (`REBALANCE_INVENTORY`).
+/// For arity-specialized spec models such as `batch_16`, strip the numeric
+/// suffix so related models dispatch through the same runtime instruction tag
+/// (`BATCH`).
 fn pinocchio_instruction_tag_const(handler_name: &str) -> String {
     let snake = to_snake_case(handler_name);
     let base = snake
@@ -807,8 +746,7 @@ fn pinocchio_instruction_tag_const(handler_name: &str) -> String {
 
 /// Rust primitive for a numeric DSL type, used to declare the symbolic
 /// param so `to_le_bytes()` packs the right width. Returns None for
-/// non-numeric / unsupported types (the harness emits a `todo!()` for
-/// those params).
+/// non-numeric / unsupported types.
 fn numeric_param_rust_type(dsl_type: &str) -> Option<&'static str> {
     match dsl_type {
         "U8" => Some("u8"),
@@ -825,108 +763,210 @@ fn numeric_param_rust_type(dsl_type: &str) -> Option<&'static str> {
     }
 }
 
-fn has_param(handler: &ParsedHandler, name: &str) -> bool {
-    handler.takes_params.iter().any(|(pname, _)| pname == name)
+fn pinocchio_param_decl_type(dsl_type: &str) -> Option<&'static str> {
+    numeric_param_rust_type(dsl_type).or(match dsl_type {
+        "Pubkey" => Some("[u8; 32]"),
+        _ => None,
+    })
 }
 
-fn rebalance_arity(handler_name: &str) -> Option<usize> {
-    let snake = to_snake_case(handler_name);
-    if snake == "rebalance_inventory" {
-        return Some(1);
+fn pinocchio_emit_profile_field_pack(out: &mut String, field: &PinocchioParamField, ident: &str) {
+    if field.rust_type.eq_ignore_ascii_case("pubkey") {
+        out.push_str(&format!(
+            "    instruction_data.extend_from_slice(&{});\n",
+            ident
+        ));
+    } else {
+        out.push_str(&format!(
+            "    instruction_data.extend_from_slice(&({} as {}).to_le_bytes());\n",
+            ident, field.rust_type
+        ));
     }
-    snake
-        .strip_prefix("rebalance_inventory_")
-        .and_then(|suffix| suffix.parse::<usize>().ok())
 }
 
 /// Emit committed Pinocchio dispatcher argument packing.
 ///
-/// This intentionally understands the common byte-dispatcher shape where
-/// runtime ABI fields are narrower than model-side spec parameters. Unknown
-/// handlers fall back to the old "all numeric params in declared order" shape.
-fn emit_pinocchio_instruction_data_pack(out: &mut String, handler: &ParsedHandler) {
-    let tag_const = pinocchio_instruction_tag_const(&handler.name);
-    out.push_str(&format!(
-        "    let instruction_tag: u8 = crate::{};\n",
-        tag_const
-    ));
+/// The fallback path packs directly declared numeric and Pubkey spec
+/// parameters in declared order. Runtime-specific ABI narrowing and
+/// repeated-record layouts belong in the source/ABI-derived profile.
+fn emit_pinocchio_instruction_data_pack_with_profile(
+    out: &mut String,
+    handler: &ParsedHandler,
+    profile: Option<&PinocchioHandlerProfile>,
+) {
+    if let Some(tag) = profile.and_then(|p| p.instruction_tag) {
+        out.push_str(&format!("    let instruction_tag: u8 = {tag}u8;\n"));
+    } else {
+        let tag_const = pinocchio_instruction_tag_const(&handler.name);
+        out.push_str(&format!(
+            "    let instruction_tag: u8 = crate::{};\n",
+            tag_const
+        ));
+    }
     out.push_str("    let mut instruction_data = alloc::vec::Vec::new();\n");
     out.push_str("    instruction_data.push(instruction_tag);\n");
 
-    let snake = to_snake_case(&handler.name);
-    match snake.as_str() {
-        "swap_exact_in"
-            if has_param(handler, "amount_in")
-                && has_param(handler, "amount_out")
-                && has_param(handler, "min_out")
-                && has_param(handler, "max_fee_bps")
-                && has_param(handler, "lane_id") =>
-        {
-            out.push_str("    instruction_data.extend_from_slice(&amount_in.to_le_bytes());\n");
-            out.push_str("    instruction_data.extend_from_slice(&amount_out.to_le_bytes());\n");
-            out.push_str("    instruction_data.extend_from_slice(&min_out.to_le_bytes());\n");
-            out.push_str(
-                "    instruction_data.extend_from_slice(&(max_fee_bps as u16).to_le_bytes());\n",
-            );
-            out.push_str("    instruction_data.push(lane_id as u8);\n");
-        }
-        "withdraw_inventory" if has_param(handler, "amount") && has_param(handler, "lane_id") => {
-            out.push_str("    instruction_data.extend_from_slice(&amount.to_le_bytes());\n");
-            out.push_str("    instruction_data.push(lane_id as u8);\n");
-        }
-        "set_paused" if has_param(handler, "paused_value") => {
-            out.push_str("    instruction_data.push(paused_value as u8);\n");
-        }
-        "set_max_fee" if has_param(handler, "new_max_fee_bps") => {
-            out.push_str(
-                "    instruction_data.extend_from_slice(&(new_max_fee_bps as u16).to_le_bytes());\n",
-            );
-        }
-        _ => {
-            if let Some(arity) = rebalance_arity(&snake) {
-                out.push_str(&format!("    instruction_data.push({arity}u8);\n"));
-                for index in 0..arity {
-                    let amount = if arity == 1 {
-                        "amount".to_string()
-                    } else {
-                        format!("amount_{index}")
-                    };
-                    let from_lane = if arity == 1 {
-                        "from_lane_id".to_string()
-                    } else {
-                        format!("from_lane_id_{index}")
-                    };
-                    let to_lane = if arity == 1 {
-                        "to_lane_id".to_string()
-                    } else {
-                        format!("to_lane_id_{index}")
-                    };
-                    out.push_str(&format!("    instruction_data.push({from_lane} as u8);\n"));
-                    out.push_str(&format!("    instruction_data.push({to_lane} as u8);\n"));
+    if let Some(profile) = profile {
+        if !profile.params.is_empty() || !profile.repeats.is_empty() {
+            for param in &profile.params {
+                if handler
+                    .takes_params
+                    .iter()
+                    .any(|(name, _)| name == &param.name)
+                {
+                    pinocchio_emit_profile_field_pack(out, param, &to_snake_case(&param.name));
+                } else {
                     out.push_str(&format!(
-                        "    instruction_data.extend_from_slice(&{amount}.to_le_bytes());\n"
+                        "    // TODO: source profile references param `{}` absent from the spec handler\n",
+                        param.name
                     ));
                 }
-            } else {
-                for (pname, ptype) in &handler.takes_params {
-                    match numeric_param_rust_type(ptype) {
-                        Some(_) => {
-                            out.push_str(&format!(
-                                "    instruction_data.extend_from_slice(&{}.to_le_bytes());\n",
-                                to_snake_case(pname)
-                            ));
-                        }
-                        None => {
-                            out.push_str(&format!(
-                                "    // TODO: pack param `{}` (spec type {}) into instruction_data\n",
-                                pname, ptype
-                            ));
-                        }
-                    }
-                }
+            }
+            for repeat in &profile.repeats {
+                emit_pinocchio_repeat_pack(out, handler, repeat);
+            }
+            return;
+        }
+    }
+
+    for (pname, ptype) in &handler.takes_params {
+        match numeric_param_rust_type(ptype) {
+            Some(_) => {
+                out.push_str(&format!(
+                    "    instruction_data.extend_from_slice(&{}.to_le_bytes());\n",
+                    to_snake_case(pname)
+                ));
+            }
+            None if ptype == "Pubkey" => {
+                out.push_str(&format!(
+                    "    instruction_data.extend_from_slice(&{});\n",
+                    to_snake_case(pname)
+                ));
+            }
+            None => {
+                out.push_str(&format!(
+                    "    // TODO: pack param `{}` (spec type {}) into instruction_data\n",
+                    pname, ptype
+                ));
             }
         }
     }
+}
+
+fn emit_pinocchio_repeat_pack(
+    out: &mut String,
+    handler: &ParsedHandler,
+    repeat: &PinocchioRepeatField,
+) {
+    let Some(count) = pinocchio_repeat_count(handler, repeat) else {
+        out.push_str(&format!(
+            "    // TODO: infer repeat count for `{}` from spec params\n",
+            repeat.name
+        ));
+        return;
+    };
+    out.push_str(&format!(
+        "    let {}: u8 = {count}u8;\n",
+        to_snake_case(&repeat.count_field)
+    ));
+    out.push_str(&format!(
+        "    instruction_data.extend_from_slice(&{}.to_le_bytes());\n",
+        to_snake_case(&repeat.count_field)
+    ));
+
+    for index in 0..count {
+        for field in &repeat.item_fields {
+            let Some(param_name) = repeat_item_param_name(handler, &field.name, index, count)
+            else {
+                out.push_str(&format!(
+                    "    // TODO: pack repeat field `{}` item {} absent from the spec handler\n",
+                    field.name, index
+                ));
+                continue;
+            };
+            pinocchio_emit_profile_field_pack(out, field, &to_snake_case(&param_name));
+        }
+    }
+}
+
+fn pinocchio_repeat_count(handler: &ParsedHandler, repeat: &PinocchioRepeatField) -> Option<usize> {
+    if let Some((_, suffix)) = handler.name.rsplit_once('_') {
+        if let Ok(count) = suffix.parse::<usize>() {
+            if repeat_has_indexed_params(handler, repeat, count) {
+                return Some(count);
+            }
+        }
+    }
+    if repeat_has_unindexed_params(handler, repeat) {
+        return Some(1);
+    }
+
+    let mut indexes = BTreeSet::new();
+    for (name, _) in &handler.takes_params {
+        for field in &repeat.item_fields {
+            if let Some(index) = indexed_param_suffix(name, &field.name) {
+                indexes.insert(index);
+            }
+        }
+    }
+    let count = indexes.iter().next_back().copied()? + 1;
+    if repeat_has_indexed_params(handler, repeat, count) {
+        Some(count)
+    } else {
+        None
+    }
+}
+
+fn repeat_has_unindexed_params(handler: &ParsedHandler, repeat: &PinocchioRepeatField) -> bool {
+    repeat.item_fields.iter().all(|field| {
+        handler
+            .takes_params
+            .iter()
+            .any(|(name, _)| name == &field.name)
+    })
+}
+
+fn repeat_has_indexed_params(
+    handler: &ParsedHandler,
+    repeat: &PinocchioRepeatField,
+    count: usize,
+) -> bool {
+    (0..count).all(|index| {
+        repeat.item_fields.iter().all(|field| {
+            let indexed = format!("{}_{}", field.name, index);
+            handler
+                .takes_params
+                .iter()
+                .any(|(name, _)| name == &indexed)
+        })
+    })
+}
+
+fn repeat_item_param_name(
+    handler: &ParsedHandler,
+    field_name: &str,
+    index: usize,
+    count: usize,
+) -> Option<String> {
+    if count == 1
+        && handler
+            .takes_params
+            .iter()
+            .any(|(name, _)| name == field_name)
+    {
+        return Some(field_name.to_string());
+    }
+    let indexed = format!("{field_name}_{index}");
+    handler
+        .takes_params
+        .iter()
+        .any(|(name, _)| name == &indexed)
+        .then_some(indexed)
+}
+
+fn indexed_param_suffix(name: &str, field_name: &str) -> Option<usize> {
+    let suffix = name.strip_prefix(field_name)?.strip_prefix('_')?;
+    suffix.parse::<usize>().ok()
 }
 
 #[derive(Debug, Clone)]
@@ -1030,502 +1070,619 @@ fn emit_pinocchio_token_post_assertions(
     out.push_str("    }\n");
 }
 
-fn emit_loyal_hub_handler_harness(
-    out: &mut String,
-    handler: &ParsedHandler,
-    snake: &str,
-    token_assertions: &[PinocchioTokenTransferAssertion],
-) -> bool {
-    match snake {
-        "initialize_config" => emit_loyal_hub_initialize_config_harness(out, handler),
-        "set_max_fee" => emit_loyal_hub_set_max_fee_harness(out, handler),
-        "set_paused" => emit_loyal_hub_set_paused_harness(out, handler),
-        "swap_exact_in" => emit_loyal_hub_swap_exact_in_harness(out, handler, token_assertions),
-        "withdraw_inventory" => {
-            emit_loyal_hub_withdraw_inventory_harness(out, handler, token_assertions)
+fn pinocchio_account_order<'a>(
+    handler: &'a ParsedHandler,
+    profile: Option<&PinocchioHandlerProfile>,
+) -> Vec<&'a ParsedHandlerAccount> {
+    let Some(profile) = profile else {
+        return handler.accounts.iter().collect();
+    };
+    if profile.accounts.is_empty() {
+        return handler.accounts.iter().collect();
+    }
+
+    let mut ordered = Vec::with_capacity(handler.accounts.len());
+    for name in &profile.accounts {
+        let Some(account) = handler.accounts.iter().find(|acct| acct.name == *name) else {
+            return handler.accounts.iter().collect();
+        };
+        ordered.push(account);
+    }
+    for account in &handler.accounts {
+        if !profile.accounts.iter().any(|name| name == &account.name) {
+            ordered.push(account);
         }
-        _ => {
-            if let Some(arity) = rebalance_arity(snake) {
-                emit_loyal_hub_rebalance_inventory_harness(out, handler, token_assertions, arity)
-            } else {
-                return false;
+    }
+    ordered
+}
+
+fn pinocchio_account_role<'a>(
+    profile: Option<&'a PinocchioHandlerProfile>,
+    account: &ParsedHandlerAccount,
+) -> Option<&'a PinocchioAccountRole> {
+    profile.and_then(|profile| {
+        let ident = to_snake_case(&account.name);
+        profile
+            .account_roles
+            .get(&ident)
+            .or_else(|| profile.account_roles.get(&account.name))
+            .or_else(|| {
+                strip_numeric_suffix(&ident)
+                    .and_then(|(base, _suffix)| profile.account_roles.get(base))
+            })
+    })
+}
+
+fn strip_numeric_suffix(ident: &str) -> Option<(&str, &str)> {
+    let (base, suffix) = ident.rsplit_once('_')?;
+    if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some((base, suffix))
+}
+
+fn pinocchio_token_account_binding<'a>(
+    profile: Option<&'a PinocchioHandlerProfile>,
+    account: &ParsedHandlerAccount,
+) -> Option<&'a PinocchioTokenAccountBinding> {
+    profile.and_then(|profile| {
+        let ident = to_snake_case(&account.name);
+        profile
+            .token_account_bindings
+            .get(&ident)
+            .or_else(|| profile.token_account_bindings.get(&account.name))
+            .or_else(|| {
+                strip_numeric_suffix(&ident)
+                    .and_then(|(base, _suffix)| profile.token_account_bindings.get(base))
+            })
+    })
+}
+
+fn pinocchio_account_key_derivation<'a>(
+    profile: Option<&'a PinocchioHandlerProfile>,
+    account: &ParsedHandlerAccount,
+) -> Option<&'a PinocchioLocalKeyDerivation> {
+    profile.and_then(|profile| {
+        let ident = to_snake_case(&account.name);
+        profile
+            .account_key_derivations
+            .get(&ident)
+            .or_else(|| profile.account_key_derivations.get(&account.name))
+            .or_else(|| {
+                strip_numeric_suffix(&ident)
+                    .and_then(|(base, _suffix)| profile.account_key_derivations.get(base))
+            })
+    })
+}
+
+fn pinocchio_bound_key_expr(
+    account_key_exprs: &BTreeMap<String, String>,
+    current_ident: &str,
+    bound_account: &str,
+) -> Option<String> {
+    account_key_exprs.get(bound_account).cloned().or_else(|| {
+        strip_numeric_suffix(current_ident).and_then(|(_base, suffix)| {
+            account_key_exprs
+                .get(&format!("{bound_account}_{suffix}"))
+                .cloned()
+        })
+    })
+}
+
+fn pinocchio_param_rust_type<'a>(
+    name: &str,
+    handler: &'a ParsedHandler,
+    handler_profile: Option<&'a PinocchioHandlerProfile>,
+) -> Option<&'a str> {
+    handler_profile
+        .and_then(|profile| {
+            profile
+                .params
+                .iter()
+                .chain(
+                    profile
+                        .repeats
+                        .iter()
+                        .flat_map(|repeat| repeat.item_fields.iter()),
+                )
+                .find(|param| param.name == name)
+                .map(|param| param.rust_type.as_str())
+        })
+        .or_else(|| {
+            handler
+                .takes_params
+                .iter()
+                .find(|(param_name, _)| to_snake_case(param_name) == name)
+                .and_then(|(_name, param_type)| numeric_param_rust_type(param_type))
+        })
+}
+
+fn pinocchio_resolve_source_expr_alias<'a>(
+    expr: &'a str,
+    handler_profile: Option<&'a PinocchioHandlerProfile>,
+) -> String {
+    let mut current = expr.trim().to_string();
+    for _ in 0..4 {
+        let key = current.trim().trim_start_matches('&').trim().to_string();
+        let Some(next) = handler_profile.and_then(|profile| profile.source_expr_aliases.get(&key))
+        else {
+            break;
+        };
+        if next == &current {
+            break;
+        }
+        current = next.clone();
+    }
+    current
+}
+
+fn pinocchio_source_expr_param_name(
+    expr: &str,
+    current_ident: &str,
+    handler_profile: Option<&PinocchioHandlerProfile>,
+) -> Option<String> {
+    let resolved = pinocchio_resolve_source_expr_alias(expr, handler_profile);
+    let expr = resolved.trim();
+    let expr = expr.strip_prefix('&').unwrap_or(expr).trim();
+    if let Some(account) = expr.strip_suffix(".key()") {
+        return Some(to_snake_case(account));
+    }
+    if let Some(field) = expr
+        .strip_prefix("transfer.")
+        .and_then(|expr| expr.strip_suffix(".0"))
+    {
+        if let Some((_base, suffix)) = strip_numeric_suffix(current_ident) {
+            return Some(format!("{}_{suffix}", to_snake_case(field)));
+        }
+        return Some(to_snake_case(field));
+    }
+    if expr
+        .chars()
+        .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+    {
+        return Some(to_snake_case(expr.trim_end_matches(".0")));
+    }
+    None
+}
+
+fn pinocchio_source_expr_account_key(
+    expr: &str,
+    account_key_exprs: &BTreeMap<String, String>,
+    handler_profile: Option<&PinocchioHandlerProfile>,
+) -> Option<String> {
+    let resolved = pinocchio_resolve_source_expr_alias(expr, handler_profile);
+    let expr = resolved
+        .trim()
+        .strip_prefix('&')
+        .unwrap_or(resolved.trim())
+        .trim();
+    let account = expr
+        .strip_suffix(".key()")
+        .or_else(|| expr.strip_suffix(".0"))
+        .unwrap_or(expr);
+    if !account
+        .chars()
+        .all(|ch| ch == '_' || ch == '.' || ch.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    account_key_exprs.get(&to_snake_case(account)).cloned()
+}
+
+fn pinocchio_pda_program_expr(program_id: &str) -> Option<String> {
+    let program_id = program_id.trim();
+    if program_id == "program_id" {
+        return Some("&program_id".to_string());
+    }
+    if let Some(rest) = program_id.strip_prefix("crate::") {
+        return Some(format!("&crate::{rest}"));
+    }
+    if is_upper_const_ident(program_id) {
+        return Some(format!("&crate::{program_id}"));
+    }
+    None
+}
+
+fn pinocchio_const_pubkey_seed_expr(expr: &str) -> Option<String> {
+    let seed = expr.trim().strip_suffix(".as_ref()")?.trim();
+    if seed.starts_with("crate::") {
+        return Some(format!("{seed}.as_ref()"));
+    }
+    if is_upper_const_ident(seed) {
+        return Some(format!("crate::{seed}.as_ref()"));
+    }
+    None
+}
+
+fn is_upper_const_ident(input: &str) -> bool {
+    let mut chars = input.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_uppercase())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_uppercase() || ch.is_ascii_digit())
+}
+
+fn pinocchio_local_derived_key_seed_exprs(
+    proof_profile: Option<&PinocchioProofProfile>,
+    handler_profile: Option<&PinocchioHandlerProfile>,
+    handler: &ParsedHandler,
+    current_ident: &str,
+    local: &PinocchioLocalKeyDerivation,
+    account_key_exprs: &BTreeMap<String, String>,
+    nested_key_exprs: &BTreeMap<String, String>,
+) -> Option<Vec<String>> {
+    let derivation = proof_profile?.pda_derivations.get(&local.derivation)?;
+    let _program_expr = pinocchio_pda_program_expr(&derivation.program_id)?;
+    let arg_by_param: BTreeMap<_, _> = derivation
+        .params
+        .iter()
+        .zip(local.args.iter())
+        .map(|(param, arg)| (param.as_str(), arg.as_str()))
+        .collect();
+
+    derivation
+        .seeds
+        .iter()
+        .map(|seed| {
+            if let Some(literal) = &seed.literal {
+                return Some(format!("b\"{}\".as_ref()", rust_string_escape(literal)));
             }
-        }
+            if let Some(const_seed) = pinocchio_const_pubkey_seed_expr(&seed.expr) {
+                return Some(const_seed);
+            }
+            if let Some(seed_param) = seed.expr.trim().strip_suffix(".as_ref()") {
+                if let Some(key_expr) = nested_key_exprs.get(seed_param.trim()) {
+                    return Some(format!("{key_expr}.as_ref()"));
+                }
+                let source_expr = arg_by_param.get(seed_param.trim())?;
+                let param_name =
+                    pinocchio_source_expr_param_name(source_expr, current_ident, handler_profile)?;
+                let rust_type = derivation
+                    .param_types
+                    .get(seed_param.trim())
+                    .map(String::as_str)
+                    .or_else(|| pinocchio_param_rust_type(&param_name, handler, handler_profile))?;
+                return match rust_type {
+                    "&Pubkey" | "Pubkey" | "pubkey" => pinocchio_source_expr_account_key(
+                        source_expr,
+                        account_key_exprs,
+                        handler_profile,
+                    )
+                    .or_else(|| Some(param_name))
+                    .map(|expr| format!("{expr}.as_ref()")),
+                    _ => None,
+                };
+            }
+            let bracketed = seed
+                .expr
+                .trim()
+                .strip_prefix('[')?
+                .strip_suffix(']')?
+                .trim();
+            let source_expr = arg_by_param.get(bracketed)?;
+            let param_name =
+                pinocchio_source_expr_param_name(source_expr, current_ident, handler_profile)?;
+            let rust_type = derivation
+                .param_types
+                .get(bracketed)
+                .map(String::as_str)
+                .or_else(|| pinocchio_param_rust_type(&param_name, handler, handler_profile))?;
+            match rust_type {
+                "u8" | "i8" => Some(format!("&[{} as u8]", param_name)),
+                "&Pubkey" | "Pubkey" | "pubkey" => pinocchio_source_expr_account_key(
+                    source_expr,
+                    account_key_exprs,
+                    handler_profile,
+                )
+                .or_else(|| Some(param_name))
+                .map(|expr| format!("{expr}.as_ref()")),
+                _ => Some(format!("&({} as {}).to_le_bytes()", param_name, rust_type)),
+            }
+        })
+        .collect::<Option<Vec<_>>>()
+}
+
+fn pinocchio_local_arg_by_param<'a>(
+    derivation: &'a PinocchioPdaDerivation,
+    local: &'a PinocchioLocalKeyDerivation,
+) -> BTreeMap<&'a str, &'a str> {
+    derivation
+        .params
+        .iter()
+        .zip(local.args.iter())
+        .map(|(param, arg)| (param.as_str(), arg.as_str()))
+        .collect()
+}
+
+fn emit_pinocchio_nested_key_bindings(
+    out: &mut String,
+    proof_profile: Option<&PinocchioProofProfile>,
+    handler_profile: Option<&PinocchioHandlerProfile>,
+    handler: &ParsedHandler,
+    current_ident: &str,
+    outer_derivation: &PinocchioPdaDerivation,
+    outer_arg_by_param: &BTreeMap<&str, &str>,
+    account_key_exprs: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut nested_keys = BTreeMap::new();
+    let Some(proof_profile) = proof_profile else {
+        return nested_keys;
+    };
+    for (local_name, local) in &outer_derivation.local_key_derivations {
+        let Some(nested_derivation) = proof_profile.pda_derivations.get(&local.derivation) else {
+            continue;
+        };
+        let Some(program_expr) = pinocchio_pda_program_expr(&nested_derivation.program_id) else {
+            continue;
+        };
+        let nested_args = local
+            .args
+            .iter()
+            .map(|arg| {
+                outer_arg_by_param
+                    .get(arg.as_str())
+                    .copied()
+                    .unwrap_or(arg.as_str())
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        let nested_local = PinocchioLocalKeyDerivation {
+            derivation: local.derivation.clone(),
+            args: nested_args,
+        };
+        let Some(seed_exprs) = pinocchio_local_derived_key_seed_exprs(
+            Some(proof_profile),
+            handler_profile,
+            handler,
+            current_ident,
+            &nested_local,
+            account_key_exprs,
+            &BTreeMap::new(),
+        ) else {
+            continue;
+        };
+        let ident = format!("{}_{}", current_ident, local_name);
+        out.push_str(&format!(
+            "    let {ident}_pda = pinocchio::pubkey::try_find_program_address(&[{}], {});\n",
+            seed_exprs.join(", "),
+            program_expr
+        ));
+        out.push_str(&format!("    kani::assume({ident}_pda.is_some());\n"));
+        out.push_str(&format!("    let {ident}_key = {ident}_pda.unwrap().0;\n"));
+        nested_keys.insert(local_name.clone(), format!("{ident}_key"));
     }
-    true
+    nested_keys
 }
 
-fn emit_loyal_hub_initialize_config_harness(out: &mut String, handler: &ParsedHandler) {
-    let snake = to_snake_case(&handler.name);
-    emit_loyal_hub_harness_header(out, handler, &snake);
-    out.push_str("    let program_id = [42u8; 32];\n");
-    out.push_str("    let payer_key = [6u8; 32];\n");
-    out.push_str("    let admin_key = [7u8; 32];\n");
-    out.push_str("    let hub_authorizer_key = [8u8; 32];\n");
-    out.push_str("    let inventory_rebalancer_key = [9u8; 32];\n");
-    out.push_str("    let allowed_mint_0_key = [3u8; 32];\n");
-    out.push_str("    let allowed_mint_1_key = [4u8; 32];\n");
-    out.push_str("    let max_fee_bps: u128 = kani::any(); // spec type: U128\n");
-    out.push_str("    let lane_count: u64 = kani::any(); // spec type: U64\n");
-    out.push_str("    kani::assume(max_fee_bps <= loyal_hub_abi::MAX_FEE_BPS as u128);\n");
-    out.push_str("    kani::assume(lane_count == 2);\n");
-    out.push_str("    kani::assume(allowed_mint_0_key != allowed_mint_1_key);\n\n");
-
-    out.push_str("    let max_fee_bps_u16 = max_fee_bps as u16;\n");
-    out.push_str("    let lane_count_u8 = lane_count as u8;\n");
-    out.push_str("    let config_key = crate::derive_config(&program_id).0;\n");
-    out.push_str(
-        "    let mut payer = loyal_build_account(payer_key, [0u8; 32], true, true, []);\n",
-    );
-    out.push_str("    payer.hdr.lamports = u64::MAX / 2;\n");
-    out.push_str("    let mut config = loyal_build_uninitialized_config_account(config_key);\n");
-    out.push_str("    let mut system_program = loyal_build_account(crate::SYSTEM_PROGRAM_ID, [0u8; 32], false, false, []);\n\n");
-
-    emit_loyal_hub_accounts_array(out, &["payer", "config", "system_program"]);
-    out.push_str("    let mut instruction_data = alloc::vec::Vec::new();\n");
-    out.push_str("    instruction_data.push(crate::INITIALIZE_CONFIG);\n");
-    out.push_str("    instruction_data.extend_from_slice(&admin_key);\n");
-    out.push_str("    instruction_data.extend_from_slice(&hub_authorizer_key);\n");
-    out.push_str("    instruction_data.extend_from_slice(&inventory_rebalancer_key);\n");
-    out.push_str("    instruction_data.extend_from_slice(&max_fee_bps_u16.to_le_bytes());\n");
-    out.push_str("    instruction_data.push(0u8);\n");
-    out.push_str("    instruction_data.push(lane_count_u8);\n");
-    out.push_str("    instruction_data.push(2u8);\n");
-    out.push_str("    instruction_data.extend_from_slice(&allowed_mint_0_key);\n");
-    out.push_str("    instruction_data.extend_from_slice(&allowed_mint_1_key);\n\n");
-    out.push_str("    let _result = crate::process_instruction(&program_id, accounts_slice, &instruction_data);\n");
-    out.push_str("    assert!(_result.is_ok());\n");
-    out.push_str("    assert_eq!(config.hdr.owner, program_id);\n");
-    out.push_str("    assert_eq!(config.hdr.data_len, crate::HUB_CONFIG_SPACE as u64);\n");
-    out.push_str("    assert_eq!(\n");
-    out.push_str("        &config.data[loyal_hub_abi::config_account::MAGIC_OFFSET\n");
-    out.push_str("            ..loyal_hub_abi::config_account::MAGIC_OFFSET + loyal_hub_abi::config_account::MAGIC_LEN],\n");
-    out.push_str("        crate::CONFIG_MAGIC\n");
-    out.push_str("    );\n");
-    out.push_str("    assert_eq!(\n");
-    out.push_str("        &config.data[loyal_hub_abi::config_account::ADMIN_OFFSET\n");
-    out.push_str("            ..loyal_hub_abi::config_account::ADMIN_OFFSET + loyal_hub_abi::config_account::ADMIN_LEN],\n");
-    out.push_str("        &admin_key\n");
-    out.push_str("    );\n");
-    out.push_str("    assert_eq!(\n");
-    out.push_str("        &config.data[loyal_hub_abi::config_account::HUB_AUTHORIZER_OFFSET\n");
-    out.push_str("            ..loyal_hub_abi::config_account::HUB_AUTHORIZER_OFFSET + loyal_hub_abi::config_account::HUB_AUTHORIZER_LEN],\n");
-    out.push_str("        &hub_authorizer_key\n");
-    out.push_str("    );\n");
-    out.push_str("    assert_eq!(\n");
-    out.push_str(
-        "        &config.data[loyal_hub_abi::config_account::INVENTORY_REBALANCER_OFFSET\n",
-    );
-    out.push_str("            ..loyal_hub_abi::config_account::INVENTORY_REBALANCER_OFFSET + loyal_hub_abi::config_account::INVENTORY_REBALANCER_LEN],\n");
-    out.push_str("        &inventory_rebalancer_key\n");
-    out.push_str("    );\n");
-    out.push_str("    assert_eq!(\n");
-    out.push_str("        loyal_read_u16(&config.data, loyal_hub_abi::config_account::MAX_FEE_BPS_OFFSET),\n");
-    out.push_str("        max_fee_bps_u16\n");
-    out.push_str("    );\n");
-    out.push_str(
-        "    assert_eq!(config.data[loyal_hub_abi::config_account::PAUSED_OFFSET], 0u8);\n",
-    );
-    out.push_str("    assert_eq!(config.data[loyal_hub_abi::config_account::LANE_COUNT_OFFSET], lane_count_u8);\n");
-    out.push_str(
-        "    assert_eq!(config.data[loyal_hub_abi::config_account::MINT_COUNT_OFFSET], 2u8);\n",
-    );
-    out.push_str("}\n\n");
+fn pinocchio_account_is_program(
+    account: &ParsedHandlerAccount,
+    role: Option<&PinocchioAccountRole>,
+) -> bool {
+    role.and_then(|role| role.is_program)
+        .unwrap_or(account.is_program)
 }
 
-fn emit_loyal_hub_set_max_fee_harness(out: &mut String, handler: &ParsedHandler) {
-    let snake = to_snake_case(&handler.name);
-    emit_loyal_hub_harness_header(out, handler, &snake);
-    out.push_str("    let program_id = [42u8; 32];\n");
-    out.push_str("    let admin_key = [7u8; 32];\n");
-    out.push_str("    let new_max_fee_bps: u128 = kani::any(); // spec type: U128\n");
-    out.push_str("    kani::assume(new_max_fee_bps <= loyal_hub_abi::MAX_FEE_BPS as u128);\n\n");
-    out.push_str("    let max_fee_bps_u16 = new_max_fee_bps as u16;\n");
-    out.push_str("    let config_key = crate::derive_config(&program_id).0;\n");
-    out.push_str("    let config_data = loyal_config_data(admin_key, [8u8; 32], [9u8; 32], 25, false, 2, &[[3u8; 32]]);\n");
-    out.push_str("    let mut config = loyal_build_account(config_key, program_id, false, true, config_data);\n");
-    out.push_str(
-        "    let mut admin = loyal_build_account(admin_key, [0u8; 32], true, false, []);\n\n",
-    );
-
-    emit_loyal_hub_accounts_array(out, &["config", "admin"]);
-    emit_pinocchio_instruction_data_pack(out, handler);
-    out.push('\n');
-    out.push_str("    let _result = crate::process_instruction(&program_id, accounts_slice, &instruction_data);\n");
-    out.push_str("    assert!(_result.is_ok());\n");
-    out.push_str("    assert_eq!(\n");
-    out.push_str("        loyal_read_u16(&config.data, loyal_hub_abi::config_account::MAX_FEE_BPS_OFFSET),\n");
-    out.push_str("        max_fee_bps_u16\n");
-    out.push_str("    );\n");
-    out.push_str("}\n\n");
+fn pinocchio_account_is_signer(
+    account: &ParsedHandlerAccount,
+    role: Option<&PinocchioAccountRole>,
+) -> bool {
+    role.and_then(|role| role.is_signer)
+        .unwrap_or(account.is_signer)
 }
 
-fn emit_loyal_hub_set_paused_harness(out: &mut String, handler: &ParsedHandler) {
-    let snake = to_snake_case(&handler.name);
-    emit_loyal_hub_harness_header(out, handler, &snake);
-    out.push_str("    let program_id = [42u8; 32];\n");
-    out.push_str("    let admin_key = [7u8; 32];\n");
-    out.push_str("    let paused_value: u64 = kani::any(); // spec type: U64\n");
-    out.push_str("    kani::assume(paused_value <= 1);\n\n");
-    out.push_str("    let config_key = crate::derive_config(&program_id).0;\n");
-    out.push_str("    let config_data = loyal_config_data(admin_key, [8u8; 32], [9u8; 32], 25, paused_value == 0, 2, &[[3u8; 32]]);\n");
-    out.push_str("    let mut config = loyal_build_account(config_key, program_id, false, true, config_data);\n");
-    out.push_str(
-        "    let mut admin = loyal_build_account(admin_key, [0u8; 32], true, false, []);\n\n",
-    );
-
-    emit_loyal_hub_accounts_array(out, &["config", "admin"]);
-    emit_pinocchio_instruction_data_pack(out, handler);
-    out.push('\n');
-    out.push_str("    let _result = crate::process_instruction(&program_id, accounts_slice, &instruction_data);\n");
-    out.push_str("    assert!(_result.is_ok());\n");
-    out.push_str("    assert_eq!(\n");
-    out.push_str("        config.data[loyal_hub_abi::config_account::PAUSED_OFFSET],\n");
-    out.push_str("        paused_value as u8\n");
-    out.push_str("    );\n");
-    out.push_str("}\n\n");
+fn pinocchio_account_is_writable(
+    account: &ParsedHandlerAccount,
+    role: Option<&PinocchioAccountRole>,
+) -> bool {
+    role.and_then(|role| role.is_writable)
+        .unwrap_or(account.is_writable)
 }
 
-fn emit_loyal_hub_harness_header(out: &mut String, handler: &ParsedHandler, snake: &str) {
-    out.push_str(&format!(
-        "/// Impl-targeted Loyal Hub harness for `{}`.\n",
-        handler.name
-    ));
-    out.push_str("/// Builds accepted config, PDA, mint, and SPL Token account state,\n");
-    out.push_str("/// then proves the generated token balance assertions on success.\n");
-    out.push_str("#[kani::proof]\n");
-    out.push_str("#[kani::unwind(34)]\n");
-    out.push_str(&format!("fn verify_{}_impl() {{\n", snake));
+fn pinocchio_account_type<'a>(
+    account: &'a ParsedHandlerAccount,
+    role: Option<&'a PinocchioAccountRole>,
+) -> Option<&'a str> {
+    role.and_then(|role| role.account_type.as_deref())
+        .or(account.account_type.as_deref())
 }
 
-fn emit_loyal_hub_param_decls(out: &mut String, handler: &ParsedHandler) {
-    for (pname, ptype) in &handler.takes_params {
-        if let Some(rust_ty) = numeric_param_rust_type(ptype) {
-            out.push_str(&format!(
-                "    let {}: {} = kani::any(); // spec type: {}\n",
-                to_snake_case(pname),
-                rust_ty,
-                ptype
-            ));
-        }
+fn pinocchio_account_layout<'a>(
+    profile: Option<&'a PinocchioProofProfile>,
+    account: &ParsedHandlerAccount,
+) -> Option<&'a PinocchioRecordLayout> {
+    let profile = profile?;
+    let account_name = to_snake_case(&account.name);
+    let record_name = profile
+        .account_layouts
+        .get(&account_name)
+        .or_else(|| profile.account_layouts.get(&account.name))?;
+    profile.record_layouts.get(record_name)
+}
+
+fn pinocchio_account_pda<'a>(
+    profile: Option<&'a PinocchioProofProfile>,
+    account: &ParsedHandlerAccount,
+) -> Option<&'a PinocchioPdaDerivation> {
+    let profile = profile?;
+    let account_name = to_snake_case(&account.name);
+    profile
+        .pda_derivations
+        .get(&account_name)
+        .or_else(|| profile.pda_derivations.get(&account.name))
+}
+
+fn pinocchio_pda_seed_expr(
+    seed: &PinocchioPdaSeed,
+    handler: &ParsedHandler,
+    handler_profile: Option<&PinocchioHandlerProfile>,
+    account_key_exprs: &BTreeMap<String, String>,
+) -> Option<String> {
+    if let Some(literal) = &seed.literal {
+        return Some(format!("b\"{}\".as_ref()", rust_string_escape(literal)));
+    }
+
+    let expr = seed.expr.trim();
+    if let Some(const_seed) = pinocchio_const_pubkey_seed_expr(expr) {
+        return Some(const_seed);
+    }
+    if let Some(param_name) = expr.strip_suffix(".as_ref()") {
+        let param_name = param_name.trim();
+        let (_param_name, param_type) = handler
+            .takes_params
+            .iter()
+            .find(|(name, _)| name == param_name)?;
+        return match param_type.as_str() {
+            "Pubkey" => account_key_exprs
+                .get(&to_snake_case(param_name))
+                .cloned()
+                .or_else(|| Some(to_snake_case(param_name)))
+                .map(|expr| format!("{expr}.as_ref()")),
+            _ => None,
+        };
+    }
+    let bracketed = expr.strip_prefix('[')?.strip_suffix(']')?.trim();
+    let (param_name, param_type) = handler
+        .takes_params
+        .iter()
+        .find(|(name, _)| name == bracketed)?;
+    let rust_type = handler_profile
+        .and_then(|profile| {
+            profile
+                .params
+                .iter()
+                .find(|param| param.name == *param_name)
+                .map(|param| param.rust_type.as_str())
+        })
+        .or_else(|| numeric_param_rust_type(param_type))?;
+    match rust_type {
+        "u8" | "i8" => Some(format!("&[{} as u8]", to_snake_case(param_name))),
+        "Pubkey" | "pubkey" => account_key_exprs
+            .get(&to_snake_case(param_name))
+            .cloned()
+            .or_else(|| Some(to_snake_case(param_name)))
+            .map(|expr| format!("{expr}.as_ref()")),
+        _ => Some(format!(
+            "&({} as {}).to_le_bytes()",
+            to_snake_case(param_name),
+            rust_type
+        )),
     }
 }
 
-fn emit_loyal_hub_swap_exact_in_harness(
+fn emit_pinocchio_pda_key_bindings(
     out: &mut String,
     handler: &ParsedHandler,
-    token_assertions: &[PinocchioTokenTransferAssertion],
-) {
-    let snake = to_snake_case(&handler.name);
-    emit_loyal_hub_harness_header(out, handler, &snake);
-    out.push_str("    let program_id = [42u8; 32];\n");
-    out.push_str("    let user_vault_key = [7u8; 32];\n");
-    out.push_str("    let hub_authorizer_key = [8u8; 32];\n");
-    out.push_str("    let inventory_rebalancer_key = [9u8; 32];\n");
-    out.push_str("    let input_mint_key = [3u8; 32];\n");
-    out.push_str("    let output_mint_key = [4u8; 32];\n\n");
-    emit_loyal_hub_param_decls(out, handler);
-    out.push_str("    let user_input_amount: u64 = kani::any();\n");
-    out.push_str("    let user_output_amount: u64 = kani::any();\n");
-    out.push_str("    let hub_input_amount: u64 = kani::any();\n");
-    out.push_str("    let hub_output_amount: u64 = kani::any();\n");
-    out.push_str("    kani::assume(amount_in > 0);\n");
-    out.push_str("    kani::assume(amount_out > 0);\n");
-    out.push_str("    kani::assume(amount_out >= min_out);\n");
-    out.push_str("    kani::assume(max_fee_bps == 0);\n");
-    out.push_str("    kani::assume(lane_id == 0);\n");
-    out.push_str("    kani::assume(input_decimals == 6);\n");
-    out.push_str("    kani::assume(output_decimals == 6);\n");
-    out.push_str("    kani::assume(user_input_amount >= amount_in);\n");
-    out.push_str("    kani::assume(hub_input_amount <= u64::MAX - amount_in);\n");
-    out.push_str("    kani::assume(hub_output_amount >= amount_out);\n");
-    out.push_str("    kani::assume(user_output_amount <= u64::MAX - amount_out);\n\n");
-
-    out.push_str("    let lane_id_u8 = lane_id as u8;\n");
-    out.push_str("    let config_key = crate::derive_config(&program_id).0;\n");
-    out.push_str(
-        "    let hub_authority_key = crate::derive_hub_authority(&program_id, lane_id_u8).0;\n",
-    );
-    out.push_str("    let user_input_key = [20u8; 32];\n");
-    out.push_str("    let user_output_key = [21u8; 32];\n");
-    out.push_str("    let hub_input_key = crate::derive_inventory_account(&program_id, &input_mint_key, lane_id_u8);\n");
-    out.push_str("    let hub_output_key = crate::derive_inventory_account(&program_id, &output_mint_key, lane_id_u8);\n");
-    out.push_str("    loyal_assume_distinct_pubkeys(&[user_input_key, user_output_key, hub_input_key, hub_output_key]);\n\n");
-
-    out.push_str("    let config_data = loyal_config_data([6u8; 32], hub_authorizer_key, inventory_rebalancer_key, 0, false, 2, &[input_mint_key, output_mint_key]);\n");
-    out.push_str("    let mut config = loyal_build_account(config_key, program_id, false, false, config_data);\n");
-    out.push_str("    let mut user_vault = loyal_build_account(user_vault_key, [0u8; 32], true, false, []);\n");
-    out.push_str("    let mut user_input = loyal_build_account(user_input_key, crate::SPL_TOKEN_ID, false, true, loyal_token_account_data(input_mint_key, user_vault_key, user_input_amount));\n");
-    out.push_str("    let mut user_output = loyal_build_account(user_output_key, crate::SPL_TOKEN_ID, false, true, loyal_token_account_data(output_mint_key, user_vault_key, user_output_amount));\n");
-    out.push_str("    let mut hub_input = loyal_build_account(hub_input_key, crate::SPL_TOKEN_ID, false, true, loyal_token_account_data(input_mint_key, hub_authority_key, hub_input_amount));\n");
-    out.push_str("    let mut hub_output = loyal_build_account(hub_output_key, crate::SPL_TOKEN_ID, false, true, loyal_token_account_data(output_mint_key, hub_authority_key, hub_output_amount));\n");
-    out.push_str("    let mut input_mint = loyal_build_account(input_mint_key, crate::SPL_TOKEN_ID, false, false, loyal_mint_data(6));\n");
-    out.push_str("    let mut output_mint = loyal_build_account(output_mint_key, crate::SPL_TOKEN_ID, false, false, loyal_mint_data(6));\n");
-    out.push_str("    let mut hub_authority = loyal_build_account(hub_authority_key, [0u8; 32], false, false, []);\n");
-    out.push_str("    let mut hub_authorizer = loyal_build_account(hub_authorizer_key, [0u8; 32], true, false, []);\n");
-    out.push_str("    let mut token_program = loyal_build_account(crate::SPL_TOKEN_ID, [0u8; 32], false, false, []);\n\n");
-
-    emit_loyal_hub_accounts_array(
-        out,
-        &[
-            "config",
-            "user_vault",
-            "user_input",
-            "user_output",
-            "hub_input",
-            "hub_output",
-            "input_mint",
-            "output_mint",
-            "hub_authority",
-            "hub_authorizer",
-            "token_program",
-        ],
-    );
-    emit_pinocchio_instruction_data_pack(out, handler);
-    out.push('\n');
-    emit_pinocchio_token_pre_snapshots(out, token_assertions);
-    out.push_str("    let _result = crate::process_instruction(&program_id, accounts_slice, &instruction_data);\n");
-    out.push_str("    assert!(_result.is_ok());\n");
-    emit_pinocchio_token_post_assertions(out, token_assertions);
-    out.push_str("}\n\n");
+    proof_profile: Option<&PinocchioProofProfile>,
+    handler_profile: Option<&PinocchioHandlerProfile>,
+    ordered_accounts: &[&ParsedHandlerAccount],
+    account_key_exprs: &BTreeMap<String, String>,
+) -> BTreeSet<String> {
+    let mut emitted = BTreeSet::new();
+    for account in ordered_accounts {
+        let ident = to_snake_case(&account.name);
+        let seed_exprs = pinocchio_account_pda_seed_exprs(
+            proof_profile,
+            handler_profile,
+            account,
+            handler,
+            account_key_exprs,
+        )
+        .or_else(|| {
+            pinocchio_account_key_derivation(handler_profile, account).and_then(|local| {
+                let derivation = proof_profile?.pda_derivations.get(&local.derivation)?;
+                let arg_by_param = pinocchio_local_arg_by_param(derivation, local);
+                let nested_key_exprs = emit_pinocchio_nested_key_bindings(
+                    out,
+                    proof_profile,
+                    handler_profile,
+                    handler,
+                    &ident,
+                    derivation,
+                    &arg_by_param,
+                    account_key_exprs,
+                );
+                pinocchio_local_derived_key_seed_exprs(
+                    proof_profile,
+                    handler_profile,
+                    handler,
+                    &ident,
+                    local,
+                    account_key_exprs,
+                    &nested_key_exprs,
+                )
+            })
+        });
+        let Some(seed_exprs) = seed_exprs else {
+            continue;
+        };
+        let derivation = pinocchio_account_pda(proof_profile, account).or_else(|| {
+            let local = pinocchio_account_key_derivation(handler_profile, account)?;
+            proof_profile?.pda_derivations.get(&local.derivation)
+        });
+        let Some(program_expr) = derivation.and_then(|d| pinocchio_pda_program_expr(&d.program_id))
+        else {
+            continue;
+        };
+        out.push_str(&format!(
+            "    let {ident}_pda = pinocchio::pubkey::try_find_program_address(&[{}], {});\n",
+            seed_exprs.join(", "),
+            program_expr
+        ));
+        out.push_str(&format!("    kani::assume({ident}_pda.is_some());\n"));
+        out.push_str(&format!("    let {ident}_key = {ident}_pda.unwrap().0;\n"));
+        emitted.insert(ident);
+    }
+    emitted
 }
 
-fn emit_loyal_hub_withdraw_inventory_harness(
-    out: &mut String,
+fn pinocchio_account_pda_seed_exprs(
+    proof_profile: Option<&PinocchioProofProfile>,
+    handler_profile: Option<&PinocchioHandlerProfile>,
+    account: &ParsedHandlerAccount,
     handler: &ParsedHandler,
-    token_assertions: &[PinocchioTokenTransferAssertion],
-) {
-    let snake = to_snake_case(&handler.name);
-    emit_loyal_hub_harness_header(out, handler, &snake);
-    out.push_str("    let program_id = [42u8; 32];\n");
-    out.push_str("    let admin_key = [7u8; 32];\n");
-    out.push_str("    let mint_key = [3u8; 32];\n");
-    out.push_str("    let destination_key = [12u8; 32];\n");
-    out.push_str("    let destination_owner = [13u8; 32];\n\n");
-    emit_loyal_hub_param_decls(out, handler);
-    out.push_str("    let hub_source_amount: u64 = kani::any();\n");
-    out.push_str("    let destination_amount: u64 = kani::any();\n");
-    out.push_str("    kani::assume(amount > 0);\n");
-    out.push_str("    kani::assume(lane_id == 0);\n");
-    out.push_str("    kani::assume(hub_source_amount >= amount);\n");
-    out.push_str("    kani::assume(destination_amount <= u64::MAX - amount);\n\n");
-
-    out.push_str("    let lane_id_u8 = lane_id as u8;\n");
-    out.push_str("    let config_key = crate::derive_config(&program_id).0;\n");
-    out.push_str(
-        "    let hub_authority_key = crate::derive_hub_authority(&program_id, lane_id_u8).0;\n",
-    );
-    out.push_str("    let hub_source_key = crate::derive_inventory_account(&program_id, &mint_key, lane_id_u8);\n");
-    out.push_str("    kani::assume(hub_source_key != destination_key);\n\n");
-    out.push_str("    let config_data = loyal_config_data(admin_key, [8u8; 32], [9u8; 32], 25, false, 2, &[mint_key]);\n");
-    out.push_str("    let mut config = loyal_build_account(config_key, program_id, false, false, config_data);\n");
-    out.push_str(
-        "    let mut admin = loyal_build_account(admin_key, [0u8; 32], true, false, []);\n",
-    );
-    out.push_str("    let mut hub_source = loyal_build_account(hub_source_key, crate::SPL_TOKEN_ID, false, true, loyal_token_account_data(mint_key, hub_authority_key, hub_source_amount));\n");
-    out.push_str("    let mut destination = loyal_build_account(destination_key, crate::SPL_TOKEN_ID, false, true, loyal_token_account_data(mint_key, destination_owner, destination_amount));\n");
-    out.push_str("    let mut mint = loyal_build_account(mint_key, crate::SPL_TOKEN_ID, false, false, loyal_mint_data(6));\n");
-    out.push_str("    let mut hub_authority = loyal_build_account(hub_authority_key, [0u8; 32], false, false, []);\n");
-    out.push_str("    let mut token_program = loyal_build_account(crate::SPL_TOKEN_ID, [0u8; 32], false, false, []);\n\n");
-
-    emit_loyal_hub_accounts_array(
-        out,
-        &[
-            "config",
-            "admin",
-            "hub_source",
-            "destination",
-            "mint",
-            "hub_authority",
-            "token_program",
-        ],
-    );
-    emit_pinocchio_instruction_data_pack(out, handler);
-    out.push('\n');
-    emit_pinocchio_token_pre_snapshots(out, token_assertions);
-    out.push_str("    let _result = crate::process_instruction(&program_id, accounts_slice, &instruction_data);\n");
-    out.push_str("    assert!(_result.is_ok());\n");
-    emit_pinocchio_token_post_assertions(out, token_assertions);
-    out.push_str("}\n\n");
+    account_key_exprs: &BTreeMap<String, String>,
+) -> Option<Vec<String>> {
+    let derivation = pinocchio_account_pda(proof_profile, account)?;
+    let _program_expr = pinocchio_pda_program_expr(&derivation.program_id)?;
+    derivation
+        .seeds
+        .iter()
+        .map(|seed| pinocchio_pda_seed_expr(seed, handler, handler_profile, account_key_exprs))
+        .collect::<Option<Vec<_>>>()
 }
 
-fn emit_loyal_hub_rebalance_inventory_harness(
-    out: &mut String,
-    handler: &ParsedHandler,
-    token_assertions: &[PinocchioTokenTransferAssertion],
-    arity: usize,
-) {
-    let snake = to_snake_case(&handler.name);
-    emit_loyal_hub_harness_header(out, handler, &snake);
-    out.push_str("    let program_id = [42u8; 32];\n");
-    out.push_str("    let inventory_rebalancer_key = [9u8; 32];\n");
-    out.push_str("    let mint_key = [3u8; 32];\n\n");
-    emit_loyal_hub_param_decls(out, handler);
-    for index in 0..arity {
-        let source_inventory = if arity == 1 {
-            "source_inventory".to_string()
-        } else {
-            format!("source_inventory_{index}")
-        };
-        let destination_inventory = if arity == 1 {
-            "destination_inventory".to_string()
-        } else {
-            format!("destination_inventory_{index}")
-        };
-        let amount = if arity == 1 {
-            "amount".to_string()
-        } else {
-            format!("amount_{index}")
-        };
-        let from_lane = if arity == 1 {
-            "from_lane_id".to_string()
-        } else {
-            format!("from_lane_id_{index}")
-        };
-        let to_lane = if arity == 1 {
-            "to_lane_id".to_string()
-        } else {
-            format!("to_lane_id_{index}")
-        };
-        out.push_str(&format!(
-            "    let {source_inventory}_amount: u64 = kani::any();\n"
-        ));
-        out.push_str(&format!(
-            "    let {destination_inventory}_amount: u64 = kani::any();\n"
-        ));
-        out.push_str(&format!("    kani::assume({amount} > 0);\n"));
-        out.push_str(&format!("    kani::assume({from_lane} == {index});\n"));
-        out.push_str(&format!("    kani::assume({to_lane} == {});\n", index + 1));
-        out.push_str(&format!(
-            "    kani::assume({source_inventory}_amount >= {amount});\n"
-        ));
-        out.push_str(&format!(
-            "    kani::assume({destination_inventory}_amount <= u64::MAX - {amount});\n"
-        ));
+fn pinocchio_account_key_expr(
+    _proof_profile: Option<&PinocchioProofProfile>,
+    _handler_profile: Option<&PinocchioHandlerProfile>,
+    _handler: &ParsedHandler,
+    account: &ParsedHandlerAccount,
+    key_byte: u8,
+    is_signer: bool,
+    emitted_pda_keys: &BTreeSet<String>,
+) -> String {
+    let ident = to_snake_case(&account.name);
+    if emitted_pda_keys.contains(&ident) {
+        return format!("{ident}_key");
     }
-    out.push('\n');
-
-    out.push_str("    let config_key = crate::derive_config(&program_id).0;\n");
-    out.push_str(&format!("    let lane_count = {}u8;\n", arity + 1));
-    for index in 0..arity {
-        let source_authority = if arity == 1 {
-            "source_authority".to_string()
-        } else {
-            format!("source_authority_{index}")
-        };
-        let source_inventory = if arity == 1 {
-            "source_inventory".to_string()
-        } else {
-            format!("source_inventory_{index}")
-        };
-        let destination_inventory = if arity == 1 {
-            "destination_inventory".to_string()
-        } else {
-            format!("destination_inventory_{index}")
-        };
-        out.push_str(&format!(
-            "    let {source_authority}_key = crate::derive_hub_authority(&program_id, {index}u8).0;\n"
-        ));
-        out.push_str(&format!(
-            "    let destination_authority_{index}_key = crate::derive_hub_authority(&program_id, {}u8).0;\n",
-            index + 1
-        ));
-        out.push_str(&format!(
-            "    let {source_inventory}_key = crate::derive_inventory_account(&program_id, &mint_key, {index}u8);\n"
-        ));
-        out.push_str(&format!(
-            "    let {destination_inventory}_key = crate::derive_inventory_account(&program_id, &mint_key, {}u8);\n",
-            index + 1
-        ));
+    if is_signer {
+        "authority_key".to_string()
+    } else {
+        format!("[{}u8; 32]", key_byte)
     }
-    out.push_str("    loyal_assume_distinct_pubkeys(&[\n");
-    for index in 0..arity {
-        let source_inventory = if arity == 1 {
-            "source_inventory".to_string()
-        } else {
-            format!("source_inventory_{index}")
-        };
-        let destination_inventory = if arity == 1 {
-            "destination_inventory".to_string()
-        } else {
-            format!("destination_inventory_{index}")
-        };
-        out.push_str(&format!("        {source_inventory}_key,\n"));
-        out.push_str(&format!("        {destination_inventory}_key,\n"));
-    }
-    out.push_str("    ]);\n\n");
-
-    out.push_str("    let config_data = loyal_config_data([7u8; 32], [8u8; 32], inventory_rebalancer_key, 25, false, lane_count, &[mint_key]);\n");
-    out.push_str("    let mut config = loyal_build_account(config_key, program_id, false, false, config_data);\n");
-    out.push_str("    let mut inventory_rebalancer = loyal_build_account(inventory_rebalancer_key, [0u8; 32], true, false, []);\n");
-    out.push_str("    let mut token_program = loyal_build_account(crate::SPL_TOKEN_ID, [0u8; 32], false, false, []);\n");
-    out.push_str("    let mut mint = loyal_build_account(mint_key, crate::SPL_TOKEN_ID, false, false, loyal_mint_data(6));\n");
-    for index in 0..arity {
-        let source_authority = if arity == 1 {
-            "source_authority".to_string()
-        } else {
-            format!("source_authority_{index}")
-        };
-        let source_inventory = if arity == 1 {
-            "source_inventory".to_string()
-        } else {
-            format!("source_inventory_{index}")
-        };
-        let destination_inventory = if arity == 1 {
-            "destination_inventory".to_string()
-        } else {
-            format!("destination_inventory_{index}")
-        };
-        out.push_str(&format!(
-            "    let mut {source_authority} = loyal_build_account({source_authority}_key, [0u8; 32], false, false, []);\n"
-        ));
-        out.push_str(&format!(
-            "    let mut {source_inventory} = loyal_build_account({source_inventory}_key, crate::SPL_TOKEN_ID, false, true, loyal_token_account_data(mint_key, {source_authority}_key, {source_inventory}_amount));\n"
-        ));
-        out.push_str(&format!(
-            "    let mut {destination_inventory} = loyal_build_account({destination_inventory}_key, crate::SPL_TOKEN_ID, false, true, loyal_token_account_data(mint_key, destination_authority_{index}_key, {destination_inventory}_amount));\n"
-        ));
-    }
-    out.push('\n');
-
-    let mut accounts = vec!["config", "inventory_rebalancer", "token_program", "mint"];
-    let mut dynamic_accounts = Vec::new();
-    for index in 0..arity {
-        if arity == 1 {
-            dynamic_accounts.push("source_authority".to_string());
-            dynamic_accounts.push("source_inventory".to_string());
-            dynamic_accounts.push("destination_inventory".to_string());
-        } else {
-            dynamic_accounts.push(format!("source_authority_{index}"));
-            dynamic_accounts.push(format!("source_inventory_{index}"));
-            dynamic_accounts.push(format!("destination_inventory_{index}"));
-        }
-    }
-    accounts.extend(dynamic_accounts.iter().map(String::as_str));
-    emit_loyal_hub_accounts_array(out, &accounts);
-    emit_pinocchio_instruction_data_pack(out, handler);
-    out.push('\n');
-    emit_pinocchio_token_pre_snapshots(out, token_assertions);
-    out.push_str("    let _result = crate::process_instruction(&program_id, accounts_slice, &instruction_data);\n");
-    out.push_str("    assert!(_result.is_ok());\n");
-    emit_pinocchio_token_post_assertions(out, token_assertions);
-    out.push_str("}\n\n");
 }
 
-fn emit_loyal_hub_accounts_array(out: &mut String, accounts: &[&str]) {
-    let n = accounts.len();
-    out.push_str(&format!(
-        "    let accounts: [ManuallyDrop<AccountInfo>; {n}] = unsafe {{\n        [\n"
-    ));
-    for ident in accounts {
-        out.push_str(&format!(
-            "            ManuallyDrop::new(account_info_from_stack(&mut {ident})),\n"
-        ));
-    }
-    out.push_str("        ]\n    };\n");
-    out.push_str(&format!(
-        "    let accounts_slice: &[AccountInfo] = unsafe {{\n        core::slice::from_raw_parts(&accounts as *const _ as *const AccountInfo, {n})\n    }};\n\n"
-    ));
+fn rust_u8_array_literal(bytes: &[u8]) -> String {
+    let inner = bytes
+        .iter()
+        .map(|byte| format!("{byte}u8"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{inner}]")
+}
+
+fn rust_string_escape(input: &str) -> String {
+    input.escape_default().to_string()
 }
 
 /// Emit one `#[kani::proof]` harness for a Pinocchio handler. Builds
@@ -1536,21 +1693,29 @@ fn emit_loyal_hub_accounts_array(out: &mut String, accounts: &[&str]) {
 fn emit_pinocchio_handler_harness(
     out: &mut String,
     handler: &ParsedHandler,
-    spec: &ParsedSpec,
+    _spec: &ParsedSpec,
+    proof_profile: Option<&PinocchioProofProfile>,
+    handler_profile: Option<&PinocchioHandlerProfile>,
 ) -> Result<()> {
     let snake = to_snake_case(&handler.name);
     let token_assertions = pinocchio_token_transfer_assertions(handler);
 
-    if spec.program_name == "LoyalHubSwap" {
-        if emit_loyal_hub_handler_harness(out, handler, &snake, &token_assertions) {
-            return Ok(());
-        }
-    }
-
-    // Classify accounts: writable non-signer → SPL Token account (holds
-    // mutable state); everything else → minimal account. Heuristic;
-    // documented so the user can adjust if their program shape differs.
-    let is_token = |a: &ParsedHandlerAccount| a.is_writable && !a.is_signer;
+    let transfer_token_accounts: BTreeSet<String> = token_assertions
+        .iter()
+        .flat_map(|assertion| [assertion.from.clone(), assertion.to.clone()])
+        .collect();
+    // Classify token accounts from the spec's explicit account type or from
+    // Token.transfer resources. A `program, type token` account is the SPL
+    // Token program, not an SPL Token account layout.
+    let is_token = |a: &ParsedHandlerAccount| {
+        let role = pinocchio_account_role(handler_profile, a);
+        (!pinocchio_account_is_program(a, role) && pinocchio_account_type(a, role) == Some("token"))
+            || transfer_token_accounts.contains(&to_snake_case(&a.name))
+    };
+    let is_mint = |a: &ParsedHandlerAccount| {
+        let role = pinocchio_account_role(handler_profile, a);
+        pinocchio_account_type(a, role) == Some("mint")
+    };
 
     // The first signer's key threads through as the token-account owner
     // so the handler's owner check passes. Falls back to a fixed key.
@@ -1588,7 +1753,7 @@ fn emit_pinocchio_handler_harness(
     // Symbolic params, declared with the primitive matching the spec
     // type so `to_le_bytes()` packs the right width below.
     for (pname, ptype) in &handler.takes_params {
-        match numeric_param_rust_type(ptype) {
+        match pinocchio_param_decl_type(ptype) {
             Some(rust_ty) => {
                 out.push_str(&format!(
                     "    let {}: {} = kani::any(); // spec type: {}\n",
@@ -1607,47 +1772,165 @@ fn emit_pinocchio_handler_harness(
     }
     out.push('\n');
 
-    // Build accounts in declared order.
-    let mut acct_idents: Vec<String> = Vec::with_capacity(handler.accounts.len());
-    for (i, a) in handler.accounts.iter().enumerate() {
+    // Build accounts in source order when the profile inferred it; fall
+    // back to spec order for greenfield/generated specs without source.
+    let ordered_accounts = pinocchio_account_order(handler, handler_profile);
+    let mut preliminary_account_key_exprs = BTreeMap::new();
+    for (i, a) in ordered_accounts.iter().enumerate() {
+        let ident = to_snake_case(&a.name);
+        let role = pinocchio_account_role(handler_profile, a);
+        let key_expr = if pinocchio_account_is_program(a, role)
+            && pinocchio_account_type(a, role) == Some("token")
+        {
+            "SPL_TOKEN_PROGRAM_ID".to_string()
+        } else if pinocchio_account_is_signer(a, role) {
+            "authority_key".to_string()
+        } else {
+            format!("[{}u8; 32]", i + 1)
+        };
+        preliminary_account_key_exprs.insert(ident, key_expr);
+    }
+    let emitted_pda_keys = emit_pinocchio_pda_key_bindings(
+        out,
+        handler,
+        proof_profile,
+        handler_profile,
+        &ordered_accounts,
+        &preliminary_account_key_exprs,
+    );
+    let mut account_key_exprs = BTreeMap::new();
+    for (i, a) in ordered_accounts.iter().enumerate() {
+        let ident = to_snake_case(&a.name);
+        let key_byte = (i + 1) as u8;
+        let role = pinocchio_account_role(handler_profile, a);
+        let is_signer = pinocchio_account_is_signer(a, role);
+        let mut key_expr = pinocchio_account_key_expr(
+            proof_profile,
+            handler_profile,
+            handler,
+            a,
+            key_byte,
+            is_signer,
+            &emitted_pda_keys,
+        );
+        if pinocchio_account_is_program(a, role) && pinocchio_account_type(a, role) == Some("token")
+        {
+            key_expr = "SPL_TOKEN_PROGRAM_ID".to_string();
+        }
+        account_key_exprs.insert(ident, key_expr);
+    }
+
+    let mut acct_idents: Vec<String> = Vec::with_capacity(ordered_accounts.len());
+    for (i, a) in ordered_accounts.iter().enumerate() {
         let ident = to_snake_case(&a.name);
         acct_idents.push(ident.clone());
         let key_byte = (i + 1) as u8;
+        let role = pinocchio_account_role(handler_profile, a);
+        let is_writable = pinocchio_account_is_writable(a, role);
+        let is_signer = pinocchio_account_is_signer(a, role);
+        let key_expr = account_key_exprs
+            .get(&ident)
+            .cloned()
+            .unwrap_or_else(|| format!("[{}u8; 32]", key_byte));
         if is_token(a) {
-            // owner_in_data: authority's key for the slot the authority
-            // signs for (heuristic: the first token account), else junk.
-            let owner_expr = if authority_idx.is_some() && i == 0 {
-                "authority_key".to_string()
-            } else {
-                "[9u8; 32]".to_string()
-            };
+            let binding = pinocchio_token_account_binding(handler_profile, a);
+            let mint_expr = binding
+                .and_then(|binding| binding.mint_account.as_ref())
+                .and_then(|account| pinocchio_bound_key_expr(&account_key_exprs, &ident, account))
+                .unwrap_or_else(|| "[0u8; 32]".to_string());
+            let owner_expr = binding
+                .and_then(|binding| binding.owner_account.as_ref())
+                .and_then(|account| pinocchio_bound_key_expr(&account_key_exprs, &ident, account))
+                .or_else(|| {
+                    let local = binding.and_then(|binding| binding.owner_key_derivation.as_ref())?;
+                    let seed_exprs = pinocchio_local_derived_key_seed_exprs(
+                        proof_profile,
+                        handler_profile,
+                        handler,
+                        &ident,
+                        local,
+                        &account_key_exprs,
+                        &BTreeMap::new(),
+                    )?;
+                    let derivation = proof_profile?.pda_derivations.get(&local.derivation)?;
+                    let program_expr = pinocchio_pda_program_expr(&derivation.program_id)?;
+                    out.push_str(&format!(
+                        "    let {ident}_owner_pda = pinocchio::pubkey::try_find_program_address(&[{}], {});\n",
+                        seed_exprs.join(", "),
+                        program_expr
+                    ));
+                    out.push_str(&format!("    kani::assume({ident}_owner_pda.is_some());\n"));
+                    out.push_str(&format!("    let {ident}_owner_key = {ident}_owner_pda.unwrap().0;\n"));
+                    Some(format!("{ident}_owner_key"))
+                })
+                .unwrap_or_else(|| {
+                    if authority_idx.is_some() && i == 0 {
+                        "authority_key".to_string()
+                    } else {
+                        "[9u8; 32]".to_string()
+                    }
+                });
             out.push_str(&format!(
-                "    let mut {ident} = build_token_account([{key_byte}u8; 32], {writable}, {signer}, {owner_expr}, {ident}_amount);\n",
-                ident = ident,
-                key_byte = key_byte,
-                writable = a.is_writable,
-                signer = a.is_signer,
-                owner_expr = owner_expr,
-            ));
-        } else {
-            let key_expr = if a.is_signer {
-                "authority_key".to_string()
-            } else {
-                format!("[{}u8; 32]", key_byte)
-            };
-            out.push_str(&format!(
-                "    let mut {ident} = build_minimal_account({key_expr}, {signer}, {writable});\n",
+                "    let mut {ident} = build_token_account({key_expr}, {writable}, {signer}, {mint_expr}, {owner_expr}, {ident}_amount);\n",
                 ident = ident,
                 key_expr = key_expr,
-                signer = a.is_signer,
-                writable = a.is_writable,
+                writable = is_writable,
+                signer = is_signer,
+                mint_expr = mint_expr,
+                owner_expr = owner_expr,
             ));
+        } else if is_mint(a) {
+            out.push_str(&format!(
+                "    let mut {ident} = build_mint_account({key_expr}, {signer}, {writable}, 6u8);\n",
+                ident = ident,
+                key_expr = key_expr,
+                signer = is_signer,
+                writable = is_writable,
+            ));
+        } else {
+            if let Some(layout) = pinocchio_account_layout(proof_profile, a) {
+                out.push_str(&format!(
+                    "    // ABI account layout `{}`: {} byte data region.\n",
+                    layout.name, layout.len
+                ));
+                out.push_str(&format!(
+                    "    let mut {ident}_data: [u8; {len}] = kani::any();\n",
+                    ident = ident,
+                    len = layout.len
+                ));
+                for field in &layout.fields {
+                    if let Some(bytes) = &field.fixed_bytes {
+                        out.push_str(&format!(
+                            "    {ident}_data[{start}..{end}].copy_from_slice(&{});\n",
+                            rust_u8_array_literal(bytes),
+                            ident = ident,
+                            start = field.offset,
+                            end = field.offset + field.len,
+                        ));
+                    }
+                }
+                out.push_str(&format!(
+                    "    let mut {ident} = build_data_account({key_expr}, {signer}, {writable}, {ident}_data);\n",
+                    ident = ident,
+                    key_expr = key_expr,
+                    signer = is_signer,
+                    writable = is_writable,
+                ));
+            } else {
+                out.push_str(&format!(
+                    "    let mut {ident} = build_minimal_account({key_expr}, {signer}, {writable});\n",
+                    ident = ident,
+                    key_expr = key_expr,
+                    signer = is_signer,
+                    writable = is_writable,
+                ));
+            }
         }
     }
     out.push('\n');
 
     // Assemble the AccountInfo array.
-    let n = handler.accounts.len();
+    let n = acct_idents.len();
     out.push_str(&format!(
         "    let accounts: [ManuallyDrop<AccountInfo>; {n}] = unsafe {{\n        [\n"
     ));
@@ -1662,7 +1945,7 @@ fn emit_pinocchio_handler_harness(
     ));
 
     // Pack instruction data from the committed instruction tag + ABI fields.
-    emit_pinocchio_instruction_data_pack(out, handler);
+    emit_pinocchio_instruction_data_pack_with_profile(out, handler, handler_profile);
     out.push('\n');
 
     emit_pinocchio_token_pre_snapshots(out, &token_assertions);
@@ -2308,15 +2591,15 @@ handler bump (delta : U64) {
     /// proved catches real overflow bugs.
     #[test]
     fn pinocchio_target_emits_stack_harness() {
-        // SPL-transfer-shaped handler: two writable token accounts
+        // SPL-transfer-shaped handler: two explicit token accounts
         // (source, destination), a readonly mint, a signer authority.
         let src = r#"spec PtokenTransfer
 state { dummy : U64 }
 handler transfer (amount : U64) {
   accounts {
-    source : writable
+    source : writable, token
     mint : readonly
-    destination : writable
+    destination : writable, token
     authority : signer
   }
   ensures state.dummy == old(state.dummy)
@@ -2358,12 +2641,12 @@ handler transfer (amount : U64) {
             "must emit the per-handler proof fn; got:\n{body}"
         );
 
-        // Account classification: writable non-signer → token account;
+        // Account classification: explicit token accounts -> token account;
         // signer/readonly → minimal.
         assert!(
             body.contains("let mut source = build_token_account(")
                 && body.contains("let mut destination = build_token_account("),
-            "writable non-signer accounts must build as token accounts; got:\n{body}"
+            "explicit token accounts must build as token accounts; got:\n{body}"
         );
         assert!(
             body.contains("let mut mint = build_minimal_account(")
@@ -2396,10 +2679,10 @@ handler transfer (amount : U64) {
     }
 
     #[test]
-    fn pinocchio_dispatcher_packs_rebalance_batch_with_base_tag() {
-        let src = r#"spec Hub
+    fn pinocchio_dispatcher_packs_numeric_params_in_spec_order() {
+        let src = r#"spec Pool
 state { lane_count : U64 }
-handler rebalance_inventory_16
+handler batch_16
   (amount_0 : U64) (from_lane_id_0 : U64) (to_lane_id_0 : U64)
   (amount_1 : U64) (from_lane_id_1 : U64) (to_lane_id_1 : U64)
   (amount_2 : U64) (from_lane_id_2 : U64) (to_lane_id_2 : U64)
@@ -2429,27 +2712,199 @@ handler rebalance_inventory_16
   effect { lane_count := lane_count }
 }"#;
         let spec = parse_str(src).expect("parse");
-        let tmp = std::env::temp_dir().join(format!(
-            "kani_impl_rebalance_pack_{}.rs",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("kani_impl_batch_pack_{}.rs", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
         generate_from_spec(&spec, &tmp, /*explicit_flag=*/ true, Target::Pinocchio)
             .expect("Pinocchio kani_impl must emit");
         let body = std::fs::read_to_string(&tmp).unwrap();
         assert!(
-            body.contains("let instruction_tag: u8 = crate::REBALANCE_INVENTORY;")
-                && body.contains("instruction_data.push(16u8);")
-                && body.contains("instruction_data.push(from_lane_id_15 as u8);")
-                && body.contains("instruction_data.push(to_lane_id_15 as u8);")
+            body.contains("let instruction_tag: u8 = crate::BATCH;")
+                && body.contains("instruction_data.extend_from_slice(&amount_0.to_le_bytes());")
+                && body.contains(
+                    "instruction_data.extend_from_slice(&from_lane_id_15.to_le_bytes());"
+                )
+                && body
+                    .contains("instruction_data.extend_from_slice(&to_lane_id_15.to_le_bytes());")
                 && body.contains("instruction_data.extend_from_slice(&amount_15.to_le_bytes());"),
-            "rebalance batch must pack the committed repeated-record ABI; got:\n{body}"
+            "generic Pinocchio packing must use the base tag and declared numeric params; got:\n{body}"
         );
         assert!(
-            !body.contains("crate::REBALANCE_INVENTORY_16"),
-            "arity-specialized specs must dispatch through the base runtime tag; got:\n{body}"
+            !body.contains("instruction_data.push(16u8);")
+                && !body.contains("from_lane_id_15 as u8")
+                && !body.contains("to_lane_id_15 as u8")
+                && !body.contains("crate::BATCH_16"),
+            "runtime-specific arity bytes and narrowing casts require an ABI profile; got:\n{body}"
         );
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn pinocchio_impl_packs_abi_repeated_records_from_indexed_params() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let program_root = workspace.path().join("program");
+        let abi_root = workspace.path().join("program-abi");
+        std::fs::create_dir_all(program_root.join("src")).unwrap();
+        std::fs::create_dir_all(program_root.join("verification")).unwrap();
+        std::fs::create_dir_all(abi_root.join("schema")).unwrap();
+        std::fs::write(program_root.join("src/lib.rs"), "").unwrap();
+        std::fs::write(
+            abi_root.join("schema/program.schema"),
+            r#"
+limit MAX_ITEMS 4
+instruction BATCH 4
+
+record TRANSFER
+field FROM_LANE_ID u8
+field TO_LANE_ID u8
+field AMOUNT u64
+end
+
+record BATCH_ARGS
+field ITEM_COUNT u8
+repeat ITEM transfer MAX_ITEMS ITEM_COUNT
+end
+
+instruction_record BATCH BATCH_ARGS
+"#,
+        )
+        .unwrap();
+
+        let spec_path = program_root.join("verification/program.qedspec");
+        std::fs::write(
+            &spec_path,
+            r#"spec Pool
+state { lane_count : U64 }
+handler batch_2
+  (amount_0 : U64) (from_lane_id_0 : U64) (to_lane_id_0 : U64)
+  (amount_1 : U64) (from_lane_id_1 : U64) (to_lane_id_1 : U64) {
+  accounts {
+    config : readonly
+    source_0 : writable
+    destination_0 : writable
+  }
+  ensures state.lane_count == old(state.lane_count)
+  effect { lane_count := lane_count }
+}"#,
+        )
+        .unwrap();
+
+        let output = program_root.join("src/kani_impl.rs");
+        generate(
+            &spec_path,
+            &output,
+            /*explicit_flag=*/ true,
+            Target::Pinocchio,
+        )
+        .expect("Pinocchio kani_impl must emit");
+        let body = std::fs::read_to_string(&output).unwrap();
+
+        assert!(
+            body.contains("let instruction_tag: u8 = 4u8;")
+                && body.contains("let item_count: u8 = 2u8;")
+                && body.contains("instruction_data.extend_from_slice(&item_count.to_le_bytes());")
+                && body.contains(
+                    "instruction_data.extend_from_slice(&(from_lane_id_0 as u8).to_le_bytes());"
+                )
+                && body.contains(
+                    "instruction_data.extend_from_slice(&(to_lane_id_0 as u8).to_le_bytes());"
+                )
+                && body.contains(
+                    "instruction_data.extend_from_slice(&(amount_0 as u64).to_le_bytes());"
+                )
+                && body.contains(
+                    "instruction_data.extend_from_slice(&(from_lane_id_1 as u8).to_le_bytes());"
+                )
+                && body.contains(
+                    "instruction_data.extend_from_slice(&(to_lane_id_1 as u8).to_le_bytes());"
+                )
+                && body.contains(
+                    "instruction_data.extend_from_slice(&(amount_1 as u64).to_le_bytes());"
+                ),
+            "ABI repeat profile must pack count and indexed item fields in ABI order; got:\n{body}"
+        );
+        assert!(
+            !body.contains("source profile references param `item_count` absent"),
+            "repeat count should be derived from indexed params, not treated as a missing param; got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn pinocchio_impl_packs_abi_repeated_pubkey_fields_from_indexed_params() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let program_root = workspace.path().join("program");
+        let abi_root = workspace.path().join("program-abi");
+        std::fs::create_dir_all(program_root.join("src")).unwrap();
+        std::fs::create_dir_all(program_root.join("verification")).unwrap();
+        std::fs::create_dir_all(abi_root.join("schema")).unwrap();
+        std::fs::write(program_root.join("src/lib.rs"), "").unwrap();
+        std::fs::write(
+            abi_root.join("schema/program.schema"),
+            r#"
+limit MAX_ITEMS 4
+instruction BATCH 4
+
+record TRANSFER
+field MINT pubkey
+field AMOUNT u64
+end
+
+record BATCH_ARGS
+field ITEM_COUNT u8
+repeat ITEM transfer MAX_ITEMS ITEM_COUNT
+end
+
+instruction_record BATCH BATCH_ARGS
+"#,
+        )
+        .unwrap();
+
+        let spec_path = program_root.join("verification/program.qedspec");
+        std::fs::write(
+            &spec_path,
+            r#"spec PubkeyBatch
+state { total : U64 }
+handler batch_2
+  (mint_0 : Pubkey) (amount_0 : U64)
+  (mint_1 : Pubkey) (amount_1 : U64) {
+  accounts { config : readonly }
+  ensures state.total == old(state.total)
+  effect { total := total }
+}"#,
+        )
+        .unwrap();
+
+        let output = program_root.join("src/kani_impl.rs");
+        generate(
+            &spec_path,
+            &output,
+            /*explicit_flag=*/ true,
+            Target::Pinocchio,
+        )
+        .expect("Pinocchio kani_impl must emit");
+        let body = std::fs::read_to_string(&output).unwrap();
+
+        assert!(
+            body.contains("let mint_0: [u8; 32] = kani::any(); // spec type: Pubkey")
+                && body.contains("let mint_1: [u8; 32] = kani::any(); // spec type: Pubkey"),
+            "indexed Pubkey repeat fields must be declared as symbolic 32-byte arrays; got:\n{body}"
+        );
+        assert!(
+            body.contains("let item_count: u8 = 2u8;")
+                && body.contains("instruction_data.extend_from_slice(&mint_0);")
+                && body.contains(
+                    "instruction_data.extend_from_slice(&(amount_0 as u64).to_le_bytes());"
+                )
+                && body.contains("instruction_data.extend_from_slice(&mint_1);")
+                && body.contains(
+                    "instruction_data.extend_from_slice(&(amount_1 as u64).to_le_bytes());"
+                ),
+            "ABI repeat profile must pack indexed Pubkey fields in ABI order; got:\n{body}"
+        );
+        assert!(
+            !body.contains("TODO: pack repeat field `mint`"),
+            "Pubkey repeat fields should no longer be dropped from the ABI profile; got:\n{body}"
+        );
     }
 
     #[test]
@@ -2501,62 +2956,1005 @@ handler move_tokens (amount : U64) {
     }
 
     #[test]
-    fn loyal_hub_pinocchio_impl_emits_config_mutation_proofs_without_ensures() {
-        let src = r#"spec LoyalHubSwap
-program_id "3qbR1eZRqXUWroWKKYhbDmR3FfqTHfqSU8zZSxtANzYh"
+    fn pinocchio_impl_does_not_classify_all_writable_accounts_as_tokens() {
+        let src = r#"spec TokenMove
+state { dummy : U64 }
+handler move_tokens (amount : U64) {
+  accounts {
+    config : writable
+    source : writable, token
+    destination : writable, token
+    authority : signer
+    token_program : program, type token
+  }
+  call Token.transfer(
+    from = source,
+    to = destination,
+    amount = amount,
+    authority = authority,
+  )
+  ensures state.dummy == old(state.dummy)
+  effect { dummy := dummy }
+}"#;
+        let spec = parse_str(src).expect("parse");
+        let tmp =
+            std::env::temp_dir().join(format!("kani_impl_token_roles_{}.rs", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        generate_from_spec(&spec, &tmp, /*explicit_flag=*/ true, Target::Pinocchio)
+            .expect("Pinocchio kani_impl must emit");
+        let body = std::fs::read_to_string(&tmp).unwrap();
 
-type State
-  | Active of {
-      admin_key   : Pubkey,
-      max_fee_bps : U128,
-      paused      : U64,
+        assert!(
+            body.contains("let mut config = build_minimal_account(")
+                && body.contains("let mut source = build_token_account(")
+                && body.contains("let mut destination = build_token_account(")
+                && body.contains("let mut token_program = build_minimal_account(")
+                && !body.contains("let config_amount: u64 = kani::any();"),
+            "only explicit token accounts or Token.transfer resources should use token layout; got:\n{body}"
+        );
+        let _ = std::fs::remove_file(&tmp);
     }
 
-handler set_max_fee (new_max_fee_bps : U128) : State.Active -> State.Active {
+    #[test]
+    fn pinocchio_impl_uses_abi_account_roles_for_token_projection() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let program_root = workspace.path().join("program");
+        let abi_root = workspace.path().join("program-abi");
+        std::fs::create_dir_all(program_root.join("src")).unwrap();
+        std::fs::create_dir_all(program_root.join("verification")).unwrap();
+        std::fs::create_dir_all(abi_root.join("schema")).unwrap();
+        std::fs::write(program_root.join("src/lib.rs"), "").unwrap();
+        std::fs::write(
+            abi_root.join("schema/program.schema"),
+            r#"
+instruction MOVE_TOKENS 8
+account MOVE_TOKENS SOURCE 0 writable type token
+account MOVE_TOKENS DESTINATION 1 writable type token
+account MOVE_TOKENS MINT 2 type mint
+account MOVE_TOKENS TOKEN_PROGRAM 3 program type token
+
+record MOVE_TOKENS_ARGS
+field AMOUNT u64
+end
+
+instruction_record MOVE_TOKENS MOVE_TOKENS_ARGS
+"#,
+        )
+        .unwrap();
+
+        let spec_path = program_root.join("verification/program.qedspec");
+        std::fs::write(
+            &spec_path,
+            r#"spec TokenMove
+state { dummy : U64 }
+handler move_tokens (amount : U64) {
+  accounts {
+    source : readonly
+    destination : readonly
+    mint : readonly
+    token_program : program
+  }
+  ensures state.dummy == old(state.dummy)
+  effect { dummy := dummy }
+}"#,
+        )
+        .unwrap();
+
+        let output = program_root.join("src/kani_impl.rs");
+        generate(
+            &spec_path,
+            &output,
+            /*explicit_flag=*/ true,
+            Target::Pinocchio,
+        )
+        .expect("Pinocchio kani_impl must emit");
+        let body = std::fs::read_to_string(&output).unwrap();
+
+        assert!(
+            body.contains("let mut source = build_token_account([1u8; 32], true, false")
+                && body
+                    .contains("let mut destination = build_token_account([2u8; 32], true, false")
+                && body.contains("let mut mint = build_mint_account([3u8; 32], false, false, 6u8);")
+                && body.contains("let mut token_program = build_minimal_account(SPL_TOKEN_PROGRAM_ID, false, false)")
+                && !body.contains("let token_program_amount: u64 = kani::any();"),
+            "ABI account roles should project token accounts and mints without treating token_program as token data; got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn pinocchio_impl_projects_source_inferred_token_account_mint_and_owner() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let program_root = workspace.path().join("program");
+        std::fs::create_dir_all(program_root.join("src")).unwrap();
+        std::fs::create_dir_all(program_root.join("verification")).unwrap();
+        std::fs::write(
+            program_root.join("src/lib.rs"),
+            r#"
+pub fn process_instruction(
+    _program_id: &pinocchio::pubkey::Pubkey,
+    accounts: &[AccountInfo],
+    instruction_data: &[u8],
+) -> ProgramResult {
+    let (tag, data) = instruction_data.split_first().unwrap();
+    match *tag {
+        8 => process_move_tokens(accounts, data),
+        _ => Err(ProgramError::InvalidInstructionData),
+    }
+}
+
+fn process_move_tokens(accounts: &[AccountInfo], instruction_data: &[u8]) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    let source = next_account_info(account_info_iter)?;
+    let mint = next_account_info(account_info_iter)?;
+    let authority = next_account_info(account_info_iter)?;
+    require_token_account(source, mint.key(), authority.key())?;
+    let decimals = read_mint_decimals(mint)?;
+    let amount = u64::from_le_bytes(
+        instruction_data
+            .get(0..8)
+            .ok_or(ProgramError::InvalidInstructionData)?
+            .try_into()
+            .map_err(|_| ProgramError::InvalidInstructionData)?,
+    );
+    Ok(())
+}
+"#,
+        )
+        .unwrap();
+
+        let spec_path = program_root.join("verification/program.qedspec");
+        std::fs::write(
+            &spec_path,
+            r#"spec TokenProjection
+state { dummy : U64 }
+handler move_tokens (amount : U64) {
+  accounts {
+    source : writable
+    mint : readonly
+    authority : signer
+  }
+  ensures state.dummy == old(state.dummy)
+  effect { dummy := dummy }
+}"#,
+        )
+        .unwrap();
+
+        let output = program_root.join("src/kani_impl.rs");
+        generate(
+            &spec_path,
+            &output,
+            /*explicit_flag=*/ true,
+            Target::Pinocchio,
+        )
+        .expect("Pinocchio kani_impl must emit");
+        let body = std::fs::read_to_string(&output).unwrap();
+
+        assert!(
+            body.contains("let mut source = build_token_account([1u8; 32], true, false, [2u8; 32], authority_key, source_amount);")
+                && body.contains("let mut mint = build_mint_account([2u8; 32], false, false, 6u8);"),
+            "source-inferred token account bindings should project mint and owner bytes; got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn pinocchio_impl_projects_repeated_token_binding_from_key_alias() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let program_root = workspace.path().join("program");
+        std::fs::create_dir_all(program_root.join("src")).unwrap();
+        std::fs::create_dir_all(program_root.join("verification")).unwrap();
+        std::fs::create_dir_all(program_root.join("schema")).unwrap();
+        std::fs::write(
+            program_root.join("src/lib.rs"),
+            r#"
+pub fn derive_authority(program_id: &pinocchio::pubkey::Pubkey, lane_id: u8) -> ([u8; 32], u8) {
+    pinocchio::pubkey::try_find_program_address(&[AUTHORITY_SEED, &[lane_id]], program_id).unwrap()
+}
+
+pub fn process_instruction(
+    program_id: &pinocchio::pubkey::Pubkey,
+    accounts: &[AccountInfo],
+    instruction_data: &[u8],
+) -> ProgramResult {
+    let (tag, data) = instruction_data.split_first().unwrap();
+    match *tag {
+        9 => process_move_tokens(program_id, accounts, data),
+        _ => Err(ProgramError::InvalidInstructionData),
+    }
+}
+
+fn process_move_tokens(program_id: &pinocchio::pubkey::Pubkey, accounts: &[AccountInfo], instruction_data: &[u8]) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    let source = next_account_info(account_info_iter)?;
+    let destination = next_account_info(account_info_iter)?;
+    let mint = next_account_info(account_info_iter)?;
+    let source_authority = next_account_info(account_info_iter)?;
+    let lane_id = u8::from_le_bytes(
+        instruction_data
+            .get(8..9)
+            .ok_or(ProgramError::InvalidInstructionData)?
+            .try_into()
+            .map_err(|_| ProgramError::InvalidInstructionData)?,
+    );
+    let source_authority_key = derive_authority(program_id, 0).0;
+    let destination_authority_key = derive_authority(program_id, lane_id).0;
+    require_key(source_authority, &source_authority_key)?;
+    require_token_account(source, mint.key(), &source_authority_key)?;
+    require_token_account(destination, mint.key(), &destination_authority_key)?;
+    let decimals = read_mint_decimals(mint)?;
+    let amount = u64::from_le_bytes(
+        instruction_data
+            .get(0..8)
+            .ok_or(ProgramError::InvalidInstructionData)?
+            .try_into()
+            .map_err(|_| ProgramError::InvalidInstructionData)?,
+    );
+    Ok(())
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            program_root.join("schema/program.schema"),
+            "seed AUTHORITY_SEED authority\n",
+        )
+        .unwrap();
+
+        let spec_path = program_root.join("verification/program.qedspec");
+        std::fs::write(
+            &spec_path,
+            r#"spec TokenProjection
+state { dummy : U64 }
+handler move_tokens (amount : U64) (lane_id : U64) {
+  accounts {
+    source_0 : writable
+    destination_0 : writable
+    mint : readonly
+    source_authority_0 : signer
+  }
+  ensures state.dummy == old(state.dummy)
+  effect { dummy := dummy }
+}"#,
+        )
+        .unwrap();
+
+        let output = program_root.join("src/kani_impl.rs");
+        generate(
+            &spec_path,
+            &output,
+            /*explicit_flag=*/ true,
+            Target::Pinocchio,
+        )
+        .expect("Pinocchio kani_impl must emit");
+        let body = std::fs::read_to_string(&output).unwrap();
+
+        assert!(
+            body.contains("let source_authority_0_pda = pinocchio::pubkey::try_find_program_address(&[b\"authority\".as_ref(), &[0 as u8]], &program_id);")
+                && body.contains("let source_authority_0_key = source_authority_0_pda.unwrap().0;")
+                && body.contains("let mut source_0 = build_token_account([1u8; 32], true, false, [3u8; 32], source_authority_0_key, source_0_amount);"),
+            "repeated token account should inherit source loop binding and owner key alias; got:\n{body}"
+        );
+        assert!(
+            body.contains("let destination_0_owner_pda = pinocchio::pubkey::try_find_program_address(&[b\"authority\".as_ref(), &[lane_id as u8]], &program_id);")
+                && body.contains("let mut destination_0 = build_token_account([2u8; 32], true, false, [3u8; 32], destination_0_owner_key, destination_0_amount);"),
+            "repeated token account should project owner bytes from a source-derived key; got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn pinocchio_impl_uses_abi_account_layout_for_symbolic_data_account() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let program_root = workspace.path().join("program");
+        let abi_root = workspace.path().join("program-abi");
+        std::fs::create_dir_all(program_root.join("src")).unwrap();
+        std::fs::create_dir_all(program_root.join("verification")).unwrap();
+        std::fs::create_dir_all(abi_root.join("schema")).unwrap();
+        std::fs::write(program_root.join("src/lib.rs"), "").unwrap();
+        std::fs::write(
+            abi_root.join("schema/program.schema"),
+            r#"
+instruction UPDATE_CONFIG 9
+account UPDATE_CONFIG CONFIG 0 writable
+
+record CONFIG_ACCOUNT
+field MAGIC bytes8
+field ADMIN pubkey
+field MAX_FEE_BPS u16
+field PAUSED bool
+end
+
+record UPDATE_CONFIG_ARGS
+field MAX_FEE_BPS u16
+end
+
+magic CONFIG_MAGIC CFGMAGIC
+instruction_record UPDATE_CONFIG UPDATE_CONFIG_ARGS
+account_record CONFIG CONFIG_ACCOUNT
+"#,
+        )
+        .unwrap();
+
+        let spec_path = program_root.join("verification/program.qedspec");
+        std::fs::write(
+            &spec_path,
+            r#"spec ConfigProgram
+state { max_fee_bps : U64 }
+handler update_config (max_fee_bps : U64) {
+  accounts {
+    config : readonly
+  }
+  ensures state.max_fee_bps == old(state.max_fee_bps)
+  effect { max_fee_bps := max_fee_bps }
+}"#,
+        )
+        .unwrap();
+
+        let output = program_root.join("src/kani_impl.rs");
+        generate(
+            &spec_path,
+            &output,
+            /*explicit_flag=*/ true,
+            Target::Pinocchio,
+        )
+        .expect("Pinocchio kani_impl must emit");
+        let body = std::fs::read_to_string(&output).unwrap();
+
+        assert!(
+            body.contains("fn build_data_account")
+                && body.contains("// ABI account layout `config_account`: 43 byte data region.")
+                && body.contains("let mut config_data: [u8; 43] = kani::any();")
+                && body.contains("config_data[0..8].copy_from_slice(&[67u8, 70u8, 71u8, 77u8, 65u8, 71u8, 73u8, 67u8]);")
+                && body.contains("let mut config = build_data_account([1u8; 32], false, true, config_data);")
+                && !body.contains("let mut config = build_minimal_account("),
+            "ABI account layouts should emit symbolic data accounts with the profiled byte length; got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn pinocchio_impl_binds_profiled_pda_account_keys() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let program_root = workspace.path().join("program");
+        let abi_root = workspace.path().join("program-abi");
+        std::fs::create_dir_all(program_root.join("src")).unwrap();
+        std::fs::create_dir_all(program_root.join("verification")).unwrap();
+        std::fs::create_dir_all(abi_root.join("schema")).unwrap();
+        std::fs::write(
+            program_root.join("src/state.rs"),
+            r#"
+pub fn derive_config(program_id: &Pubkey) -> (Pubkey, u8) {
+    pinocchio::pubkey::find_program_address(&[CONFIG_SEED], program_id)
+}
+
+pub fn derive_vault_authority(program_id: &Pubkey, lane_id: u8) -> (Pubkey, u8) {
+    pinocchio::pubkey::find_program_address(&[VAULT_AUTHORITY_SEED, &[lane_id]], program_id)
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            abi_root.join("schema/program.schema"),
+            r#"
+seed CONFIG_SEED config
+seed VAULT_AUTHORITY_SEED vault-authority
+instruction ROUTE 3
+account ROUTE CONFIG 0 writable
+account ROUTE VAULT_AUTHORITY 1
+
+record ROUTE_ARGS
+field LANE_ID u8
+end
+
+instruction_record ROUTE ROUTE_ARGS
+"#,
+        )
+        .unwrap();
+
+        let spec_path = program_root.join("verification/program.qedspec");
+        std::fs::write(
+            &spec_path,
+            r#"spec RouteProgram
+state { dummy : U64 }
+handler route (lane_id : U64) {
+  accounts {
+    config : writable
+    vault_authority : readonly
+  }
+  ensures state.dummy == old(state.dummy)
+  effect { dummy := dummy }
+}"#,
+        )
+        .unwrap();
+
+        let output = program_root.join("src/kani_impl.rs");
+        generate(
+            &spec_path,
+            &output,
+            /*explicit_flag=*/ true,
+            Target::Pinocchio,
+        )
+        .expect("Pinocchio kani_impl must emit");
+        let body = std::fs::read_to_string(&output).unwrap();
+
+        assert!(
+            body.contains(
+                "let config_pda = pinocchio::pubkey::try_find_program_address(&[b\"config\".as_ref()], &program_id);"
+            )
+                && body.contains("kani::assume(config_pda.is_some());")
+                && body.contains("let config_key = config_pda.unwrap().0;")
+                && body.contains(
+                    "let vault_authority_pda = pinocchio::pubkey::try_find_program_address(&[b\"vault-authority\".as_ref(), &[lane_id as u8]], &program_id);"
+                )
+                && body.contains("let vault_authority_key = vault_authority_pda.unwrap().0;")
+                && body.contains(
+                    "let mut config = build_minimal_account(config_key, false, true);"
+                )
+                && body.contains(
+                    "let mut vault_authority = build_minimal_account(vault_authority_key, false, false);"
+                ),
+            "profiled PDA derivations should bind exact account keys generically; got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn pinocchio_impl_binds_account_keys_from_source_require_key_derivation() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let program_root = workspace.path().join("program");
+        std::fs::create_dir_all(program_root.join("src")).unwrap();
+        std::fs::create_dir_all(program_root.join("verification")).unwrap();
+        std::fs::create_dir_all(program_root.join("schema")).unwrap();
+        std::fs::write(
+            program_root.join("src/lib.rs"),
+            r#"
+pub fn derive_vault_authority(program_id: &Pubkey, lane_id: u8) -> (Pubkey, u8) {
+    pinocchio::pubkey::try_find_program_address(&[VAULT_AUTHORITY_SEED, &[lane_id]], program_id).unwrap()
+}
+
+pub fn process_instruction(
+    program_id: &pinocchio::pubkey::Pubkey,
+    accounts: &[AccountInfo],
+    instruction_data: &[u8],
+) -> ProgramResult {
+    let (tag, data) = instruction_data.split_first().unwrap();
+    match *tag {
+        3 => process_route(program_id, accounts, data),
+        _ => Err(ProgramError::InvalidInstructionData),
+    }
+}
+
+fn process_route(program_id: &pinocchio::pubkey::Pubkey, accounts: &[AccountInfo], instruction_data: &[u8]) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    let vault = next_account_info(account_info_iter)?;
+    let lane_id = u8::from_le_bytes(
+        instruction_data
+            .get(0..1)
+            .ok_or(ProgramError::InvalidInstructionData)?
+            .try_into()
+            .map_err(|_| ProgramError::InvalidInstructionData)?,
+    );
+    let vault_key = derive_vault_authority(program_id, lane_id).0;
+    require_key(vault, &vault_key)?;
+    Ok(())
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            program_root.join("schema/program.schema"),
+            "seed VAULT_AUTHORITY_SEED vault-authority\n",
+        )
+        .unwrap();
+
+        let spec_path = program_root.join("verification/program.qedspec");
+        std::fs::write(
+            &spec_path,
+            r#"spec RouteProgram
+state { dummy : U64 }
+handler route (lane_id : U64) {
+  accounts {
+    vault : readonly
+  }
+  ensures state.dummy == old(state.dummy)
+  effect { dummy := dummy }
+}"#,
+        )
+        .unwrap();
+
+        let output = program_root.join("src/kani_impl.rs");
+        generate(
+            &spec_path,
+            &output,
+            /*explicit_flag=*/ true,
+            Target::Pinocchio,
+        )
+        .expect("Pinocchio kani_impl must emit");
+        let body = std::fs::read_to_string(&output).unwrap();
+
+        assert!(
+            body.contains(
+                "let vault_pda = pinocchio::pubkey::try_find_program_address(&[b\"vault-authority\".as_ref(), &[lane_id as u8]], &program_id);"
+            )
+                && body.contains("kani::assume(vault_pda.is_some());")
+                && body.contains("let vault_key = vault_pda.unwrap().0;")
+                && body.contains("let mut vault = build_minimal_account(vault_key, false, false);"),
+            "source require_key derived-key guards should bind exact account keys; got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn pinocchio_impl_binds_non_program_id_pda_from_source_require_key_derivation() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let program_root = workspace.path().join("program");
+        std::fs::create_dir_all(program_root.join("src")).unwrap();
+        std::fs::create_dir_all(program_root.join("verification")).unwrap();
+        std::fs::write(
+            program_root.join("src/lib.rs"),
+            r#"
+use pinocchio::{account_info::AccountInfo, pubkey::Pubkey, ProgramResult};
+
+pub const ASSOCIATED_TOKEN_PROGRAM_ID: Pubkey = [8u8; 32];
+pub const TOKEN_PROGRAM_ID: Pubkey = [9u8; 32];
+
+pub fn derive_token_vault(authority: &Pubkey, mint: &Pubkey) -> (Pubkey, u8) {
+    pinocchio::pubkey::find_program_address(
+        &[authority.as_ref(), mint.as_ref()],
+        &ASSOCIATED_TOKEN_PROGRAM_ID,
+    )
+}
+
+pub fn process_instruction(
+    program_id: &pinocchio::pubkey::Pubkey,
+    accounts: &[AccountInfo],
+    instruction_data: &[u8],
+) -> ProgramResult {
+    let (tag, data) = instruction_data.split_first().unwrap();
+    match *tag {
+        3 => process_route(program_id, accounts, data),
+        _ => Ok(()),
+    }
+}
+
+fn process_route(_program_id: &pinocchio::pubkey::Pubkey, accounts: &[AccountInfo], _instruction_data: &[u8]) -> ProgramResult {
+    let [authority, mint, vault, ..] = accounts else {
+        return Ok(());
+    };
+    require_key(vault, &derive_token_vault(authority.key(), mint.key()).0)?;
+    Ok(())
+}
+"#,
+        )
+        .unwrap();
+
+        let spec_path = program_root.join("verification/program.qedspec");
+        std::fs::write(
+            &spec_path,
+            r#"spec NonProgramPda
+state { balance : U64 }
+handler route (nonce : U64) {
+  accounts {
+    authority : readonly
+    mint      : readonly
+    vault     : writable
+  }
+  ensures state.balance == old(state.balance)
+  effect { balance := balance }
+}"#,
+        )
+        .unwrap();
+
+        let output = program_root.join("src/kani_impl.rs");
+        generate(
+            &spec_path,
+            &output,
+            /*explicit_flag=*/ true,
+            Target::Pinocchio,
+        )
+        .expect("Pinocchio kani_impl must emit");
+        let body = std::fs::read_to_string(&output).unwrap();
+
+        assert!(
+            body.contains(
+                "let vault_pda = pinocchio::pubkey::try_find_program_address(&[[1u8; 32].as_ref(), [2u8; 32].as_ref()], &crate::ASSOCIATED_TOKEN_PROGRAM_ID);"
+            )
+                && body.contains("let vault_key = vault_pda.unwrap().0;")
+                && body.contains("let mut vault = build_minimal_account(vault_key, false, true);"),
+            "non-program-id PDA account keys should render from source require_key derivations; got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn pinocchio_impl_binds_non_program_id_pda_with_nested_derived_key_seed() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let program_root = workspace.path().join("program");
+        std::fs::create_dir_all(program_root.join("src")).unwrap();
+        std::fs::create_dir_all(program_root.join("verification")).unwrap();
+        std::fs::create_dir_all(program_root.join("schema")).unwrap();
+        std::fs::write(
+            program_root.join("src/lib.rs"),
+            r#"
+use pinocchio::{account_info::AccountInfo, pubkey::Pubkey, ProgramResult};
+
+pub const ASSOCIATED_TOKEN_PROGRAM_ID: Pubkey = [8u8; 32];
+
+pub fn derive_authority(program_id: &Pubkey, lane_id: u8) -> (Pubkey, u8) {
+    pinocchio::pubkey::find_program_address(&[AUTHORITY_SEED, &[lane_id]], program_id)
+}
+
+pub fn derive_token_vault(program_id: &Pubkey, mint: &Pubkey, lane_id: u8) -> (Pubkey, u8) {
+    let authority = derive_authority(program_id, lane_id).0;
+    pinocchio::pubkey::find_program_address(
+        &[authority.as_ref(), crate::TOKEN_PROGRAM_ID.as_ref(), mint.as_ref()],
+        &ASSOCIATED_TOKEN_PROGRAM_ID,
+    )
+}
+
+pub fn process_instruction(
+    program_id: &pinocchio::pubkey::Pubkey,
+    accounts: &[AccountInfo],
+    instruction_data: &[u8],
+) -> ProgramResult {
+    let (tag, data) = instruction_data.split_first().unwrap();
+    match *tag {
+        3 => process_route(program_id, accounts, data),
+        _ => Ok(()),
+    }
+}
+
+fn process_route(program_id: &pinocchio::pubkey::Pubkey, accounts: &[AccountInfo], instruction_data: &[u8]) -> ProgramResult {
+    let [mint, vault, ..] = accounts else {
+        return Ok(());
+    };
+    let lane_id = u8::from_le_bytes(
+        instruction_data
+            .get(0..1)
+            .ok_or(ProgramError::InvalidInstructionData)?
+            .try_into()
+            .map_err(|_| ProgramError::InvalidInstructionData)?,
+    );
+    let descriptor = VaultDescriptor {
+        lane_id,
+        mint: MintKey(*mint.key()),
+    };
+    require_key(
+        vault,
+        &derive_token_vault(program_id, &descriptor.mint.0, descriptor.lane_id.0).0,
+    )?;
+    Ok(())
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            program_root.join("schema/program.schema"),
+            "seed AUTHORITY_SEED authority\n",
+        )
+        .unwrap();
+
+        let spec_path = program_root.join("verification/program.qedspec");
+        std::fs::write(
+            &spec_path,
+            r#"spec NestedPda
+state { balance : U64 }
+handler route (lane_id : U64) {
+  accounts {
+    mint  : readonly
+    vault : writable
+  }
+  ensures state.balance == old(state.balance)
+  effect { balance := balance }
+}"#,
+        )
+        .unwrap();
+
+        let output = program_root.join("src/kani_impl.rs");
+        generate(
+            &spec_path,
+            &output,
+            /*explicit_flag=*/ true,
+            Target::Pinocchio,
+        )
+        .expect("Pinocchio kani_impl must emit");
+        let body = std::fs::read_to_string(&output).unwrap();
+
+        assert!(
+            body.contains(
+                "let vault_authority_pda = pinocchio::pubkey::try_find_program_address(&[b\"authority\".as_ref(), &[lane_id as u8]], &program_id);"
+            )
+                && body.contains("let vault_authority_key = vault_authority_pda.unwrap().0;")
+                && body.contains(
+                    "let vault_pda = pinocchio::pubkey::try_find_program_address(&[vault_authority_key.as_ref(), crate::TOKEN_PROGRAM_ID.as_ref(), [1u8; 32].as_ref()], &crate::ASSOCIATED_TOKEN_PROGRAM_ID);"
+                )
+                && body.contains("let mut vault = build_minimal_account(vault_key, false, true);"),
+            "nested derived-key PDA seeds should render before the outer non-program-id PDA; got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn pinocchio_impl_binds_repeated_loop_account_derivations_from_source() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let program_root = workspace.path().join("program");
+        std::fs::create_dir_all(program_root.join("src")).unwrap();
+        std::fs::create_dir_all(program_root.join("verification")).unwrap();
+        std::fs::create_dir_all(program_root.join("schema")).unwrap();
+        std::fs::write(
+            program_root.join("src/lib.rs"),
+            r#"
+use pinocchio::{account_info::AccountInfo, pubkey::Pubkey, ProgramResult};
+
+pub const ASSOCIATED_TOKEN_PROGRAM_ID: Pubkey = [8u8; 32];
+pub const TOKEN_PROGRAM_ID: Pubkey = [9u8; 32];
+
+pub fn derive_authority(program_id: &Pubkey, lane_id: u8) -> (Pubkey, u8) {
+    pinocchio::pubkey::find_program_address(&[AUTHORITY_SEED, &[lane_id]], program_id)
+}
+
+pub fn derive_token_vault(program_id: &Pubkey, mint: &Pubkey, lane_id: u8) -> (Pubkey, u8) {
+    let authority = derive_authority(program_id, lane_id).0;
+    pinocchio::pubkey::find_program_address(
+        &[authority.as_ref(), crate::TOKEN_PROGRAM_ID.as_ref(), mint.as_ref()],
+        &ASSOCIATED_TOKEN_PROGRAM_ID,
+    )
+}
+
+pub fn process_instruction(
+    program_id: &pinocchio::pubkey::Pubkey,
+    accounts: &[AccountInfo],
+    instruction_data: &[u8],
+) -> ProgramResult {
+    let (tag, data) = instruction_data.split_first().unwrap();
+    match *tag {
+        3 => process_route(program_id, accounts, data),
+        _ => Ok(()),
+    }
+}
+
+fn process_route(program_id: &pinocchio::pubkey::Pubkey, accounts: &[AccountInfo], instruction_data: &[u8]) -> ProgramResult {
+    let args = RouteArgs::try_from(instruction_data)?;
+    let account_info_iter = &mut accounts.iter();
+    let mint = next_account_info(account_info_iter)?;
+    let route_mint = MintKey(*mint.key());
+    for transfer in args.transfers {
+        let source_vault = next_account_info(account_info_iter)?;
+        let destination_vault = next_account_info(account_info_iter)?;
+        require_key(
+            source_vault,
+            &derive_token_vault(program_id, &route_mint.0, transfer.from_lane_id.0).0,
+        )?;
+        require_key(
+            destination_vault,
+            &derive_token_vault(program_id, &route_mint.0, transfer.to_lane_id.0).0,
+        )?;
+    }
+    Ok(())
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            program_root.join("schema/program.schema"),
+            r#"seed AUTHORITY_SEED authority
+field FROM_LANE_ID u8
+field TO_LANE_ID u8
+record TRANSFER
+field FROM_LANE_ID u8
+field TO_LANE_ID u8
+record ROUTE_ARGS
+field TRANSFER_COUNT u8
+repeat TRANSFER transfer 2 TRANSFER_COUNT
+instruction ROUTE 3
+instruction_record ROUTE ROUTE_ARGS
+"#,
+        )
+        .unwrap();
+
+        let spec_path = program_root.join("verification/program.qedspec");
+        std::fs::write(
+            &spec_path,
+            r#"spec RepeatedLoopPda
+state { balance : U64 }
+handler route_2
+  (from_lane_id_0 : U64)
+  (to_lane_id_0 : U64)
+  (from_lane_id_1 : U64)
+  (to_lane_id_1 : U64) {
+  accounts {
+    mint                  : readonly
+    source_vault_0        : writable
+    destination_vault_0   : writable
+    source_vault_1        : writable
+    destination_vault_1   : writable
+  }
+  ensures state.balance == old(state.balance)
+  effect { balance := balance }
+}"#,
+        )
+        .unwrap();
+
+        let output = program_root.join("src/kani_impl.rs");
+        generate(
+            &spec_path,
+            &output,
+            /*explicit_flag=*/ true,
+            Target::Pinocchio,
+        )
+        .expect("Pinocchio kani_impl must emit");
+        let body = std::fs::read_to_string(&output).unwrap();
+
+        assert!(
+            body.contains(
+                "let source_vault_0_authority_pda = pinocchio::pubkey::try_find_program_address(&[b\"authority\".as_ref(), &[from_lane_id_0 as u8]], &program_id);"
+            )
+                && body.contains(
+                    "let source_vault_0_pda = pinocchio::pubkey::try_find_program_address(&[source_vault_0_authority_key.as_ref(), crate::TOKEN_PROGRAM_ID.as_ref(), [1u8; 32].as_ref()], &crate::ASSOCIATED_TOKEN_PROGRAM_ID);"
+                )
+                && body.contains(
+                    "let destination_vault_1_authority_pda = pinocchio::pubkey::try_find_program_address(&[b\"authority\".as_ref(), &[to_lane_id_1 as u8]], &program_id);"
+                )
+                && body.contains(
+                    "let destination_vault_1_pda = pinocchio::pubkey::try_find_program_address(&[destination_vault_1_authority_key.as_ref(), crate::TOKEN_PROGRAM_ID.as_ref(), [1u8; 32].as_ref()], &crate::ASSOCIATED_TOKEN_PROGRAM_ID);"
+                )
+                && body.contains("let mut source_vault_0 = build_minimal_account(source_vault_0_key, false, true);")
+                && body.contains("let mut destination_vault_1 = build_minimal_account(destination_vault_1_key, false, true);"),
+            "repeated loop account-key derivations should bind suffixed accounts from source; got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn pinocchio_impl_uses_source_profile_for_tag_accounts_and_payload_widths() {
+        let src = r#"spec TokenMove
+state { dummy : U64 }
+handler move_tokens (amount : U64) (lane : U64) {
+  accounts {
+    source : writable
+    destination : writable
+    authority : signer
+  }
+  call Token.transfer(
+    from = source,
+    to = destination,
+    amount = amount,
+    authority = authority,
+  )
+  ensures state.dummy == old(state.dummy)
+  effect { dummy := dummy }
+}"#;
+        let spec = parse_str(src).expect("parse");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(src_dir.join("instructions")).unwrap();
+        std::fs::write(
+            src_dir.join("lib.rs"),
+            r#"
+pub fn process_instruction(
+    _program_id: &pinocchio::pubkey::Pubkey,
+    accounts: &[AccountInfo],
+    instruction_data: &[u8],
+) -> ProgramResult {
+    let (discriminant, data) = instruction_data.split_first().unwrap();
+    match *discriminant {
+        9 => instructions::move_tokens::process_move_tokens(accounts, data),
+        _ => Err(ProgramError::InvalidInstructionData),
+    }
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            src_dir.join("instructions/move_tokens.rs"),
+            r#"
+pub fn process_move_tokens(accounts: &[AccountInfo], instruction_data: &[u8]) -> ProgramResult {
+    let [destination, authority, source, ..] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+    let lane = u8::from_le_bytes(
+        instruction_data
+            .get(0..1)
+            .ok_or(ProgramError::InvalidInstructionData)?
+            .try_into()
+            .map_err(|_| ProgramError::InvalidInstructionData)?,
+    );
+    let amount = u64::from_le_bytes(
+        instruction_data
+            .get(1..9)
+            .ok_or(ProgramError::InvalidInstructionData)?
+            .try_into()
+            .map_err(|_| ProgramError::InvalidInstructionData)?,
+    );
+    Ok(())
+}
+"#,
+        )
+        .unwrap();
+
+        let output = src_dir.join("kani_impl.rs");
+        generate_from_spec(
+            &spec,
+            &output,
+            /*explicit_flag=*/ true,
+            Target::Pinocchio,
+        )
+        .expect("Pinocchio kani_impl must emit");
+        let body = std::fs::read_to_string(&output).unwrap();
+
+        assert!(
+            body.contains("let instruction_tag: u8 = 9u8;"),
+            "must use source-inferred dispatcher tag; got:\n{body}"
+        );
+        let destination_pos = body
+            .find("ManuallyDrop::new(account_info_from_stack(&mut destination))")
+            .unwrap();
+        let authority_pos = body
+            .find("ManuallyDrop::new(account_info_from_stack(&mut authority))")
+            .unwrap();
+        let source_pos = body
+            .find("ManuallyDrop::new(account_info_from_stack(&mut source))")
+            .unwrap();
+        assert!(
+            destination_pos < authority_pos && authority_pos < source_pos,
+            "must use source-inferred account order; got:\n{body}"
+        );
+        assert!(
+            body.contains("instruction_data.extend_from_slice(&(lane as u8).to_le_bytes());")
+                && body.contains(
+                    "instruction_data.extend_from_slice(&(amount as u64).to_le_bytes());"
+                ),
+            "must use source-inferred payload order and widths; got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn pinocchio_impl_does_not_emit_project_specific_handlers_without_ensures() {
+        let src = r#"spec ProjectSpecificConfig
+state { max_fee_bps : U128 }
+handler update_limit (new_max_fee_bps : U128) {
   accounts {
     config : writable, pda ["config"]
     admin  : signer
   }
   modifies [max_fee_bps]
   effect { max_fee_bps := new_max_fee_bps }
-}
-
-handler set_paused (paused_value : U64) : State.Active -> State.Active {
-  accounts {
-    config : writable, pda ["config"]
-    admin  : signer
-  }
-  modifies [paused]
-  effect { paused := paused_value }
-}
-
-handler initialize_config (max_fee_bps : U128) (lane_count : U64) {
-  accounts {
-    payer          : signer, writable
-    config         : writable, pda ["config"]
-    system_program : program
-  }
-  effect { max_fee_bps := max_fee_bps }
 }"#;
         let spec = parse_str(src).expect("parse");
-        let tmp =
-            std::env::temp_dir().join(format!("kani_impl_loyal_config_{}.rs", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!(
+            "kani_impl_project_config_{}.rs",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+        generate_from_spec(&spec, &tmp, /*explicit_flag=*/ true, Target::Pinocchio)
+            .expect("Pinocchio kani_impl must emit");
+        assert!(
+            !tmp.exists(),
+            "generic Pinocchio impl generation should not synthesize project-specific proofs without ensures"
+        );
+    }
+
+    #[test]
+    fn pinocchio_impl_declares_and_packs_pubkey_params() {
+        let src = r#"spec PubkeyParam
+state { dummy : U64 }
+handler register (member : Pubkey) {
+  accounts { config : writable }
+  modifies [dummy]
+  ensures state.dummy == old(state.dummy)
+  effect { dummy := dummy }
+}"#;
+        let spec = parse_str(src).expect("parse");
+        let tmp = std::env::temp_dir().join(format!("kani_impl_pubkey_{}.rs", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
         generate_from_spec(&spec, &tmp, /*explicit_flag=*/ true, Target::Pinocchio)
             .expect("Pinocchio kani_impl must emit");
         let body = std::fs::read_to_string(&tmp).unwrap();
+
         assert!(
-            body.contains("fn verify_set_max_fee_impl()")
-                && body.contains("fn verify_set_paused_impl()")
-                && body.contains("fn verify_initialize_config_impl()"),
-            "Loyal Hub config handlers must emit even without explicit ensures; got:\n{body}"
+            body.contains("let member: [u8; 32] = kani::any(); // spec type: Pubkey"),
+            "Pubkey params must be declared as symbolic 32-byte arrays; got:\n{body}"
         );
         assert!(
-            body.contains("loyal_read_u16(&config.data, loyal_hub_abi::config_account::MAX_FEE_BPS_OFFSET)")
-                && body.contains("config.data[loyal_hub_abi::config_account::PAUSED_OFFSET]")
-                && body.contains("config.hdr.data_len, crate::HUB_CONFIG_SPACE as u64")
-                && body.matches("assert!(_result.is_ok());").count() >= 2,
-            "Loyal Hub config handlers must assert successful dispatch and config bytes; got:\n{body}"
+            body.contains("instruction_data.extend_from_slice(&member);"),
+            "Pubkey params must pack raw 32-byte values into instruction data; got:\n{body}"
+        );
+        assert!(
+            !body.contains("TODO: declare symbolic param `member`")
+                && !body.contains("TODO: pack param `member`"),
+            "Pubkey params should no longer fall through to TODOs; got:\n{body}"
         );
         let _ = std::fs::remove_file(&tmp);
     }
@@ -2636,12 +4034,12 @@ handler open (deposit_amount : U64) {
     /// Pubkey seeds / account keys keep `.as_ref()`.
     #[test]
     fn integer_param_seed_serializes_via_to_le_bytes() {
-        let src = r#"spec Hub
+        let src = r#"spec Pool
 state { lane_count : U64 }
-pda hub_authority ["hub-authority", lane_id]
+pda vault_authority ["vault-authority", lane_id]
 handler swap (lane_id : U64) {
   accounts {
-    hub_authority : writable, pda ["hub-authority", lane_id]
+    vault_authority : writable, pda ["vault-authority", lane_id]
     caller        : signer
   }
   modifies [lane_count]
@@ -2659,7 +4057,7 @@ handler swap (lane_id : U64) {
             body
         );
         assert!(
-            !body.contains("[b\"hub-authority\", lane_id.as_ref()"),
+            !body.contains("[b\"vault-authority\", lane_id.as_ref()"),
             "must not emit bare `lane_id.as_ref()` for a u64 param; got:\n{}",
             body
         );

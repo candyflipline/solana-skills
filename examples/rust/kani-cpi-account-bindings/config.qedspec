@@ -72,7 +72,7 @@ handler bound_transfer (amount : U64) : State.Active -> State.Active {
   )
 }
 
-handler loyal_swap_large_guard (amount_in : U128) (min_out : U128) (fee_bps : U128) (lane : U8) (input_mint : Pubkey) (output_mint : Pubkey) : State.Active -> State.Active {
+handler stable_swap_large_guard (amount_in : U128) (min_out : U128) (fee_bps : U128) (lane : U8) (input_mint : Pubkey) (output_mint : Pubkey) : State.Active -> State.Active {
   accounts {
     admin         : signer
     pool_ta       : writable, type token

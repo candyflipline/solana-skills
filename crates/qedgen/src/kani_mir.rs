@@ -2497,15 +2497,15 @@ mod tests {
         let (mir, parsed) = lower_fixture("examples/rust/kani-cpi-account-bindings/config.qedspec");
         let out = render(&mir, &parsed);
         assert!(
-            !out.contains("fn verify_loyal_swap_large_guard_rejects_invalid()"),
+            !out.contains("fn verify_stable_swap_large_guard_rejects_invalid()"),
             "large guard should omit the monolithic rejects_invalid harness"
         );
         assert!(
-            out.contains("fn verify_loyal_swap_large_guard_rejects_invalid_1_pubkey_eq_accounts_admin_pubkey_s_admin_key()"),
+            out.contains("fn verify_stable_swap_large_guard_rejects_invalid_1_pubkey_eq_accounts_admin_pubkey_s_admin_key()"),
             "expected deterministic pubkey split harness name:\n{out}"
         );
         assert!(
-            out.contains("fn verify_loyal_swap_large_guard_rejects_invalid_8_mul_bps_floor_u128_amount_in_fee_bps_amount_in()"),
+            out.contains("fn verify_stable_swap_large_guard_rejects_invalid_8_mul_bps_floor_u128_amount_in_fee_bps_amount_in()"),
             "expected deterministic fee arithmetic split harness name:\n{out}"
         );
         assert!(
@@ -2518,7 +2518,7 @@ mod tests {
         );
         assert!(
             out.contains(
-                "assert!(!(__qed_bps_floor_1 <= amount_in),\n        \"loyal_swap_large_guard guard term must be false when violated\");"
+                "assert!(!(__qed_bps_floor_1 <= amount_in),\n        \"stable_swap_large_guard guard term must be false when violated\");"
             ),
             "split term should prove the violated guard term directly:\n{out}"
         );
