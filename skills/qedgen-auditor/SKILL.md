@@ -35,13 +35,24 @@ Invoke this skill when the user asks to:
 - "check for vulnerabilities" / "find bugs in this code"
 - `/audit`
 
-Works on Solana programs targeting any qedgen-supported runtime:
+Supported runtimes:
 - **Anchor** (detected by `Anchor.toml` or `anchor-lang` in Cargo.toml)
 - **Native Rust solana-program** (detected by `solana-program` dep
   without `anchor-lang`)
-- **sBPF** (detected by `.s` files under `programs/` or `src/`)
 - **qedgen's own codegen target** (detected by `quasar-lang` dep or
   `#[qed(verified)]` markers)
+
+**sBPF / hand-written assembly (`.s` files) is NOT supported.** The
+auditor finds bugs by pattern-matching Rust *source text* (account
+structs, typed wrappers, `checked_*`); assembly carries none of those
+cues, rust-analyzer doesn't index `.s` files, and the auditor has never
+surfaced a real finding on an assembly target. **If you detect an sBPF
+program, say so plainly and stop** — don't run a thin audit that implies
+coverage it doesn't have. Redirect the user: sBPF is a first-class qedgen
+*proof/codegen* target (Lean via `qedgen asm2lean` — see the main
+`qedgen` skill), and if they want auditor-style coverage they should
+write a `.qedspec` and use spec-aware mode (the CLI-emitted predicates
+are runtime-agnostic).
 
 ## Tool surface
 
@@ -63,8 +74,7 @@ just string analysis, no type resolution required for most predicates.
 - LSP-style type queries / find-references — speeds up data-flow tracing
   for `arithmetic_overflow_wrapping` and cross-handler analysis for
   `lifecycle_one_shot_violation`. Falls back to surface analysis if
-  unavailable. sBPF predicates ignore LSP entirely (rust-analyzer
-  doesn't index `.s` files).
+  unavailable.
 
 ## Adversarial mindset
 
@@ -462,9 +472,11 @@ MEDIUM and below: a repro is encouraged but not required.
    step skipped (use the existing spec, not a synthesized skeleton).
    Phase 3 continues.
 
-   ### Runtimes the extractor doesn't cover yet (sBPF, exotic)
+   ### Runtimes the extractor doesn't cover (sBPF, exotic)
 
-   Fall back to the legacy silent scaffold or hand-walk the source
+   sBPF/assembly is out of scope for the auditor (see the "NOT
+   supported" note above) — stop and redirect rather than scaffold.
+   For other exotic-but-Rust shapes, hand-walk the source
    (`qedgen spec --idl <path>` for Anchor with IDL).
 
    ### Artifact emission
@@ -488,7 +500,9 @@ MEDIUM and below: a repro is encouraged but not required.
 
 Each category has a **spec-aware predicate** (CLI-emitted via
 `qedgen probe --spec`) and **per-runtime spec-less predicates**
-(your job to apply via Read+Grep on the impl).
+(your job to apply via Read+Grep on the impl). Spec-less predicates
+cover **Anchor and native Rust only** — sBPF/assembly is out of scope
+(see the "NOT supported" note above).
 
 ### `missing_signer` — CRITICAL
 Spec-aware: handler has no `auth X` clause and is not marked
@@ -503,8 +517,6 @@ Spec-less per-runtime:
   handler's authority-shaped account is consumed by an `invoke_signed`
   to a trusted program (stake / token / system / spl-associated-token),
   signer is enforced downstream by the callee program. Not a finding.
-- **sBPF:** look for the bytes-comparison pattern that checks the signer
-  flag in the AccountInfo header.
 
 ### `arbitrary_cpi` — HIGH
 Spec-aware: handler has a writable `token`-typed account but spec
@@ -518,8 +530,6 @@ Spec-less per-runtime:
   validates the program ID. (Pattern: many native programs centralize
   validation in helpers — recognize `check_*_program` style names as
   authoritative.)
-- **sBPF:** program-ID-comparison pattern (`ldxw` of caller-supplied
-  program-ID, compare against constant) before `invoke_signed_c`.
 - Corpus: "CPI without program-id check on Token CPI" — recurring
   audit-firm shape; the typed-`Program<T>` Anchor wrapper exists
   specifically to close it.
@@ -535,9 +545,6 @@ Spec-less per-runtime:
   `QuoteLots(u64)` or `BaseAtoms(u64)` may have `Mul`/`Add` impls that
   use raw operators on the inner field. Naive grep for `* u64` misses
   these; check the wrapper type's impls.
-- **sBPF:** `add64` / `sub64` / `mul64` without subsequent bound checks.
-  `lddw` constants compared against intermediate sums is a strong hit
-  pattern.
 - **Saturating-by-design suppression:** explicit `saturating_*` on
   rent / fee / supply math is a documented design choice in many Anza
   programs. Surface as informational only when the field is amount-shaped
@@ -575,12 +582,11 @@ Spec-less per-runtime:
   discriminator-zeroing pattern. Cross-handler analysis: same account
   shape consumed by multiple non-terminal handlers without flag
   transitions.
-- **Native / sBPF:** harder; spec-less coverage is limited at this
-  layer. Recommend the user write a `.qedspec` for robust
-  state-machine reasoning (transitions to spec-aware mode on next
-  audit).
+- **Native:** harder; spec-less coverage is limited at this layer.
+  Recommend the user write a `.qedspec` for robust state-machine
+  reasoning (transitions to spec-aware mode on next audit).
 
-### `cpi_param_swap` — HIGH (Anchor + Native; sBPF n/a)
+### `cpi_param_swap` — HIGH (Anchor + Native)
 Spec-less only — spec-aware shape is weak (the spec already declares
 `transfer from X to Y`).
 
@@ -595,7 +601,7 @@ signature gives the vault-PDA the right to authorize transfers from
 itself. This is the intended pattern for vault withdrawals; do **not**
 flag it as a swap.
 
-### `pda_canonical_bump` — MEDIUM (Anchor + Native; sBPF rare)
+### `pda_canonical_bump` — MEDIUM (Anchor + Native)
 Spec-less only.
 - **Anchor:** `#[account(seeds = [...], bump)]` — the `bump` keyword
   signals canonical-bump enforcement. Absence is the warning.
@@ -1760,9 +1766,13 @@ case the pattern shouldn't have been flagged at CRIT/HIGH).
 - **Don't ask consent for the audit's named side-effects.** `.qedspec`,
   `.qed/findings/`, `.qed/probe-suppress.toml` are all expected
   artifacts of the named operation. Show them in the digest footer.
-- **Don't refuse if the runtime is sBPF or native Rust.** Reduced
-  category coverage is OK; surface what categories apply, mark the
-  others "not applicable to this runtime."
+- **Don't refuse a native-Rust audit.** Reduced category coverage vs
+  Anchor is OK; surface what categories apply, mark the others "not
+  applicable to this runtime."
+- **Do decline an sBPF/assembly audit.** It's not supported (the
+  auditor has never surfaced a real finding on bytecode). Say so
+  plainly, don't run a thin audit that implies coverage, and redirect
+  to the qedgen proof path (`asm2lean`) or spec-aware mode.
 - **Don't dispatch to dylint / anchor-lints / external static analyzers.**
   You're in author position via the user's harness; you have strictly
   more info than dylint's HIR/MIR analysis can recover.
