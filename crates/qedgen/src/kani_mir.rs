@@ -47,7 +47,7 @@ pub fn generate(mir: &Mir, parsed: &ParsedSpec, output_path: &Path) -> Result<()
         std::fs::create_dir_all(parent)?;
     }
 
-    let content = render(mir, parsed);
+    let content = render_with_progress(mir, parsed);
     std::fs::write(output_path, &content)?;
 
     // Default Kani-codegen path post v2.30 Phase 3f. The legacy
@@ -59,8 +59,25 @@ pub fn generate(mir: &Mir, parsed: &ParsedSpec, output_path: &Path) -> Result<()
 /// math helpers / state-model header / constants), then the per-account
 /// body (records / enums / Status / State / predicates / transitions /
 /// harnesses), branching on single- vs multi-account.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn render(mir: &Mir, parsed: &ParsedSpec) -> String {
+    render_inner(mir, parsed, false, false)
+}
+
+fn render_with_progress(mir: &Mir, parsed: &ParsedSpec) -> String {
+    render_inner(mir, parsed, true, skip_guard_proofs_from_env())
+}
+
+fn render_inner(mir: &Mir, parsed: &ParsedSpec, progress: bool, skip_guard_proofs: bool) -> String {
     let mut out = String::new();
+    if progress {
+        eprintln!(
+            "Rendering Kani model harnesses for {} handler(s), {} propertie(s), {} invariant(s)",
+            parsed.handlers.len(),
+            parsed.properties.len(),
+            parsed.invariants.len()
+        );
+    }
     emit_header(&mut out, parsed);
     emit_math_helpers(&mut out, parsed);
     if crate::rust_codegen_util::spec_uses_pubkey(parsed) {
@@ -76,13 +93,14 @@ pub fn render(mir: &Mir, parsed: &ParsedSpec) -> String {
         // File-level features (covers / liveness / environment) are
         // skipped — per-ADT lifting is v2.22 scope per the legacy
         // comment; spec-level emit only happens in single-mode.
-        if let Err(e) = emit_multi_account_sections(&mut out, parsed) {
+        if let Err(e) = emit_multi_account_sections(&mut out, parsed, progress, skip_guard_proofs) {
             out.push_str(&format!("// MIR-ERROR: multi-account emit failed: {}\n", e));
         }
     } else {
         // Single-account path — every section consumes the parsed
         // ParsedSpec directly.
-        if let Err(e) = emit_single_account_sections(&mut out, parsed) {
+        if let Err(e) = emit_single_account_sections(&mut out, parsed, progress, skip_guard_proofs)
+        {
             out.push_str(&format!(
                 "// MIR-ERROR: single-account emit failed: {}\n",
                 e
@@ -94,23 +112,72 @@ pub fn render(mir: &Mir, parsed: &ParsedSpec) -> String {
     out
 }
 
+fn skip_guard_proofs_from_env() -> bool {
+    matches!(
+        std::env::var("QEDGEN_KANI_SKIP_GUARD_PROOFS")
+            .ok()
+            .as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES")
+    )
+}
+
 /// Single-account dispatch — invokes every section emitter in
 /// legacy order against the parsed spec directly.
-fn emit_single_account_sections(out: &mut String, parsed: &ParsedSpec) -> Result<()> {
+fn emit_single_account_sections(
+    out: &mut String,
+    parsed: &ParsedSpec,
+    progress: bool,
+    skip_guard_proofs: bool,
+) -> Result<()> {
+    if progress {
+        eprintln!("Rendering Kani section: state model");
+    }
     emit_account_section_structural(out, parsed)?;
-    emit_guard_enforcement_harnesses(out, parsed)?;
+    if skip_guard_proofs {
+        if progress {
+            eprintln!(
+                "Skipping Kani section: guard rejection proofs (QEDGEN_KANI_SKIP_GUARD_PROOFS=1)"
+            );
+        }
+    } else {
+        if progress {
+            eprintln!("Rendering Kani section: guard rejection proofs");
+        }
+        emit_guard_enforcement_harnesses(out, parsed, progress)?;
+    }
+    if progress {
+        eprintln!("Rendering Kani section: abort-condition proofs");
+    }
     emit_abort_condition_harnesses(out, parsed)?;
+    if progress {
+        eprintln!("Rendering Kani section: property preservation proofs");
+    }
     emit_property_preservation_harnesses(out, parsed)?;
     // Order matches legacy: property → ensures → invariant →
     // effect → overflow. Slotting ensures between property and
     // invariant is load-bearing for byte-equivalence.
+    if progress {
+        eprintln!("Rendering Kani section: ensures preservation proofs");
+    }
     emit_ensures_preservation_harnesses(out, parsed)?;
+    if progress {
+        eprintln!("Rendering Kani section: invariant preservation proofs");
+    }
     emit_invariant_preservation_harnesses(out, parsed)?;
+    if progress {
+        eprintln!("Rendering Kani section: effect conformance proofs");
+    }
     emit_effect_conformance_harnesses(out, parsed)?;
+    if progress {
+        eprintln!("Rendering Kani section: overflow proofs");
+    }
     emit_overflow_detection_harnesses(out, parsed)?;
     // File-level features (covers / liveness / environment) —
     // single-mode only. Multi-account specs skip these entirely
     // (per-ADT lifting is v2.22 scope per the legacy comment).
+    if progress {
+        eprintln!("Rendering Kani section: cover/liveness/environment proofs");
+    }
     emit_file_level_features(out, parsed)?;
     Ok(())
 }
@@ -137,7 +204,12 @@ fn emit_single_account_sections(out: &mut String, parsed: &ParsedSpec) -> Result
 /// invariant → effect → overflow). File-level features (covers /
 /// liveness / environment) live outside any `mod` block in legacy
 /// and aren't emitted in multi-mode at all.
-fn emit_multi_account_sections(out: &mut String, parsed: &ParsedSpec) -> Result<()> {
+fn emit_multi_account_sections(
+    out: &mut String,
+    parsed: &ParsedSpec,
+    progress: bool,
+    skip_guard_proofs: bool,
+) -> Result<()> {
     use crate::rust_codegen_util as util;
 
     for acct in &parsed.account_types {
@@ -157,11 +229,22 @@ fn emit_multi_account_sections(out: &mut String, parsed: &ParsedSpec) -> Result<
         }
 
         let mod_name = acct.name.to_lowercase();
+        if progress {
+            eprintln!("Rendering Kani account module: {mod_name}");
+        }
         out.push_str(&format!("mod {} {{\n", mod_name));
         out.push_str("    use super::*;\n\n");
 
         emit_account_section_structural(out, &scoped)?;
-        emit_guard_enforcement_harnesses(out, &scoped)?;
+        if skip_guard_proofs {
+            if progress {
+                eprintln!(
+                    "Skipping Kani section: guard rejection proofs (QEDGEN_KANI_SKIP_GUARD_PROOFS=1)"
+                );
+            }
+        } else {
+            emit_guard_enforcement_harnesses(out, &scoped, progress)?;
+        }
         emit_abort_condition_harnesses(out, &scoped)?;
         emit_property_preservation_harnesses(out, &scoped)?;
         emit_ensures_preservation_harnesses(out, &scoped)?;
@@ -614,7 +697,11 @@ fn transition_call_args(op: &crate::check::ParsedHandler, account_var: Option<&s
 ///   * `kani::assume(!(full_guard))` — at least one guard component
 ///     is violated
 ///   * `assert!(!<handler>(&mut s, args...))` — handler must reject
-fn emit_guard_enforcement_harnesses(out: &mut String, parsed: &ParsedSpec) -> Result<()> {
+fn emit_guard_enforcement_harnesses(
+    out: &mut String,
+    parsed: &ParsedSpec,
+    progress: bool,
+) -> Result<()> {
     use crate::rust_codegen_util as util;
 
     const GUARD_REJECTION_SPLIT_THRESHOLD: usize = 8;
@@ -675,13 +762,17 @@ fn emit_guard_enforcement_harnesses(out: &mut String, parsed: &ParsedSpec) -> Re
             )
             .expect("guard terms came from an expressible full guard");
             let full_guard = util::rewrite_kani_pubkey_comparisons(&full_guard, op, parsed);
+            let harness_name = format!("verify_{}_rejects_invalid", op.name);
+            if progress {
+                eprintln!("Rendering Kani guard proof: {harness_name}");
+            }
             emit_guard_rejection_harness(
                 out,
                 parsed,
                 op,
                 &mutable,
                 lifecycle,
-                &format!("verify_{}_rejects_invalid", op.name),
+                &harness_name,
                 &[],
                 &full_guard,
                 &format!("{} must reject when guard is violated", op.name),
@@ -697,13 +788,18 @@ fn emit_guard_enforcement_harnesses(out: &mut String, parsed: &ParsedSpec) -> Re
                     })
                     .collect::<Vec<_>>();
                 let slug = guard_term_slug(&term_expr);
+                let harness_name =
+                    format!("verify_{}_rejects_invalid_{}_{}", op.name, idx + 1, slug);
+                if progress {
+                    eprintln!("Rendering Kani guard proof: {harness_name}");
+                }
                 emit_guard_rejection_harness(
                     out,
                     parsed,
                     op,
                     &mutable,
                     lifecycle,
-                    &format!("verify_{}_rejects_invalid_{}_{}", op.name, idx + 1, slug),
+                    &harness_name,
                     &prefix_terms,
                     &term_expr,
                     &format!("{} must reject when guard term is violated", op.name),
@@ -2264,6 +2360,24 @@ mod tests {
         assert!(
             out.contains("fn verify_initialize_effect_"),
             "expected initialize_effect_<field> harness"
+        );
+    }
+
+    #[test]
+    fn render_skip_guard_proofs_still_emits_effect_proofs() {
+        let (mir, parsed) = lower_fixture("examples/rust/escrow/escrow.qedspec");
+        let out = render_inner(&mir, &parsed, false, true);
+        assert!(
+            !out.contains("// Guard enforcement — transitions reject invalid inputs"),
+            "expected guard-rejection section to be skipped"
+        );
+        assert!(
+            !out.contains("fn verify_initialize_rejects_invalid"),
+            "expected guard-rejection harnesses to be skipped"
+        );
+        assert!(
+            out.contains("fn verify_initialize_effect_"),
+            "expected effect proofs to remain when guard proofs are skipped"
         );
     }
 

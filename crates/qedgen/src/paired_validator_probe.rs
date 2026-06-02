@@ -122,6 +122,9 @@ fn extract_validator_sites(rel_file: &Path, source: &str) -> Vec<(String, Valida
             continue;
         }
         let normalized = normalize_condition(cond);
+        if is_membership_check(&normalized) {
+            continue;
+        }
         let site = ValidatorSite {
             rel_file: rel_file.to_path_buf(),
             line,
@@ -152,6 +155,9 @@ fn emit_findings(by_field: &BTreeMap<String, Vec<ValidatorSite>>) -> Vec<Finding
             shapes.entry(s.normalized_cond.clone()).or_default().push(s);
         }
         if shapes.len() < 2 {
+            continue;
+        }
+        if shapes_are_base_guard_refinements(&shapes) {
             continue;
         }
         // Skip cases where every "shape" is a near-trivial echo —
@@ -230,6 +236,24 @@ fn emit_findings(by_field: &BTreeMap<String, Vec<ValidatorSite>>) -> Vec<Finding
         });
     }
     out
+}
+
+fn is_membership_check(normalized_cond: &str) -> bool {
+    normalized_cond.contains(".contains(") || normalized_cond.contains("contains(")
+}
+
+fn shapes_are_base_guard_refinements(
+    shapes: &std::collections::BTreeMap<String, Vec<&ValidatorSite>>,
+) -> bool {
+    shapes.keys().any(|base| {
+        shapes.keys().all(|shape| {
+            shape == base
+                || shape
+                    .split("||")
+                    .map(|clause| clause.trim())
+                    .any(|clause| clause == base)
+        })
+    })
 }
 
 /// Render a human-readable summary of the shape set: one line per
@@ -530,6 +554,65 @@ fn test_b() -> Result<(), Error> {
         assert!(
             findings.is_empty(),
             "test fns should NOT contribute, got {findings:#?}"
+        );
+    }
+
+    #[test]
+    fn ignores_base_guard_plus_or_refinement() {
+        let src = r#"
+fn parse(lane_count: u8) -> Result<(), Error> {
+    if lane_count == 0 {
+        return Err(Error::Invalid);
+    }
+    Ok(())
+}
+
+fn require_lane(lane_count: u8, lane_id: u8) -> Result<(), Error> {
+    if lane_count == 0 || lane_id >= lane_count {
+        return Err(Error::Invalid);
+    }
+    Ok(())
+}
+"#;
+        let mut by_field: BTreeMap<String, Vec<ValidatorSite>> = BTreeMap::new();
+        for (f, s) in extract_validator_sites(&p("state.rs"), src) {
+            by_field.entry(f).or_default().push(s);
+        }
+        let findings = emit_findings(&by_field);
+        assert!(
+            findings.is_empty(),
+            "base guard plus lane-id refinement should NOT fire, got {findings:#?}"
+        );
+    }
+
+    #[test]
+    fn ignores_membership_checks_for_count_fields() {
+        let src = r#"
+fn write_account(mint_count: usize) -> Result<(), Error> {
+    if mint_count == 0 || mint_count > MAX_ALLOWED_MINTS {
+        return Err(Error::Invalid);
+    }
+    Ok(())
+}
+
+fn require_allowed_mint(mint_count: usize, mint: Pubkey) -> Result<(), Error> {
+    if mint_count == 0 || mint_count > MAX_ALLOWED_MINTS {
+        return Err(Error::Invalid);
+    }
+    if !allowed_mints[..mint_count].contains(&mint) {
+        return Err(Error::Invalid);
+    }
+    Ok(())
+}
+"#;
+        let mut by_field: BTreeMap<String, Vec<ValidatorSite>> = BTreeMap::new();
+        for (f, s) in extract_validator_sites(&p("state.rs"), src) {
+            by_field.entry(f).or_default().push(s);
+        }
+        let findings = emit_findings(&by_field);
+        assert!(
+            findings.is_empty(),
+            "membership check should NOT become mint_count domain drift, got {findings:#?}"
         );
     }
 

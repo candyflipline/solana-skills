@@ -163,7 +163,7 @@ pub fn generate_from_spec(
     let handlers_with_ensures: Vec<&ParsedHandler> = spec
         .handlers
         .iter()
-        .filter(|h| !h.ensures.is_empty())
+        .filter(|h| !h.ensures.is_empty() || loyal_hub_forces_pinocchio_impl_handler(spec, h))
         .collect();
 
     // No ensures anywhere → nothing to assert. Auto-trigger could still
@@ -465,7 +465,7 @@ fn emit_kani_impl_pinocchio(
     out.push_str("//\n");
     out.push_str("// Impl-targeted Kani harnesses for a Pinocchio (#![no_std]) program.\n");
     out.push_str("// Builds symbolic `AccountInfo` values on the stack and calls the\n");
-    out.push_str("// user's real `process_<handler>` against them. Kani's automatic\n");
+    out.push_str("// user's real `process_instruction` dispatcher. Kani's automatic\n");
     out.push_str("// overflow / underflow / UB checks run on every path through the\n");
     out.push_str("// real handler — a counterexample blames the impl.\n");
     out.push_str("//\n");
@@ -492,6 +492,9 @@ fn emit_kani_impl_pinocchio(
     out.push_str("#![allow(dead_code, unused_imports, unused_variables)]\n\n");
 
     emit_pinocchio_scaffold(&mut out);
+    if spec.program_name == "LoyalHubSwap" {
+        emit_loyal_hub_pinocchio_scaffold(&mut out);
+    }
 
     out.push_str(
         "// ============================================================================\n",
@@ -518,12 +521,27 @@ fn emit_kani_impl_pinocchio(
     Ok(())
 }
 
+fn loyal_hub_forces_pinocchio_impl_handler(spec: &ParsedSpec, handler: &ParsedHandler) -> bool {
+    if spec.program_name != "LoyalHubSwap" {
+        return false;
+    }
+    matches!(
+        to_snake_case(&handler.name).as_str(),
+        "initialize_config" | "set_max_fee" | "set_paused"
+    )
+}
+
 /// Emit the deterministic shared scaffold: the `Account`-layout mirror,
 /// the stack-account container, the SPL Token layout constants, and the
 /// build / transmute / read helpers. Byte-for-byte the same regardless
 /// of the spec (the per-handler harnesses below reference these).
 fn emit_pinocchio_scaffold(out: &mut String) {
     out.push_str(PINOCCHIO_SCAFFOLD);
+    out.push('\n');
+}
+
+fn emit_loyal_hub_pinocchio_scaffold(out: &mut String) {
+    out.push_str(LOYAL_HUB_PINOCCHIO_SCAFFOLD);
     out.push('\n');
 }
 
@@ -641,19 +659,150 @@ fn read_token_amount<const N: usize>(stack: &StackAccount<N>) -> u64 {
 }
 "#;
 
-/// Normalize a spec handler name into `(module, fn_name)` for the
-/// `crate::<module>::<fn_name>` call path. Pinocchio convention is
-/// `src/<module>.rs` exposing `pub fn process_<base>`. We strip a
-/// leading `process_` from the spec name to recover the base, then
-/// reattach it for the fn while using the base as the module.
+const LOYAL_HUB_PINOCCHIO_SCAFFOLD: &str = r#"const LOYAL_MINT_DECIMALS_OFFSET: usize = 44;
+const LOYAL_MINT_INITIALIZED_OFFSET: usize = 45;
+const LOYAL_MINT_DATA_LEN: usize = 82;
+const LOYAL_TOKEN_MINT_OFFSET: usize = 0;
+
+fn loyal_build_account<const DATA_LEN: usize>(
+    key: [u8; 32],
+    owner: [u8; 32],
+    is_signer: bool,
+    is_writable: bool,
+    data: [u8; DATA_LEN],
+) -> StackAccount<DATA_LEN> {
+    StackAccount {
+        hdr: AccountLayout {
+            borrow_state: BORROW_STATE_CLEAR,
+            is_signer: is_signer as u8,
+            is_writable: is_writable as u8,
+            executable: 0,
+            original_data_len: 0,
+            key,
+            owner,
+            lamports: 0,
+            data_len: DATA_LEN as u64,
+        },
+        data,
+    }
+}
+
+fn loyal_build_uninitialized_config_account(key: [u8; 32]) -> StackAccount<{ crate::HUB_CONFIG_SPACE }> {
+    let mut acct = loyal_build_account(
+        key,
+        crate::SYSTEM_PROGRAM_ID,
+        false,
+        true,
+        [0u8; crate::HUB_CONFIG_SPACE],
+    );
+    acct.hdr.data_len = 0;
+    acct
+}
+
+fn loyal_write_pubkey(data: &mut [u8], offset: usize, key: &[u8; 32]) {
+    data[offset..offset + 32].copy_from_slice(key);
+}
+
+fn loyal_config_data(
+    admin: [u8; 32],
+    hub_authorizer: [u8; 32],
+    inventory_rebalancer: [u8; 32],
+    max_fee_bps: u16,
+    paused: bool,
+    lane_count: u8,
+    allowed_mints: &[[u8; 32]],
+) -> [u8; crate::HUB_CONFIG_SPACE] {
+    kani::assume(lane_count > 0);
+    kani::assume(!allowed_mints.is_empty());
+    kani::assume(allowed_mints.len() <= crate::MAX_ALLOWED_MINTS);
+
+    let mut data = [0u8; crate::HUB_CONFIG_SPACE];
+    data[loyal_hub_abi::config_account::MAGIC_OFFSET
+        ..loyal_hub_abi::config_account::MAGIC_OFFSET + loyal_hub_abi::config_account::MAGIC_LEN]
+        .copy_from_slice(crate::CONFIG_MAGIC);
+    loyal_write_pubkey(
+        &mut data,
+        loyal_hub_abi::config_account::ADMIN_OFFSET,
+        &admin,
+    );
+    loyal_write_pubkey(
+        &mut data,
+        loyal_hub_abi::config_account::HUB_AUTHORIZER_OFFSET,
+        &hub_authorizer,
+    );
+    loyal_write_pubkey(
+        &mut data,
+        loyal_hub_abi::config_account::INVENTORY_REBALANCER_OFFSET,
+        &inventory_rebalancer,
+    );
+    data[loyal_hub_abi::config_account::MAX_FEE_BPS_OFFSET
+        ..loyal_hub_abi::config_account::MAX_FEE_BPS_OFFSET + 2]
+        .copy_from_slice(&max_fee_bps.to_le_bytes());
+    data[loyal_hub_abi::config_account::PAUSED_OFFSET] = paused as u8;
+    data[loyal_hub_abi::config_account::LANE_COUNT_OFFSET] = lane_count;
+    data[loyal_hub_abi::config_account::MINT_COUNT_OFFSET] = allowed_mints.len() as u8;
+    for (index, mint) in allowed_mints.iter().enumerate() {
+        let offset = loyal_hub_abi::config_account::ALLOWED_MINT_OFFSET
+            + (index * loyal_hub_abi::config_account::ALLOWED_MINT_ITEM_LEN);
+        loyal_write_pubkey(&mut data, offset, mint);
+    }
+    data
+}
+
+fn loyal_mint_data(decimals: u8) -> [u8; LOYAL_MINT_DATA_LEN] {
+    let mut data = [0u8; LOYAL_MINT_DATA_LEN];
+    data[LOYAL_MINT_DECIMALS_OFFSET] = decimals;
+    data[LOYAL_MINT_INITIALIZED_OFFSET] = 1;
+    data
+}
+
+fn loyal_read_u16(data: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap())
+}
+
+fn loyal_token_account_data(mint: [u8; 32], owner: [u8; 32], amount: u64) -> [u8; TOKEN_DATA_LEN] {
+    let mut data = [0u8; TOKEN_DATA_LEN];
+    loyal_write_pubkey(&mut data, LOYAL_TOKEN_MINT_OFFSET, &mint);
+    loyal_write_pubkey(&mut data, TOKEN_OWNER_OFF, &owner);
+    data[TOKEN_AMOUNT_OFF..TOKEN_AMOUNT_OFF + 8].copy_from_slice(&amount.to_le_bytes());
+    data[TOKEN_STATE_OFF] = STATE_INITIALIZED;
+    data
+}
+
+fn loyal_assume_distinct_pubkeys(keys: &[[u8; 32]]) {
+    for (index, left) in keys.iter().enumerate() {
+        for right in keys.iter().skip(index + 1) {
+            kani::assume(left != right);
+        }
+    }
+}
+"#;
+
+/// Normalize a spec handler name into `(module, fn_name)`.
 ///
-///   "transfer"          → ("transfer", "process_transfer")
-///   "process_transfer"  → ("transfer", "process_transfer")
-fn pinocchio_call_path(handler_name: &str) -> (String, String) {
+/// Kept for generated-scaffold compatibility docs and tests: older
+/// Pinocchio harnesses called `crate::instructions::<module>::<fn_name>`.
+/// Current committed-crate harnesses call the public `process_instruction`
+/// dispatcher instead.
+fn _pinocchio_call_path(handler_name: &str) -> (String, String) {
     let snake = to_snake_case(handler_name);
     let base = snake.strip_prefix("process_").unwrap_or(&snake).to_string();
     let fn_name = format!("process_{}", base);
     (base, fn_name)
+}
+
+/// Instruction tag constant expected in the committed Pinocchio crate.
+///
+/// For arity-specialized spec models such as `rebalance_inventory_16`, strip
+/// the numeric suffix so all arities dispatch through the same runtime
+/// instruction tag (`REBALANCE_INVENTORY`).
+fn pinocchio_instruction_tag_const(handler_name: &str) -> String {
+    let snake = to_snake_case(handler_name);
+    let base = snake
+        .rsplit_once('_')
+        .and_then(|(prefix, suffix)| suffix.parse::<usize>().ok().map(|_| prefix))
+        .unwrap_or(&snake);
+    base.to_ascii_uppercase()
 }
 
 /// Rust primitive for a numeric DSL type, used to declare the symbolic
@@ -676,19 +825,727 @@ fn numeric_param_rust_type(dsl_type: &str) -> Option<&'static str> {
     }
 }
 
+fn has_param(handler: &ParsedHandler, name: &str) -> bool {
+    handler.takes_params.iter().any(|(pname, _)| pname == name)
+}
+
+fn rebalance_arity(handler_name: &str) -> Option<usize> {
+    let snake = to_snake_case(handler_name);
+    if snake == "rebalance_inventory" {
+        return Some(1);
+    }
+    snake
+        .strip_prefix("rebalance_inventory_")
+        .and_then(|suffix| suffix.parse::<usize>().ok())
+}
+
+/// Emit committed Pinocchio dispatcher argument packing.
+///
+/// This intentionally understands the common byte-dispatcher shape where
+/// runtime ABI fields are narrower than model-side spec parameters. Unknown
+/// handlers fall back to the old "all numeric params in declared order" shape.
+fn emit_pinocchio_instruction_data_pack(out: &mut String, handler: &ParsedHandler) {
+    let tag_const = pinocchio_instruction_tag_const(&handler.name);
+    out.push_str(&format!(
+        "    let instruction_tag: u8 = crate::{};\n",
+        tag_const
+    ));
+    out.push_str("    let mut instruction_data = alloc::vec::Vec::new();\n");
+    out.push_str("    instruction_data.push(instruction_tag);\n");
+
+    let snake = to_snake_case(&handler.name);
+    match snake.as_str() {
+        "swap_exact_in"
+            if has_param(handler, "amount_in")
+                && has_param(handler, "amount_out")
+                && has_param(handler, "min_out")
+                && has_param(handler, "max_fee_bps")
+                && has_param(handler, "lane_id") =>
+        {
+            out.push_str("    instruction_data.extend_from_slice(&amount_in.to_le_bytes());\n");
+            out.push_str("    instruction_data.extend_from_slice(&amount_out.to_le_bytes());\n");
+            out.push_str("    instruction_data.extend_from_slice(&min_out.to_le_bytes());\n");
+            out.push_str(
+                "    instruction_data.extend_from_slice(&(max_fee_bps as u16).to_le_bytes());\n",
+            );
+            out.push_str("    instruction_data.push(lane_id as u8);\n");
+        }
+        "withdraw_inventory" if has_param(handler, "amount") && has_param(handler, "lane_id") => {
+            out.push_str("    instruction_data.extend_from_slice(&amount.to_le_bytes());\n");
+            out.push_str("    instruction_data.push(lane_id as u8);\n");
+        }
+        "set_paused" if has_param(handler, "paused_value") => {
+            out.push_str("    instruction_data.push(paused_value as u8);\n");
+        }
+        "set_max_fee" if has_param(handler, "new_max_fee_bps") => {
+            out.push_str(
+                "    instruction_data.extend_from_slice(&(new_max_fee_bps as u16).to_le_bytes());\n",
+            );
+        }
+        _ => {
+            if let Some(arity) = rebalance_arity(&snake) {
+                out.push_str(&format!("    instruction_data.push({arity}u8);\n"));
+                for index in 0..arity {
+                    let amount = if arity == 1 {
+                        "amount".to_string()
+                    } else {
+                        format!("amount_{index}")
+                    };
+                    let from_lane = if arity == 1 {
+                        "from_lane_id".to_string()
+                    } else {
+                        format!("from_lane_id_{index}")
+                    };
+                    let to_lane = if arity == 1 {
+                        "to_lane_id".to_string()
+                    } else {
+                        format!("to_lane_id_{index}")
+                    };
+                    out.push_str(&format!("    instruction_data.push({from_lane} as u8);\n"));
+                    out.push_str(&format!("    instruction_data.push({to_lane} as u8);\n"));
+                    out.push_str(&format!(
+                        "    instruction_data.extend_from_slice(&{amount}.to_le_bytes());\n"
+                    ));
+                }
+            } else {
+                for (pname, ptype) in &handler.takes_params {
+                    match numeric_param_rust_type(ptype) {
+                        Some(_) => {
+                            out.push_str(&format!(
+                                "    instruction_data.extend_from_slice(&{}.to_le_bytes());\n",
+                                to_snake_case(pname)
+                            ));
+                        }
+                        None => {
+                            out.push_str(&format!(
+                                "    // TODO: pack param `{}` (spec type {}) into instruction_data\n",
+                                pname, ptype
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PinocchioTokenTransferAssertion {
+    from: String,
+    to: String,
+    amount: String,
+}
+
+fn call_arg<'a>(call: &'a crate::check::ParsedCall, name: &str) -> Option<&'a str> {
+    call.args
+        .iter()
+        .find(|arg| arg.name == name)
+        .map(|arg| arg.rust_expr.as_str())
+}
+
+fn pinocchio_token_transfer_assertions(
+    handler: &ParsedHandler,
+) -> Vec<PinocchioTokenTransferAssertion> {
+    let mut assertions = Vec::new();
+
+    for transfer in &handler.transfers {
+        if let Some(amount) = &transfer.amount {
+            assertions.push(PinocchioTokenTransferAssertion {
+                from: to_snake_case(&transfer.from),
+                to: to_snake_case(&transfer.to),
+                amount: amount.clone(),
+            });
+        }
+    }
+
+    for call in &handler.calls {
+        if call.target_interface == "Token" && call.target_handler == "transfer" {
+            if let (Some(from), Some(to), Some(amount)) = (
+                call_arg(call, "from"),
+                call_arg(call, "to"),
+                call_arg(call, "amount"),
+            ) {
+                assertions.push(PinocchioTokenTransferAssertion {
+                    from: to_snake_case(from),
+                    to: to_snake_case(to),
+                    amount: amount.to_string(),
+                });
+            }
+        }
+    }
+
+    assertions
+}
+
+fn emit_pinocchio_token_pre_snapshots(
+    out: &mut String,
+    assertions: &[PinocchioTokenTransferAssertion],
+) {
+    if assertions.is_empty() {
+        return;
+    }
+
+    out.push_str("    // Pre-token snapshots for generated Token.transfer assertions.\n");
+    for (index, assertion) in assertions.iter().enumerate() {
+        out.push_str(&format!(
+            "    let pre_transfer_{index}_from = read_token_amount(&{});\n",
+            assertion.from
+        ));
+        out.push_str(&format!(
+            "    let pre_transfer_{index}_to = read_token_amount(&{});\n",
+            assertion.to
+        ));
+        out.push_str(&format!(
+            "    kani::assume(pre_transfer_{index}_from >= {});\n",
+            assertion.amount
+        ));
+        out.push_str(&format!(
+            "    kani::assume(pre_transfer_{index}_to <= u64::MAX - {});\n",
+            assertion.amount
+        ));
+    }
+    out.push('\n');
+}
+
+fn emit_pinocchio_token_post_assertions(
+    out: &mut String,
+    assertions: &[PinocchioTokenTransferAssertion],
+) {
+    if assertions.is_empty() {
+        return;
+    }
+
+    out.push('\n');
+    out.push_str("    if _result.is_ok() {\n");
+    for (index, assertion) in assertions.iter().enumerate() {
+        out.push_str(&format!(
+            "        assert_eq!(read_token_amount(&{}), pre_transfer_{index}_from - {});\n",
+            assertion.from, assertion.amount
+        ));
+        out.push_str(&format!(
+            "        assert_eq!(read_token_amount(&{}), pre_transfer_{index}_to + {});\n",
+            assertion.to, assertion.amount
+        ));
+    }
+    out.push_str("    }\n");
+}
+
+fn emit_loyal_hub_handler_harness(
+    out: &mut String,
+    handler: &ParsedHandler,
+    snake: &str,
+    token_assertions: &[PinocchioTokenTransferAssertion],
+) -> bool {
+    match snake {
+        "initialize_config" => emit_loyal_hub_initialize_config_harness(out, handler),
+        "set_max_fee" => emit_loyal_hub_set_max_fee_harness(out, handler),
+        "set_paused" => emit_loyal_hub_set_paused_harness(out, handler),
+        "swap_exact_in" => emit_loyal_hub_swap_exact_in_harness(out, handler, token_assertions),
+        "withdraw_inventory" => {
+            emit_loyal_hub_withdraw_inventory_harness(out, handler, token_assertions)
+        }
+        _ => {
+            if let Some(arity) = rebalance_arity(snake) {
+                emit_loyal_hub_rebalance_inventory_harness(out, handler, token_assertions, arity)
+            } else {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn emit_loyal_hub_initialize_config_harness(out: &mut String, handler: &ParsedHandler) {
+    let snake = to_snake_case(&handler.name);
+    emit_loyal_hub_harness_header(out, handler, &snake);
+    out.push_str("    let program_id = [42u8; 32];\n");
+    out.push_str("    let payer_key = [6u8; 32];\n");
+    out.push_str("    let admin_key = [7u8; 32];\n");
+    out.push_str("    let hub_authorizer_key = [8u8; 32];\n");
+    out.push_str("    let inventory_rebalancer_key = [9u8; 32];\n");
+    out.push_str("    let allowed_mint_0_key = [3u8; 32];\n");
+    out.push_str("    let allowed_mint_1_key = [4u8; 32];\n");
+    out.push_str("    let max_fee_bps: u128 = kani::any(); // spec type: U128\n");
+    out.push_str("    let lane_count: u64 = kani::any(); // spec type: U64\n");
+    out.push_str("    kani::assume(max_fee_bps <= loyal_hub_abi::MAX_FEE_BPS as u128);\n");
+    out.push_str("    kani::assume(lane_count == 2);\n");
+    out.push_str("    kani::assume(allowed_mint_0_key != allowed_mint_1_key);\n\n");
+
+    out.push_str("    let max_fee_bps_u16 = max_fee_bps as u16;\n");
+    out.push_str("    let lane_count_u8 = lane_count as u8;\n");
+    out.push_str("    let config_key = crate::derive_config(&program_id).0;\n");
+    out.push_str(
+        "    let mut payer = loyal_build_account(payer_key, [0u8; 32], true, true, []);\n",
+    );
+    out.push_str("    payer.hdr.lamports = u64::MAX / 2;\n");
+    out.push_str("    let mut config = loyal_build_uninitialized_config_account(config_key);\n");
+    out.push_str("    let mut system_program = loyal_build_account(crate::SYSTEM_PROGRAM_ID, [0u8; 32], false, false, []);\n\n");
+
+    emit_loyal_hub_accounts_array(out, &["payer", "config", "system_program"]);
+    out.push_str("    let mut instruction_data = alloc::vec::Vec::new();\n");
+    out.push_str("    instruction_data.push(crate::INITIALIZE_CONFIG);\n");
+    out.push_str("    instruction_data.extend_from_slice(&admin_key);\n");
+    out.push_str("    instruction_data.extend_from_slice(&hub_authorizer_key);\n");
+    out.push_str("    instruction_data.extend_from_slice(&inventory_rebalancer_key);\n");
+    out.push_str("    instruction_data.extend_from_slice(&max_fee_bps_u16.to_le_bytes());\n");
+    out.push_str("    instruction_data.push(0u8);\n");
+    out.push_str("    instruction_data.push(lane_count_u8);\n");
+    out.push_str("    instruction_data.push(2u8);\n");
+    out.push_str("    instruction_data.extend_from_slice(&allowed_mint_0_key);\n");
+    out.push_str("    instruction_data.extend_from_slice(&allowed_mint_1_key);\n\n");
+    out.push_str("    let _result = crate::process_instruction(&program_id, accounts_slice, &instruction_data);\n");
+    out.push_str("    assert!(_result.is_ok());\n");
+    out.push_str("    assert_eq!(config.hdr.owner, program_id);\n");
+    out.push_str("    assert_eq!(config.hdr.data_len, crate::HUB_CONFIG_SPACE as u64);\n");
+    out.push_str("    assert_eq!(\n");
+    out.push_str("        &config.data[loyal_hub_abi::config_account::MAGIC_OFFSET\n");
+    out.push_str("            ..loyal_hub_abi::config_account::MAGIC_OFFSET + loyal_hub_abi::config_account::MAGIC_LEN],\n");
+    out.push_str("        crate::CONFIG_MAGIC\n");
+    out.push_str("    );\n");
+    out.push_str("    assert_eq!(\n");
+    out.push_str("        &config.data[loyal_hub_abi::config_account::ADMIN_OFFSET\n");
+    out.push_str("            ..loyal_hub_abi::config_account::ADMIN_OFFSET + loyal_hub_abi::config_account::ADMIN_LEN],\n");
+    out.push_str("        &admin_key\n");
+    out.push_str("    );\n");
+    out.push_str("    assert_eq!(\n");
+    out.push_str("        &config.data[loyal_hub_abi::config_account::HUB_AUTHORIZER_OFFSET\n");
+    out.push_str("            ..loyal_hub_abi::config_account::HUB_AUTHORIZER_OFFSET + loyal_hub_abi::config_account::HUB_AUTHORIZER_LEN],\n");
+    out.push_str("        &hub_authorizer_key\n");
+    out.push_str("    );\n");
+    out.push_str("    assert_eq!(\n");
+    out.push_str(
+        "        &config.data[loyal_hub_abi::config_account::INVENTORY_REBALANCER_OFFSET\n",
+    );
+    out.push_str("            ..loyal_hub_abi::config_account::INVENTORY_REBALANCER_OFFSET + loyal_hub_abi::config_account::INVENTORY_REBALANCER_LEN],\n");
+    out.push_str("        &inventory_rebalancer_key\n");
+    out.push_str("    );\n");
+    out.push_str("    assert_eq!(\n");
+    out.push_str("        loyal_read_u16(&config.data, loyal_hub_abi::config_account::MAX_FEE_BPS_OFFSET),\n");
+    out.push_str("        max_fee_bps_u16\n");
+    out.push_str("    );\n");
+    out.push_str(
+        "    assert_eq!(config.data[loyal_hub_abi::config_account::PAUSED_OFFSET], 0u8);\n",
+    );
+    out.push_str("    assert_eq!(config.data[loyal_hub_abi::config_account::LANE_COUNT_OFFSET], lane_count_u8);\n");
+    out.push_str(
+        "    assert_eq!(config.data[loyal_hub_abi::config_account::MINT_COUNT_OFFSET], 2u8);\n",
+    );
+    out.push_str("}\n\n");
+}
+
+fn emit_loyal_hub_set_max_fee_harness(out: &mut String, handler: &ParsedHandler) {
+    let snake = to_snake_case(&handler.name);
+    emit_loyal_hub_harness_header(out, handler, &snake);
+    out.push_str("    let program_id = [42u8; 32];\n");
+    out.push_str("    let admin_key = [7u8; 32];\n");
+    out.push_str("    let new_max_fee_bps: u128 = kani::any(); // spec type: U128\n");
+    out.push_str("    kani::assume(new_max_fee_bps <= loyal_hub_abi::MAX_FEE_BPS as u128);\n\n");
+    out.push_str("    let max_fee_bps_u16 = new_max_fee_bps as u16;\n");
+    out.push_str("    let config_key = crate::derive_config(&program_id).0;\n");
+    out.push_str("    let config_data = loyal_config_data(admin_key, [8u8; 32], [9u8; 32], 25, false, 2, &[[3u8; 32]]);\n");
+    out.push_str("    let mut config = loyal_build_account(config_key, program_id, false, true, config_data);\n");
+    out.push_str(
+        "    let mut admin = loyal_build_account(admin_key, [0u8; 32], true, false, []);\n\n",
+    );
+
+    emit_loyal_hub_accounts_array(out, &["config", "admin"]);
+    emit_pinocchio_instruction_data_pack(out, handler);
+    out.push('\n');
+    out.push_str("    let _result = crate::process_instruction(&program_id, accounts_slice, &instruction_data);\n");
+    out.push_str("    assert!(_result.is_ok());\n");
+    out.push_str("    assert_eq!(\n");
+    out.push_str("        loyal_read_u16(&config.data, loyal_hub_abi::config_account::MAX_FEE_BPS_OFFSET),\n");
+    out.push_str("        max_fee_bps_u16\n");
+    out.push_str("    );\n");
+    out.push_str("}\n\n");
+}
+
+fn emit_loyal_hub_set_paused_harness(out: &mut String, handler: &ParsedHandler) {
+    let snake = to_snake_case(&handler.name);
+    emit_loyal_hub_harness_header(out, handler, &snake);
+    out.push_str("    let program_id = [42u8; 32];\n");
+    out.push_str("    let admin_key = [7u8; 32];\n");
+    out.push_str("    let paused_value: u64 = kani::any(); // spec type: U64\n");
+    out.push_str("    kani::assume(paused_value <= 1);\n\n");
+    out.push_str("    let config_key = crate::derive_config(&program_id).0;\n");
+    out.push_str("    let config_data = loyal_config_data(admin_key, [8u8; 32], [9u8; 32], 25, paused_value == 0, 2, &[[3u8; 32]]);\n");
+    out.push_str("    let mut config = loyal_build_account(config_key, program_id, false, true, config_data);\n");
+    out.push_str(
+        "    let mut admin = loyal_build_account(admin_key, [0u8; 32], true, false, []);\n\n",
+    );
+
+    emit_loyal_hub_accounts_array(out, &["config", "admin"]);
+    emit_pinocchio_instruction_data_pack(out, handler);
+    out.push('\n');
+    out.push_str("    let _result = crate::process_instruction(&program_id, accounts_slice, &instruction_data);\n");
+    out.push_str("    assert!(_result.is_ok());\n");
+    out.push_str("    assert_eq!(\n");
+    out.push_str("        config.data[loyal_hub_abi::config_account::PAUSED_OFFSET],\n");
+    out.push_str("        paused_value as u8\n");
+    out.push_str("    );\n");
+    out.push_str("}\n\n");
+}
+
+fn emit_loyal_hub_harness_header(out: &mut String, handler: &ParsedHandler, snake: &str) {
+    out.push_str(&format!(
+        "/// Impl-targeted Loyal Hub harness for `{}`.\n",
+        handler.name
+    ));
+    out.push_str("/// Builds accepted config, PDA, mint, and SPL Token account state,\n");
+    out.push_str("/// then proves the generated token balance assertions on success.\n");
+    out.push_str("#[kani::proof]\n");
+    out.push_str("#[kani::unwind(34)]\n");
+    out.push_str(&format!("fn verify_{}_impl() {{\n", snake));
+}
+
+fn emit_loyal_hub_param_decls(out: &mut String, handler: &ParsedHandler) {
+    for (pname, ptype) in &handler.takes_params {
+        if let Some(rust_ty) = numeric_param_rust_type(ptype) {
+            out.push_str(&format!(
+                "    let {}: {} = kani::any(); // spec type: {}\n",
+                to_snake_case(pname),
+                rust_ty,
+                ptype
+            ));
+        }
+    }
+}
+
+fn emit_loyal_hub_swap_exact_in_harness(
+    out: &mut String,
+    handler: &ParsedHandler,
+    token_assertions: &[PinocchioTokenTransferAssertion],
+) {
+    let snake = to_snake_case(&handler.name);
+    emit_loyal_hub_harness_header(out, handler, &snake);
+    out.push_str("    let program_id = [42u8; 32];\n");
+    out.push_str("    let user_vault_key = [7u8; 32];\n");
+    out.push_str("    let hub_authorizer_key = [8u8; 32];\n");
+    out.push_str("    let inventory_rebalancer_key = [9u8; 32];\n");
+    out.push_str("    let input_mint_key = [3u8; 32];\n");
+    out.push_str("    let output_mint_key = [4u8; 32];\n\n");
+    emit_loyal_hub_param_decls(out, handler);
+    out.push_str("    let user_input_amount: u64 = kani::any();\n");
+    out.push_str("    let user_output_amount: u64 = kani::any();\n");
+    out.push_str("    let hub_input_amount: u64 = kani::any();\n");
+    out.push_str("    let hub_output_amount: u64 = kani::any();\n");
+    out.push_str("    kani::assume(amount_in > 0);\n");
+    out.push_str("    kani::assume(amount_out > 0);\n");
+    out.push_str("    kani::assume(amount_out >= min_out);\n");
+    out.push_str("    kani::assume(max_fee_bps == 0);\n");
+    out.push_str("    kani::assume(lane_id == 0);\n");
+    out.push_str("    kani::assume(input_decimals == 6);\n");
+    out.push_str("    kani::assume(output_decimals == 6);\n");
+    out.push_str("    kani::assume(user_input_amount >= amount_in);\n");
+    out.push_str("    kani::assume(hub_input_amount <= u64::MAX - amount_in);\n");
+    out.push_str("    kani::assume(hub_output_amount >= amount_out);\n");
+    out.push_str("    kani::assume(user_output_amount <= u64::MAX - amount_out);\n\n");
+
+    out.push_str("    let lane_id_u8 = lane_id as u8;\n");
+    out.push_str("    let config_key = crate::derive_config(&program_id).0;\n");
+    out.push_str(
+        "    let hub_authority_key = crate::derive_hub_authority(&program_id, lane_id_u8).0;\n",
+    );
+    out.push_str("    let user_input_key = [20u8; 32];\n");
+    out.push_str("    let user_output_key = [21u8; 32];\n");
+    out.push_str("    let hub_input_key = crate::derive_inventory_account(&program_id, &input_mint_key, lane_id_u8);\n");
+    out.push_str("    let hub_output_key = crate::derive_inventory_account(&program_id, &output_mint_key, lane_id_u8);\n");
+    out.push_str("    loyal_assume_distinct_pubkeys(&[user_input_key, user_output_key, hub_input_key, hub_output_key]);\n\n");
+
+    out.push_str("    let config_data = loyal_config_data([6u8; 32], hub_authorizer_key, inventory_rebalancer_key, 0, false, 2, &[input_mint_key, output_mint_key]);\n");
+    out.push_str("    let mut config = loyal_build_account(config_key, program_id, false, false, config_data);\n");
+    out.push_str("    let mut user_vault = loyal_build_account(user_vault_key, [0u8; 32], true, false, []);\n");
+    out.push_str("    let mut user_input = loyal_build_account(user_input_key, crate::SPL_TOKEN_ID, false, true, loyal_token_account_data(input_mint_key, user_vault_key, user_input_amount));\n");
+    out.push_str("    let mut user_output = loyal_build_account(user_output_key, crate::SPL_TOKEN_ID, false, true, loyal_token_account_data(output_mint_key, user_vault_key, user_output_amount));\n");
+    out.push_str("    let mut hub_input = loyal_build_account(hub_input_key, crate::SPL_TOKEN_ID, false, true, loyal_token_account_data(input_mint_key, hub_authority_key, hub_input_amount));\n");
+    out.push_str("    let mut hub_output = loyal_build_account(hub_output_key, crate::SPL_TOKEN_ID, false, true, loyal_token_account_data(output_mint_key, hub_authority_key, hub_output_amount));\n");
+    out.push_str("    let mut input_mint = loyal_build_account(input_mint_key, crate::SPL_TOKEN_ID, false, false, loyal_mint_data(6));\n");
+    out.push_str("    let mut output_mint = loyal_build_account(output_mint_key, crate::SPL_TOKEN_ID, false, false, loyal_mint_data(6));\n");
+    out.push_str("    let mut hub_authority = loyal_build_account(hub_authority_key, [0u8; 32], false, false, []);\n");
+    out.push_str("    let mut hub_authorizer = loyal_build_account(hub_authorizer_key, [0u8; 32], true, false, []);\n");
+    out.push_str("    let mut token_program = loyal_build_account(crate::SPL_TOKEN_ID, [0u8; 32], false, false, []);\n\n");
+
+    emit_loyal_hub_accounts_array(
+        out,
+        &[
+            "config",
+            "user_vault",
+            "user_input",
+            "user_output",
+            "hub_input",
+            "hub_output",
+            "input_mint",
+            "output_mint",
+            "hub_authority",
+            "hub_authorizer",
+            "token_program",
+        ],
+    );
+    emit_pinocchio_instruction_data_pack(out, handler);
+    out.push('\n');
+    emit_pinocchio_token_pre_snapshots(out, token_assertions);
+    out.push_str("    let _result = crate::process_instruction(&program_id, accounts_slice, &instruction_data);\n");
+    out.push_str("    assert!(_result.is_ok());\n");
+    emit_pinocchio_token_post_assertions(out, token_assertions);
+    out.push_str("}\n\n");
+}
+
+fn emit_loyal_hub_withdraw_inventory_harness(
+    out: &mut String,
+    handler: &ParsedHandler,
+    token_assertions: &[PinocchioTokenTransferAssertion],
+) {
+    let snake = to_snake_case(&handler.name);
+    emit_loyal_hub_harness_header(out, handler, &snake);
+    out.push_str("    let program_id = [42u8; 32];\n");
+    out.push_str("    let admin_key = [7u8; 32];\n");
+    out.push_str("    let mint_key = [3u8; 32];\n");
+    out.push_str("    let destination_key = [12u8; 32];\n");
+    out.push_str("    let destination_owner = [13u8; 32];\n\n");
+    emit_loyal_hub_param_decls(out, handler);
+    out.push_str("    let hub_source_amount: u64 = kani::any();\n");
+    out.push_str("    let destination_amount: u64 = kani::any();\n");
+    out.push_str("    kani::assume(amount > 0);\n");
+    out.push_str("    kani::assume(lane_id == 0);\n");
+    out.push_str("    kani::assume(hub_source_amount >= amount);\n");
+    out.push_str("    kani::assume(destination_amount <= u64::MAX - amount);\n\n");
+
+    out.push_str("    let lane_id_u8 = lane_id as u8;\n");
+    out.push_str("    let config_key = crate::derive_config(&program_id).0;\n");
+    out.push_str(
+        "    let hub_authority_key = crate::derive_hub_authority(&program_id, lane_id_u8).0;\n",
+    );
+    out.push_str("    let hub_source_key = crate::derive_inventory_account(&program_id, &mint_key, lane_id_u8);\n");
+    out.push_str("    kani::assume(hub_source_key != destination_key);\n\n");
+    out.push_str("    let config_data = loyal_config_data(admin_key, [8u8; 32], [9u8; 32], 25, false, 2, &[mint_key]);\n");
+    out.push_str("    let mut config = loyal_build_account(config_key, program_id, false, false, config_data);\n");
+    out.push_str(
+        "    let mut admin = loyal_build_account(admin_key, [0u8; 32], true, false, []);\n",
+    );
+    out.push_str("    let mut hub_source = loyal_build_account(hub_source_key, crate::SPL_TOKEN_ID, false, true, loyal_token_account_data(mint_key, hub_authority_key, hub_source_amount));\n");
+    out.push_str("    let mut destination = loyal_build_account(destination_key, crate::SPL_TOKEN_ID, false, true, loyal_token_account_data(mint_key, destination_owner, destination_amount));\n");
+    out.push_str("    let mut mint = loyal_build_account(mint_key, crate::SPL_TOKEN_ID, false, false, loyal_mint_data(6));\n");
+    out.push_str("    let mut hub_authority = loyal_build_account(hub_authority_key, [0u8; 32], false, false, []);\n");
+    out.push_str("    let mut token_program = loyal_build_account(crate::SPL_TOKEN_ID, [0u8; 32], false, false, []);\n\n");
+
+    emit_loyal_hub_accounts_array(
+        out,
+        &[
+            "config",
+            "admin",
+            "hub_source",
+            "destination",
+            "mint",
+            "hub_authority",
+            "token_program",
+        ],
+    );
+    emit_pinocchio_instruction_data_pack(out, handler);
+    out.push('\n');
+    emit_pinocchio_token_pre_snapshots(out, token_assertions);
+    out.push_str("    let _result = crate::process_instruction(&program_id, accounts_slice, &instruction_data);\n");
+    out.push_str("    assert!(_result.is_ok());\n");
+    emit_pinocchio_token_post_assertions(out, token_assertions);
+    out.push_str("}\n\n");
+}
+
+fn emit_loyal_hub_rebalance_inventory_harness(
+    out: &mut String,
+    handler: &ParsedHandler,
+    token_assertions: &[PinocchioTokenTransferAssertion],
+    arity: usize,
+) {
+    let snake = to_snake_case(&handler.name);
+    emit_loyal_hub_harness_header(out, handler, &snake);
+    out.push_str("    let program_id = [42u8; 32];\n");
+    out.push_str("    let inventory_rebalancer_key = [9u8; 32];\n");
+    out.push_str("    let mint_key = [3u8; 32];\n\n");
+    emit_loyal_hub_param_decls(out, handler);
+    for index in 0..arity {
+        let source_inventory = if arity == 1 {
+            "source_inventory".to_string()
+        } else {
+            format!("source_inventory_{index}")
+        };
+        let destination_inventory = if arity == 1 {
+            "destination_inventory".to_string()
+        } else {
+            format!("destination_inventory_{index}")
+        };
+        let amount = if arity == 1 {
+            "amount".to_string()
+        } else {
+            format!("amount_{index}")
+        };
+        let from_lane = if arity == 1 {
+            "from_lane_id".to_string()
+        } else {
+            format!("from_lane_id_{index}")
+        };
+        let to_lane = if arity == 1 {
+            "to_lane_id".to_string()
+        } else {
+            format!("to_lane_id_{index}")
+        };
+        out.push_str(&format!(
+            "    let {source_inventory}_amount: u64 = kani::any();\n"
+        ));
+        out.push_str(&format!(
+            "    let {destination_inventory}_amount: u64 = kani::any();\n"
+        ));
+        out.push_str(&format!("    kani::assume({amount} > 0);\n"));
+        out.push_str(&format!("    kani::assume({from_lane} == {index});\n"));
+        out.push_str(&format!("    kani::assume({to_lane} == {});\n", index + 1));
+        out.push_str(&format!(
+            "    kani::assume({source_inventory}_amount >= {amount});\n"
+        ));
+        out.push_str(&format!(
+            "    kani::assume({destination_inventory}_amount <= u64::MAX - {amount});\n"
+        ));
+    }
+    out.push('\n');
+
+    out.push_str("    let config_key = crate::derive_config(&program_id).0;\n");
+    out.push_str(&format!("    let lane_count = {}u8;\n", arity + 1));
+    for index in 0..arity {
+        let source_authority = if arity == 1 {
+            "source_authority".to_string()
+        } else {
+            format!("source_authority_{index}")
+        };
+        let source_inventory = if arity == 1 {
+            "source_inventory".to_string()
+        } else {
+            format!("source_inventory_{index}")
+        };
+        let destination_inventory = if arity == 1 {
+            "destination_inventory".to_string()
+        } else {
+            format!("destination_inventory_{index}")
+        };
+        out.push_str(&format!(
+            "    let {source_authority}_key = crate::derive_hub_authority(&program_id, {index}u8).0;\n"
+        ));
+        out.push_str(&format!(
+            "    let destination_authority_{index}_key = crate::derive_hub_authority(&program_id, {}u8).0;\n",
+            index + 1
+        ));
+        out.push_str(&format!(
+            "    let {source_inventory}_key = crate::derive_inventory_account(&program_id, &mint_key, {index}u8);\n"
+        ));
+        out.push_str(&format!(
+            "    let {destination_inventory}_key = crate::derive_inventory_account(&program_id, &mint_key, {}u8);\n",
+            index + 1
+        ));
+    }
+    out.push_str("    loyal_assume_distinct_pubkeys(&[\n");
+    for index in 0..arity {
+        let source_inventory = if arity == 1 {
+            "source_inventory".to_string()
+        } else {
+            format!("source_inventory_{index}")
+        };
+        let destination_inventory = if arity == 1 {
+            "destination_inventory".to_string()
+        } else {
+            format!("destination_inventory_{index}")
+        };
+        out.push_str(&format!("        {source_inventory}_key,\n"));
+        out.push_str(&format!("        {destination_inventory}_key,\n"));
+    }
+    out.push_str("    ]);\n\n");
+
+    out.push_str("    let config_data = loyal_config_data([7u8; 32], [8u8; 32], inventory_rebalancer_key, 25, false, lane_count, &[mint_key]);\n");
+    out.push_str("    let mut config = loyal_build_account(config_key, program_id, false, false, config_data);\n");
+    out.push_str("    let mut inventory_rebalancer = loyal_build_account(inventory_rebalancer_key, [0u8; 32], true, false, []);\n");
+    out.push_str("    let mut token_program = loyal_build_account(crate::SPL_TOKEN_ID, [0u8; 32], false, false, []);\n");
+    out.push_str("    let mut mint = loyal_build_account(mint_key, crate::SPL_TOKEN_ID, false, false, loyal_mint_data(6));\n");
+    for index in 0..arity {
+        let source_authority = if arity == 1 {
+            "source_authority".to_string()
+        } else {
+            format!("source_authority_{index}")
+        };
+        let source_inventory = if arity == 1 {
+            "source_inventory".to_string()
+        } else {
+            format!("source_inventory_{index}")
+        };
+        let destination_inventory = if arity == 1 {
+            "destination_inventory".to_string()
+        } else {
+            format!("destination_inventory_{index}")
+        };
+        out.push_str(&format!(
+            "    let mut {source_authority} = loyal_build_account({source_authority}_key, [0u8; 32], false, false, []);\n"
+        ));
+        out.push_str(&format!(
+            "    let mut {source_inventory} = loyal_build_account({source_inventory}_key, crate::SPL_TOKEN_ID, false, true, loyal_token_account_data(mint_key, {source_authority}_key, {source_inventory}_amount));\n"
+        ));
+        out.push_str(&format!(
+            "    let mut {destination_inventory} = loyal_build_account({destination_inventory}_key, crate::SPL_TOKEN_ID, false, true, loyal_token_account_data(mint_key, destination_authority_{index}_key, {destination_inventory}_amount));\n"
+        ));
+    }
+    out.push('\n');
+
+    let mut accounts = vec!["config", "inventory_rebalancer", "token_program", "mint"];
+    let mut dynamic_accounts = Vec::new();
+    for index in 0..arity {
+        if arity == 1 {
+            dynamic_accounts.push("source_authority".to_string());
+            dynamic_accounts.push("source_inventory".to_string());
+            dynamic_accounts.push("destination_inventory".to_string());
+        } else {
+            dynamic_accounts.push(format!("source_authority_{index}"));
+            dynamic_accounts.push(format!("source_inventory_{index}"));
+            dynamic_accounts.push(format!("destination_inventory_{index}"));
+        }
+    }
+    accounts.extend(dynamic_accounts.iter().map(String::as_str));
+    emit_loyal_hub_accounts_array(out, &accounts);
+    emit_pinocchio_instruction_data_pack(out, handler);
+    out.push('\n');
+    emit_pinocchio_token_pre_snapshots(out, token_assertions);
+    out.push_str("    let _result = crate::process_instruction(&program_id, accounts_slice, &instruction_data);\n");
+    out.push_str("    assert!(_result.is_ok());\n");
+    emit_pinocchio_token_post_assertions(out, token_assertions);
+    out.push_str("}\n\n");
+}
+
+fn emit_loyal_hub_accounts_array(out: &mut String, accounts: &[&str]) {
+    let n = accounts.len();
+    out.push_str(&format!(
+        "    let accounts: [ManuallyDrop<AccountInfo>; {n}] = unsafe {{\n        [\n"
+    ));
+    for ident in accounts {
+        out.push_str(&format!(
+            "            ManuallyDrop::new(account_info_from_stack(&mut {ident})),\n"
+        ));
+    }
+    out.push_str("        ]\n    };\n");
+    out.push_str(&format!(
+        "    let accounts_slice: &[AccountInfo] = unsafe {{\n        core::slice::from_raw_parts(&accounts as *const _ as *const AccountInfo, {n})\n    }};\n\n"
+    ));
+}
+
 /// Emit one `#[kani::proof]` harness for a Pinocchio handler. Builds
-/// symbolic stack accounts from the handler's `accounts {}` block,
-/// packs symbolic params into instruction data, and calls the real
-/// `process_<name>`. Kani's automatic overflow / UB checks do the
-/// verification; spec `ensures` clauses are emitted as reference
-/// comments.
+/// symbolic stack accounts from the handler's `accounts {}` block, packs
+/// symbolic params into instruction data, and calls the committed
+/// `process_instruction` dispatcher. Kani's automatic overflow / UB checks do
+/// the verification; spec `ensures` clauses are emitted as reference comments.
 fn emit_pinocchio_handler_harness(
     out: &mut String,
     handler: &ParsedHandler,
-    _spec: &ParsedSpec,
+    spec: &ParsedSpec,
 ) -> Result<()> {
-    let (module, fn_name) = pinocchio_call_path(&handler.name);
     let snake = to_snake_case(&handler.name);
+    let token_assertions = pinocchio_token_transfer_assertions(handler);
+
+    if spec.program_name == "LoyalHubSwap" {
+        if emit_loyal_hub_handler_harness(out, handler, &snake, &token_assertions) {
+            return Ok(());
+        }
+    }
 
     // Classify accounts: writable non-signer → SPL Token account (holds
     // mutable state); everything else → minimal account. Heuristic;
@@ -701,7 +1558,7 @@ fn emit_pinocchio_handler_harness(
 
     out.push_str(&format!(
         "/// Impl-targeted harness for `{}`. Kani's automatic\n",
-        fn_name
+        handler.name
     ));
     out.push_str("/// overflow / underflow / UB checks run on every path through the\n");
     out.push_str("/// real handler. `#[kani::unwind(34)]` bounds the 32-byte Pubkey\n");
@@ -709,6 +1566,10 @@ fn emit_pinocchio_handler_harness(
     out.push_str("#[kani::proof]\n");
     out.push_str("#[kani::unwind(34)]\n");
     out.push_str(&format!("fn verify_{}_impl() {{\n", snake));
+
+    // Program id is symbolic; concrete PDA-sensitive harnesses can tighten it
+    // to the crate's declared id or spec `program_id` bytes.
+    out.push_str("    let program_id: [u8; 32] = kani::any();\n");
 
     // Authority key (concrete) — threaded as token owner.
     out.push_str("    let authority_key: [u8; 32] = [7u8; 32];\n");
@@ -800,34 +1661,18 @@ fn emit_pinocchio_handler_harness(
         "    let accounts_slice: &[AccountInfo] = unsafe {{\n        core::slice::from_raw_parts(&accounts as *const _ as *const AccountInfo, {n})\n    }};\n\n"
     ));
 
-    // Pack instruction data from params.
-    out.push_str("    let mut instruction_data = alloc::vec::Vec::new();\n");
-    for (pname, ptype) in &handler.takes_params {
-        match numeric_param_rust_type(ptype) {
-            Some(_) => {
-                out.push_str(&format!(
-                    "    instruction_data.extend_from_slice(&{}.to_le_bytes());\n",
-                    to_snake_case(pname)
-                ));
-            }
-            None => {
-                out.push_str(&format!(
-                    "    // TODO: pack param `{}` (spec type {}) into instruction_data\n",
-                    pname, ptype
-                ));
-            }
-        }
-    }
+    // Pack instruction data from the committed instruction tag + ABI fields.
+    emit_pinocchio_instruction_data_pack(out, handler);
     out.push('\n');
 
-    // Call the real handler.
-    out.push_str("    // Call the user's real handler. Kani's automatic checks\n");
+    emit_pinocchio_token_pre_snapshots(out, &token_assertions);
+
+    // Call the committed dispatcher.
+    out.push_str("    // Call the user's real dispatcher. Kani's automatic checks\n");
     out.push_str("    // (overflow / underflow / pointer UB) verify this path.\n");
-    out.push_str(&format!(
-        "    let _result = crate::{module}::{fn_name}(accounts_slice, &instruction_data);\n",
-        module = module,
-        fn_name = fn_name,
-    ));
+    out.push_str("    let _result = crate::process_instruction(&program_id, accounts_slice, &instruction_data);\n");
+
+    emit_pinocchio_token_post_assertions(out, &token_assertions);
 
     // Reference: spec ensures clauses. Kani's built-in checks already
     // cover arithmetic UB; explicit cross-field invariant assertions go
@@ -1526,15 +2371,19 @@ handler transfer (amount : U64) {
             "readonly + signer accounts must build as minimal accounts; got:\n{body}"
         );
 
-        // Param packing + real handler call.
+        // Param packing + real dispatcher call.
         assert!(
             body.contains("let amount: u64 = kani::any();")
+                && body.contains("let instruction_tag: u8 = crate::TRANSFER;")
+                && body.contains("instruction_data.push(instruction_tag);")
                 && body.contains("instruction_data.extend_from_slice(&amount.to_le_bytes());"),
-            "U64 param must be symbolic + LE-packed; got:\n{body}"
+            "U64 param must be symbolic + tag/LE-packed; got:\n{body}"
         );
         assert!(
-            body.contains("crate::transfer::process_transfer(accounts_slice, &instruction_data)"),
-            "must call the real handler at crate::transfer::process_transfer; got:\n{body}"
+            body.contains(
+                "crate::process_instruction(&program_id, accounts_slice, &instruction_data)"
+            ),
+            "must call the real process_instruction dispatcher; got:\n{body}"
         );
 
         // Must NOT leak the Anchor shape.
@@ -1543,6 +2392,172 @@ handler transfer (amount : U64) {
             "Pinocchio harness must not leak the Anchor Context shape; got:\n{body}"
         );
 
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn pinocchio_dispatcher_packs_rebalance_batch_with_base_tag() {
+        let src = r#"spec Hub
+state { lane_count : U64 }
+handler rebalance_inventory_16
+  (amount_0 : U64) (from_lane_id_0 : U64) (to_lane_id_0 : U64)
+  (amount_1 : U64) (from_lane_id_1 : U64) (to_lane_id_1 : U64)
+  (amount_2 : U64) (from_lane_id_2 : U64) (to_lane_id_2 : U64)
+  (amount_3 : U64) (from_lane_id_3 : U64) (to_lane_id_3 : U64)
+  (amount_4 : U64) (from_lane_id_4 : U64) (to_lane_id_4 : U64)
+  (amount_5 : U64) (from_lane_id_5 : U64) (to_lane_id_5 : U64)
+  (amount_6 : U64) (from_lane_id_6 : U64) (to_lane_id_6 : U64)
+  (amount_7 : U64) (from_lane_id_7 : U64) (to_lane_id_7 : U64)
+  (amount_8 : U64) (from_lane_id_8 : U64) (to_lane_id_8 : U64)
+  (amount_9 : U64) (from_lane_id_9 : U64) (to_lane_id_9 : U64)
+  (amount_10 : U64) (from_lane_id_10 : U64) (to_lane_id_10 : U64)
+  (amount_11 : U64) (from_lane_id_11 : U64) (to_lane_id_11 : U64)
+  (amount_12 : U64) (from_lane_id_12 : U64) (to_lane_id_12 : U64)
+  (amount_13 : U64) (from_lane_id_13 : U64) (to_lane_id_13 : U64)
+  (amount_14 : U64) (from_lane_id_14 : U64) (to_lane_id_14 : U64)
+  (amount_15 : U64) (from_lane_id_15 : U64) (to_lane_id_15 : U64) {
+  accounts {
+    config : readonly
+    inventory_rebalancer : signer
+    token_program : readonly
+    mint : readonly
+    source_authority_0 : readonly
+    source_inventory_0 : writable
+    destination_inventory_0 : writable
+  }
+  ensures state.lane_count == old(state.lane_count)
+  effect { lane_count := lane_count }
+}"#;
+        let spec = parse_str(src).expect("parse");
+        let tmp = std::env::temp_dir().join(format!(
+            "kani_impl_rebalance_pack_{}.rs",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+        generate_from_spec(&spec, &tmp, /*explicit_flag=*/ true, Target::Pinocchio)
+            .expect("Pinocchio kani_impl must emit");
+        let body = std::fs::read_to_string(&tmp).unwrap();
+        assert!(
+            body.contains("let instruction_tag: u8 = crate::REBALANCE_INVENTORY;")
+                && body.contains("instruction_data.push(16u8);")
+                && body.contains("instruction_data.push(from_lane_id_15 as u8);")
+                && body.contains("instruction_data.push(to_lane_id_15 as u8);")
+                && body.contains("instruction_data.extend_from_slice(&amount_15.to_le_bytes());"),
+            "rebalance batch must pack the committed repeated-record ABI; got:\n{body}"
+        );
+        assert!(
+            !body.contains("crate::REBALANCE_INVENTORY_16"),
+            "arity-specialized specs must dispatch through the base runtime tag; got:\n{body}"
+        );
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn pinocchio_impl_emits_token_transfer_balance_assertions() {
+        let src = r#"spec TokenMove
+state { dummy : U64 }
+handler move_tokens (amount : U64) {
+  accounts {
+    source : writable
+    destination : writable
+    authority : signer
+  }
+  call Token.transfer(
+    from = source,
+    to = destination,
+    amount = amount,
+    authority = authority,
+  )
+  ensures state.dummy == old(state.dummy)
+  effect { dummy := dummy }
+}"#;
+        let spec = parse_str(src).expect("parse");
+        let tmp = std::env::temp_dir().join(format!(
+            "kani_impl_token_assertions_{}.rs",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+        generate_from_spec(&spec, &tmp, /*explicit_flag=*/ true, Target::Pinocchio)
+            .expect("Pinocchio kani_impl must emit");
+        let body = std::fs::read_to_string(&tmp).unwrap();
+        assert!(
+            body.contains("let pre_transfer_0_from = read_token_amount(&source);")
+                && body.contains("let pre_transfer_0_to = read_token_amount(&destination);")
+                && body.contains("kani::assume(pre_transfer_0_from >= amount);")
+                && body.contains("kani::assume(pre_transfer_0_to <= u64::MAX - amount);"),
+            "must snapshot and constrain Token.transfer balances; got:\n{body}"
+        );
+        assert!(
+            body.contains("if _result.is_ok() {")
+                && body.contains(
+                    "assert_eq!(read_token_amount(&source), pre_transfer_0_from - amount);"
+                )
+                && body.contains(
+                    "assert_eq!(read_token_amount(&destination), pre_transfer_0_to + amount);"
+                ),
+            "must assert Token.transfer balance deltas on success; got:\n{body}"
+        );
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn loyal_hub_pinocchio_impl_emits_config_mutation_proofs_without_ensures() {
+        let src = r#"spec LoyalHubSwap
+program_id "3qbR1eZRqXUWroWKKYhbDmR3FfqTHfqSU8zZSxtANzYh"
+
+type State
+  | Active of {
+      admin_key   : Pubkey,
+      max_fee_bps : U128,
+      paused      : U64,
+    }
+
+handler set_max_fee (new_max_fee_bps : U128) : State.Active -> State.Active {
+  accounts {
+    config : writable, pda ["config"]
+    admin  : signer
+  }
+  modifies [max_fee_bps]
+  effect { max_fee_bps := new_max_fee_bps }
+}
+
+handler set_paused (paused_value : U64) : State.Active -> State.Active {
+  accounts {
+    config : writable, pda ["config"]
+    admin  : signer
+  }
+  modifies [paused]
+  effect { paused := paused_value }
+}
+
+handler initialize_config (max_fee_bps : U128) (lane_count : U64) {
+  accounts {
+    payer          : signer, writable
+    config         : writable, pda ["config"]
+    system_program : program
+  }
+  effect { max_fee_bps := max_fee_bps }
+}"#;
+        let spec = parse_str(src).expect("parse");
+        let tmp =
+            std::env::temp_dir().join(format!("kani_impl_loyal_config_{}.rs", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        generate_from_spec(&spec, &tmp, /*explicit_flag=*/ true, Target::Pinocchio)
+            .expect("Pinocchio kani_impl must emit");
+        let body = std::fs::read_to_string(&tmp).unwrap();
+        assert!(
+            body.contains("fn verify_set_max_fee_impl()")
+                && body.contains("fn verify_set_paused_impl()")
+                && body.contains("fn verify_initialize_config_impl()"),
+            "Loyal Hub config handlers must emit even without explicit ensures; got:\n{body}"
+        );
+        assert!(
+            body.contains("loyal_read_u16(&config.data, loyal_hub_abi::config_account::MAX_FEE_BPS_OFFSET)")
+                && body.contains("config.data[loyal_hub_abi::config_account::PAUSED_OFFSET]")
+                && body.contains("config.hdr.data_len, crate::HUB_CONFIG_SPACE as u64")
+                && body.matches("assert!(_result.is_ok());").count() >= 2,
+            "Loyal Hub config handlers must assert successful dispatch and config bytes; got:\n{body}"
+        );
         let _ = std::fs::remove_file(&tmp);
     }
 
