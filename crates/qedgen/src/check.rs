@@ -1218,6 +1218,12 @@ pub struct ParsedSpec {
     #[allow(dead_code)]
     pub ref_impls: Vec<ParsedRefImpl>,
 
+    /// Issue #67 item 3 — `ghost <name> : <Ty> { init {…} on H {…} }`
+    /// spec-only auxiliary state. Rendered to verification-State fields
+    /// (Lean / proptest / Kani) plus per-handler update expressions;
+    /// omitted from the on-chain program codegen entirely.
+    pub ghosts: Vec<ParsedGhost>,
+
     /// v2.27 Track B — verified-callee composition (Stance 2).
     ///
     /// For each imported interface whose provider shipped a
@@ -1293,6 +1299,31 @@ pub struct ParsedRefImpl {
     pub return_type: String,
     pub lean_body: String,
     pub rust_body: String,
+}
+
+/// Issue #67 item 3 — lowered `ghost` declaration. Pre-rendered per
+/// backend, same opaque-string discipline as `ParsedRefImpl`.
+#[derive(Debug, Clone)]
+pub struct ParsedGhost {
+    pub name: String,
+    pub doc: Option<String>,
+    /// DSL type string (`U64`, `I128`, `Bool`, …). Scalar only.
+    pub ty: String,
+    /// Initial value, rendered for each backend.
+    pub init_lean: String,
+    pub init_rust: String,
+    pub updates: Vec<ParsedGhostUpdate>,
+}
+
+/// One `on <handler>` update of a ghost. `value_*` is the *complete* new
+/// value of the ghost after the handler runs (the assignment operator has
+/// already been folded in: `+= d` became `<ghost> + (d)`), so each backend
+/// just emits `<ghost> := <value>`.
+#[derive(Debug, Clone)]
+pub struct ParsedGhostUpdate {
+    pub handler: String,
+    pub value_lean: String,
+    pub value_rust: String,
 }
 
 impl ParsedSpec {
@@ -2897,6 +2928,91 @@ pub fn check_completeness(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
         });
     }
 
+    // Issue #67 item 3 — ghost-variable validation.
+    if !spec.ghosts.is_empty() {
+        let scalar = |t: &str| {
+            matches!(
+                t.trim(),
+                "U8" | "U16"
+                    | "U32"
+                    | "U64"
+                    | "U128"
+                    | "I8"
+                    | "I16"
+                    | "I32"
+                    | "I64"
+                    | "I128"
+                    | "Bool"
+            )
+        };
+        // Ghosts are only wired into the flat single-account verification
+        // State today. Indexed (`Map[N]`), multi-account, and explicit
+        // ADT-state shapes don't yet thread ghost fields through their
+        // renderers, so flag rather than silently drop them.
+        let is_indexed = spec
+            .state_fields
+            .iter()
+            .any(|(_, t)| t.trim_start().starts_with("Map"));
+        let is_multi_account = spec.account_types.len() > 1;
+        let is_adt = spec.state_repr_is_adt();
+        let unsupported_shape = is_indexed || is_multi_account || is_adt;
+        let handler_names: std::collections::BTreeSet<&str> =
+            spec.handlers.iter().map(|h| h.name.as_str()).collect();
+        for g in &spec.ghosts {
+            if !scalar(&g.ty) {
+                warnings.push(CompletenessWarning {
+                    rule: "ghost_non_scalar_type".to_string(),
+                    severity: Severity::Warning,
+                    priority: 2,
+                    message: format!(
+                        "ghost '{}' has non-scalar type '{}' — ghosts must be a scalar (U8…U128 / I8…I128 / Bool)",
+                        g.name, g.ty
+                    ),
+                    subject: Some(g.name.clone()),
+                    fix: "Use a scalar ghost type. Aggregate quantities over collections belong in a `property` via `sum i : Idx, …`, not a ghost.".to_string(),
+                    example: None,
+                    counterexample: None,
+                    fix_options: vec![],
+                });
+            }
+            for u in &g.updates {
+                if !handler_names.contains(u.handler.as_str()) {
+                    warnings.push(CompletenessWarning {
+                        rule: "ghost_update_unknown_handler".to_string(),
+                        severity: Severity::Warning,
+                        priority: 2,
+                        message: format!(
+                            "ghost '{}' has an `on {}` clause, but no handler named '{}' exists",
+                            g.name, u.handler, u.handler
+                        ),
+                        subject: Some(g.name.clone()),
+                        fix: "Name an existing handler in the `on` clause, or remove the clause."
+                            .to_string(),
+                        example: None,
+                        counterexample: None,
+                        fix_options: vec![],
+                    });
+                }
+            }
+            if unsupported_shape {
+                warnings.push(CompletenessWarning {
+                    rule: "ghost_unsupported_state_shape".to_string(),
+                    severity: Severity::Warning,
+                    priority: 2,
+                    message: format!(
+                        "ghost '{}' is declared with an indexed / multi-account / ADT state — ghost fields are only wired into the flat single-account verification State today",
+                        g.name
+                    ),
+                    subject: Some(g.name.clone()),
+                    fix: "Move the ghost to a flat single-account spec, or track the quantity in a `property` (e.g. `sum i : Idx, accounts[i].x`) until ghost support lands for this shape.".to_string(),
+                    example: None,
+                    counterexample: None,
+                    fix_options: vec![],
+                });
+            }
+        }
+    }
+
     for op in &spec.handlers {
         // v2.7 G4: `auth X` and `permissionless` are mutually exclusive — one
         // declares who can call, the other declares "anyone can call." Both
@@ -3290,9 +3406,11 @@ pub fn check_completeness(spec: &ParsedSpec) -> Vec<CompletenessWarning> {
                  `Vec<T>` / `List<T>` aren't enumerable by Kani / proptest in v2.20."
             }
             "exists_quantifier" => {
-                "v2.20 only lowers `forall`. Rephrase as `forall <binder> : <T>, \
-                 P(<binder>) ⟹ Q(<binder>)` if the property is really about a \
-                 witnessed case."
+                "A bounded `exists` (binder typed `Fin[N]`, e.g. via an index \
+                 alias like `MemberIdx = Fin[MAX_MEMBERS]`) lowers to \
+                 `(0..N).any(…)`. This `exists` ranges over an unbounded domain \
+                 (e.g. `U64`); bound the binder with a `Fin[N]` index type so it \
+                 can be enumerated."
             }
             _ => "See docs/limitations.md#unsupported-quantifier-shapes for the workaround.",
         };

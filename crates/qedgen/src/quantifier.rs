@@ -51,8 +51,14 @@ pub enum Reason {
     /// (`Vec<T>`, `List<T>`, etc.). Bounded `Map[N] T` would be supported
     /// but the spec grammar uses it as a state-field type, not a binder.
     UnboundedBinderType { ty: String, span: Span },
-    /// `exists` quantifier. v2.20 only lowers `forall`; existence proofs
-    /// need a witness-emission contract that doesn't fit the harness model.
+    /// `exists` quantifier. A *bounded* `exists` (binder is a `Fin[N]`
+    /// index domain, directly or via an alias) lowers to a real
+    /// `(0..N).any(…)` harness predicate — the chumsky_adapter resolves
+    /// the alias, renders that, and suppresses this reason. This variant
+    /// only survives for an *unbounded* `exists` (e.g. over `U64`), which
+    /// can't be enumerated in a test loop. The classifier can't resolve
+    /// aliases on its own, so it conservatively reports every `exists`
+    /// here and lets the adapter clear it when the body lowered cleanly.
     ExistsQuantifier { span: Span },
 }
 
@@ -69,7 +75,9 @@ impl Reason {
                 ty
             ),
             Reason::ExistsQuantifier { .. } => {
-                "`exists` quantifier — only `forall` is lowered in v2.20".to_string()
+                "`exists` over an unbounded domain — bound the binder with a \
+                 `Fin[N]` index type (or `U8`) so it lowers to `(0..N).any(…)`"
+                    .to_string()
             }
         }
     }

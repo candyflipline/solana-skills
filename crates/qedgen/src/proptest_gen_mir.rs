@@ -288,6 +288,13 @@ fn emit_record_prop_composes(out: &mut String, spec: &ParsedSpec) -> Result<()> 
         if rec.fields.is_empty() {
             continue;
         }
+        // The flat-state `State` record is materialised as the state-machine
+        // struct (with its own `arb_state()`); skip the value-record form so
+        // we don't emit a colliding `arb_State()`. Mirrors the skip in
+        // `rust_codegen_util::emit_record_structs`.
+        if rec.name == "State" {
+            continue;
+        }
         out.push_str("prop_compose! {\n");
         out.push_str(&format!("    fn arb_{}()(", rec.name));
         for (i, (fname, ftype)) in rec.fields.iter().enumerate() {
@@ -555,7 +562,18 @@ fn mul_div_ceil_u128(a: u128, b: u128, d: u128) -> u128 {\n\
         }
     } else {
         // Single-account: generate flat (no module wrapper)
-        let state_fields: &[(String, String)] = &spec.state_fields;
+        // Issue #67 item 3 — ghosts are spec-only *verification*-State fields:
+        // present in the harness State struct + `arb_state` + transitions (so
+        // properties / invariants can read them and the inductive `prop_assume`
+        // ties them down), but NEVER in the on-chain program codegen, which
+        // reads `spec.state_fields` directly.
+        let state_fields_owned: Vec<(String, String)> = spec
+            .state_fields
+            .iter()
+            .cloned()
+            .chain(spec.ghosts.iter().map(|g| (g.name.clone(), g.ty.clone())))
+            .collect();
+        let state_fields: &[(String, String)] = &state_fields_owned;
         let mutable_fields = rust_codegen_util::mutable_fields(state_fields);
         let all_handlers: Vec<&ParsedHandler> = spec.handlers.iter().collect();
         let all_props: Vec<&ParsedProperty> = spec.properties.iter().collect();
@@ -947,6 +965,25 @@ fn emit_transition_functions_for(
 }
 
 /// Emit per-(handler, property) preservation tests.
+/// True iff `rust` references the state field `name` as `s.<name>`,
+/// word-bounded so `s.total` doesn't match `s.total_supply`.
+fn references_field(rust: &str, name: &str) -> bool {
+    let needle = format!("s.{}", name);
+    let mut from = 0;
+    while let Some(pos) = rust[from..].find(&needle) {
+        let end = from + pos + needle.len();
+        let next_is_word = rust[end..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_');
+        if !next_is_word {
+            return true;
+        }
+        from = end;
+    }
+    false
+}
+
 fn emit_preservation_tests_for(
     out: &mut String,
     handlers: &[&ParsedHandler],
@@ -958,6 +995,20 @@ fn emit_preservation_tests_for(
     for prop in properties {
         if prop.expression.is_none() {
             continue;
+        }
+
+        // Issue #67 item 3 — a property that reads a ghost (spec-only
+        // accumulator) is validated by the init-seeded `state_machine_sequence`
+        // harness, not the single-step `_preserves_` one. A ghost is a function
+        // of the handler history, so an *arbitrary* pre-state ghost value
+        // rarely satisfies the invariant and `arb_state` rejection sampling
+        // exhausts ("too many global rejects"). The sequence harness drives the
+        // property from `init`, where the ghost/real-state relationship holds
+        // and is maintained inductively — the semantically correct check.
+        if let Some(rust) = &prop.rust_expression {
+            if spec.ghosts.iter().any(|g| references_field(rust, &g.name)) {
+                continue;
+            }
         }
 
         for op_name in &prop.preserved_by {

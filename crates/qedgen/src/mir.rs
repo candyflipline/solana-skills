@@ -168,6 +168,11 @@ pub struct Mir {
     /// mutations. Each property × environment cross emits a
     /// preservation theorem.
     pub environments: Vec<EnvironmentMir>,
+    /// Issue #67 item 3 — `ghost` spec-only auxiliary state. Lowered to
+    /// extra verification-State fields (Lean / proptest / Kani) plus a
+    /// per-handler new-value expression; the on-chain codegen ignores
+    /// these entirely.
+    pub ghosts: Vec<GhostMir>,
     /// Top-level `type T = { … }` record declarations (the value types of
     /// `Map[N] T` fields, e.g. percolator's `Account`). The indexed-state
     /// Lean renderer emits a `structure T` + `instance Inhabited T` per
@@ -758,6 +763,23 @@ pub struct RefImpl {
     pub rust_body: String,
 }
 
+/// Issue #67 item 3 — lowered `ghost` declaration. A spec-only auxiliary
+/// State field with a pre-rendered initial value and a per-handler
+/// new-value expression (keyed by handler name). Backends that model the
+/// verification State (Lean / proptest / Kani) add `name : ty` as a State
+/// field, initialise it to `init`, and — in each handler that appears in
+/// `updates` — assign `name := updates[handler]` alongside the normal
+/// effects. The on-chain program codegen never reads this.
+#[derive(Debug, Clone)]
+pub struct GhostMir {
+    pub name: Symbol,
+    pub doc: Option<String>,
+    pub ty: Ty,
+    pub init: Expr,
+    /// Handler name → complete new-value expression after that handler.
+    pub updates: BTreeMap<Symbol, Expr>,
+}
+
 #[derive(Debug, Clone)]
 pub struct InterfaceDecl {
     pub name: Symbol,
@@ -1083,6 +1105,7 @@ pub fn lower(parsed: &ParsedSpec) -> Mir {
         covers: lower_covers(parsed),
         liveness_props: lower_liveness(parsed),
         environments: lower_environments(parsed),
+        ghosts: lower_ghosts(parsed),
         records: parsed.records.clone(),
         is_assembly: parsed.is_assembly_target(),
         adt_state: parsed.state_repr_is_adt(),
@@ -1373,6 +1396,37 @@ fn lower_liveness(parsed: &ParsedSpec) -> Vec<LivenessMir> {
             leads_to_state: l.leads_to_state.clone(),
             via_ops: l.via_ops.clone(),
             within_steps: l.within_steps,
+        })
+        .collect()
+}
+
+fn lower_ghosts(parsed: &ParsedSpec) -> Vec<GhostMir> {
+    parsed
+        .ghosts
+        .iter()
+        .map(|g| GhostMir {
+            name: g.name.clone(),
+            doc: g.doc.clone(),
+            ty: parse_ty(&g.ty),
+            init: Expr {
+                lean: g.init_lean.clone(),
+                rust: g.init_rust.clone(),
+                ..Default::default()
+            },
+            updates: g
+                .updates
+                .iter()
+                .map(|u| {
+                    (
+                        u.handler.clone(),
+                        Expr {
+                            lean: u.value_lean.clone(),
+                            rust: u.value_rust.clone(),
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect(),
         })
         .collect()
 }
@@ -1759,6 +1813,7 @@ mod tests {
             covers: vec![],
             liveness_props: vec![],
             environments: vec![],
+            ghosts: vec![],
             records: vec![],
             is_assembly: false,
             adt_state: false,

@@ -388,6 +388,64 @@ multiple `ensures` clauses or when the math is too complex to inline
 readably (LP share-value, mul-div with rounding, Pyth-style price
 derivations).
 
+### `ghost`
+
+Spec-only **auxiliary state** — a field that exists purely for
+verification (invariants, properties, `requires`/`ensures`) and never
+appears in the on-chain program. Use it for a quantity the program
+doesn't store but you want to reason about: a running total, a count of
+operations, a high-water mark.
+
+```
+ghost total_supply : U64 {
+  init { 0 }
+  on mint { total_supply := state.total_supply + amount }
+  on burn { total_supply := state.total_supply - amount }
+}
+
+property supply_tracks_balance :
+  state.total_supply == state.balance
+  preserved_by all
+```
+
+- **`init { <expr> }`** — the ghost's value when the State is first
+  constructed. A constant expression.
+- **`on <handler> { <name> := <expr> }`** — how the ghost changes when
+  that handler runs. The named handler's parameters are in scope (no
+  type redeclaration), and the RHS may read the ghost's own pre-value as
+  `state.<name>`. A handler with no `on` clause leaves the ghost
+  unchanged (frame condition). `+=` / `-=` work as in a real effect.
+- Reference the ghost anywhere as `state.<name>` — in properties,
+  invariants, `requires`, `ensures`.
+
+**Codegen.** The ghost becomes a field on the *verification* State
+(Lean `structure State`, proptest / Kani `struct State`), updated
+alongside the real effects in each handler's transition. It is **omitted
+from the on-chain program codegen** (Anchor / Quasar / Pinocchio) — it
+has no storage cost and no runtime presence.
+
+**Validation note.** A ghost is a function of the handler history, so
+its invariants are checked inductively from `init`: the proptest
+`state_machine_sequence` harness drives random handler sequences from the
+initial state and asserts the property after each step. The single-step
+`<handler>_preserves_<prop>` harness is *skipped* for ghost-referencing
+properties (an arbitrary pre-state ghost value rarely satisfies the
+invariant, so rejection sampling would exhaust). The Lean preservation
+proof is written in `Proofs.lean` like any other.
+
+**Scope.** v1 wires ghosts into the **flat single-account** State shape
+(the canonical token example). Indexed (`Map[N]`), multi-account, and
+explicit-ADT state shapes fire the `ghost_unsupported_state_shape` lint —
+track the aggregate in a `property` (`sum i : Idx, accounts[i].x`)
+instead, which is fully supported there. Ghosts must be **scalar**
+(`U8…U128` / `I8…I128` / `Bool`); a non-scalar fires
+`ghost_non_scalar_type`, and an `on` clause naming a missing handler
+fires `ghost_update_unknown_handler`.
+
+`ghost` vs [`ref_impl`](#ref_impl-v225): a `ref_impl` is a *stateless*
+pure function the real Rust impl is checked against; a `ghost` is
+*stateful* spec-only state with no on-chain counterpart.
+
 ## PDA and events
 
 ### `pda`
@@ -791,12 +849,18 @@ exists l : Loan.Active, l.collateral > 0
 // Quantifiers — multi-binder (desugars to nested single-binder forms)
 forall p1 p2 : Path, black_count(p1) == black_count(p2)
 
-// Lowering notes (v2.6):
+// Lowering notes:
 //   - `implies`  Lean: → ; Rust: `(!a) || (b)` — valid in property fn bodies.
-//   - `forall` / `exists` in a `property` body emit a
-//     `/* QEDGEN_UNSUPPORTED_QUANTIFIER */` marker in Rust and the
-//     property fn returns `true`. Lift quantified universals to
-//     harness-level `kani::any()` / proptest generators instead.
+//   - `forall i : Fin[N], …` (e.g. over an index alias like `AccountIdx`)
+//     lowers to a real per-slot harness — see `property` below.
+//   - `exists i : Fin[N], …` (bounded; directly or via an index alias)
+//     lowers to Lean `∃` and Rust `(0..N).any(|i| …)`. Works in
+//     `requires` / `ensures` / `property` bodies. An *unbounded* `exists`
+//     (e.g. `exists v : U64, …`) can't be enumerated — it keeps the
+//     `/* QEDGEN_UNSUPPORTED_QUANTIFIER */` marker and the `property` fn
+//     returns `true`; bound the binder with a `Fin[N]` index type.
+//   - Nested quantifiers still emit the marker — split into single-binder
+//     properties.
 
 // Aggregate sum over a bounded index type
 sum i : AccountIdx, state.accounts[i].capital
