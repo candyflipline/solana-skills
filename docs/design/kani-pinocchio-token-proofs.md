@@ -42,6 +42,16 @@ The upstreamable long-term path is a Pinocchio proof profile produced from sourc
 
 The Kani emitter should keep consuming that profile without knowing the program name. This keeps QEDGen general while still allowing programs with rich ABI schemas to get precise implementation proofs.
 
+## Proof Strength Boundaries
+
+QEDGen now has several Kani proof shapes with different claims. The spec-model `--kani` backend proves consistency of the spec-translated transition model; it does not call the program implementation. The implementation-targeted `--kani-impl` backend calls the real dispatcher with symbolic accounts and instruction data; it can catch implementation paths that violate the modeled setup or trigger Kani overflow, underflow, or pointer checks.
+
+The Pinocchio token delta proof is narrower than full CPI semantics. It currently proves byte-level SPL Token account amount deltas for successful dispatcher calls when the profile can construct the relevant token account bytes and the spec contains a `Token.transfer` call. It does not yet prove full account-state conservation, arbitrary CPI semantics, or all helper behavior outside the recovered source/ABI profile.
+
+Generated `TODO` comments mark conservative fallback paths. A proof function that still contains placeholder packing, declaration, or repeat-count TODOs should be treated as partial generation requiring more profile evidence before it is presented as a concrete implementation proof for those facts.
+
+Each generated Pinocchio impl proof now includes proof-profile notes for the handler. These comments report whether source account order, dispatcher or ABI tag, PDA derivations, and token owner/mint projections were found, missing, or unavailable. The notes are diagnostics for reviewers and users; the proof claim still comes from the concrete code that follows them.
+
 ## Validation
 
 The focused repository check was run after removing the program-specific branch:
@@ -53,3 +63,14 @@ cargo test -p qedgen-solana-skills kani_impl -- --nocapture
 It passed with 36 focused Kani-emitter tests. Additional profile tests cover parser-backed source-derived dispatcher/account/role/parameter extraction, account-order inference from sequential `next_account_info` reads, SPL token evidence from the source, direct account-key derivation from `require_key(account, &derive_*(...).0)`, context lookup for source-derived account-key derivations, multiline token account bindings through derived key aliases, nearby ABI schema import for tags/accounts/roles/scalar fields, sibling schema discovery from a spec-derived program path, record offset calculation, account-to-record layout binding, fixed byte extraction from ABI magic literals, repeated-record length calculation, repeated item-field exposure, generated `kani_impl.rs` exclusion, simple source-derived PDA seed extraction with ABI seed literal resolution, and numeric arity suffix lookup.
 
 The updated Kani emitter tests assert that generic Pinocchio token-transfer balance deltas still emit. They also cover source-derived dispatcher tags, account order, payload widths, direct and repeated `Pubkey` parameter packing, token account mint/owner bytes, owner PDA variables from known `derive_*` seed profiles, account-key binding from direct and alias-based source `require_key` derivation guards, non-`program_id` PDA programs with direct and one-level nested account-key seeds, repeated loop account-key derivations through ABI item fields, ABI account-role projection for token accounts and mints, ABI data account byte lengths with fixed byte ranges, exact account-key binding from profiled PDA derivations, ABI repeated-record packing, arity-suffixed handler lookup, repeated token account binding through numeric suffixes, writable non-token account handling, runtime-neutral ABI packing, and project-shaped handlers without custom proof bodies.
+
+The generated implementation harness smoke is intentionally opt-in because it
+requires `cargo kani`:
+
+```sh
+QEDGEN_RUN_CARGO_KANI_SMOKE=1 cargo test -p qedgen-solana-skills --test codegen_smoke generated_pinocchio_kani_impl_proves_with_cargo_kani -- --ignored --nocapture
+```
+
+That smoke generates a generic Pinocchio fixture, writes `src/kani_impl.rs`,
+checks that the green proof path has no generated `TODO:` placeholders, and
+then proves `verify_ping_impl` with Kani.

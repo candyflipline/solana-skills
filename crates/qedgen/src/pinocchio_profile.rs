@@ -1619,9 +1619,7 @@ fn from_le_bytes_instruction_slice(expr: &Expr) -> Option<(String, usize, usize)
         return None;
     }
     let rust_type = path.path.segments.iter().rev().nth(1)?.ident.to_string();
-    if integer_rust_type(&rust_type).is_none() {
-        return None;
-    }
+    integer_rust_type(&rust_type)?;
     let arg = call.args.first()?;
     let (start, end) = instruction_data_range(arg)?;
     Some((rust_type, start, end))
@@ -2370,7 +2368,9 @@ fn infer_pda_derivations(source: &str, derivations: &mut BTreeMap<String, Pinocc
     }
 }
 
-fn derive_fn_bodies(source: &str) -> Vec<(String, Vec<(String, String)>, String)> {
+type DeriveFnBody = (String, Vec<(String, String)>, String);
+
+fn derive_fn_bodies(source: &str) -> Vec<DeriveFnBody> {
     let re = Regex::new(r"pub\s+fn\s+derive_([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)").unwrap();
     let mut out = Vec::new();
     for cap in re.captures_iter(source) {

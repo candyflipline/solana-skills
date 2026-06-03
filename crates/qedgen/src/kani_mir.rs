@@ -768,15 +768,17 @@ fn emit_guard_enforcement_harnesses(
             }
             emit_guard_rejection_harness(
                 out,
-                parsed,
-                op,
-                &mutable,
-                lifecycle,
-                &harness_name,
-                &[],
-                &full_guard,
-                &format!("{} must reject when guard is violated", op.name),
-                false,
+                GuardRejectionHarness {
+                    parsed,
+                    op,
+                    mutable: &mutable,
+                    lifecycle,
+                    harness_name: &harness_name,
+                    prefix_terms: &[],
+                    violated_expr: &full_guard,
+                    assert_message: &format!("{} must reject when guard is violated", op.name),
+                    direct_negated_assume: false,
+                },
             )?;
         } else {
             for (idx, term) in guard_terms.iter().enumerate() {
@@ -795,15 +797,20 @@ fn emit_guard_enforcement_harnesses(
                 }
                 emit_guard_rejection_harness(
                     out,
-                    parsed,
-                    op,
-                    &mutable,
-                    lifecycle,
-                    &harness_name,
-                    &prefix_terms,
-                    &term_expr,
-                    &format!("{} must reject when guard term is violated", op.name),
-                    true,
+                    GuardRejectionHarness {
+                        parsed,
+                        op,
+                        mutable: &mutable,
+                        lifecycle,
+                        harness_name: &harness_name,
+                        prefix_terms: &prefix_terms,
+                        violated_expr: &term_expr,
+                        assert_message: &format!(
+                            "{} must reject when guard term is violated",
+                            op.name
+                        ),
+                        direct_negated_assume: true,
+                    },
                 )?;
             }
         }
@@ -812,20 +819,30 @@ fn emit_guard_enforcement_harnesses(
     Ok(())
 }
 
-fn emit_guard_rejection_harness(
-    out: &mut String,
-    parsed: &ParsedSpec,
-    op: &crate::check::ParsedHandler,
-    mutable: &[&(String, String)],
-    lifecycle: &[String],
-    harness_name: &str,
-    prefix_terms: &[String],
-    violated_expr: &str,
-    assert_message: &str,
+struct GuardRejectionHarness<'a> {
+    parsed: &'a ParsedSpec,
+    op: &'a crate::check::ParsedHandler,
+    mutable: &'a [&'a (String, String)],
+    lifecycle: &'a [String],
+    harness_name: &'a str,
+    prefix_terms: &'a [String],
+    violated_expr: &'a str,
+    assert_message: &'a str,
     direct_negated_assume: bool,
-) -> Result<()> {
+}
+
+fn emit_guard_rejection_harness(out: &mut String, ctx: GuardRejectionHarness<'_>) -> Result<()> {
     use crate::codegen_shared::map_type;
     use crate::rust_codegen_util as util;
+    let parsed = ctx.parsed;
+    let op = ctx.op;
+    let mutable = ctx.mutable;
+    let lifecycle = ctx.lifecycle;
+    let harness_name = ctx.harness_name;
+    let prefix_terms = ctx.prefix_terms;
+    let violated_expr = ctx.violated_expr;
+    let assert_message = ctx.assert_message;
+    let direct_negated_assume = ctx.direct_negated_assume;
 
     out.push_str("#[kani::proof]\n");
     out.push_str("#[kani::unwind(2)]\n");

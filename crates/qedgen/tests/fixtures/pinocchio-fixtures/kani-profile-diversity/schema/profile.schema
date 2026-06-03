@@ -1,0 +1,62 @@
+seed VAULT_AUTHORITY_SEED vault-authority
+
+instruction MOVE_TOKENS 1
+account MOVE_TOKENS SOURCE 0 writable type token
+account MOVE_TOKENS DESTINATION 1 writable type token
+account MOVE_TOKENS AUTHORITY 2 signer
+account MOVE_TOKENS MINT 3 type mint
+account MOVE_TOKENS TOKEN_PROGRAM 4 program type token
+
+record MOVE_TOKENS_ARGS
+field AMOUNT u64
+end
+
+instruction_record MOVE_TOKENS MOVE_TOKENS_ARGS
+
+instruction MOVE_BATCH 2
+account MOVE_BATCH BATCH_STATE 0 writable
+
+record TRANSFER
+field FROM_LANE_ID u8
+field TO_LANE_ID u8
+field AMOUNT u64
+end
+
+record MOVE_BATCH_ARGS
+field TRANSFER_COUNT u8
+repeat TRANSFER transfer 2 TRANSFER_COUNT
+end
+
+instruction_record MOVE_BATCH MOVE_BATCH_ARGS
+
+instruction TOUCH_CONFIG 3
+account TOUCH_CONFIG CONFIG 0 writable
+
+record CONFIG_ACCOUNT
+field MAGIC bytes8
+field ADMIN pubkey
+field MAX_FEE_BPS u16
+field PAUSED bool
+end
+
+record TOUCH_CONFIG_ARGS
+field MAX_FEE_BPS u16
+end
+
+magic CONFIG_MAGIC CFGMAGIC
+instruction_record TOUCH_CONFIG TOUCH_CONFIG_ARGS
+account_record CONFIG CONFIG_ACCOUNT
+
+instruction ROUTE_ATA 4
+account ROUTE_ATA AUTHORITY 0
+account ROUTE_ATA MINT 1
+account ROUTE_ATA VAULT 2 writable
+
+record ROUTE_ATA_ARGS
+field LANE_ID u8
+end
+
+instruction_record ROUTE_ATA ROUTE_ATA_ARGS
+
+instruction PARTIAL_FALLBACK 5
+account PARTIAL_FALLBACK SCRATCH 0 writable

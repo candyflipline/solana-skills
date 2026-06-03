@@ -1349,7 +1349,7 @@ fn pinocchio_local_derived_key_seed_exprs(
                         account_key_exprs,
                         handler_profile,
                     )
-                    .or_else(|| Some(param_name))
+                    .or(Some(param_name))
                     .map(|expr| format!("{expr}.as_ref()")),
                     _ => None,
                 };
@@ -1375,7 +1375,7 @@ fn pinocchio_local_derived_key_seed_exprs(
                     account_key_exprs,
                     handler_profile,
                 )
-                .or_else(|| Some(param_name))
+                .or(Some(param_name))
                 .map(|expr| format!("{expr}.as_ref()")),
                 _ => Some(format!("&({} as {}).to_le_bytes()", param_name, rust_type)),
             }
@@ -1395,21 +1395,33 @@ fn pinocchio_local_arg_by_param<'a>(
         .collect()
 }
 
+struct PinocchioNestedKeyBindingCtx<'a> {
+    proof_profile: Option<&'a PinocchioProofProfile>,
+    handler_profile: Option<&'a PinocchioHandlerProfile>,
+    handler: &'a ParsedHandler,
+    current_ident: &'a str,
+    outer_derivation: &'a PinocchioPdaDerivation,
+    outer_arg_by_param: &'a BTreeMap<&'a str, &'a str>,
+    account_key_exprs: &'a BTreeMap<String, String>,
+}
+
+struct PinocchioPdaKeyBindingsCtx<'a> {
+    handler: &'a ParsedHandler,
+    proof_profile: Option<&'a PinocchioProofProfile>,
+    handler_profile: Option<&'a PinocchioHandlerProfile>,
+    ordered_accounts: &'a [&'a ParsedHandlerAccount],
+    account_key_exprs: &'a BTreeMap<String, String>,
+}
+
 fn emit_pinocchio_nested_key_bindings(
     out: &mut String,
-    proof_profile: Option<&PinocchioProofProfile>,
-    handler_profile: Option<&PinocchioHandlerProfile>,
-    handler: &ParsedHandler,
-    current_ident: &str,
-    outer_derivation: &PinocchioPdaDerivation,
-    outer_arg_by_param: &BTreeMap<&str, &str>,
-    account_key_exprs: &BTreeMap<String, String>,
+    ctx: PinocchioNestedKeyBindingCtx<'_>,
 ) -> BTreeMap<String, String> {
     let mut nested_keys = BTreeMap::new();
-    let Some(proof_profile) = proof_profile else {
+    let Some(proof_profile) = ctx.proof_profile else {
         return nested_keys;
     };
-    for (local_name, local) in &outer_derivation.local_key_derivations {
+    for (local_name, local) in &ctx.outer_derivation.local_key_derivations {
         let Some(nested_derivation) = proof_profile.pda_derivations.get(&local.derivation) else {
             continue;
         };
@@ -1420,7 +1432,7 @@ fn emit_pinocchio_nested_key_bindings(
             .args
             .iter()
             .map(|arg| {
-                outer_arg_by_param
+                ctx.outer_arg_by_param
                     .get(arg.as_str())
                     .copied()
                     .unwrap_or(arg.as_str())
@@ -1433,16 +1445,16 @@ fn emit_pinocchio_nested_key_bindings(
         };
         let Some(seed_exprs) = pinocchio_local_derived_key_seed_exprs(
             Some(proof_profile),
-            handler_profile,
-            handler,
-            current_ident,
+            ctx.handler_profile,
+            ctx.handler,
+            ctx.current_ident,
             &nested_local,
-            account_key_exprs,
+            ctx.account_key_exprs,
             &BTreeMap::new(),
         ) else {
             continue;
         };
-        let ident = format!("{}_{}", current_ident, local_name);
+        let ident = format!("{}_{}", ctx.current_ident, local_name);
         out.push_str(&format!(
             "    let {ident}_pda = pinocchio::pubkey::try_find_program_address(&[{}], {});\n",
             seed_exprs.join(", "),
@@ -1572,43 +1584,41 @@ fn pinocchio_pda_seed_expr(
 
 fn emit_pinocchio_pda_key_bindings(
     out: &mut String,
-    handler: &ParsedHandler,
-    proof_profile: Option<&PinocchioProofProfile>,
-    handler_profile: Option<&PinocchioHandlerProfile>,
-    ordered_accounts: &[&ParsedHandlerAccount],
-    account_key_exprs: &BTreeMap<String, String>,
+    ctx: PinocchioPdaKeyBindingsCtx<'_>,
 ) -> BTreeSet<String> {
     let mut emitted = BTreeSet::new();
-    for account in ordered_accounts {
+    for account in ctx.ordered_accounts {
         let ident = to_snake_case(&account.name);
         let seed_exprs = pinocchio_account_pda_seed_exprs(
-            proof_profile,
-            handler_profile,
+            ctx.proof_profile,
+            ctx.handler_profile,
             account,
-            handler,
-            account_key_exprs,
+            ctx.handler,
+            ctx.account_key_exprs,
         )
         .or_else(|| {
-            pinocchio_account_key_derivation(handler_profile, account).and_then(|local| {
-                let derivation = proof_profile?.pda_derivations.get(&local.derivation)?;
+            pinocchio_account_key_derivation(ctx.handler_profile, account).and_then(|local| {
+                let derivation = ctx.proof_profile?.pda_derivations.get(&local.derivation)?;
                 let arg_by_param = pinocchio_local_arg_by_param(derivation, local);
                 let nested_key_exprs = emit_pinocchio_nested_key_bindings(
                     out,
-                    proof_profile,
-                    handler_profile,
-                    handler,
-                    &ident,
-                    derivation,
-                    &arg_by_param,
-                    account_key_exprs,
+                    PinocchioNestedKeyBindingCtx {
+                        proof_profile: ctx.proof_profile,
+                        handler_profile: ctx.handler_profile,
+                        handler: ctx.handler,
+                        current_ident: &ident,
+                        outer_derivation: derivation,
+                        outer_arg_by_param: &arg_by_param,
+                        account_key_exprs: ctx.account_key_exprs,
+                    },
                 );
                 pinocchio_local_derived_key_seed_exprs(
-                    proof_profile,
-                    handler_profile,
-                    handler,
+                    ctx.proof_profile,
+                    ctx.handler_profile,
+                    ctx.handler,
                     &ident,
                     local,
-                    account_key_exprs,
+                    ctx.account_key_exprs,
                     &nested_key_exprs,
                 )
             })
@@ -1616,9 +1626,9 @@ fn emit_pinocchio_pda_key_bindings(
         let Some(seed_exprs) = seed_exprs else {
             continue;
         };
-        let derivation = pinocchio_account_pda(proof_profile, account).or_else(|| {
-            let local = pinocchio_account_key_derivation(handler_profile, account)?;
-            proof_profile?.pda_derivations.get(&local.derivation)
+        let derivation = pinocchio_account_pda(ctx.proof_profile, account).or_else(|| {
+            let local = pinocchio_account_key_derivation(ctx.handler_profile, account)?;
+            ctx.proof_profile?.pda_derivations.get(&local.derivation)
         });
         let Some(program_expr) = derivation.and_then(|d| pinocchio_pda_program_expr(&d.program_id))
         else {
@@ -1685,6 +1695,92 @@ fn rust_string_escape(input: &str) -> String {
     input.escape_default().to_string()
 }
 
+fn emit_pinocchio_profile_notes(
+    out: &mut String,
+    handler: &ParsedHandler,
+    proof_profile: Option<&PinocchioProofProfile>,
+    handler_profile: Option<&PinocchioHandlerProfile>,
+) {
+    out.push_str("/// Proof profile notes:\n");
+    if let Some(profile) = handler_profile {
+        if profile.accounts.is_empty() {
+            out.push_str("/// - source account order: not inferred; using spec order\n");
+        } else {
+            out.push_str(&format!(
+                "/// - source account order: {}\n",
+                profile.accounts.join(", ")
+            ));
+        }
+        match profile.instruction_tag {
+            Some(tag) => out.push_str(&format!("/// - ABI/dispatcher tag: {tag}\n")),
+            None => out.push_str("/// - ABI/dispatcher tag: not inferred\n"),
+        }
+        let pda_notes = handler
+            .accounts
+            .iter()
+            .filter_map(|account| {
+                let account_name = to_snake_case(&account.name);
+                if let Some(derivation) = pinocchio_account_pda(proof_profile, account) {
+                    return Some(format!("{} -> {} (found)", account_name, derivation.name));
+                }
+                let local = pinocchio_account_key_derivation(handler_profile, account)?;
+                let status = if proof_profile
+                    .and_then(|profile| profile.pda_derivations.get(&local.derivation))
+                    .is_some()
+                {
+                    "found"
+                } else {
+                    "missing"
+                };
+                Some(format!(
+                    "{} -> {} ({})",
+                    account_name, local.derivation, status
+                ))
+            })
+            .collect::<Vec<_>>();
+        if pda_notes.is_empty() {
+            out.push_str("/// - PDA derivations: none inferred\n");
+        } else {
+            out.push_str(&format!(
+                "/// - PDA derivations: {}\n",
+                pda_notes.join("; ")
+            ));
+        }
+        let token_notes = handler
+            .accounts
+            .iter()
+            .filter_map(|account| {
+                let account_name = to_snake_case(&account.name);
+                let binding = pinocchio_token_account_binding(handler_profile, account)?;
+                Some(format!(
+                    "{} mint={} owner={} owner_pda={}",
+                    account_name,
+                    binding.mint_account.as_deref().unwrap_or("missing"),
+                    binding.owner_account.as_deref().unwrap_or("missing"),
+                    binding
+                        .owner_key_derivation
+                        .as_ref()
+                        .map(|local| local.derivation.as_str())
+                        .unwrap_or("missing")
+                ))
+            })
+            .collect::<Vec<_>>();
+        if token_notes.is_empty() {
+            out.push_str("/// - token owner/mint projections: none inferred\n");
+        } else {
+            out.push_str(&format!(
+                "/// - token owner/mint projections: {}\n",
+                token_notes.join("; ")
+            ));
+        }
+    } else {
+        out.push_str("/// - source account order: profile unavailable; using spec order\n");
+        out.push_str("/// - ABI/dispatcher tag: profile unavailable\n");
+        out.push_str("/// - PDA derivations: profile unavailable\n");
+        out.push_str("/// - token owner/mint projections: profile unavailable\n");
+    }
+}
+
 /// Emit one `#[kani::proof]` harness for a Pinocchio handler. Builds
 /// symbolic stack accounts from the handler's `accounts {}` block, packs
 /// symbolic params into instruction data, and calls the committed
@@ -1728,6 +1824,7 @@ fn emit_pinocchio_handler_harness(
     out.push_str("/// overflow / underflow / UB checks run on every path through the\n");
     out.push_str("/// real handler. `#[kani::unwind(34)]` bounds the 32-byte Pubkey\n");
     out.push_str("/// memcmp loops in pinocchio's owner checks (+2 slack).\n");
+    emit_pinocchio_profile_notes(out, handler, proof_profile, handler_profile);
     out.push_str("#[kani::proof]\n");
     out.push_str("#[kani::unwind(34)]\n");
     out.push_str(&format!("fn verify_{}_impl() {{\n", snake));
@@ -1792,11 +1889,13 @@ fn emit_pinocchio_handler_harness(
     }
     let emitted_pda_keys = emit_pinocchio_pda_key_bindings(
         out,
-        handler,
-        proof_profile,
-        handler_profile,
-        &ordered_accounts,
-        &preliminary_account_key_exprs,
+        PinocchioPdaKeyBindingsCtx {
+            handler,
+            proof_profile,
+            handler_profile,
+            ordered_accounts: &ordered_accounts,
+            account_key_exprs: &preliminary_account_key_exprs,
+        },
     );
     let mut account_key_exprs = BTreeMap::new();
     for (i, a) in ordered_accounts.iter().enumerate() {
@@ -1887,44 +1986,42 @@ fn emit_pinocchio_handler_harness(
                 signer = is_signer,
                 writable = is_writable,
             ));
-        } else {
-            if let Some(layout) = pinocchio_account_layout(proof_profile, a) {
-                out.push_str(&format!(
-                    "    // ABI account layout `{}`: {} byte data region.\n",
-                    layout.name, layout.len
-                ));
-                out.push_str(&format!(
-                    "    let mut {ident}_data: [u8; {len}] = kani::any();\n",
-                    ident = ident,
-                    len = layout.len
-                ));
-                for field in &layout.fields {
-                    if let Some(bytes) = &field.fixed_bytes {
-                        out.push_str(&format!(
-                            "    {ident}_data[{start}..{end}].copy_from_slice(&{});\n",
-                            rust_u8_array_literal(bytes),
-                            ident = ident,
-                            start = field.offset,
-                            end = field.offset + field.len,
-                        ));
-                    }
+        } else if let Some(layout) = pinocchio_account_layout(proof_profile, a) {
+            out.push_str(&format!(
+                "    // ABI account layout `{}`: {} byte data region.\n",
+                layout.name, layout.len
+            ));
+            out.push_str(&format!(
+                "    let mut {ident}_data: [u8; {len}] = kani::any();\n",
+                ident = ident,
+                len = layout.len
+            ));
+            for field in &layout.fields {
+                if let Some(bytes) = &field.fixed_bytes {
+                    out.push_str(&format!(
+                        "    {ident}_data[{start}..{end}].copy_from_slice(&{});\n",
+                        rust_u8_array_literal(bytes),
+                        ident = ident,
+                        start = field.offset,
+                        end = field.offset + field.len,
+                    ));
                 }
-                out.push_str(&format!(
-                    "    let mut {ident} = build_data_account({key_expr}, {signer}, {writable}, {ident}_data);\n",
-                    ident = ident,
-                    key_expr = key_expr,
-                    signer = is_signer,
-                    writable = is_writable,
-                ));
-            } else {
-                out.push_str(&format!(
-                    "    let mut {ident} = build_minimal_account({key_expr}, {signer}, {writable});\n",
-                    ident = ident,
-                    key_expr = key_expr,
-                    signer = is_signer,
-                    writable = is_writable,
-                ));
             }
+            out.push_str(&format!(
+                "    let mut {ident} = build_data_account({key_expr}, {signer}, {writable}, {ident}_data);\n",
+                ident = ident,
+                key_expr = key_expr,
+                signer = is_signer,
+                writable = is_writable,
+            ));
+        } else {
+            out.push_str(&format!(
+                "    let mut {ident} = build_minimal_account({key_expr}, {signer}, {writable});\n",
+                ident = ident,
+                key_expr = key_expr,
+                signer = is_signer,
+                writable = is_writable,
+            ));
         }
     }
     out.push('\n');
@@ -3392,6 +3489,12 @@ handler route (lane_id : U64) {
                 ),
             "profiled PDA derivations should bind exact account keys generically; got:\n{body}"
         );
+        assert!(
+            body.contains(
+                "/// - PDA derivations: config -> config (found); vault_authority -> vault_authority (found)"
+            ),
+            "generated impl harness should report inferred PDA derivations; got:\n{body}"
+        );
     }
 
     #[test]
@@ -3877,6 +3980,12 @@ pub fn process_move_tokens(accounts: &[AccountInfo], instruction_data: &[u8]) ->
         assert!(
             body.contains("let instruction_tag: u8 = 9u8;"),
             "must use source-inferred dispatcher tag; got:\n{body}"
+        );
+        assert!(
+            body.contains("/// - source account order: destination, authority, source")
+                && body.contains("/// - ABI/dispatcher tag: 9")
+                && body.contains("/// - PDA derivations: none inferred"),
+            "generated impl harness should explain profile facts and fallbacks; got:\n{body}"
         );
         let destination_pos = body
             .find("ManuallyDrop::new(account_info_from_stack(&mut destination))")

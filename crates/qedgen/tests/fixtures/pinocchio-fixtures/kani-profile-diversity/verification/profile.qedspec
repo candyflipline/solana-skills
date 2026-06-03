@@ -1,0 +1,82 @@
+spec KaniProfileDiversity
+program_id "11111111111111111111111111111111"
+
+interface Token {
+  program_id "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+  handler transfer (amount : U64) {
+    discriminant "0x03"
+    accounts {
+      from      : writable
+      to        : writable
+      authority : signer
+    }
+    requires amount > 0
+    ensures amount > 0
+  }
+}
+
+type Error | InvalidAmount
+
+handler move_tokens (amount : U64) {
+  permissionless
+  accounts {
+    source        : writable, type token
+    destination   : writable, type token
+    authority     : signer
+    mint          : readonly, type mint
+    token_program : program, type token
+  }
+  requires amount > 0 else InvalidAmount
+  call Token.transfer(from = source, to = destination, amount = amount, authority = authority)
+  ensures amount > 0
+}
+
+handler move_batch
+  (transfer_count : U64)
+  (from_lane_id_0 : U64)
+  (to_lane_id_0 : U64)
+  (amount_0 : U64)
+  (from_lane_id_1 : U64)
+  (to_lane_id_1 : U64)
+  (amount_1 : U64) {
+  permissionless
+  accounts {
+    batch_state : writable
+  }
+  requires transfer_count <= 2
+  ensures transfer_count <= 2
+}
+
+handler touch_config (max_fee_bps : U64) {
+  permissionless
+  accounts {
+    config : writable
+  }
+  ensures max_fee_bps <= 10000
+}
+
+handler route_ata (lane_id : U64) {
+  permissionless
+  accounts {
+    authority : readonly
+    mint      : readonly
+    vault     : writable
+  }
+  ensures lane_id <= 255
+}
+
+handler partial_fallback (opaque : Pubkey) {
+  permissionless
+  accounts {
+    scratch : writable
+  }
+  ensures true
+}
+
+handler missing_profile (opaque : Pubkey) {
+  permissionless
+  accounts {
+    scratch : writable
+  }
+  ensures true
+}

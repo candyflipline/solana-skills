@@ -180,6 +180,173 @@ fn smoke_pinocchio_scaffold(fixture: &str, spec_file: &str) {
         .arg(output_dir.join("Cargo.toml")));
 }
 
+/// Generate a Pinocchio program and its impl-targeted Kani proof, then run
+/// real `cargo kani` against the generated `src/kani_impl.rs`. This is kept
+/// ignored so normal CI does not need cargo-kani installed, but optional CI can
+/// exercise the exact generated proof path instead of only snapshots.
+fn smoke_pinocchio_generated_kani_impl(fixture: &str, spec_file: &str, harness: &str) {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let spec_src = repo_root()
+        .join("crates/qedgen/tests/fixtures/pinocchio-fixtures")
+        .join(fixture)
+        .join(spec_file);
+    let spec_path = temp.path().join(spec_file);
+    std::fs::copy(&spec_src, &spec_path).unwrap_or_else(|e| panic!("copy {fixture} spec: {e}"));
+    std::fs::create_dir(temp.path().join(".qed")).expect("create .qed");
+
+    run(Command::new("git").arg("init").current_dir(temp.path()));
+
+    let output_dir = temp.path().join("programs");
+    run(Command::new(env!("CARGO_BIN_EXE_qedgen"))
+        .arg("codegen")
+        .arg("--spec")
+        .arg(&spec_path)
+        .arg("--target")
+        .arg("pinocchio")
+        .arg("--output-dir")
+        .arg(&output_dir)
+        .current_dir(temp.path()));
+
+    run(Command::new(env!("CARGO_BIN_EXE_qedgen"))
+        .arg("codegen")
+        .arg("--spec")
+        .arg(&spec_path)
+        .arg("--target")
+        .arg("pinocchio")
+        .arg("--kani-impl")
+        .arg("--kani-impl-output")
+        .arg(output_dir.join("tests/kani_impl.rs"))
+        .current_dir(temp.path()));
+
+    let kani_impl = output_dir.join("src/kani_impl.rs");
+    let body = std::fs::read_to_string(&kani_impl).expect("read generated kani_impl.rs");
+    assert!(
+        !body.contains("TODO:"),
+        "generated proof path should not present placeholder TODOs as green Kani evidence:\n{body}"
+    );
+    assert!(
+        body.contains("Proof profile notes:"),
+        "generated proof should include profile diagnostics:\n{body}"
+    );
+
+    redirect_macros_to_path(&output_dir.join("Cargo.toml"));
+
+    run(Command::new("cargo")
+        .arg("kani")
+        .arg("--harness")
+        .arg(harness)
+        .env("CARGO_NET_OFFLINE", "true")
+        .current_dir(&output_dir));
+}
+
+fn copy_dir_contents(src: &Path, dst: &Path) {
+    for file in walk_files(src) {
+        let relative = file.strip_prefix(src).expect("fixture file under root");
+        let target = dst.join(relative);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).expect("create fixture parent");
+        }
+        std::fs::copy(&file, &target)
+            .unwrap_or_else(|e| panic!("copy fixture file {}: {e}", file.display()));
+    }
+}
+
+fn smoke_pinocchio_kani_profile_diversity() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let fixture_root = repo_root()
+        .join("crates/qedgen/tests/fixtures/pinocchio-fixtures")
+        .join("kani-profile-diversity");
+    copy_dir_contents(&fixture_root, temp.path());
+    std::fs::create_dir(temp.path().join(".qed")).expect("create root .qed");
+    std::fs::create_dir(temp.path().join("verification/.qed")).expect("create spec .qed");
+
+    run(Command::new("git").arg("init").current_dir(temp.path()));
+
+    let spec_path = temp.path().join("verification/profile.qedspec");
+    let kani_impl = temp.path().join("src/kani_impl.rs");
+    run(Command::new(env!("CARGO_BIN_EXE_qedgen"))
+        .arg("codegen")
+        .arg("--spec")
+        .arg(&spec_path)
+        .arg("--target")
+        .arg("pinocchio")
+        .arg("--kani-impl")
+        .arg("--kani-impl-output")
+        .arg(&kani_impl)
+        .current_dir(temp.path()));
+
+    let body = std::fs::read_to_string(&kani_impl).expect("read generated kani_impl.rs");
+
+    assert!(
+        body.contains("fn verify_move_tokens_impl"),
+        "missing move_tokens impl harness:\n{body}"
+    );
+    assert!(
+        body.contains("let pre_transfer_0_from = read_token_amount(&source);")
+            && body.contains("let pre_transfer_0_to = read_token_amount(&destination);")
+            && body.contains("kani::assume(pre_transfer_0_from >= amount);")
+            && body.contains("kani::assume(pre_transfer_0_to <= u64::MAX - amount);")
+            && body
+                .contains("assert_eq!(read_token_amount(&source), pre_transfer_0_from - amount);")
+            && body.contains(
+                "assert_eq!(read_token_amount(&destination), pre_transfer_0_to + amount);"
+            ),
+        "simple SPL token transfer should emit concrete token delta assertions:\n{body}"
+    );
+    assert!(
+        body.contains("token owner/mint projections:")
+            && body.contains("source mint=mint owner=authority")
+            && body.contains("destination mint=mint owner=authority"),
+        "token owner/mint profile notes should explain inferred token account projections:\n{body}"
+    );
+
+    assert!(
+        body.contains("fn verify_move_batch_impl")
+            && body.contains("let transfer_count: u8 = 2u8;")
+            && body.contains("instruction_data.extend_from_slice(&transfer_count.to_le_bytes());")
+            && body.contains(
+                "instruction_data.extend_from_slice(&(from_lane_id_0 as u8).to_le_bytes());"
+            )
+            && body
+                .contains("instruction_data.extend_from_slice(&(amount_0 as u64).to_le_bytes());")
+            && body.contains(
+                "instruction_data.extend_from_slice(&(from_lane_id_1 as u8).to_le_bytes());"
+            )
+            && body
+                .contains("instruction_data.extend_from_slice(&(amount_1 as u64).to_le_bytes());"),
+        "repeated record batch should pack indexed fields from the ABI schema:\n{body}"
+    );
+
+    assert!(
+        body.contains("fn verify_touch_config_impl")
+            && body.contains("// ABI account layout `config_account`: 43 byte data region.")
+            && body.contains("let mut config_data: [u8; 43] = kani::any();")
+            && body.contains(
+                "config_data[0..8].copy_from_slice(&[67u8, 70u8, 71u8, 77u8, 65u8, 71u8, 73u8, 67u8]);"
+            ),
+        "ABI data account should allocate schema length and stamp CFGMAGIC bytes:\n{body}"
+    );
+
+    assert!(
+        body.contains("fn verify_route_ata_impl")
+            && body.contains("&crate::ASSOCIATED_TOKEN_PROGRAM_ID")
+            && body.contains("let vault_key = vault_pda.unwrap().0;")
+            && body.contains("let mut vault = build_minimal_account(vault_key, false, true);"),
+        "non-program_id PDA should derive the vault with the associated-token program id:\n{body}"
+    );
+
+    assert!(
+        body.contains("fn verify_missing_profile_impl")
+            && body.contains("- source account order: profile unavailable; using spec order")
+            && body.contains("- ABI/dispatcher tag: profile unavailable"),
+        "missing source/ABI fallback should be reported in proof profile notes:\n{body}"
+    );
+    assert!(
+        !body.contains("TODO: concrete account layout from source/ABI profile"),
+        "profile-backed green proof paths should not carry placeholder TODOs:\n{body}"
+    );
+}
+
 /// Rewrite the `qedgen-macros` line in a generated Cargo.toml from a git
 /// dep tagged at the current crate version (which doesn't exist on GitHub
 /// until release time) to a `path` dep pointing at the in-repo crate.
@@ -331,4 +498,21 @@ fn vault_pinocchio_scaffold_compiles() {
 #[ignore = "runs qedgen codegen + cargo build on a generated Pinocchio crate"]
 fn config_pubkey_pinocchio_scaffold_compiles() {
     smoke_pinocchio_scaffold("config-pubkey", "config.qedspec");
+}
+
+#[test]
+#[ignore = "runs qedgen codegen + cargo kani on a generated Pinocchio impl harness"]
+fn generated_pinocchio_kani_impl_proves_with_cargo_kani() {
+    if std::env::var_os("QEDGEN_RUN_CARGO_KANI_SMOKE").is_none() {
+        eprintln!(
+            "skipping generated Pinocchio cargo-kani smoke; set QEDGEN_RUN_CARGO_KANI_SMOKE=1"
+        );
+        return;
+    }
+    smoke_pinocchio_generated_kani_impl("kani-generated-ping", "ping.qedspec", "verify_ping_impl");
+}
+
+#[test]
+fn pinocchio_kani_profile_diversity_fixture_generates_expected_proofs() {
+    smoke_pinocchio_kani_profile_diversity();
 }

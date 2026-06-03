@@ -462,19 +462,19 @@ fn spec_field_is_pubkey(field: &str, spec: &ParsedSpec) -> bool {
     if spec
         .state_fields
         .iter()
-        .any(|(name, ty)| name == &field && type_is_or_contains_pubkey(ty))
+        .any(|(name, ty)| name == field && type_is_or_contains_pubkey(ty))
     {
         return true;
     }
     spec.account_types.iter().any(|acct| {
         acct.fields
             .iter()
-            .any(|(name, ty)| name == &field && type_is_or_contains_pubkey(ty))
+            .any(|(name, ty)| name == field && type_is_or_contains_pubkey(ty))
             || acct.variants.iter().any(|variant| {
                 variant
                     .fields
                     .iter()
-                    .any(|(name, ty)| name == &field && type_is_or_contains_pubkey(ty))
+                    .any(|(name, ty)| name == field && type_is_or_contains_pubkey(ty))
             })
     })
 }

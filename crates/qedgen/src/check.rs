@@ -4799,10 +4799,8 @@ fn parse_top_level_cmp(expr: &str) -> Option<(&str, &str, &str)> {
                         let rhs = expr[i + 1..].trim();
                         return Some((lhs, ">", rhs));
                     }
-                } else {
-                    if depth > 0 {
-                        depth -= 1;
-                    }
+                } else if depth > 0 {
+                    depth -= 1;
                 }
             }
             b'=' => {
