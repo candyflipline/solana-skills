@@ -36,7 +36,7 @@ private key, and every subsequent caller hits the same operator. If
 the first call hits the `Err` arm, the address is **permanently
 locked** — no escape, no recovery, no way to drain the dust.
 
-Canonical from subscriptions Run A (CAN-H3 firm-High miss):
+Canonical example (a real-world subscription program):
 
 ```rust
 // helpers/program.rs:48
@@ -64,7 +64,7 @@ unrecoverable namespace collision is a permanent griefing attack.
    library entrypoint with attacker-controlled inputs is.
 3. **Recovery path**: is there an alternate code path that drains the
    pre-funded lamports and unlocks the address? If yes, suppress.
-   The subscriptions bench's `program.rs::init` has no recovery
+   The canonical example's `program.rs::init` has no recovery
    path — strict `?` propagation, no alternate branch.
 4. **Idempotency**: the suppression hint pattern is to treat
    pre-funded PDAs as "lamports already there" and skip the transfer.

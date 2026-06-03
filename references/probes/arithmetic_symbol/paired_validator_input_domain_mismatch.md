@@ -26,17 +26,16 @@ expires" passes the transfer validator (which honors the sentinel)
 but fails create-path validation (which compares against
 `current_time - drift` and finds `0` to be "very far in the past").
 
-Canonical from subscriptions Run A:
+Canonical examples (a real-world subscription/delegation program):
 
-- **CAN-M1**: `create_fixed_delegation::validate` vs
-  `transfer_validation` on `expiry_ts == 0`.
-- **CAN-M2**: `create_recurring_delegation::validate` vs
-  `transfer_validation` on `expiry_ts == 0`.
-- **CAN-L2**: `create_plan::validate` enforces
-  `end_ts >= now + period_secs`; `update_plan::validate` enforces
-  only `end_ts > now`.
-- **CAN-L3**: creation uses `TIME_DRIFT_ALLOWED_SECS` tolerance;
-  transfer uses strict `>`.
+- `create_fixed_delegation::validate` vs `transfer_validation` on
+  `expiry_ts == 0`.
+- `create_recurring_delegation::validate` vs `transfer_validation` on
+  `expiry_ts == 0`.
+- `create_plan::validate` enforces `end_ts >= now + period_secs`;
+  `update_plan::validate` enforces only `end_ts > now`.
+- creation uses a `TIME_DRIFT_ALLOWED_SECS` tolerance; transfer uses
+  strict `>`.
 
 ## What the agent should check
 

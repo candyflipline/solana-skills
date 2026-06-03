@@ -33,7 +33,7 @@ program-owned PDA is gone. Downstream programs (multi-sig vaults,
 on-chain consumer guards) that read the delegate field see live
 permission too.
 
-Canonical from subscriptions Run B (QED-HEAD-MED-3, QEDGen-only):
+Canonical example (a real-world subscription program; a QEDGen-only finding):
 
 - `close_subscription_authority.rs:70` / `:78` close the
   `subscription_authority` PDA in both the self-funded and
@@ -42,9 +42,9 @@ Canonical from subscriptions Run B (QED-HEAD-MED-3, QEDGen-only):
   `initialize_subscription_authority.rs:121` / `:130` granted SPL
   Approve with `amount = u64::MAX` to the PDA.
 
-Same shape applies at the audited commit on `close_multidelegate.rs`
-(Cantina missed this — additional QEDGen-only novel that fires
-structurally now that the rule lands).
+Same shape applies on `close_multidelegate.rs` (a manual professional
+audit missed this — a QEDGen-only novel finding that fires structurally
+now that the rule lands).
 
 ## What the agent should check
 
