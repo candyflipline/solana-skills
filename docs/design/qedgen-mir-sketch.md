@@ -1,6 +1,8 @@
 # qedgen MIR — design sketch
 
-**Status:** Phase 1 + 2 (Lean), Phase 3 (Kani), Phase 4 (Anchor/Quasar), Phase 5 (proptest) all complete. **All four primary codegens are MIR-default and snapshot-gated.** Escape hatches: `QEDGEN_LEGACY_LEAN=1`, `QEDGEN_LEGACY_KANI=1`, `QEDGEN_LEGACY_CODEGEN=1`, `QEDGEN_LEGACY_PROPTEST=1`. Snapshot suites: `mir_snapshot` (Lean, 6 pilots), `kani_snapshot` (6), `codegen_snapshot` (6, multi-file dump), `proptest_snapshot` (6). Two known carve-outs: `generate_guards` (636L, Anchor) and the full proptest emit body stay delegated to legacy pending the typed-Stmt MIR refactor (v3.0); the dispatch surfaces are MIR-default so future cleanups land without touching callers.
+> **Historical design doc (the v2.29–v2.30 MIR migration).** The `QEDGEN_LEGACY_*` escape hatches and parallel legacy renderers described below existed only during the migration soak; **v2.32 deleted them** — the four MIR codegens are now the sole path. For current behavior see [`references/cli.md`](../../references/cli.md). Kept for the migration rationale.
+
+**Status:** Phase 1 + 2 (Lean), Phase 3 (Kani), Phase 4 (Anchor/Quasar), Phase 5 (proptest) all complete. **All four primary codegens are MIR-default and snapshot-gated.** Escape hatches `QEDGEN_LEGACY_{LEAN,KANI,CODEGEN,PROPTEST}=1` existed through the soak and were removed in v2.32. Snapshot suites: `mir_snapshot` (Lean, 6 pilots), `kani_snapshot` (6), `codegen_snapshot` (6, multi-file dump), `proptest_snapshot` (6). Two known carve-outs: `generate_guards` (636L, Anchor) and the full proptest emit body stay delegated to legacy pending the typed-Stmt MIR refactor (v3.0); the dispatch surfaces are MIR-default so future cleanups land without touching callers.
 
 **Last revised:** 2026-05-25 (Phase 5 proptest scaffold + snapshot + dispatch flip — MIR carry-through complete across all four primary codegens).
 

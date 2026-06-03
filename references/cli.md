@@ -743,15 +743,15 @@ signer/writable tightening.
 
 ```bash
 # Standard upgrade diff
-$QEDGEN check-upgrade --baseline old.json --candidate new.json
+$QEDGEN check-upgrade --old old.json --new new.json
 
 # Acknowledge a specific finding so it reports as Additive
-$QEDGEN check-upgrade --baseline old.json --candidate new.json \
-  --ack R007=ProgramId
+$QEDGEN check-upgrade --old old.json --new new.json \
+  --unsafe R007=ProgramId
 
 # Declare a migration / realloc was added in source
-$QEDGEN check-upgrade --baseline old.json --candidate new.json \
-  --has-migration TreasuryV2 --has-realloc UserConfig
+$QEDGEN check-upgrade --old old.json --new new.json \
+  --migrated-account TreasuryV2 --realloc-account UserConfig
 
 # Print the rule catalog and exit
 $QEDGEN check-upgrade --list-rules
@@ -759,11 +759,11 @@ $QEDGEN check-upgrade --list-rules
 
 | Flag | Type | Default | Description |
 |---|---|---|---|
-| `--baseline` | Path | required | Baseline IDL (the one on-chain today) |
-| `--candidate` | Path | required | Candidate IDL (the one the upgrade would ship) |
-| `--ack` | String | - | Acknowledge a specific finding so it reports as Additive (repeatable). Pass `--list-rules` to see the full flag catalog. |
-| `--has-migration` | String | - | Declare an account as having a migration in source; demotes R003/R004 findings for that account to Additive (repeatable) |
-| `--has-realloc` | String | - | Declare an account as having `realloc = ...` in source; demotes R005 for that account to Additive (repeatable) |
+| `--old` | Path | required (unless `--list-rules`) | Baseline IDL (the one on-chain today) |
+| `--new` | Path | required (unless `--list-rules`) | Candidate IDL (the one the upgrade would ship) |
+| `--unsafe` | String | - | Acknowledge a specific finding so it reports as Additive (repeatable). Pass `--list-rules` to see the full flag catalog. |
+| `--migrated-account` | String | - | Declare an account as having a migration in source; demotes R003/R004 findings for that account to Additive (repeatable) |
+| `--realloc-account` | String | - | Declare an account as having `realloc = ...` in source; demotes R005 for that account to Additive (repeatable) |
 | `--list-rules` | bool | false | Print the catalog of R-rules applied and exit |
 | `--json` | bool | false | Machine-readable output |
 

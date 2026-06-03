@@ -1,6 +1,6 @@
 # Design — Pre/post property lowering
 
-**Status:** draft
+**Status:** shipped in v2.23 (historical design note). Module names below predate the v2.32 MIR migration: `proptest_gen.rs` → `proptest_gen_mir.rs`, `kani.rs` → `kani_mir.rs`.
 **Date:** 2026-05-20
 **Triggered by:** `solana-payment-channels/.qed/plan/findings/001-temporal-marker-loss-in-proptest-lowering.md`
 **Related findings:** 002 (quantifier drop — same anti-pattern, different surface)

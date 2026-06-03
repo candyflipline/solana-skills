@@ -722,7 +722,6 @@ fn strip_line_comment(line: &str) -> String {
     out
 }
 
-#[allow(dead_code)]
 fn nearby_text(lines: &[&str], idx: usize, radius: usize) -> String {
     let lo = idx.saturating_sub(radius);
     let hi = (idx + radius + 1).min(lines.len());
