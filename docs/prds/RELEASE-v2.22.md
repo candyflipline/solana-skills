@@ -1,7 +1,6 @@
 # Release v2.22.0 — Bench-driven catalog + Pinocchio brownfield Crucible fuzz
 
-v2.22 is the inverse-recall response to the subscriptions-vs-Cantina
-bench that ran the day v2.21 shipped. The bench surfaced 4 firm-rated
+v2.22 is the inverse-recall response to the internal recall benchmark that ran the day v2.21 shipped. The bench surfaced 4 firm-rated
 findings the v2.21 probe catalog missed (2 firm-High, 2 firm-Medium,
 plus 2 firm-Low) and one QEDGen-only novel at HEAD that needed a new
 category to surface structurally. v2.22 closes all five gaps and lifts
@@ -79,7 +78,7 @@ placeholder is gone. The harness now emits a real
   seed-aware derivation is v2.22.x.
 - `.signers(&[&*self.x, ...])` is built from `isSigner: true` accounts.
 
-Bench result on `solana-program-escrow-2026-05` (Pinocchio audit):
+Bench result on an audited escrow program (Pinocchio audit):
 
   qedgen probe --fuzz 30 --no-smoke --root <audit-root>
   → 6,803 executions in 24s (~300 exec/s)
@@ -104,7 +103,7 @@ Codama support).
 ### Slice 1 — Arithmetic-symbol catalog (`cde36c5`, `6e9646a`, `7750999`)
 
 Three new source-scanner probe rules, runtime-agnostic. All three
-fire on the canonical PRD-cited sites on subscriptions Run A with
+fire on the canonical PRD-cited sites on the benchmark program (Run A) with
 zero false positives on the two clean audit corpora (escrow +
 rewards).
 
@@ -113,8 +112,7 @@ rewards).
 `Clock::get()?.unix_timestamp`, `slot`, `epoch`, `block_height`, or
 identifier ending in `_ts` / `_secs` / `_time`) whose result feeds a
 `>=`/`>` comparison gating a non-trivial effect. The boundary value
-(0 / MAX) silently opens a fund-flow gate. Closes CAN-H1 on the
-subscriptions bench — `transfer_validation.rs:61`.
+(0 / MAX) silently opens a fund-flow gate. Closes Audit-H1 on the benchmark program — `transfer_validation.rs:61`.
 
 **`graceful_error_as_dos`** (HIGH) — `checked_sub` / `checked_add` /
 `checked_mul` in an init / create / initialize handler where the
@@ -122,7 +120,7 @@ touched account reaches a PDA (signalled by `find_program_address`,
 `invoke_signed`, `seeds:` parameter, or `&[Seed`) and the `Err` arm
 propagates via `?` or `return Err`. The arithmetic is correct in
 isolation; the bug is the failure-mode interaction with the
-address's permanence. Closes CAN-H3 on the subscriptions bench —
+address's permanence. Closes Audit-H3 on the benchmark program —
 `helpers/program.rs:48`.
 
 **`unchecked_arith_with_fund_flow`** (LOW) — bare `<ident> *
@@ -130,8 +128,8 @@ address's permanence. Closes CAN-H3 on the subscriptions bench —
 also dispatches a token / system CPI (literal `invoke`, `Transfer`,
 `MintTo`, or helper-shape `transfer_with_delegate`, `mint_to_user`,
 etc.). Preventive: most call sites are safe today under upstream
-bounds, but the local code makes no invariant claim. Closes CAN-I3
-on the bench — `transfer_subscription.rs:61`.
+bounds, but the local code makes no invariant claim. Closes Audit-I3
+on the benchmark program — `transfer_subscription.rs:61`.
 
 Each rule emits a `Reproducer::MolluskPrompt` with a per-rule
 markdown template at `references/probes/arithmetic_symbol/<rule>.md`.
@@ -157,9 +155,9 @@ Denylist for time-source idents (`current_ts`, `current_time`, `now`,
 `current_epoch`) — those match the `_ts` suffix but are validator
 arguments, not state fields.
 
-Bench: 7 findings on subscriptions Run A. Two of them are the
-PRD-targeted shapes (`expiry_ts` covers CAN-M1/M2 — 3 distinct
-shapes; `end_ts` covers CAN-L2/L3 — 5 distinct shapes). Five
+Bench: 7 findings on the benchmark program (Run A). Two of them are the
+PRD-targeted shapes (`expiry_ts` covers Audit-M1/M2 — 3 distinct
+shapes; `end_ts` covers Audit-L2/L3 — 5 distinct shapes). Five
 additional plausible signals (`expires_at_ts`, `start_ts`,
 `token_mint`, `token_program`, `transfer_amount`) the audit
 subagent triages. Zero false positives on the clean audits.
@@ -186,21 +184,20 @@ HIGH; otherwise MEDIUM.
 - Pair grants × closes by `closed_account == target_account`; emit
   one finding per match.
 
-Bench: 2 findings on subscriptions HEAD (the QED-HEAD-MED-3
+Bench: 2 findings on the benchmark program at HEAD (the QED-HEAD-MED-3
 canonical) — `close_subscription_authority.rs:70` (self-funded
 branch) + `:78` (sponsor-funded branch), both citing the Approve2022
 + ApproveSpl grant sites in `initialize_subscription_authority.rs`.
 
-**Bonus:** 1 finding on subscriptions Run A (`close_multidelegate.rs:59`)
-— the same shape at the audited commit (pre-rename). Cantina missed
-this; the rule fires structurally. **Additional QEDGen-only novel
+**Bonus:** 1 finding on the benchmark program (Run A) (`close_multidelegate.rs:59`)
+— the same shape at the audited commit (pre-rename). an independent audit missed this; the rule fires structurally. **Additional QEDGen-only novel
 beyond the PRD-named finding.**
 
 Zero false positives on escrow / rewards.
 
 ### Slice 5 — Probe envelope noise reduction (`48024d0`, `f0e2eca`)
 
-Drops the subscriptions Pinocchio probe noise floor from 114 → 12
+Drops the benchmark program's Pinocchio probe noise floor from 114 → 12
 ungated Medium findings (PRD target ≤ 25). Two complementary changes
 behind a new `Finding.gated_by: Option<Vec<String>>` field:
 
@@ -210,7 +207,7 @@ imports and transmutes on non-account locals. Adds a `use ` line
 guard and the same LHS-shape guard the `raw_ptr_cast` branch uses
 (requires `data` / `borrow` / `account` / `input` in the surrounding
 expression). First-line impact: 82 → 30 `account_type_confusion`
-findings on subscriptions.
+findings on the benchmark program.
 
 **`gated_by` triad detector.** For every Pinocchio site that maps to
 a zero-copy / offset-overrun finding (`BytemuckCall`,
@@ -227,7 +224,7 @@ site for canonical gate signals:
 Empty gate list collapses to `None` so the JSON envelope omits the
 field for ungated findings — those are the auditor-focus subset.
 
-Final distribution on subscriptions Run A:
+Final distribution on the benchmark program (Run A):
 - 24 length_check only (instruction-data zero-copy parses)
 - 24 discriminator_check only (account-type checks)
 - 2 length_check + discriminator_check
@@ -279,31 +276,31 @@ Decision saved as a feedback memory ([[feedback_bench_stays_a_skill]])
 to avoid re-litigating next release. The CLI commit was reverted
 before push; v2.22 ships with no `qedgen bench` verb.
 
-## Bench coverage on subscriptions Run A
+## Bench coverage on the benchmark program (Run A)
 
 The empirical bench-vs-firm result that drove this release:
 
 | PRD ref | Firm finding | Status |
 |---|---|---|
-| CAN-H1 | `saturating_sub` collapsing time skew | ✅ `silent_success_arithmetic` |
-| CAN-H3 | `checked_sub` permanent DoS on PDA init | ✅ `graceful_error_as_dos` |
-| CAN-I3 | `period_hours * 3600` unchecked × fund-flow | ✅ `unchecked_arith_with_fund_flow` |
-| CAN-M1 | `expiry_ts == 0` sentinel drift (fixed delegation) | ✅ `paired_validator_input_domain_mismatch` |
-| CAN-M2 | `expiry_ts == 0` sentinel drift (recurring delegation) | ✅ (subsumed in same) |
-| CAN-L2 | `end_ts` strictness drift (create vs update plan) | ✅ (subsumed) |
-| CAN-L3 | `TIME_DRIFT_ALLOWED_SECS` tolerance asymmetry | ✅ (subsumed) |
+| Audit-H1 | `saturating_sub` collapsing time skew | ✅ `silent_success_arithmetic` |
+| Audit-H3 | `checked_sub` permanent DoS on PDA init | ✅ `graceful_error_as_dos` |
+| Audit-I3 | `period_hours * 3600` unchecked × fund-flow | ✅ `unchecked_arith_with_fund_flow` |
+| Audit-M1 | `expiry_ts == 0` sentinel drift (fixed delegation) | ✅ `paired_validator_input_domain_mismatch` |
+| Audit-M2 | `expiry_ts == 0` sentinel drift (recurring delegation) | ✅ (subsumed in same) |
+| Audit-L2 | `end_ts` strictness drift (create vs update plan) | ✅ (subsumed) |
+| Audit-L3 | `TIME_DRIFT_ALLOWED_SECS` tolerance asymmetry | ✅ (subsumed) |
 | QED-HEAD-MED-3 | `close_subscription_authority` SPL Approve dangling | ✅ `external_authority_not_revoked_on_close` |
 
 **8 named PRD-targeted shapes → 8 categorical hits.** Zero false
-positives on `solana-program-escrow-2026-05` and
-`solana-rewards-2026-05/rewards-ghsa-8hgp-gwvv-wrjf` clean smokes
+positives on an audited escrow program and
+an audited rewards program clean smokes
 across all new categories.
 
 Plus the Slice 5 noise reduction:
-- Subscriptions Run A medium findings: **114 → 12 ungated**.
+- Benchmark program (Run A) medium findings: **114 → 12 ungated**.
 
 Plus the Slice 3 Pinocchio brownfield empirical:
-- `solana-program-escrow-2026-05` harness compiles + runs Crucible
+- an audited escrow program harness compiles + runs Crucible
   for 30s, reaching 16% branch coverage on the audited tree.
 
 ## Pre-release gates
@@ -350,8 +347,7 @@ Plus the Slice 3 Pinocchio brownfield empirical:
 
 ## Footer — relationship to existing memories
 
-- [[project_subscriptions_cantina_bench]] — the design document. Every
-  catalog gap in v2.22 traces back to a finding on this bench.
+- the internal bench design notes — every catalog gap in v2.22 traces back to a finding on the benchmark program.
 - [[feedback_audit_bear_hug]] — strategic frame; v2.22 lifts recall
   numbers without changing the composition-bias positioning.
 - [[feedback_crucible_crash_first]] — Slice 3 closes the verification
