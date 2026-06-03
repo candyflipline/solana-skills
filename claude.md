@@ -1,489 +1,96 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for Claude Code when working in this repository. This file is loaded into **every** session — keep it lean. Deep material lives in `references/` and `docs/design/`; this file orients and points.
 
-## Overview
+> The lowercase `claude.md` is a byte-identical mirror — edit both together (CI gate; see [docs/RELEASING.md](docs/RELEASING.md)).
 
-QEDGen is a Claude Code skill for spec-driven verification of Solana programs. The `.qedspec` is the single source of truth — QEDGen validates it (proptest, Kani, Lean) and generates all downstream artifacts (Rust code, test harnesses, Lean proofs, CI workflows). Leanstral and Aristotle handle hard proof sub-goals when escalated.
+## What this is
 
-**Core workflow**: User describes intent → agent writes `.qedspec` → `qedgen check` validates (lint + proptest + Lean) → iterate on spec → `qedgen codegen --all` generates committed artifacts → `#[qed(verified)]` stamps verified code
+QEDGen is a Claude Code skill for spec-driven verification of Solana programs. The `.qedspec` is the single source of truth: `qedgen check` validates it (lint + proptest + Lean), `qedgen codegen` generates downstream artifacts (Rust scaffold, Kani/proptest harnesses, Lean proofs, CI), and `#[qed(verified)]` stamps verified code. Leanstral and Aristotle fill hard proof sub-goals when escalated.
 
-## Primary user interface: agent + skill
+**Core loop:** intent → write `.qedspec` → `qedgen check` → iterate → `qedgen codegen --all` → fill `todo!()` → `qedgen verify`.
 
-QEDGen's UX is **agent-first**, not CLI-first. The end user interacts with:
+The UX is **agent-first**: the user interacts with the SKILL (`SKILL.md`) and agents; the `qedgen` CLI is glue between agents and artifacts, not a user-facing tool. Full CLI reference: [`references/cli.md`](references/cli.md).
 
-1. **The SKILL** (`.claude/skills/qedgen/SKILL.md` + this file) — declarative guidance that shapes Claude's behavior when working with `.qedspec` files.
-2. **Agents** — Claude (orchestrator), Leanstral (fast sorry-filling), Aristotle (long-running proof search). The CLI (`qedgen …`) is the *interface between agents and artifacts*, not a user-facing tool in its own right.
+## How to think about this codebase
 
-**Proof-filling escalation order** (default → last resort):
+**Escalation ladders — mechanize first, escalate only after you've tried.**
 
-1. **Mechanical → codegen template** (`lean_gen_mir.rs`): trivial preservation, vacuous cases from aborting branches, scalar-arithmetic goals closable by `omega`, `forall`-over-unchanged-Map via `Function.update_of_ne`.
-2. **Non-mechanical but tractable → local LLM** (the LLM driving this session — Claude Code, Codex, or similar). Most real Lean proof bodies — case analysis, Mathlib lemma selection, sum-update rewrites, per-handler structural proofs — are well within a frontier LLM's reach and should be written directly in-context, not shelled out.
-3. **Hard → Leanstral** (`qedgen fill-sorry`): when the local LLM has tried a few passes and still can't close the goal. Fast, non-deterministic, pass@N sampling.
-4. **Last resort → Aristotle** (`qedgen aristotle submit`): agentic proof search measured in minutes to hours. Only when Leanstral has failed after multiple passes.
+- *Proofs:* (1) mechanical → codegen template (`lean_gen_mir.rs`); (2) tractable → write the Lean directly in-session (most real proof bodies: case analysis, Mathlib lemma selection, per-handler structural proofs); (3) hard → Leanstral (`qedgen fill-sorry`); (4) last resort → Aristotle (`qedgen aristotle submit`).
+- *Code/tests:* (1) mechanical → codegen template (`codegen_mir` + `codegen_shared::mechanize_effect`); (2) tractable → fill `todo!()` in-session (events, transfers, CPI wiring, complex effect RHS); (3) last resort → refine the spec (under-specification is the real bug).
 
-**CPI ensures-as-axiom theorems**: when a handler does `call Interface.handler(...)`, codegen emits a per-call-site theorem whose statement is the callee's `ensures` substituted with the call-site arguments. Tier-1/2 callees (interfaces declaring `ensures` AND an `upstream { binary_hash }` pin) discharge the goal with `exact <Iface>.<handler>.ensures_axiom_<idx> <args>`; a sibling `<Iface>.lean` module emits alongside `Spec.lean` carrying `def binary_hash` + one `axiom ensures_axiom_<idx>` per declared ensures clause. Tier-0 callees (no ensures) keep the `by sorry` shape and fire the P1 lint `cpi_no_callee_ensures` to surface the upstream contract gap. Treat axiom-discharged Tier-1/2 theorems as "verified by the imported `upstream { binary_hash }` pin, not by a Lean proof."
+**Design principles:**
+- A DSL feature that *structurally eliminates* a proof obligation beats a new proof template or a shelled-out sorry.
+- Codegen mechanizes only deterministic translation; business logic (transfers, CPI authority, events, PDA creation) stays agent-filled `todo!()`.
+- When a template can't close a case, emit `sorry` with a comment — never bury it in tactics that might spuriously close.
+- Don't pre-shell to Leanstral/Aristotle for what a local LLM can do. Escalation is for *after* you've tried, not when you expect to need to.
+- The typed MIR (`mir.rs`) exists for bug-class elimination, not LoC: every codegen matches its closed `Stmt` enum, so a missing backend is a compile error, not silent drift. Measure intrinsics by bugs eliminated, not lines saved.
 
-**First-class interfaces**: the `interface` declaration is a verification participant across all three backends. (1) Lean `render_cpi_theorems` applies the bundled axiom for Tier-1/2 callees (above). (2) Kani harnesses — both the ensures-preservation shape (`kani_mir.rs`) and the impl-targeted shape (`kani_impl.rs`) — emit `kani::assume(<callee_ensures, substituted>)` after every CPI call site whose callee declares ensures, via the shared `cpi_substitute::substitute_callee_ensures_{lean,rust_binary}` helper. (3) `qedgen verify --check-upstream` promotes pin mismatches to CRIT-severity Findings (P2 in `check --frozen` by default, `--strict` escalates, `--upstream-stale-ok` suppresses for offline dev). Bundled SPL Token + System Program + Metaplex Token Metadata stdlib resolves `import X from "spl"` / `"system"` / `"metaplex"` via `crates/qedgen/data/interfaces/` with no `qed.toml` entry needed. Multi-CPI handlers whose callee ensures touch the same caller-state field fire the `multi_cpi_same_field` P2 lint + a `// WARNING: multi-CPI ordering` breadcrumb in the generated harness.
-
-**Impl-targeted Kani harness (`--kani-impl`, opt-in)**: `kani_impl.rs` emits `programs/tests/kani_impl.rs` calling the user's REAL Anchor handler against a symbolic `Accounts` context (PDA-derived addresses bind via spec-declared seeds, account-data fields are `kani::any()`). Two trigger conditions: (a) explicit `--kani-impl`, or (b) auto-trigger when any handler has `modifies ⊋ effect.lhs` OR any `ref_impl` carries potentially-overflowing arithmetic over bounded-numeric params (`ref_impl_unbounded_arith` P2 lint). Anchor target only.
-
-**`result` binder on interface handler return types**: optional `-> <ident> : <Type>` syntax names the binder used in callee ensures (`handler absorb (amount : U64) -> burned : U64 { ensures burned <= amount }`). The substitution helper maps the declared binder to the caller's `let X = call ...` name. Bare `-> Type` (no binder) defaults to the literal `result`.
-
-**State-aware interface contracts**: callee `ensures` may reference abstract callee-state via `state.X` / `old(state.X)`; the bundled axiom is polymorphic over `{State : Type} [Inhabited State] (pre post : State) (X : State → T)`. Callers map onto concrete state with per-call-site `state_binders { callee_field = state.caller_field, ... }` — a caller that supplies no binders for an ensures' abstract fields silently drops that per-ensures theorem (the contract still holds in the callee). An optional interface-level `state { name : Type, ... }` block picks the accessor codomain (`Nat` / `Int` / `Bool` / `Pubkey`) per field, enabling Bool ensures (e.g. Metaplex `creator_verified`). Verified-callee composition (Stance 2): providers shipping `.qed/proofs/<Iface>.lean` + `lakefile.lean` get their theorems imported via `require <pkg>Proofs from "..."`; the consumer's theorem-application string is byte-identical to the bundled-axiom (Stance 1) form. Bundled proof packages live at `crates/qedgen/data/proofs/{spl,metaplex}/`, with real `binary_hash` pins (sha256 from mainnet payload dumps); System Program stays Stance 1 (Pubkey params would force a `QEDGen.Solana.Account` dep). `verify --recursive` walks the transitive proof-package closure and `lake build`s per layer; `verify --require-verified` exits non-zero on any Tier-1+ import without a bundled proof package; `check --frozen --strict` escalates proof_hash drift from P2 advisory to CRIT.
-
-**State representation — `pragma state_repr = adt`**: the State shape is an explicit opt-in. The default is the flat `structure State` + `status` discriminant (the flat path auto-fills abort/liveness/overflow obligations). `pragma state_repr = adt` selects the inductive multi-variant `State` — per-variant payload, match-based transitions / Anchor wrapper-struct + inner-enum (the ADT path punts liveness+overflow to `sorry`). One source of truth — `ParsedSpec::state_repr_is_adt()` → `Mir::adt_state` — feeds all four backends (`lean_gen_mir` reads `mir.adt_state`; `codegen_shared` + `check.rs` read `state_repr_is_adt()`). `WrongState` is the error returned on a variant-mismatch fallthrough; the P2 lint `adt_state_missing_wrong_state` fires if the pragma is set without it. Every bundled example lowers flat (sorry-free) **except `cross-program-vault`**, whose hand-written instruction logic destructures the inner-enum (`acct.inner`) — it declares the pragma and is the bundled ADT-representation showcase. Note: flat `State`/`Status` derive `Inhabited` (required by the polymorphic CPI ensures-axioms).
-
-**Code- and test-filling escalation order** (same shape as proofs):
-
-1. **Mechanical → codegen template** (`codegen_mir` + `codegen_shared::mechanize_effect`): scalar effects with simple RHS (`field := param`, `field += literal`, `field -= constant`) become real Rust; fully-mechanizable handlers ship as `Ok(())` with no `todo!()`.
-2. **Non-mechanical but tractable → local LLM**: events (payload binding from spec event schema), token transfers (CPI builder shape), complex effect RHS (match/arith), and integration-test assertions (post-state checks, lifecycle chains). Run `qedgen codegen --fill` / `--fill-tests` to get one structured prompt per remaining `todo!()` site, then edit in-session.
-3. **Last resort → spec refinement**: if the LLM can't fill the body from the prompt, the spec is under-specified. Add the missing detail (event field bindings, transfer authority chain, declared invariant) and re-run codegen. This is the Rust analog of "add a DSL feature that eliminates the proof obligation structurally".
-
-**`qedgen verify` runs the generated harnesses**: `--proptest` shells `cargo test --release`, `--kani` shells `cargo kani --tests`, `--lean` shells `lake build`. With no backend flags, `verify` auto-detects every backend whose artifact is on disk and runs them all; failures surface verbatim with summarized diagnostics so the agent can act on them. Closes the loop that `qedgen check` opens (check validates the spec; verify validates the implementation).
-
-**Design implications:**
-- A new DSL feature that *eliminates* a proof obligation structurally (e.g. sum types making vacuous cases literal) is always preferable to a new proof template or a sorry to shell out.
-- When a proof template can't handle a case, emit `sorry` with a comment documenting the obligation — don't bury it in complex tactics that might spuriously close.
-- Don't pre-shell to Leanstral/Aristotle from code that a local LLM can handle. Escalation is when you've tried; not when you expect to need to.
-- Routing between Leanstral and Aristotle is agent-decided per SKILL.md heuristics, not hardcoded in the CLI. The same applies to code/test fills: `--fill` emits prompts to stdout; the in-session agent decides when to call out (it almost never needs to).
-
-## Build and Development Commands
-
-### Build the CLI
+## Build and test
 
 ```bash
-# Build qedgen binary and copy to ./bin/qedgen
-cargo build --release && cp target/release/qedgen bin/qedgen
-
-# Build just the Lean support library
-cd lean_solana
-lake build
+cargo build --release && cp target/release/qedgen bin/qedgen   # always copy to bin/
+cargo test                                                      # Rust unit + snapshot tests
+cd lean_solana && lake build                                    # Lean support library
 ```
 
-### Run Tests
-
-```bash
-# Rust unit tests
-cargo test
-
-# Test Lean support library axioms
-cd lean_solana
-lake env lean test_lemmas.lean
-
-# Build the example escrow verification
-cd examples/rust/escrow/formal_verification
-lake build                # Verify all proofs compile
-```
-
-### QEDGen Commands
-
-```bash
-# Set up global validation workspace (first time: 15-45 min for Mathlib)
-qedgen setup
-
-# Generate proofs from a prompt file (used by Claude internally)
-qedgen generate \
-  --prompt-file /tmp/proof/prompt.txt \
-  --output-dir /tmp/proof \
-  --passes 3 \
-  --temperature 0.3 \
-  --validate
-
-# Fill sorry markers in a Lean file (Claude calls this for hard sub-goals)
-qedgen fill-sorry \
-  --file formal_verification/Spec.lean \
-  --passes 3 \
-  --validate
-
-# Validate a spec (lint, coverage, drift)
-qedgen check --spec program.qedspec                     # lint + coverage
-qedgen check --spec program.qedspec --json              # machine-readable
-qedgen check --spec program.qedspec --explain           # Markdown report
-qedgen check --spec program.qedspec --drift src/        # drift detection
-qedgen check --spec program.qedspec --drift src/ --deep # transitive drift
-
-# Generate committed artifacts from a .qedspec
-qedgen codegen --spec program.qedspec --all             # everything
-qedgen codegen --spec program.qedspec --lean            # Lean proofs only
-qedgen codegen --spec program.qedspec --kani            # Kani harnesses
-qedgen codegen --spec program.qedspec --proptest        # proptest harnesses
-
-# Agent-fill prompts for unfilled handlers
-qedgen codegen --spec program.qedspec --fill                       # all handlers
-qedgen codegen --spec program.qedspec --fill --handler initialize  # one handler
-qedgen codegen --spec program.qedspec --fill-tests                 # integration test sites
-
-# Run the generated harnesses against the implementation
-qedgen verify --spec program.qedspec                    # auto-detect: every backend on disk
-qedgen verify --spec program.qedspec --proptest         # cargo test --release proptest
-qedgen verify --spec program.qedspec --kani             # cargo kani --tests
-qedgen verify --spec program.qedspec --lean             # lake build
-qedgen verify --spec program.qedspec --json             # machine-readable for CI
-
-# Scaffold a .qedspec from an Anchor IDL
-qedgen spec --idl target/idl/program.json --output-dir ./formal_verification
-
-# Consolidate multiple proof projects into single project
-qedgen consolidate \
-  --input-dir /tmp/proofs \
-  --output-dir formal_verification
-
-# Transpile sBPF assembly to Lean 4 program module
-qedgen asm2lean \
-  --input examples/sbpf/transfer/src/transfer.s \
-  --output formal_verification/Program.lean \
-  --namespace Program
-
-# Brownfield / audit (pre-spec): enumerate audit sites or fuzz an existing program
-qedgen probe --program path/to/program                  # auto-detect runtime, list audit sites
-qedgen probe --program path/to/program --fuzz 60        # protocol-invariant crash fuzz (seconds)
-
-# Stamp #[qed(verified, ...)] onto an existing handler set (Anchor adapter)
-qedgen adapt --program path/to/program --spec program.qedspec
-
-# Generate a Tier-0 interface stub from an Anchor IDL (shape only, no ensures)
-qedgen interface --idl target/idl/callee.json --out interfaces/callee.qedspec
-
-# Upgrade-safety: is the new IDL a safe on-chain evolution of the old one?
-qedgen check-upgrade --old old.json --new new.json      # exit 0=additive, 1=breaking, 2=unsafe
-qedgen readiness --idl target/idl/program.json          # mainnet-readiness gate
-
-# Unified drift report (Rust handlers + Lean proofs vs .qedspec); report-only
-qedgen reconcile --spec program.qedspec --json
-```
-
-## Architecture
-
-### Crate Structure
-
-**`crates/qedgen-macros/`** - Proc macro crate: compile-time drift detection
-- `lib.rs` - `#[qed]` attribute macro entry point, dispatches on keyword
-- `verified.rs` - Content hash computation + `compile_error!` on drift
-
-**`crates/qedgen/`** - Main crate: CLI, parsers, code generators
-- `main.rs` - CLI entry points (init, setup, check, codegen, verify, reconcile, generate, fill-sorry, aristotle, spec, asm2lean, consolidate, probe, adapt, interface, ratify, readiness, check-upgrade, feedback)
-- `chumsky_parser.rs` - chumsky parser for `.qedspec` files (produces typed AST via `chumsky_adapter.rs`)
-- `check.rs` - Spec validation: lint, coverage matrix, drift detection
-- `lean_gen_mir.rs` - The Lean 4 codegen path. Consumes `mir::Mir` and dispatches by spec shape: single/multi-account, indexed records, multi-variant ADT (opt-in via `pragma state_repr = adt` → `mir.adt_state`; default is the flat `structure State`), and sBPF (`mir.is_assembly` → `render_sbpf`, which reads `ParsedSpec` directly for assembly proofs). Gated by `tests/mir_snapshot.rs` + the in-module `sbpf_render_matches_golden` test.
-- `lean_sidecars.rs` - Renderer-agnostic Lean sidecar writer (`write_spec_with_sidecars`): injects pinned-interface `import` lines, writes sibling `<Iface>.lean` axiom modules, and updates the consumer lakefile's `roots` / verified-callee `require` directives. Gated by `axiom_module_matches_golden`.
-- `codegen_shared.rs` - Shared Rust-codegen helper library. Holds the per-target `FrameworkSurface`, `generate_guards`, the Pinocchio scaffold emitters (`emit_pinocchio_program_lib`, `emit_pinocchio_effect_body`), the per-target SPL CPI dispatch (`try_emit_cpi` / `emit_spl_{anchor,quasar,pinocchio}`), and helpers (`map_type`, `to_pascal_case`, …) that `codegen_mir` calls. These read `ParsedSpec` directly — they're account-constraint / guard-predicate surface, not effect-body `Stmt` IR.
-- `codegen_mir.rs` - The Rust-codegen path for **all three** targets (Anchor / Quasar / Pinocchio). Each `emit_<X>` is MIR-direct; the account-constraint / guard surface (`generate_guards`, framework helpers, Pinocchio scaffold) is read from `ParsedSpec` via the shared `codegen_shared.rs` helpers. Pinocchio is fully MIR-native: `#![no_std]` lib + byte-discriminant dispatch, zeropod zero-copy state, `&AccountInfo` account structs with `.handler()` methods, checked effects, SPL Token CPIs (`call Token.transfer(...)` → `pinocchio_token::instructions::*`), System Program CPIs (`call System.transfer(...)` → `pinocchio_system::instructions::Transfer { from, to, lamports }` — the spec `amount` arg binds `lamports`), and plain-struct events. System Program `transfer` is mechanized on **both** Pinocchio (`pinocchio_system::instructions::Transfer`) and Anchor (idiomatic `anchor_lang::system_program::transfer(CpiContext::new(...), amount)`); `create_account`/`assign` deliberately stay breadcrumbs on every target because PDA creation needs `invoke_signed` + seed assembly (CPI authority **business logic** the agent fills, the same boundary that keeps `transfers {}` agent-filled — not deterministic codegen). The per-target SPL/System CPI dispatch (`try_emit_cpi` → `emit_spl_{anchor,pinocchio}` / `emit_system_{anchor,pinocchio}`) lives in `codegen_shared.rs` and keys off the called interface's `program_id` (`SPL_TOKEN_PROGRAM_ID` / `SYSTEM_PROGRAM_ID`).
-- `pinocchio_probe.rs` - Pinocchio audit site enumerator. Scans `*.rs` under `src/` for 10 site kinds (`BorrowUnchecked`, `BytemuckCall`, `RawPtrCastFromAccount`, `CustomLoadCall`, `TryIntoUnwrapOnSlice`, `SetLamportsArith`, `SetAmountArith`, `IndexedAccountAccess`, `IndexedDataSlice`, `SafetyComment`), parses adjacent `// SAFETY:` comments, emits a `PinocchioCatalogue` JSON. Maps each site to a candidate `Finding` paired with both `Reproducer::MolluskPrompt` and `Reproducer::MiriPrompt`. Routed via `qedgen probe --program <path>` (auto-detect) or `--runtime pinocchio` (explicit).
-- `miri_verify.rs` - Miri verify backend. Discovers `.qed/probes/pinocchio/*/repro_miri.rs`, shells `cargo +nightly miri test`, parses UB / aliasing / overflow / `SAFETY claim STALE` markers into structured `MiriDiagnostic`s. Dual-execution divergence detection (Miri-fail / Mollusk-pass) surfaces as `Category::ExecutionDivergence` (Critical).
-- `kani_mir.rs` - The Kani BMC harness codegen path. Consumes `mir::Mir` + the originating `ParsedSpec` (passed through to shared `rust_codegen_util::emit_*` helpers). Gated by `tests/kani_snapshot.rs`. sBPF specs never reach it — `codegen --kani` skips assembly targets (verified via Lean + client-side tests).
-- `proptest_gen_mir.rs` - The proptest harness codegen path. Public `generate(mir, parsed, …)` delegates to the private `generate_impl` (the per-handler arb_state / preservation / invariant / guard / overflow / sequence sub-emitters, which read `ParsedSpec` directly — property / requires surface, not effect-body `Stmt` IR). Gated by `tests/proptest_snapshot.rs`.
-- `mir.rs` - Typed Solana-native IR consumed by `{lean_gen_mir, kani_mir, codegen_mir, proptest_gen_mir}`. `lower(parsed) -> Mir` is the canonical entry. Cross-codegen divergence (one backend understanding a new spec feature, others silently ignoring) becomes a compile error rather than a runtime drift.
-- `unit_test.rs` - Unit test generation
-- `integration_test.rs` - in-process SVM integration test generation
-- `init.rs` - Project scaffolding (`qedgen init`, `.qed/` directory)
-- `api.rs` - Mistral API client, pass@N sampling, sorry-filling, retry logic
-- `aristotle.rs` - Aristotle (Harmonic) client for long-running proof search
-- `asm2lean.rs` - sBPF assembly → Lean 4 transpiler (parses `.s`, emits program module)
-- `deps.rs` - Point-of-use dependency checks (Lean, Kani)
-- `validate.rs` - Lake build validation in persistent workspace
-- `drift.rs` - `#[qed(verified)]` drift detection: scan Rust source, compute hashes, report/update
-- `idl2spec.rs` - Anchor IDL → `.qedspec` scaffold generation
-- `fingerprint.rs` - Spec section hashing for generated artifact staleness detection
-- `project.rs` - Lean project scaffolding generation
-- `consolidate.rs` - Merges multiple proof projects
-- `idl.rs` - Anchor IDL parsing + first-pass pattern inference (consumed by `idl2spec` and `interface_gen`)
-
-**`lean_solana/`** - Standalone Lean 4 library: Solana axioms (QEDGen.Solana)
-- `QEDGen/Solana/Account.lean` - Account structure
-- `QEDGen/Solana/Cpi.lean` - Generic CPI envelope (invoke_signed model)
-- `QEDGen/Solana/State.lean` - Lifecycle and state machines
-- `QEDGen/Solana/Valid.lean` - Numeric bounds and validity predicates
-
-### Key Design Decisions
-
-**Why Claude-driven (not pipeline-driven)?**
-- Claude reads code context and writes proofs directly — no lossy analyzer step
-- Proof patterns generalize across programs without per-property prompt templates
-- Claude iterates on `lake build` errors naturally
-- Scales to large programs without combinatorial prompt explosion
-
-**Why Leanstral model only for sorry-filling?**
-- Full module generation requires too much context (import ordering, namespace management)
-- Focused sorry-filling gives Leanstral maximum signal with minimal noise
-- Claude handles the modeling/structuring; Leanstral handles hard tactic proofs
-
-**Why pass@N sampling?**
-- The Leanstral model is non-deterministic; multiple attempts increase success rate
-- Validation selects compilable proof over heuristics (sorry count)
-
-**Why persistent validation workspace?**
-- Lake's first Mathlib build takes 15-45 minutes
-- Reusing `.lake/packages/` avoids repeated Mathlib compilation
-- Location: platform cache dir or `QEDGEN_VALIDATION_WORKSPACE`
-
-**Why axioms instead of proving SPL Token?**
-- Verification scope: program logic only (see VERIFICATION_SCOPE.md)
-- Trust boundary: SPL Token, Solana runtime, CPI mechanics
-- Pragmatic: keeps proofs tractable and completion time reasonable
-
-**Why a typed MIR between the parser and the codegens?**
-- Without it, each codegen consumes `ParsedSpec` directly and re-implements cross-cutting transforms (lifecycle gating, effect-op dispatch, abort semantics, CPI substitution) in parallel. Divergence between backends — one understands a new spec feature, the others silently ignore it — was a recurring source of bugs.
-- `mir::Mir` is a typed IR with a closed `Stmt` enum every codegen matches exhaustively. Adding a new feature means extending one IR node and four codegens' match arms; missing a backend is a compile error, not a runtime drift. The value is bug-class elimination, not LoC reduction.
-- `lean_gen_mir` / `kani_mir` / `codegen_mir` / `proptest_gen_mir` are the sole paths for their backends; the legacy `ParsedSpec`-direct generators have been deleted. `generate_guards` + the proptest sub-emitters intentionally stay `ParsedSpec`-based — they emit account-constraint / property surface, not effect-body `Stmt` IR, so the typed-`Stmt` benefit doesn't apply to them.
-- Snapshot suites (`tests/{mir,kani,codegen,proptest}_snapshot.rs`) gate every pilot fixture against checked-in references — any drift between routes fails CI immediately.
-
-## Verification Scope
-
-**What we verify:**
-- Authorization (signer checks, constraints)
-- Conservation (token totals preserved)
-- State machines (lifecycle, one-shot safety)
-- Arithmetic safety (overflow/underflow)
-- CPI correctness (program, accounts, discriminator match intent)
-
-**What we trust (axioms):**
-- SPL Token implementation
-- Solana runtime (PDA derivation, account ownership)
-- CPI mechanics
-- Anchor framework
-
-See `examples/rust/escrow/formal_verification/VERIFICATION_SCOPE.md` for details.
-
-## Common Development Tasks
-
-### Adding New Axioms
-
-When a proof pattern is reusable across programs:
-
-1. Add to the appropriate module in `lean_solana/QEDGen/Solana/`
-2. Document the trust assumption with a comment
-3. Export in `QEDGen.lean`
-4. Update SKILL.md support library API section
-5. Test: `cd lean_solana && lake build`
-
-### Debugging Failed Proofs
-
-If `lake build` fails:
-1. Read the error output directly
-2. Common issues:
-   - `split_ifs` fails → use `unfold` before `split_ifs`
-   - `omega could not prove` → unfold named predicates in BOTH hypothesis and goal: `unfold pred at h ⊢`
-   - `no goals to be solved` → remove redundant tactic (e.g., `· contradiction` after auto-closed branch)
-   - `unexpected token 'open'` → use `«open»` quoting for Lean keywords
-   - Namespace collision → check `open` statements
-   - `simp` timeout on sBPF proofs → see **sBPF simp performance** section below
-   - `omega` fails on address disjointness after stack writes → normalize hypotheses with `simp [wrapAdd, toU64, ...]` (not `simp only`) so they match the goal form. Step-level simp applies `@[simp]` lemmas (modular identity, numeric evaluation) that `simp only` misses.
-3. Fix the proof and re-run `lake build`
-
-### sBPF Proof Workflow
-
-For sBPF assembly programs, use `qedgen asm2lean` to generate the program module instead of hand-transcribing:
-
-```bash
-qedgen asm2lean --input src/program.s --output formal_verification/Program.lean
-```
-
-Then write proofs in Spec.lean that imports the generated module:
-
-```lean
-import QEDGen.Solana.SBPF
-import Program
-
-open QEDGen.Solana.SBPF
-open QEDGen.Solana.SBPF.Memory
-open Prog
-
--- wp_exec is the primary tactic for sBPF proofs.
--- First bracket: fetch function + chunk defs (for dsimp instruction decode)
--- Second bracket: effectiveAddr lemmas + extras (for simp branch resolution)
-theorem my_property ... :=
-    (executeFn progAt (initState inputAddr mem) FUEL).exitCode = some CODE := by
-  have h1 : ¬(readU64 mem inputAddr = SOME_CONST) := by rw [h_val]; exact h_ne
-  wp_exec [progAt, progAt_0, progAt_1] [ea_0, ea_88]
-```
-
-For programs with two input pointers (r1=input buffer, r2=instruction data, e.g. SIMD-0321), use `initState2`:
-
-```lean
--- entryPc allows non-zero entry points (e.g. error handlers before main logic)
-(executeFn progAt (initState2 inputAddr insnAddr mem 24) FUEL).exitCode = some CODE
-```
-
-The `wp_exec` tactic uses the monadic WP bridge (`executeFn_eq_execSegment`) to iteratively unfold execution at O(1) kernel depth per step. For complex paths needing manual guidance (e.g., memory disjointness lemmas between steps), use `wp_step` to advance one instruction at a time.
-
-### Memory Disjointness Through Stack Writes
-
-When sBPF programs write to the stack then read from the input buffer, use memory axioms to prove reads see original memory:
-
-```lean
--- Byte read through dword stack write
-rw [readU8_writeU64_outside _ _ _ _
-  (by left; unfold STACK_START at h_addr ⊢; omega)]
-```
-
-Key patterns:
-- Add a **stack-input separation hypothesis**: `h_sep : STACK_START + 0x1000 > inputAddr + 100000`
-- For **dynamic addresses** (after `add64`/`and64`), introduce bound hypotheses so omega can prove disjointness
-- Use **`simp`** (not `simp only`) to normalize hypotheses containing `wrapAdd`/`toU64` to match step-execution goal forms — `simp only` misses modular identities like `(a % m + b) % m = (a + b) % m`
-- For complex paths (20+ steps), organize into **phases**: (1) validation prefix, (2) pointer arithmetic / stack writes, (3) property-specific read-and-branch with disjointness proofs
-
-See SKILL.md "Memory disjointness through stack writes" for the full pattern.
-
-### sBPF simp Performance (Critical)
-
-The `wp_exec` tactic is sensitive to how constants are typed and named. Violations cause exponential blowup (seconds → hours).
-
-**Rule 1: Offset constants MUST be `Int`, not `Nat`.**
-`effectiveAddr` takes `(off : Int)`. With `Nat` offsets, Lean inserts a `Nat → Int` coercion that `simp` cannot efficiently process.
-```lean
--- BAD: causes simp timeout
-abbrev MY_OFFSET : Nat := 80
-
--- GOOD: matches effectiveAddr signature directly
-abbrev MY_OFFSET : Int := 80
-```
-
-**Rule 2: Named constants in `prog` MUST match hypothesis names.**
-`simp` uses syntactic matching. If `prog` has a raw numeric but the hypothesis uses a named constant, `simp` must unfold the constant at every subterm at every step.
-```lean
--- BAD: prog has 80, hypothesis has MY_OFFSET — simp must unfold at each step
-@[simp] def prog := #[ .ldx .dword .r2 .r1 80, ... ]
-theorem t ... (h : readU64 mem (effectiveAddr inputAddr MY_OFFSET) = v) ...
-
--- GOOD: both use MY_OFFSET — syntactic match, instant
-@[simp] def prog := #[ .ldx .dword .r2 .r1 MY_OFFSET, ... ]
-theorem t ... (h : readU64 mem (effectiveAddr inputAddr MY_OFFSET) = v) ...
-```
-
-**Rule 3: `@[simp]` on `prog` is required.** The tactic needs to evaluate `prog[n]?` at each step.
-
-The `qedgen asm2lean` command handles Rules 1-3 automatically: it emits `Int`-typed offsets, `Nat`-typed non-offsets, named constants in the `prog` array, and `@[simp]` on `prog`. It also auto-generates:
-- `@[simp] theorem ea_NAME` — effectiveAddr lemmas for each offset symbol
-- `@[simp] theorem bridge_NAME` — toU64 bridge lemmas for Nat lddw constants
-- `@[simp] theorem insn_N` — instruction fetch cache (`progAt N = some (...)` via `native_decide`)
-
-### Aristotle (Harmonic) — Long-Running Sorry-Filling
-
-For hard sub-goals that Leanstral cannot crack, Aristotle provides agentic proof search (minutes to hours):
-
-```bash
-# Submit a Lean project and wait for completion
-qedgen aristotle submit \
-  --project-dir formal_verification \
-  --wait
-
-# Submit without waiting (returns project ID)
-qedgen aristotle submit --project-dir formal_verification
-
-# Check status (single shot)
-qedgen aristotle status <project-id>
-
-# Poll until done, then auto-download result
-qedgen aristotle status <project-id> \
-  --wait \
-  --output-dir formal_verification
-
-# Download result manually when complete
-qedgen aristotle result <project-id> --output-dir formal_verification
-
-# List recent projects
-qedgen aristotle list
-
-# Cancel a running project
-qedgen aristotle cancel <project-id>
-```
-
-`status --wait` is the recommended way to attach to a previously submitted project. It polls every 30s (override with `--poll-interval`), prints progress updates, and auto-downloads the result on completion.
-
-**When to use which backend:**
-- **Leanstral** (`fill-sorry`): Fast (seconds), good for straightforward goals. Try first.
-- **Aristotle** (`aristotle submit`): Slow but powerful (minutes–hours). Use when Leanstral fails after multiple passes.
-
-## Environment Variables
-
-- `MISTRAL_API_KEY` - For `fill-sorry` and `generate` commands (only needed for Lean proof sorry-filling)
-- `ARISTOTLE_API_KEY` - For `aristotle` commands (only needed for hard sub-goals; get at https://aristotle.harmonic.fun)
-- `QEDGEN_VALIDATION_WORKSPACE` - Override validation workspace path (default: platform cache dir)
-
-API keys and Lean toolchain are not needed for spec writing, validation, or code generation.
-
-## Common Lean Proof Patterns
-
-### Tactic Sequencing
-```lean
--- BAD: simp eliminates if-structure
-simp [transition] at h
-split_ifs at h  -- ERROR
-
--- GOOD: unfold preserves structure
-unfold transition at h
-split_ifs at h with h_eq
-```
-
-### Conservation Proofs
-```lean
--- CRITICAL: unfold named predicate in BOTH hypothesis and goal
-unfold conservation at h_inv ⊢
-omega
-```
-
-### CPI Correctness (pure rfl)
-```lean
--- Build a generic CpiInstruction (models invoke_signed)
-def build_cpi (ctx : Context) : CpiInstruction :=
-  { programId := TOKEN_PROGRAM_ID
-  , accounts := [⟨ctx.src, false, true⟩, ⟨ctx.dst, false, true⟩, ⟨ctx.auth, true, false⟩]
-  , data := [DISC_TRANSFER] }
-
-theorem cpi_correct (ctx : Context) :
-    let cpi := build_cpi ctx
-    targetsProgram cpi TOKEN_PROGRAM_ID ∧
-    accountAt cpi 0 ctx.src false true ∧
-    accountAt cpi 1 ctx.dst false true ∧
-    accountAt cpi 2 ctx.auth true false ∧
-    hasDiscriminator cpi [DISC_TRANSFER] := by
-  unfold build_cpi targetsProgram accountAt hasDiscriminator
-  exact ⟨rfl, rfl, rfl, rfl, rfl⟩
-```
-
-## Output Artifacts
-
-After `qedgen generate`:
-```
-/tmp/proof/
-├── Best.lean              # Selected best completion
-├── metadata.json          # Rankings, timings, tokens
-├── prompt.txt             # Prompt sent to Leanstral model
-├── attempts/
-│   ├── completion_0.lean
-│   ├── completion_0_raw.txt
-│   └── ...
-└── validation/
-    └── completion_0.log   # Lake build log
-```
-
-## Notes
-
-- First Lean build is expensive (15-45 min for Mathlib). Run `qedgen setup` first.
-- If `lake build` fails with "could not resolve 'HEAD' to a commit", remove `.lake/packages/mathlib` and run `lake update`.
-- Binary: `cargo build --release` outputs to `target/release/qedgen`. Always copy to `bin/qedgen` after building: `cp target/release/qedgen bin/qedgen`.
-- The SKILL.md file defines the full proof-writing workflow that Claude follows.
-
-## Pre-release checklist
-
-Before cutting a new release or tag:
-
-1. **Bump version** in BOTH `crates/qedgen/Cargo.toml` AND `package.json` — `install.sh` derives its version from Cargo.toml; the `check-version-consistency.sh` CI gate fails the build if the two drift (v2.28.0 shipped with this exact mismatch; v2.28.1 hotfixed it). Run `bash scripts/check-version-consistency.sh` after bumping to confirm.
-1a. **Re-stamp the version-pinned generated artifacts** — codegen stamps `qedgen-macros = { …, tag = "v<version>" }` into every generated `Cargo.toml`, so a version bump drifts BOTH the codegen snapshots AND the committed bundled examples. After bumping, run (rebuild `bin/qedgen` first): `UPDATE_SNAPSHOTS=1 cargo test --test codegen_snapshot` (refresh the 6 codegen fixtures) AND `qedgen check --regen-drift --write` (re-stamp the 8 `examples/rust/*/**/Cargo.toml` pins). Skipping this fails the `Run tests` (codegen_snapshot) + `Check example codegen drift` CI steps — v2.31 hit both in sequence. Verify each diff is *only* the tag line, then `cargo test` / `qedgen check --regen-drift` should be clean.
-2. **`cargo fmt --check`** — matches the CI gate; `cargo test` does NOT run fmt, so this is an easy miss if skipped
-3. **`cargo clippy -- -D warnings`** — matches the CI gate (plain `cargo clippy` is too lenient)
-4. **`cargo test`** — all tests must pass
-5. **`bash scripts/check-readme-drift.sh`** — CI runs this; catches undocumented CLI commands
-6. **`bash scripts/check-lake-build.sh --strict`** — runs `lake build` in every `examples/*/formal_verification/` (rust + sBPF) and exits 1 on any failure. `--strict` also fails on missing `.lake/`/manifests (cold checkout); drop `--strict` for a non-release sanity check. v2.11.2 shipped two examples with broken `Spec.lean` because this gate didn't exist — earlier `qedgen check --regen-drift` and `cargo check` only verify the Rust scaffold, not Lean.
-7. **Zero `sorry`** — `grep -r '\bsorry\b' examples/**/*.lean` must return nothing. v2.26 (Slice 4a) closes the v2.8 G3 carve-out for Tier-1/2 CPI theorems: those now apply `<Iface>.<handler>.ensures_axiom_<idx>` and no longer carry `by sorry`. Only Tier-0 callees (interfaces with no declared `ensures`) keep the `by sorry` shape — the P1 lint `cpi_no_callee_ensures` surfaces them at check time. Filter via `grep -rL "ensures @ \`" examples/**/*.lean | xargs grep '\bsorry\b'` to surface only unintended sorry; Tier-0 carve-outs still match the `ensures @ \`` marker.
-8. **`qedgen check --frozen` against bundled examples** — every `examples/rust/*/qed.lock` must be current. Stale locks fail the frozen check. Run for each spec dir that has a `qed.toml`: `qedgen check --frozen --spec examples/rust/escrow-split/`.
-8a. **`old(...)` preservation harnesses (v2.23+)** — for every bundled spec whose `property` body contains `old(...)` (`grep -rl '\bold(' examples crates/qedgen/tests/fixtures --include='*.qedspec'`), regen and confirm `tests/proptest.rs` emits the binary signature (`fn <prop>(pre: &State, post: &State) -> bool`) and the per-handler harness captures `let pre = s.clone(); let mut post = s;` before the handler call. Pre-v2.23 this lowered to a structural tautology silently. Bundled coverage today: `crates/qedgen/tests/fixtures/regressions/issue-8/pool.qedspec` is the canonical pre/post test corpus; `examples/rust/percolator/percolator.qedspec`'s `old(...)` is in `ensures` and goes through the transition-fn assume path, unchanged by v2.23.
-8b. **Supply-chain gate** — `cargo audit --deny warnings` (with the ignores below) and `cargo deny check` must both exit 0. CI's `supply-chain` job runs both on every push and PR. Install once with `cargo install --locked cargo-audit cargo-deny`. New RustSec advisories on transitive deps are the actionable signal; the ignored IDs are documented in `deny.toml`'s `[advisories].ignore` array — keep the CI command, README, and `deny.toml` ignore lists in sync. Currently ignored: `RUSTSEC-2024-0436` (`paste` unmaintained), `RUSTSEC-2024-0388` (`derivative` unmaintained), `RUSTSEC-2025-0141` (`bincode` unmaintained — Anza migrating to 2.x), `RUSTSEC-2025-0161` (`libsecp256k1` unmaintained — pulled by `agave-syscalls`), `RUSTSEC-2026-0097` (`rand` unsoundness with custom logger — doesn't fire in our usage). License allowlist + registry / git-source pin live in `deny.toml`.
-9. **Doc/code drift sweep** — README, SKILL.md, CLAUDE.md, `references/`, `docs/prds/RELEASE-v<version>.md`, and module `//!` docstrings all have to match shipped reality. The `check-readme-drift.sh` script only covers top-level command coverage in README; everything else needs an explicit pass. Concretely:
-   - Every `Subcommand` arm in `crates/qedgen/src/main.rs` has a section in `references/cli.md`, with every flag in its `#[arg]` set documented.
-   - No `references/`, README, SKILL.md, or `docs/prds/RELEASE-v<version>.md` page references symbols / files / flags that no longer exist (`grep` for the names of just-removed modules, types, fns, CLI flags).
-   - No mention in user-facing docs of features the release doesn't ship (the RELEASE notes are the worst offender — bring the "What's in" list in line with the actual shipped commits).
-   - `feedback_no_anchor_v2_mentions.md` policy: don't name external codebases as the **source of audit findings** (anchor-v2, named protocols like Marinade/Squads/Drift/Raydium/Jito) in SKILL.md, references/, RELEASE-v<version>.md, or `clap` help text — present findings as qedgen's own taxonomy. This does NOT cover frameworks we **actively integrate** as codegen / audit targets: Anchor, Quasar, and Pinocchio are first-class `--target` / `--runtime` values, so naming them (incl. `quasar_lang` / "Blueshift Quasar" in target help text) is correct and necessary. Internal-only (test fixtures, private comments) is fine.
-   - `CLAUDE.md` and the lowercase `claude.md` mirror are byte-identical.
-   - Module-level `//!` docstrings on files you touched in the release reflect current behavior — not the behavior pre-fix.
+Snapshot suites (`tests/{mir,kani,codegen,proptest}_snapshot.rs`) gate every fixture against checked-in references. Regenerate with `UPDATE_SNAPSHOTS=1 cargo test --test <suite>` — but `rm bin/qedgen` and rebuild first (snapshots run the built binary and won't auto-rebuild a stale one). Full command + flag reference: [`references/cli.md`](references/cli.md).
+
+## Crate map
+
+**`crates/qedgen-macros/`** — `#[qed]` proc macro: compile-time drift detection (`lib.rs` entry, `verified.rs` content-hash + `compile_error!`).
+
+**`crates/qedgen/src/`** — CLI, parsers, codegens:
+- `main.rs` — CLI entry points (init, setup, check, codegen, verify, reconcile, generate, fill-sorry, aristotle, spec, asm2lean, consolidate, probe, adapt, interface, readiness, check-upgrade, …)
+- `chumsky_parser.rs` / `chumsky_adapter.rs` — `.qedspec` → typed AST
+- `mir.rs` — typed Solana-native IR; `lower(parsed) -> Mir` is the canonical entry, consumed by all four codegens
+- `lean_gen_mir.rs` — Lean 4 codegen (flat `structure State` default; `mir.adt_state` for inductive; `mir.is_assembly` → sBPF `render_sbpf`)
+- `kani_mir.rs` / `proptest_gen_mir.rs` — Kani BMC + proptest harness codegens
+- `codegen_mir.rs` — Rust codegen for all three targets (Anchor / Quasar / Pinocchio)
+- `codegen_shared.rs` — shared Rust-codegen helpers: `FrameworkSurface`, `generate_guards`, Pinocchio scaffold, per-target SPL/System CPI dispatch (`try_emit_cpi`)
+- `lean_sidecars.rs` — pinned-interface `import` lines + sibling `<Iface>.lean` axiom modules
+- `check.rs` — lint, coverage matrix, drift detection
+- `pinocchio_probe.rs` / `miri_verify.rs` — Pinocchio audit-site enumerator + Miri verify backend
+- `asm2lean.rs` — sBPF `.s` → Lean program module
+- supporting: `api.rs` (Mistral), `aristotle.rs`, `drift.rs`, `idl.rs` / `idl2spec.rs`, `fingerprint.rs`, `validate.rs`, `deps.rs`, `project.rs`, `consolidate.rs`, `unit_test.rs`, `integration_test.rs`
+
+**`lean_solana/`** — Solana axiom library (`QEDGen.Solana.{Account,Cpi,State,Valid,SBPF}`).
+
+Codegen/MIR architecture rationale (cross-cutting transforms, CPI composition, divergence) lives in [`docs/design/`](docs/design/).
+
+## Key concepts
+
+First-class verification features — one-line orientation; full mechanics in [`references/qedspec-dsl.md`](references/qedspec-dsl.md):
+
+- **CPI ensures-as-axiom** — `call Iface.handler(...)` emits a per-call-site theorem. Tier-1/2 callees (declare `ensures` + `upstream { binary_hash }` pin) discharge via `exact Iface.handler.ensures_axiom_<i>`; Tier-0 (no ensures) keep `by sorry` + fire the `cpi_no_callee_ensures` lint. (`lean_gen_mir::render_cpi_theorems`, `cpi_substitute`)
+- **First-class interfaces** — `interface` participates across Lean / Kani / verify. Bundled SPL + System + Metaplex stdlib in `crates/qedgen/data/interfaces/`; `verify --check-upstream` promotes pin mismatches to CRIT.
+- **State-aware contracts** — callee `ensures` over abstract `state.X`; callers map via per-call-site `state_binders {}`; verified-callee composition imports `.qed/proofs/<Iface>.lean`.
+- **`pragma state_repr = adt`** — explicit opt-in to inductive multi-variant `State` (default is flat `structure State` + `status`). Single source: `ParsedSpec::state_repr_is_adt()` → `Mir::adt_state`. `cross-program-vault` is the sole bundled ADT example.
+- **Impl-targeted Kani (`--kani-impl`)** — `kani_impl.rs` exercises the real Anchor handler against a symbolic `Accounts` context; auto-triggers on `modifies ⊋ effect.lhs` or unbounded `ref_impl` arithmetic. Anchor only.
+
+## Verification scope
+
+- **Verify:** authorization (signers/constraints), conservation (token totals), state machines (lifecycle/one-shot), arithmetic safety (overflow/underflow), CPI correctness (program/accounts/discriminator).
+- **Trust (axioms):** SPL Token, Solana runtime (PDA derivation, ownership), CPI mechanics, Anchor framework.
+
+See `examples/rust/escrow/formal_verification/VERIFICATION_SCOPE.md`.
+
+## References
+
+- [`references/cli.md`](references/cli.md) — every CLI command + flag
+- [`references/qedspec-dsl.md`](references/qedspec-dsl.md) — full `.qedspec` DSL
+- [`references/proof-patterns.md`](references/proof-patterns.md) — Lean tactic rules + common errors/fixes
+- [`references/sbpf.md`](references/sbpf.md) — sBPF workflow, `wp_exec`/`wp_step`, memory disjointness, simp-performance rules
+- [`references/support-library.md`](references/support-library.md) — `QEDGen.Solana` API
+- [`docs/design/`](docs/design/) — codegen / MIR architecture
+- [`docs/RELEASING.md`](docs/RELEASING.md) — **pre-release checklist (run before any tag)**
+- `SKILL.md` — the user-facing proof/verification workflow
+- `.claude/rules/lean-proofs.md` — Lean gotchas, auto-loaded when editing `.lean` files
+
+## Environment
+
+- `MISTRAL_API_KEY` — `fill-sorry` / `generate` (Lean sorry-filling only)
+- `ARISTOTLE_API_KEY` — `aristotle` commands (hard sub-goals; https://aristotle.harmonic.fun)
+- `QEDGEN_VALIDATION_WORKSPACE` — override validation workspace (default: platform cache dir)
+
+Spec writing, validation, and codegen need no API keys or Lean toolchain. First Lean build is expensive (15–45 min for Mathlib) — run `qedgen setup` first. If `lake build` reports "could not resolve 'HEAD' to a commit", remove `.lake/packages/mathlib` and run `lake update`.

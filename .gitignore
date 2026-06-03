@@ -90,6 +90,8 @@ LEARNINGS_*.md
 
 # Local agent/editor state
 .agents/
-.claude/
+.claude/*
+# ...but track shared path-scoped rules
+!.claude/rules/
 \n# Generated proof artifacts\nlean_project/\nqedgen_*/
 tests/kani.rs
