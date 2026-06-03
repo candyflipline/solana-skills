@@ -16,14 +16,14 @@ inside a function whose body also contains a token / system CPI
 ## Why it matters
 
 The arithmetic is locally safe today under the program's current
-bounds (subscriptions' `period_hours` is capped at
+bounds (e.g. a subscription program where `period_hours` is capped at
 `MAX_PLAN_PERIOD_HOURS = 8760` upstream), but the local code makes
 no explicit invariant claim. If the upstream bound ever loosens, the
 operator wraps and the fund-flow effect proceeds on a corrupted
 value. This is the canonical "fuse hidden three call frames away"
 failure mode.
 
-Canonical from subscriptions Run A (CAN-I3 info-severity miss):
+Canonical example (a real-world subscription program):
 
 ```rust
 // transfer_subscription.rs:61

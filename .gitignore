@@ -86,7 +86,7 @@ LEARNINGS_*.md
 # state, not repo content. (`*.log` above already covers .log; the JSON
 # and the feedback directory need explicit entries.)
 .qed/feedback/
-.qed/last-error.json
+**/.qed/last-error.json
 
 # Local agent/editor state
 .agents/

@@ -23,7 +23,7 @@ threshold yet" — but the boundary value 0 is *also* "exactly at the
 threshold." A `>=` comparison can't tell them apart, so a downstream
 gate fires when it shouldn't.
 
-Canonical from subscriptions Run A (CAN-H1 firm-High miss):
+Canonical example (a real-world subscription program):
 
 ```rust
 // transfer_validation.rs:61
