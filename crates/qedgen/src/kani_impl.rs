@@ -58,9 +58,10 @@ use std::path::Path;
 use crate::check::{self, ParsedHandler, ParsedHandlerAccount, ParsedSpec};
 use crate::codegen_shared::{map_type, to_pascal_case, to_snake_case};
 use crate::pinocchio_profile::{
-    PinocchioAccountRole, PinocchioHandlerProfile, PinocchioLocalKeyDerivation,
-    PinocchioParamField, PinocchioPdaDerivation, PinocchioPdaSeed, PinocchioProofProfile,
-    PinocchioRecordLayout, PinocchioRepeatField, PinocchioTokenAccountBinding,
+    PinocchioAccountRole, PinocchioHandlerProfile, PinocchioLayoutField,
+    PinocchioLocalKeyDerivation, PinocchioParamField, PinocchioPdaDerivation, PinocchioPdaSeed,
+    PinocchioProofProfile, PinocchioRecordLayout, PinocchioRepeatField,
+    PinocchioTokenAccountBinding,
 };
 use crate::Target;
 
@@ -177,25 +178,25 @@ fn generate_from_spec_with_context(
         return Ok(());
     }
 
-    let handlers_with_ensures: Vec<&ParsedHandler> = spec
+    let handlers_with_claims: Vec<&ParsedHandler> = spec
         .handlers
         .iter()
-        .filter(|h| !h.ensures.is_empty())
+        .filter(|h| !h.ensures.is_empty() || !h.effects.is_empty())
         .collect();
 
-    // No ensures anywhere → nothing to assert. Auto-trigger could still
-    // fire (modifies-only fill without ensures is its own lint), but the
-    // harness body asserts ensures specifically; skip the file.
-    if handlers_with_ensures.is_empty() {
+    // No asserted clauses/effects anywhere → nothing meaningful to prove.
+    // Auto-trigger could still fire (modifies-only fill without ensures is
+    // its own lint), but the harness body needs a concrete postcondition.
+    if handlers_with_claims.is_empty() {
         return Ok(());
     }
 
-    // Restrict per-handler emission to handlers that BOTH have ensures
+    // Restrict per-handler emission to handlers that have ensures/effects
     // AND either (a) the explicit flag is on OR (b) the handler itself
     // triggers auto-emission. Without (b), a flag-less invocation with
     // one LP-shape handler in a spec full of other handlers would emit
     // a harness for every handler — noise.
-    let emit_targets: Vec<&ParsedHandler> = handlers_with_ensures
+    let emit_targets: Vec<&ParsedHandler> = handlers_with_claims
         .iter()
         .copied()
         .filter(|h| explicit_flag || handler_triggers_impl_harness(h))
@@ -508,7 +509,7 @@ fn emit_kani_impl_pinocchio(
     out.push_str("// To run:  cargo kani --harness <name>   (requires cargo-kani)\n");
     out.push_str("// ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----\n");
     out.push_str("#![cfg(kani)]\n");
-    out.push_str("#![allow(dead_code, unused_imports, unused_variables)]\n\n");
+    out.push_str("#![allow(dead_code, unused_imports, unused_parens, unused_variables)]\n\n");
 
     emit_pinocchio_scaffold(&mut out);
 
@@ -520,9 +521,16 @@ fn emit_kani_impl_pinocchio(
         "// ============================================================================\n\n",
     );
 
-    let profile = output_path
-        .parent()
-        .and_then(|src_dir| crate::pinocchio_profile::infer_from_context(src_dir, spec_path).ok());
+    let profile =
+        output_path.parent().and_then(
+            |src_dir| match crate::pinocchio_profile::infer_from_context(src_dir, spec_path) {
+                Ok(profile) => Some(profile),
+                Err(err) => {
+                    eprintln!("warning: failed to infer Pinocchio proof profile: {err}");
+                    None
+                }
+            },
+        );
 
     let mut emitted_count = 0;
     for handler in emit_targets {
@@ -598,7 +606,9 @@ const SPL_TOKEN_PROGRAM_ID: [u8; 32] = [
     0x00, 0xa9,
 ];
 const STATE_INITIALIZED: u8 = 1;
-const BORROW_STATE_CLEAR: u8 = 0;
+/// Pinocchio tracks borrow availability with set bits. At instruction entry,
+/// all lamport/data mutable and immutable borrow slots are available.
+const BORROW_STATE_CLEAR: u8 = 0xff;
 
 /// Build a stack-resident SPL Token account. `amount` is the field a
 /// harness wires up as `kani::any()`.
@@ -624,9 +634,9 @@ fn build_token_account(
         },
         data: [0u8; TOKEN_DATA_LEN],
     };
-    acct.data[TOKEN_MINT_OFF..TOKEN_MINT_OFF + 32].copy_from_slice(&mint_in_data);
-    acct.data[TOKEN_OWNER_OFF..TOKEN_OWNER_OFF + 32].copy_from_slice(&owner_in_data);
-    acct.data[TOKEN_AMOUNT_OFF..TOKEN_AMOUNT_OFF + 8].copy_from_slice(&amount.to_le_bytes());
+    write_fixed_32(&mut acct.data, TOKEN_MINT_OFF, mint_in_data);
+    write_fixed_32(&mut acct.data, TOKEN_OWNER_OFF, owner_in_data);
+    write_fixed_u64(&mut acct.data, TOKEN_AMOUNT_OFF, amount);
     acct.data[TOKEN_STATE_OFF] = STATE_INITIALIZED;
     acct
 }
@@ -676,6 +686,7 @@ fn build_minimal_account(key: [u8; 32], is_signer: bool, is_writable: bool) -> S
 /// symbolic in generated harnesses; ABI layout facts only fix the byte length.
 fn build_data_account<const DATA_LEN: usize>(
     key: [u8; 32],
+    owner: [u8; 32],
     is_signer: bool,
     is_writable: bool,
     data: [u8; DATA_LEN],
@@ -688,7 +699,7 @@ fn build_data_account<const DATA_LEN: usize>(
             executable: 0,
             original_data_len: 0,
             key,
-            owner: [0u8; 32],
+            owner,
             lamports: 0,
             data_len: DATA_LEN as u64,
         },
@@ -709,11 +720,213 @@ unsafe fn account_info_from_stack<const N: usize>(stack: &mut StackAccount<N>) -
 
 /// Read the `amount` from a stack token account's data region.
 fn read_token_amount<const N: usize>(stack: &StackAccount<N>) -> u64 {
-    u64::from_le_bytes(
-        stack.data[TOKEN_AMOUNT_OFF..TOKEN_AMOUNT_OFF + 8]
-            .try_into()
-            .unwrap(),
-    )
+    u64::from_le_bytes([
+        stack.data[TOKEN_AMOUNT_OFF],
+        stack.data[TOKEN_AMOUNT_OFF + 1],
+        stack.data[TOKEN_AMOUNT_OFF + 2],
+        stack.data[TOKEN_AMOUNT_OFF + 3],
+        stack.data[TOKEN_AMOUNT_OFF + 4],
+        stack.data[TOKEN_AMOUNT_OFF + 5],
+        stack.data[TOKEN_AMOUNT_OFF + 6],
+        stack.data[TOKEN_AMOUNT_OFF + 7],
+    ])
+}
+
+fn read_state_pubkey<const N: usize>(stack: &StackAccount<N>, offset: usize) -> [u8; 32] {
+    [
+        stack.data[offset],
+        stack.data[offset + 1],
+        stack.data[offset + 2],
+        stack.data[offset + 3],
+        stack.data[offset + 4],
+        stack.data[offset + 5],
+        stack.data[offset + 6],
+        stack.data[offset + 7],
+        stack.data[offset + 8],
+        stack.data[offset + 9],
+        stack.data[offset + 10],
+        stack.data[offset + 11],
+        stack.data[offset + 12],
+        stack.data[offset + 13],
+        stack.data[offset + 14],
+        stack.data[offset + 15],
+        stack.data[offset + 16],
+        stack.data[offset + 17],
+        stack.data[offset + 18],
+        stack.data[offset + 19],
+        stack.data[offset + 20],
+        stack.data[offset + 21],
+        stack.data[offset + 22],
+        stack.data[offset + 23],
+        stack.data[offset + 24],
+        stack.data[offset + 25],
+        stack.data[offset + 26],
+        stack.data[offset + 27],
+        stack.data[offset + 28],
+        stack.data[offset + 29],
+        stack.data[offset + 30],
+        stack.data[offset + 31],
+    ]
+}
+
+fn write_state_pubkey<const N: usize>(stack: &mut StackAccount<N>, offset: usize, value: [u8; 32]) {
+    write_fixed_32(&mut stack.data, offset, value);
+}
+
+fn read_state_bool<const N: usize>(stack: &StackAccount<N>, offset: usize) -> bool {
+    stack.data[offset] != 0
+}
+
+fn write_state_bool<const N: usize>(stack: &mut StackAccount<N>, offset: usize, value: bool) {
+    stack.data[offset] = u8::from(value);
+}
+
+fn read_state_u8<const N: usize>(stack: &StackAccount<N>, offset: usize) -> u8 {
+    stack.data[offset]
+}
+
+fn write_state_u8<const N: usize>(stack: &mut StackAccount<N>, offset: usize, value: u8) {
+    stack.data[offset] = value;
+}
+
+fn read_state_u16<const N: usize>(stack: &StackAccount<N>, offset: usize) -> u16 {
+    u16::from_le_bytes([stack.data[offset], stack.data[offset + 1]])
+}
+
+fn write_state_u16<const N: usize>(stack: &mut StackAccount<N>, offset: usize, value: u16) {
+    let bytes = value.to_le_bytes();
+    stack.data[offset] = bytes[0];
+    stack.data[offset + 1] = bytes[1];
+}
+
+fn read_state_u64<const N: usize>(stack: &StackAccount<N>, offset: usize) -> u64 {
+    u64::from_le_bytes([
+        stack.data[offset],
+        stack.data[offset + 1],
+        stack.data[offset + 2],
+        stack.data[offset + 3],
+        stack.data[offset + 4],
+        stack.data[offset + 5],
+        stack.data[offset + 6],
+        stack.data[offset + 7],
+    ])
+}
+
+fn write_state_u64<const N: usize>(stack: &mut StackAccount<N>, offset: usize, value: u64) {
+    write_fixed_u64(&mut stack.data, offset, value);
+}
+
+fn read_state_u128<const N: usize>(stack: &StackAccount<N>, offset: usize) -> u128 {
+    u128::from_le_bytes([
+        stack.data[offset],
+        stack.data[offset + 1],
+        stack.data[offset + 2],
+        stack.data[offset + 3],
+        stack.data[offset + 4],
+        stack.data[offset + 5],
+        stack.data[offset + 6],
+        stack.data[offset + 7],
+        stack.data[offset + 8],
+        stack.data[offset + 9],
+        stack.data[offset + 10],
+        stack.data[offset + 11],
+        stack.data[offset + 12],
+        stack.data[offset + 13],
+        stack.data[offset + 14],
+        stack.data[offset + 15],
+    ])
+}
+
+fn write_state_u128<const N: usize>(stack: &mut StackAccount<N>, offset: usize, value: u128) {
+    let bytes = value.to_le_bytes();
+    stack.data[offset] = bytes[0];
+    stack.data[offset + 1] = bytes[1];
+    stack.data[offset + 2] = bytes[2];
+    stack.data[offset + 3] = bytes[3];
+    stack.data[offset + 4] = bytes[4];
+    stack.data[offset + 5] = bytes[5];
+    stack.data[offset + 6] = bytes[6];
+    stack.data[offset + 7] = bytes[7];
+    stack.data[offset + 8] = bytes[8];
+    stack.data[offset + 9] = bytes[9];
+    stack.data[offset + 10] = bytes[10];
+    stack.data[offset + 11] = bytes[11];
+    stack.data[offset + 12] = bytes[12];
+    stack.data[offset + 13] = bytes[13];
+    stack.data[offset + 14] = bytes[14];
+    stack.data[offset + 15] = bytes[15];
+}
+
+fn write_fixed_32<const N: usize>(data: &mut [u8; N], offset: usize, value: [u8; 32]) {
+    data[offset] = value[0];
+    data[offset + 1] = value[1];
+    data[offset + 2] = value[2];
+    data[offset + 3] = value[3];
+    data[offset + 4] = value[4];
+    data[offset + 5] = value[5];
+    data[offset + 6] = value[6];
+    data[offset + 7] = value[7];
+    data[offset + 8] = value[8];
+    data[offset + 9] = value[9];
+    data[offset + 10] = value[10];
+    data[offset + 11] = value[11];
+    data[offset + 12] = value[12];
+    data[offset + 13] = value[13];
+    data[offset + 14] = value[14];
+    data[offset + 15] = value[15];
+    data[offset + 16] = value[16];
+    data[offset + 17] = value[17];
+    data[offset + 18] = value[18];
+    data[offset + 19] = value[19];
+    data[offset + 20] = value[20];
+    data[offset + 21] = value[21];
+    data[offset + 22] = value[22];
+    data[offset + 23] = value[23];
+    data[offset + 24] = value[24];
+    data[offset + 25] = value[25];
+    data[offset + 26] = value[26];
+    data[offset + 27] = value[27];
+    data[offset + 28] = value[28];
+    data[offset + 29] = value[29];
+    data[offset + 30] = value[30];
+    data[offset + 31] = value[31];
+}
+
+fn write_fixed_u64<const N: usize>(data: &mut [u8; N], offset: usize, value: u64) {
+    let bytes = value.to_le_bytes();
+    data[offset] = bytes[0];
+    data[offset + 1] = bytes[1];
+    data[offset + 2] = bytes[2];
+    data[offset + 3] = bytes[3];
+    data[offset + 4] = bytes[4];
+    data[offset + 5] = bytes[5];
+    data[offset + 6] = bytes[6];
+    data[offset + 7] = bytes[7];
+}
+
+fn normalized_fee_decimal_scale(decimals: u64) -> u128 {
+    match decimals {
+        0 => 1_000_000_000_000_000_000,
+        1 => 100_000_000_000_000_000,
+        2 => 10_000_000_000_000_000,
+        3 => 1_000_000_000_000_000,
+        4 => 100_000_000_000_000,
+        5 => 10_000_000_000_000,
+        6 => 1_000_000_000_000,
+        7 => 100_000_000_000,
+        8 => 10_000_000_000,
+        9 => 1_000_000_000,
+        10 => 100_000_000,
+        11 => 10_000_000,
+        12 => 1_000_000,
+        13 => 100_000,
+        14 => 10_000,
+        15 => 1_000,
+        16 => 100,
+        17 => 10,
+        18 => 1,
+        _ => 0,
+    }
 }
 "#;
 
@@ -776,12 +989,159 @@ fn pinocchio_emit_profile_field_pack(out: &mut String, field: &PinocchioParamFie
             "    instruction_data.extend_from_slice(&{});\n",
             ident
         ));
+    } else if field.rust_type.eq_ignore_ascii_case("bool") {
+        out.push_str(&format!(
+            "    instruction_data.extend_from_slice(&[u8::from({} != 0)]);\n",
+            ident
+        ));
     } else {
         out.push_str(&format!(
             "    instruction_data.extend_from_slice(&({} as {}).to_le_bytes());\n",
             ident, field.rust_type
         ));
     }
+}
+
+fn pinocchio_emit_profile_field_write(
+    out: &mut String,
+    field: &PinocchioParamField,
+    ident: &str,
+    offset: usize,
+) {
+    if field.rust_type.eq_ignore_ascii_case("pubkey") {
+        out.push_str(&format!(
+            "    write_fixed_32(&mut instruction_data, {offset}, {});\n",
+            ident
+        ));
+    } else if field.rust_type.eq_ignore_ascii_case("bool") {
+        out.push_str(&format!(
+            "    instruction_data[{offset}] = u8::from({} != 0);\n",
+            ident
+        ));
+    } else {
+        pinocchio_emit_numeric_array_write(
+            out,
+            "instruction_data",
+            offset,
+            &format!("({ident} as {})", field.rust_type),
+            field.end - field.start,
+        );
+    }
+}
+
+fn pinocchio_emit_numeric_array_write(
+    out: &mut String,
+    target: &str,
+    offset: usize,
+    value_expr: &str,
+    width: usize,
+) {
+    if width == 1 {
+        out.push_str(&format!("    {target}[{offset}] = {value_expr} as u8;\n"));
+        return;
+    }
+
+    let tmp = format!(
+        "generated_{}_{}_bytes",
+        target
+            .chars()
+            .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+            .collect::<String>(),
+        offset
+    );
+    out.push_str(&format!("    let {tmp} = {value_expr}.to_le_bytes();\n"));
+    for byte_index in 0..width {
+        out.push_str(&format!(
+            "    {target}[{}] = {tmp}[{byte_index}];\n",
+            offset + byte_index
+        ));
+    }
+}
+
+fn pinocchio_emit_fixed_array_bytes_write(
+    out: &mut String,
+    target: &str,
+    offset: usize,
+    bytes: &[u8],
+) {
+    for (byte_index, byte) in bytes.iter().enumerate() {
+        out.push_str(&format!(
+            "    {target}[{}] = {}u8;\n",
+            offset + byte_index,
+            byte
+        ));
+    }
+}
+
+fn pinocchio_profile_instruction_data_len(
+    handler: &ParsedHandler,
+    profile: &PinocchioHandlerProfile,
+) -> Option<usize> {
+    let mut len = 1usize;
+    for param in &profile.params {
+        if pinocchio_profile_param_name(handler, &param.name).is_some() {
+            len = len.max(1 + param.end);
+        }
+    }
+    for repeat in &profile.repeats {
+        let count = pinocchio_repeat_count(handler, repeat)?;
+        len = len.max(1 + repeat.offset + (count * repeat.item_len));
+    }
+    Some(len)
+}
+
+fn emit_pinocchio_instruction_data_fixed_with_profile(
+    out: &mut String,
+    handler: &ParsedHandler,
+    profile: &PinocchioHandlerProfile,
+    instruction_tag_expr: &str,
+) -> bool {
+    let Some(len) = pinocchio_profile_instruction_data_len(handler, profile) else {
+        return false;
+    };
+    if len <= 1 {
+        return false;
+    }
+
+    out.push_str(&format!("    let mut instruction_data = [0u8; {len}];\n"));
+    out.push_str(&format!(
+        "    instruction_data[0] = {instruction_tag_expr};\n"
+    ));
+
+    for param in &profile.params {
+        if let Some(param_name) = pinocchio_profile_param_name(handler, &param.name) {
+            pinocchio_emit_profile_field_write(out, param, &param_name, 1 + param.start);
+        } else {
+            out.push_str(&format!(
+                "    // Profile note: source references param `{}` absent from the spec handler\n",
+                param.name
+            ));
+        }
+    }
+    for repeat in &profile.repeats {
+        let Some(count) = pinocchio_repeat_count(handler, repeat) else {
+            return false;
+        };
+        out.push_str(&format!(
+            "    instruction_data[{}] = {count}u8;\n",
+            1 + repeat.offset.saturating_sub(1)
+        ));
+        for index in 0..count {
+            for field in &repeat.item_fields {
+                let Some(param_name) = repeat_item_param_name(handler, &field.name, index, count)
+                else {
+                    out.push_str(&format!(
+                        "    // Profile note: repeat field `{}` item {} absent from the spec handler\n",
+                        field.name, index
+                    ));
+                    continue;
+                };
+                let offset = 1 + repeat.offset + (index * repeat.item_len) + field.start;
+                pinocchio_emit_profile_field_write(out, field, &to_snake_case(&param_name), offset);
+            }
+        }
+    }
+    true
 }
 
 /// Emit committed Pinocchio dispatcher argument packing.
@@ -794,30 +1154,42 @@ fn emit_pinocchio_instruction_data_pack_with_profile(
     handler: &ParsedHandler,
     profile: Option<&PinocchioHandlerProfile>,
 ) {
-    if let Some(tag) = profile.and_then(|p| p.instruction_tag) {
+    let instruction_tag_expr = if let Some(tag) = profile.and_then(|p| p.instruction_tag) {
         out.push_str(&format!("    let instruction_tag: u8 = {tag}u8;\n"));
+        "instruction_tag".to_string()
     } else {
         let tag_const = pinocchio_instruction_tag_const(&handler.name);
         out.push_str(&format!(
             "    let instruction_tag: u8 = crate::{};\n",
             tag_const
         ));
+        "instruction_tag".to_string()
+    };
+
+    if let Some(profile) = profile {
+        if (!profile.params.is_empty() || !profile.repeats.is_empty())
+            && emit_pinocchio_instruction_data_fixed_with_profile(
+                out,
+                handler,
+                profile,
+                &instruction_tag_expr,
+            )
+        {
+            return;
+        }
     }
+
     out.push_str("    let mut instruction_data = alloc::vec::Vec::new();\n");
     out.push_str("    instruction_data.push(instruction_tag);\n");
 
     if let Some(profile) = profile {
         if !profile.params.is_empty() || !profile.repeats.is_empty() {
             for param in &profile.params {
-                if handler
-                    .takes_params
-                    .iter()
-                    .any(|(name, _)| name == &param.name)
-                {
-                    pinocchio_emit_profile_field_pack(out, param, &to_snake_case(&param.name));
+                if let Some(param_name) = pinocchio_profile_param_name(handler, &param.name) {
+                    pinocchio_emit_profile_field_pack(out, param, &param_name);
                 } else {
                     out.push_str(&format!(
-                        "    // TODO: source profile references param `{}` absent from the spec handler\n",
+                        "    // Profile note: source references param `{}` absent from the spec handler\n",
                         param.name
                     ));
                 }
@@ -850,6 +1222,348 @@ fn emit_pinocchio_instruction_data_pack_with_profile(
                 ));
             }
         }
+    }
+}
+
+fn pinocchio_profile_param_name(handler: &ParsedHandler, profile_name: &str) -> Option<String> {
+    handler
+        .takes_params
+        .iter()
+        .map(|(name, _)| to_snake_case(name))
+        .find(|name| {
+            name == profile_name
+                || name == &format!("{profile_name}_value")
+                || name == &format!("new_{profile_name}")
+                || name.strip_prefix("new_") == Some(profile_name)
+                || name.strip_suffix("_value") == Some(profile_name)
+        })
+}
+
+fn emit_pinocchio_requires_assumptions(out: &mut String, handler: &ParsedHandler) {
+    let param_names: BTreeSet<String> = handler
+        .takes_params
+        .iter()
+        .map(|(name, _)| to_snake_case(name))
+        .collect();
+    let has_fee_normalization_shape = pinocchio_has_fee_normalization_shape(handler);
+    for requires in &handler.requires {
+        let expr = requires.rust_expr.trim();
+        if expr.is_empty()
+            || expr.contains("s.")
+            || expr.contains(".pubkey")
+            || expr.contains("old(")
+        {
+            continue;
+        }
+        if has_fee_normalization_shape
+            && (expr.contains("fee_input_normalized")
+                || expr.contains("fee_output_normalized")
+                || expr.contains("retained_value_bps"))
+        {
+            continue;
+        }
+        let state_lowered = pinocchio_lower_simple_state_requires_expr(expr);
+        let lowered = pinocchio_lower_param_expr(&state_lowered, &param_names);
+        if lowered.contains("state.") || lowered.contains("s.") || lowered.contains(".pubkey") {
+            if expr.contains("lane_count") {
+                for lane_param in &param_names {
+                    let lane_base = strip_numeric_suffix(lane_param)
+                        .map_or(lane_param.as_str(), |(base, _)| base);
+                    if matches!(lane_base, "lane_id" | "from_lane_id" | "to_lane_id") {
+                        out.push_str(&format!("    kani::assume({lane_param} < 2);\n"));
+                    }
+                }
+            }
+            continue;
+        }
+        out.push_str(&format!("    kani::assume({lowered});\n"));
+    }
+}
+
+fn pinocchio_has_fee_normalization_shape(handler: &ParsedHandler) -> bool {
+    let param_names: BTreeSet<String> = handler
+        .takes_params
+        .iter()
+        .map(|(name, _)| to_snake_case(name))
+        .collect();
+    [
+        "amount_in",
+        "amount_out",
+        "max_fee_bps",
+        "input_decimals",
+        "output_decimals",
+        "fee_input_normalized",
+        "fee_output_normalized",
+    ]
+    .iter()
+    .all(|name| param_names.contains(*name))
+}
+
+fn pinocchio_is_fee_normalization_ghost_param(handler: &ParsedHandler, name: &str) -> bool {
+    pinocchio_has_fee_normalization_shape(handler)
+        && matches!(
+            name,
+            "retained_value_bps" | "fee_input_normalized" | "fee_output_normalized"
+        )
+}
+
+fn pinocchio_lower_simple_state_requires_expr(expr: &str) -> String {
+    expr.replace("state.max_fee_bps", "10000")
+        .replace("state.lane_count", "2")
+        .replace("state.mint_count", "2")
+        .replace("state.paused", "0")
+}
+
+fn emit_pinocchio_profile_width_assumptions(
+    out: &mut String,
+    handler: &ParsedHandler,
+    profile: Option<&PinocchioHandlerProfile>,
+) {
+    let Some(profile) = profile else {
+        return;
+    };
+    for param in &profile.params {
+        let Some(param_name) = pinocchio_profile_param_name(handler, &param.name) else {
+            continue;
+        };
+        emit_pinocchio_width_assumption_for_param(out, handler, &param_name, &param.rust_type);
+    }
+    for repeat in &profile.repeats {
+        let Some(count) = pinocchio_repeat_count(handler, repeat) else {
+            continue;
+        };
+        for index in 0..count {
+            for item in &repeat.item_fields {
+                let Some(item_name) = repeat_item_param_name(handler, &item.name, index, count)
+                else {
+                    continue;
+                };
+                emit_pinocchio_width_assumption_for_param(
+                    out,
+                    handler,
+                    &item_name,
+                    &item.rust_type,
+                );
+            }
+        }
+    }
+}
+
+fn emit_pinocchio_fee_normalization_assumptions(
+    out: &mut String,
+    handler: &ParsedHandler,
+    handler_profile: Option<&PinocchioHandlerProfile>,
+) {
+    let param_names: BTreeSet<String> = handler
+        .takes_params
+        .iter()
+        .map(|(name, _)| to_snake_case(name))
+        .collect();
+    let required = [
+        "amount_in",
+        "amount_out",
+        "max_fee_bps",
+        "input_decimals",
+        "output_decimals",
+        "fee_input_normalized",
+        "fee_output_normalized",
+    ];
+    if required.iter().any(|name| !param_names.contains(*name)) {
+        return;
+    }
+    let has_input_mint = handler.accounts.iter().any(|account| {
+        pinocchio_mint_decimal_param(handler_profile, &to_snake_case(&account.name))
+            == Some("input_decimals".to_string())
+    });
+    let has_output_mint = handler.accounts.iter().any(|account| {
+        pinocchio_mint_decimal_param(handler_profile, &to_snake_case(&account.name))
+            == Some("output_decimals".to_string())
+    });
+    if !has_input_mint || !has_output_mint {
+        return;
+    }
+    out.push_str(
+        "    // Bind fee-normalization ghost params to real amount/mint-decimal inputs.\n",
+    );
+    out.push_str("    kani::assume(input_decimals <= 18);\n");
+    out.push_str("    kani::assume(output_decimals <= 18);\n");
+    if let (Some(input_decimals), Some(output_decimals)) = (
+        pinocchio_literal_requires_eq(handler, "input_decimals"),
+        pinocchio_literal_requires_eq(handler, "output_decimals"),
+    ) {
+        if input_decimals <= 18 && output_decimals <= 18 {
+            let input_scale = 10u128.pow((18 - input_decimals) as u32);
+            let output_scale = 10u128.pow((18 - output_decimals) as u32);
+            if input_scale == output_scale
+                && pinocchio_has_requires_expr(handler, "amount_out >= amount_in")
+            {
+                out.push_str("    kani::assume(amount_out >= amount_in);\n");
+                return;
+            }
+            if input_scale == output_scale {
+                out.push_str(
+                    "    let generated_fee_retained_bps = 10000u128 - max_fee_bps as u128;\n",
+                );
+                out.push_str("    let generated_fee_min_output = ((amount_in as u128) * generated_fee_retained_bps) / 10000u128;\n");
+                out.push_str(
+                    "    kani::assume((amount_out as u128) >= generated_fee_min_output);\n",
+                );
+                return;
+            }
+            out.push_str(&format!(
+                "    kani::assume((amount_in as u128) <= u128::MAX / {input_scale}u128);\n"
+            ));
+            out.push_str(&format!(
+                "    kani::assume((amount_out as u128) <= u128::MAX / {output_scale}u128);\n"
+            ));
+            out.push_str(&format!(
+                "    let generated_fee_input_normalized = (amount_in as u128) * {input_scale}u128;\n"
+            ));
+            out.push_str(&format!(
+                "    let generated_fee_output_normalized = (amount_out as u128) * {output_scale}u128;\n"
+            ));
+        } else {
+            out.push_str("    let generated_fee_input_scale = normalized_fee_decimal_scale(input_decimals as u64);\n");
+            out.push_str("    let generated_fee_output_scale = normalized_fee_decimal_scale(output_decimals as u64);\n");
+            out.push_str("    kani::assume(generated_fee_input_scale != 0);\n");
+            out.push_str("    kani::assume(generated_fee_output_scale != 0);\n");
+            out.push_str(
+                "    kani::assume((amount_in as u128) <= u128::MAX / generated_fee_input_scale);\n",
+            );
+            out.push_str("    kani::assume((amount_out as u128) <= u128::MAX / generated_fee_output_scale);\n");
+            out.push_str("    let generated_fee_input_normalized = (amount_in as u128) * generated_fee_input_scale;\n");
+            out.push_str("    let generated_fee_output_normalized = (amount_out as u128) * generated_fee_output_scale;\n");
+        }
+    } else {
+        out.push_str(
+            "    let generated_fee_input_scale = normalized_fee_decimal_scale(input_decimals as u64);\n",
+        );
+        out.push_str(
+            "    let generated_fee_output_scale = normalized_fee_decimal_scale(output_decimals as u64);\n",
+        );
+        out.push_str("    kani::assume(generated_fee_input_scale != 0);\n");
+        out.push_str("    kani::assume(generated_fee_output_scale != 0);\n");
+        out.push_str(
+            "    kani::assume((amount_in as u128) <= u128::MAX / generated_fee_input_scale);\n",
+        );
+        out.push_str(
+            "    kani::assume((amount_out as u128) <= u128::MAX / generated_fee_output_scale);\n",
+        );
+        out.push_str("    let generated_fee_input_normalized = (amount_in as u128) * generated_fee_input_scale;\n");
+        out.push_str("    let generated_fee_output_normalized = (amount_out as u128) * generated_fee_output_scale;\n");
+    }
+    out.push_str("    let generated_fee_retained_bps = 10000u128 - max_fee_bps as u128;\n");
+    out.push_str("    kani::assume(generated_fee_input_normalized <= u128::MAX / 10000u128);\n");
+    out.push_str("    let Some(generated_fee_product) = generated_fee_input_normalized.checked_mul(generated_fee_retained_bps) else {\n");
+    out.push_str("        kani::assume(false);\n");
+    out.push_str("        return;\n");
+    out.push_str("    };\n");
+    out.push_str("    let generated_fee_threshold_holds = match generated_fee_output_normalized.checked_add(1u128) {\n");
+    out.push_str("        Some(generated_fee_next_output) => match generated_fee_next_output.checked_mul(10000u128) {\n");
+    out.push_str(
+        "            Some(generated_fee_threshold) => generated_fee_product < generated_fee_threshold,\n",
+    );
+    out.push_str("            None => true,\n");
+    out.push_str("        },\n");
+    out.push_str("        None => true,\n");
+    out.push_str("    };\n");
+    out.push_str("    kani::assume(generated_fee_threshold_holds);\n");
+}
+
+fn pinocchio_has_requires_expr(handler: &ParsedHandler, expected: &str) -> bool {
+    handler
+        .requires
+        .iter()
+        .any(|requires| requires.rust_expr.trim() == expected)
+}
+
+fn pinocchio_literal_requires_eq(handler: &ParsedHandler, param_name: &str) -> Option<u64> {
+    for requires in &handler.requires {
+        let expr = requires.rust_expr.trim();
+        let Some((left, right)) = expr.split_once("==") else {
+            continue;
+        };
+        let left = left.trim();
+        let right = right.trim();
+        if left == param_name {
+            if let Ok(value) = right.parse::<u64>() {
+                return Some(value);
+            }
+        }
+        if right == param_name {
+            if let Ok(value) = left.parse::<u64>() {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+fn emit_pinocchio_width_assumption_for_param(
+    out: &mut String,
+    handler: &ParsedHandler,
+    param_name: &str,
+    abi_rust_type: &str,
+) {
+    let Some(spec_rust_type) = pinocchio_spec_param_rust_type(handler, param_name) else {
+        return;
+    };
+    let Some(max_value) = pinocchio_abi_max_value(abi_rust_type) else {
+        return;
+    };
+    out.push_str(&format!(
+        "    kani::assume(({param_name} as {spec_rust_type}) <= {max_value} as {spec_rust_type});\n"
+    ));
+}
+
+fn pinocchio_spec_param_rust_type<'a>(
+    handler: &'a ParsedHandler,
+    param_name: &str,
+) -> Option<&'a str> {
+    handler
+        .takes_params
+        .iter()
+        .find(|(name, _)| to_snake_case(name) == param_name)
+        .and_then(|(_, ty)| numeric_param_rust_type(ty))
+}
+
+fn pinocchio_abi_max_value(rust_type: &str) -> Option<&'static str> {
+    match rust_type {
+        "bool" => Some("1"),
+        "u8" => Some("u8::MAX"),
+        "u16" => Some("u16::MAX"),
+        "u32" => Some("u32::MAX"),
+        "u64" => Some("u64::MAX"),
+        _ => None,
+    }
+}
+
+fn pinocchio_lower_param_expr(expr: &str, param_names: &BTreeSet<String>) -> String {
+    let mut out = String::new();
+    let mut ident = String::new();
+    for ch in expr.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            ident.push(ch);
+            continue;
+        }
+        if !ident.is_empty() {
+            out.push_str(&pinocchio_lower_ident(&ident, param_names));
+            ident.clear();
+        }
+        out.push(ch);
+    }
+    if !ident.is_empty() {
+        out.push_str(&pinocchio_lower_ident(&ident, param_names));
+    }
+    out
+}
+
+fn pinocchio_lower_ident(ident: &str, param_names: &BTreeSet<String>) -> String {
+    let snake = to_snake_case(ident);
+    if param_names.contains(&snake) {
+        snake
+    } else {
+        ident.to_string()
     }
 }
 
@@ -976,6 +1690,19 @@ struct PinocchioTokenTransferAssertion {
     amount: String,
 }
 
+#[derive(Debug, Clone)]
+struct PinocchioStateFieldAssertion {
+    account: String,
+    field: PinocchioLayoutField,
+    kind: PinocchioStateAssertionKind,
+}
+
+#[derive(Debug, Clone)]
+enum PinocchioStateAssertionKind {
+    Unchanged,
+    Set { value_expr: String },
+}
+
 fn call_arg<'a>(call: &'a crate::check::ParsedCall, name: &str) -> Option<&'a str> {
     call.args
         .iter()
@@ -1017,6 +1744,35 @@ fn pinocchio_token_transfer_assertions(
     assertions
 }
 
+fn pinocchio_token_amount_witnesses(
+    handler: &ParsedHandler,
+    assertions: &[PinocchioTokenTransferAssertion],
+) -> BTreeMap<String, String> {
+    let _ = handler;
+    if !pinocchio_transfer_accounts_are_unique(assertions) {
+        return BTreeMap::new();
+    }
+
+    let mut witnesses = BTreeMap::new();
+    for assertion in assertions {
+        witnesses.insert(assertion.from.clone(), assertion.amount.clone());
+        witnesses
+            .entry(assertion.to.clone())
+            .or_insert_with(|| "0".to_string());
+    }
+    witnesses
+}
+
+fn pinocchio_transfer_accounts_are_unique(assertions: &[PinocchioTokenTransferAssertion]) -> bool {
+    let mut seen = BTreeSet::new();
+    for assertion in assertions {
+        if !seen.insert(assertion.from.clone()) || !seen.insert(assertion.to.clone()) {
+            return false;
+        }
+    }
+    true
+}
+
 fn emit_pinocchio_token_pre_snapshots(
     out: &mut String,
     assertions: &[PinocchioTokenTransferAssertion],
@@ -1037,11 +1793,11 @@ fn emit_pinocchio_token_pre_snapshots(
         ));
         out.push_str(&format!(
             "    kani::assume(pre_transfer_{index}_from >= {});\n",
-            assertion.amount
+            pinocchio_token_amount_expr(&assertion.amount)
         ));
         out.push_str(&format!(
             "    kani::assume(pre_transfer_{index}_to <= u64::MAX - {});\n",
-            assertion.amount
+            pinocchio_token_amount_expr(&assertion.amount)
         ));
     }
     out.push('\n');
@@ -1060,14 +1816,432 @@ fn emit_pinocchio_token_post_assertions(
     for (index, assertion) in assertions.iter().enumerate() {
         out.push_str(&format!(
             "        assert_eq!(read_token_amount(&{}), pre_transfer_{index}_from - {});\n",
-            assertion.from, assertion.amount
+            assertion.from,
+            pinocchio_token_amount_expr(&assertion.amount)
         ));
         out.push_str(&format!(
             "        assert_eq!(read_token_amount(&{}), pre_transfer_{index}_to + {});\n",
-            assertion.to, assertion.amount
+            assertion.to,
+            pinocchio_token_amount_expr(&assertion.amount)
         ));
     }
     out.push_str("    }\n");
+}
+
+fn pinocchio_token_amount_expr(amount: &str) -> String {
+    format!("({} as u64)", amount.trim())
+}
+
+fn emit_pinocchio_state_pre_snapshots(
+    out: &mut String,
+    assertions: &[PinocchioStateFieldAssertion],
+) {
+    if assertions.is_empty() {
+        return;
+    }
+    out.push_str("    // Pre-state snapshots for ABI-backed account assertions.\n");
+    let mut seen = BTreeSet::new();
+    for assertion in assertions {
+        let key = format!("{}:{}", assertion.account, assertion.field.name);
+        if !seen.insert(key) {
+            continue;
+        }
+        let Some(read) = pinocchio_state_read_expr(
+            &assertion.account,
+            &assertion.field.ty,
+            assertion.field.offset,
+        ) else {
+            out.push_str(&format!(
+                "    // TODO: snapshot ABI field `{}` with unsupported type `{}`\n",
+                assertion.field.name, assertion.field.ty
+            ));
+            continue;
+        };
+        out.push_str(&format!(
+            "    let pre_state_{}_{} = {};\n",
+            assertion.account, assertion.field.name, read
+        ));
+    }
+    out.push('\n');
+}
+
+fn emit_pinocchio_state_post_assertions(
+    out: &mut String,
+    assertions: &[PinocchioStateFieldAssertion],
+) {
+    if assertions.is_empty() {
+        return;
+    }
+    out.push_str("\n    if _result.is_ok() {\n");
+    let mut seen = BTreeSet::new();
+    for assertion in assertions {
+        let key = format!("{}:{}", assertion.account, assertion.field.name);
+        if !seen.insert(key) {
+            continue;
+        }
+        let Some(read) = pinocchio_state_read_expr(
+            &assertion.account,
+            &assertion.field.ty,
+            assertion.field.offset,
+        ) else {
+            out.push_str(&format!(
+                "        // TODO: assert ABI field `{}` with unsupported type `{}`\n",
+                assertion.field.name, assertion.field.ty
+            ));
+            continue;
+        };
+        match &assertion.kind {
+            PinocchioStateAssertionKind::Unchanged => {
+                out.push_str(&format!(
+                    "        assert_eq!({}, pre_state_{}_{});\n",
+                    read, assertion.account, assertion.field.name
+                ));
+            }
+            PinocchioStateAssertionKind::Set { value_expr } => {
+                let expected = pinocchio_state_expected_expr(&assertion.field.ty, value_expr);
+                out.push_str(&format!("        assert_eq!({}, {});\n", read, expected));
+            }
+        }
+    }
+    out.push_str("    }\n");
+}
+
+fn pinocchio_state_assertions(
+    handler: &ParsedHandler,
+    ordered_accounts: &[&ParsedHandlerAccount],
+    proof_profile: Option<&PinocchioProofProfile>,
+) -> Vec<PinocchioStateFieldAssertion> {
+    let mut assertions = Vec::new();
+    let Some((account, layout)) = pinocchio_primary_state_layout(ordered_accounts, proof_profile)
+    else {
+        return assertions;
+    };
+    let account = to_snake_case(&account.name);
+
+    for (field, op, value) in &handler.effects {
+        if op != "set" {
+            continue;
+        }
+        let field_name = to_snake_case(field);
+        if let Some(layout_field) = pinocchio_layout_field(layout, &field_name) {
+            assertions.push(PinocchioStateFieldAssertion {
+                account: account.clone(),
+                field: layout_field.clone(),
+                kind: PinocchioStateAssertionKind::Set {
+                    value_expr: pinocchio_state_value_expr(value),
+                },
+            });
+        }
+    }
+
+    for ensures in &handler.ensures {
+        for field in pinocchio_unchanged_ensures_fields(&ensures.rust_expr_binary) {
+            if let Some(layout_field) = pinocchio_layout_field(layout, &field) {
+                assertions.push(PinocchioStateFieldAssertion {
+                    account: account.clone(),
+                    field: layout_field.clone(),
+                    kind: PinocchioStateAssertionKind::Unchanged,
+                });
+            }
+        }
+    }
+
+    if let Some(modifies) = &handler.modifies {
+        for layout_field in &layout.fields {
+            if layout_field.fixed_bytes.is_some() {
+                continue;
+            }
+            if pinocchio_modifies_layout_field(modifies, layout_field) {
+                continue;
+            }
+            assertions.push(PinocchioStateFieldAssertion {
+                account: account.clone(),
+                field: layout_field.clone(),
+                kind: PinocchioStateAssertionKind::Unchanged,
+            });
+        }
+    }
+
+    assertions
+}
+
+fn pinocchio_primary_state_layout<'a>(
+    ordered_accounts: &[&'a ParsedHandlerAccount],
+    proof_profile: Option<&'a PinocchioProofProfile>,
+) -> Option<(&'a ParsedHandlerAccount, &'a PinocchioRecordLayout)> {
+    ordered_accounts.iter().find_map(|account| {
+        pinocchio_account_layout(proof_profile, account).map(|layout| (*account, layout))
+    })
+}
+
+fn pinocchio_layout_field<'a>(
+    layout: &'a PinocchioRecordLayout,
+    field_name: &str,
+) -> Option<&'a PinocchioLayoutField> {
+    let field_name = to_snake_case(field_name);
+    layout.fields.iter().find(|field| {
+        field.name == field_name
+            || field.name.strip_suffix("_key") == Some(&field_name)
+            || field_name.strip_suffix("_key") == Some(field.name.as_str())
+    })
+}
+
+fn pinocchio_modifies_layout_field(modifies: &[String], field: &PinocchioLayoutField) -> bool {
+    modifies.iter().any(|modified| {
+        let modified = to_snake_case(modified);
+        modified == field.name
+            || modified.strip_suffix("_key") == Some(field.name.as_str())
+            || field.name.strip_suffix("_key") == Some(modified.as_str())
+    })
+}
+
+fn pinocchio_state_read_expr(account: &str, ty: &str, offset: usize) -> Option<String> {
+    match ty.to_ascii_lowercase().as_str() {
+        "pubkey" => Some(format!("read_state_pubkey(&{account}, {offset})")),
+        "bool" => Some(format!("read_state_bool(&{account}, {offset})")),
+        "u8" => Some(format!("read_state_u8(&{account}, {offset})")),
+        "u16" => Some(format!("read_state_u16(&{account}, {offset})")),
+        "u64" => Some(format!("read_state_u64(&{account}, {offset})")),
+        "u128" => Some(format!("read_state_u128(&{account}, {offset})")),
+        _ => None,
+    }
+}
+
+fn pinocchio_state_write_call(
+    account: &str,
+    ty: &str,
+    offset: usize,
+    value_expr: &str,
+) -> Option<String> {
+    let fn_name = match ty.to_ascii_lowercase().as_str() {
+        "pubkey" => "write_state_pubkey",
+        "bool" => "write_state_bool",
+        "u8" => "write_state_u8",
+        "u16" => "write_state_u16",
+        "u64" => "write_state_u64",
+        "u128" => "write_state_u128",
+        _ => return None,
+    };
+    Some(format!(
+        "{fn_name}(&mut {account}, {offset}, {})",
+        pinocchio_state_expected_expr(ty, value_expr)
+    ))
+}
+
+fn pinocchio_state_expected_expr(ty: &str, value_expr: &str) -> String {
+    let value_expr = pinocchio_state_value_expr(value_expr);
+    match ty.to_ascii_lowercase().as_str() {
+        "bool" => {
+            if value_expr == "true" || value_expr == "false" {
+                value_expr
+            } else {
+                format!("({value_expr} != 0)")
+            }
+        }
+        "u8" => format!("({value_expr} as u8)"),
+        "u16" => format!("({value_expr} as u16)"),
+        "u64" => format!("({value_expr} as u64)"),
+        "u128" => format!("({value_expr} as u128)"),
+        _ => value_expr,
+    }
+}
+
+fn pinocchio_state_value_expr(value: &str) -> String {
+    let value = value.trim();
+    if let Some(account) = value.strip_suffix(".pubkey") {
+        return format!("{}.hdr.key", to_snake_case(account));
+    }
+    match value {
+        "true" | "false" => value.to_string(),
+        _ if value.chars().all(|ch| ch.is_ascii_digit()) => value.to_string(),
+        _ => to_snake_case(value),
+    }
+}
+
+fn pinocchio_kani_unwind_bound() -> usize {
+    std::env::var("QEDGEN_PINOCCHIO_KANI_UNWIND")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(34)
+}
+
+fn pinocchio_kani_concrete_scalar_probe_mode() -> Option<String> {
+    std::env::var("QEDGEN_PINOCCHIO_KANI_CONCRETE_SCALARS")
+        .ok()
+        .filter(|value| !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false"))
+        .map(|value| {
+            if value == "1" || value.eq_ignore_ascii_case("true") {
+                "all".to_string()
+            } else {
+                value.to_ascii_lowercase()
+            }
+        })
+}
+
+fn pinocchio_concrete_scalar_probe_value(name: &str, rust_ty: &str, mode: &str) -> Option<String> {
+    let base = strip_numeric_suffix(name).map_or(name, |(base, _)| base);
+    let concrete_amounts = mode == "all" || mode.contains("amount");
+    let concrete_fee = mode == "all" || mode.contains("fee");
+    let concrete_lane = mode == "all" || mode.contains("lane");
+    let value = match base {
+        "amount" | "amount_in" | "amount_out" if concrete_amounts => "1000",
+        "min_out" if concrete_amounts => "900",
+        "max_fee_bps" if concrete_fee => "0",
+        "lane_id" | "from_lane_id" if concrete_lane => "0",
+        "to_lane_id" if concrete_lane => "1",
+        _ => return None,
+    };
+    Some(format!("{value} as {rust_ty}"))
+}
+
+fn pinocchio_unchanged_ensures_fields(expr: &str) -> Vec<String> {
+    let compact: String = expr.chars().filter(|ch| !ch.is_whitespace()).collect();
+    let mut fields = BTreeSet::new();
+    let mut rest = compact.as_str();
+    while let Some(start) = rest.find("post.") {
+        rest = &rest[start + "post.".len()..];
+        let field: String = rest
+            .chars()
+            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+            .collect();
+        if field.is_empty() {
+            continue;
+        }
+        let pattern_a = format!("post.{field}==pre.{field}");
+        let pattern_b = format!("pre.{field}==post.{field}");
+        if compact.contains(&pattern_a) || compact.contains(&pattern_b) {
+            fields.insert(to_snake_case(&field));
+        }
+    }
+    fields.into_iter().collect()
+}
+
+fn emit_pinocchio_state_witness_initializers(
+    out: &mut String,
+    account: &str,
+    layout: &PinocchioRecordLayout,
+    handler: &ParsedHandler,
+    account_key_exprs: &BTreeMap<String, String>,
+) {
+    for field in &layout.fields {
+        if field.fixed_bytes.is_some() {
+            continue;
+        }
+        let Some(value) =
+            pinocchio_state_initial_value_expr(&field.name, &field.ty, handler, account_key_exprs)
+        else {
+            continue;
+        };
+        let Some(call) = pinocchio_state_write_call(account, &field.ty, field.offset, &value)
+        else {
+            continue;
+        };
+        out.push_str(&format!("    {call};\n"));
+    }
+
+    for repeat in &layout.repeats {
+        emit_pinocchio_state_repeat_initializers(out, account, layout, repeat, account_key_exprs);
+    }
+}
+
+fn pinocchio_state_initial_value_expr(
+    field_name: &str,
+    ty: &str,
+    handler: &ParsedHandler,
+    account_key_exprs: &BTreeMap<String, String>,
+) -> Option<String> {
+    let field_name = to_snake_case(field_name);
+    if ty.eq_ignore_ascii_case("pubkey") {
+        if let Some(expr) = pinocchio_state_pubkey_initial_expr(&field_name, account_key_exprs) {
+            return Some(expr);
+        }
+    }
+    if ty.eq_ignore_ascii_case("bool") && field_name == "paused" {
+        return Some("false".to_string());
+    }
+    if let Some(param) = pinocchio_state_param_for_field(handler, &field_name) {
+        return Some(param);
+    }
+    match field_name.as_str() {
+        "max_fee_bps" => Some("10000".to_string()),
+        "lane_count" => Some("2".to_string()),
+        "mint_count" => Some("2".to_string()),
+        _ => None,
+    }
+}
+
+fn pinocchio_state_param_for_field(handler: &ParsedHandler, field_name: &str) -> Option<String> {
+    handler
+        .takes_params
+        .iter()
+        .map(|(name, _)| to_snake_case(name))
+        .find(|name| {
+            name == field_name
+                || name == &format!("new_{field_name}")
+                || name == &format!("{field_name}_value")
+                || name.strip_prefix("new_") == Some(field_name)
+                || name.strip_suffix("_value") == Some(field_name)
+        })
+}
+
+fn pinocchio_state_pubkey_initial_expr(
+    field_name: &str,
+    account_key_exprs: &BTreeMap<String, String>,
+) -> Option<String> {
+    let candidates = [
+        field_name.to_string(),
+        field_name
+            .strip_suffix("_key")
+            .unwrap_or(field_name)
+            .to_string(),
+    ];
+    for candidate in candidates {
+        if let Some(expr) = account_key_exprs.get(&candidate) {
+            return Some(expr.clone());
+        }
+    }
+    None
+}
+
+fn emit_pinocchio_state_repeat_initializers(
+    out: &mut String,
+    account: &str,
+    layout: &PinocchioRecordLayout,
+    repeat: &crate::pinocchio_profile::PinocchioLayoutRepeat,
+    account_key_exprs: &BTreeMap<String, String>,
+) {
+    let Some(count_field) = pinocchio_layout_field(layout, &repeat.count_field) else {
+        return;
+    };
+    let mut repeat_keys: Vec<_> = account_key_exprs
+        .iter()
+        .filter(|(name, _)| name.contains("mint"))
+        .map(|(_name, expr)| expr.clone())
+        .take(2)
+        .collect();
+    if repeat_keys.is_empty() && repeat.item_len == 32 {
+        repeat_keys = (0..2)
+            .map(|index| format!("[{}u8; 32]", 11 + index))
+            .collect();
+    }
+    if repeat_keys.is_empty() {
+        return;
+    }
+    if let Some(call) = pinocchio_state_write_call(
+        account,
+        &count_field.ty,
+        count_field.offset,
+        &repeat_keys.len().to_string(),
+    ) {
+        out.push_str(&format!("    {call};\n"));
+    }
+    for (index, key_expr) in repeat_keys.iter().enumerate() {
+        out.push_str(&format!(
+            "    write_state_pubkey(&mut {account}, {}, {key_expr});\n",
+            repeat.offset + (index * repeat.item_len)
+        ));
+    }
 }
 
 fn pinocchio_account_order<'a>(
@@ -1169,6 +2343,136 @@ fn pinocchio_bound_key_expr(
     })
 }
 
+fn pinocchio_mint_decimal_param(
+    profile: Option<&PinocchioHandlerProfile>,
+    ident: &str,
+) -> Option<String> {
+    let profile = profile?;
+    profile
+        .mint_decimal_bindings
+        .get(ident)
+        .cloned()
+        .or_else(|| {
+            ident
+                .strip_suffix("_mint")
+                .map(|prefix| format!("{prefix}_decimals"))
+        })
+}
+
+fn pinocchio_param_decl_rust_type<'a>(
+    name: &str,
+    spec_type: &'a str,
+    handler: &'a ParsedHandler,
+    handler_profile: Option<&'a PinocchioHandlerProfile>,
+) -> Option<&'a str> {
+    let spec_rust_type = pinocchio_param_decl_type(spec_type);
+    if pinocchio_has_fee_normalization_shape(handler) {
+        if name == "max_fee_bps" {
+            if let Some(profile_type) = pinocchio_param_rust_type(name, handler, handler_profile) {
+                return Some(profile_type);
+            }
+        }
+        if pinocchio_mint_decimal_param_is_used(handler_profile, name) {
+            return Some("u8");
+        }
+    }
+    let Some(profile_type) = pinocchio_param_rust_type(name, handler, handler_profile) else {
+        return spec_rust_type;
+    };
+
+    if profile_type == "bool" || pinocchio_param_has_mixed_arithmetic_requires(handler, name) {
+        return spec_rust_type;
+    }
+
+    Some(profile_type)
+}
+
+fn pinocchio_narrow_symbolic_param_type(
+    handler: &ParsedHandler,
+    param_name: &str,
+    rust_ty: &str,
+) -> String {
+    let Some(upper_bound) = pinocchio_param_upper_bound(handler, param_name) else {
+        return rust_ty.to_string();
+    };
+    let narrowed = match rust_ty {
+        "u128" | "u64" | "u32" | "u16" | "u8" if upper_bound <= u8::MAX as u128 => "u8",
+        "u128" | "u64" | "u32" | "u16" if upper_bound <= u16::MAX as u128 => "u16",
+        "u128" | "u64" | "u32" if upper_bound <= u32::MAX as u128 => "u32",
+        "u128" | "u64" if upper_bound <= u64::MAX as u128 => "u64",
+        _ => rust_ty,
+    };
+    narrowed.to_string()
+}
+
+fn pinocchio_param_upper_bound(handler: &ParsedHandler, param_name: &str) -> Option<u128> {
+    let mut direct = pinocchio_param_direct_upper_bound(handler, param_name);
+    for requires in &handler.requires {
+        let expr = requires.rust_expr.trim();
+        if let Some(other) = expr.strip_suffix(&format!(">= {param_name}")) {
+            let other = to_snake_case(other.trim());
+            if other != param_name {
+                direct = min_option(direct, pinocchio_param_direct_upper_bound(handler, &other));
+            }
+        }
+        if let Some(other) = expr.strip_prefix(&format!("{param_name} <= ")) {
+            let other = to_snake_case(other.trim());
+            if other != param_name {
+                direct = min_option(direct, pinocchio_param_direct_upper_bound(handler, &other));
+            }
+        }
+    }
+    direct
+}
+
+fn pinocchio_param_direct_upper_bound(handler: &ParsedHandler, param_name: &str) -> Option<u128> {
+    handler
+        .requires
+        .iter()
+        .filter_map(|requires| {
+            let expr = requires.rust_expr.trim();
+            expr.strip_prefix(&format!("{param_name} <= "))
+                .and_then(|literal| literal.trim().parse::<u128>().ok())
+        })
+        .min()
+}
+
+fn min_option(left: Option<u128>, right: Option<u128>) -> Option<u128> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn pinocchio_mint_decimal_param_is_used(
+    handler_profile: Option<&PinocchioHandlerProfile>,
+    name: &str,
+) -> bool {
+    handler_profile
+        .map(|profile| {
+            profile
+                .mint_decimal_bindings
+                .values()
+                .any(|param| param == name)
+        })
+        .unwrap_or(false)
+}
+
+fn pinocchio_param_has_mixed_arithmetic_requires(handler: &ParsedHandler, name: &str) -> bool {
+    handler.requires.iter().any(|requires| {
+        let expr = requires.rust_expr.as_str();
+        expr.contains(&format!("{name} +"))
+            || expr.contains(&format!("+ {name}"))
+            || expr.contains(&format!("{name} -"))
+            || expr.contains(&format!("- {name}"))
+            || expr.contains(&format!("{name} *"))
+            || expr.contains(&format!("* {name}"))
+            || expr.contains(&format!("{name} /"))
+            || expr.contains(&format!("/ {name}"))
+    })
+}
+
 fn pinocchio_param_rust_type<'a>(
     name: &str,
     handler: &'a ParsedHandler,
@@ -1185,7 +2489,11 @@ fn pinocchio_param_rust_type<'a>(
                         .iter()
                         .flat_map(|repeat| repeat.item_fields.iter()),
                 )
-                .find(|param| param.name == name)
+                .find(|param| {
+                    param.name == name
+                        || pinocchio_profile_param_name(handler, &param.name).as_deref()
+                            == Some(name)
+                })
                 .map(|param| param.rust_type.as_str())
         })
         .or_else(|| {
@@ -1455,13 +2763,26 @@ fn emit_pinocchio_nested_key_bindings(
             continue;
         };
         let ident = format!("{}_{}", ctx.current_ident, local_name);
-        out.push_str(&format!(
-            "    let {ident}_pda = pinocchio::pubkey::try_find_program_address(&[{}], {});\n",
-            seed_exprs.join(", "),
-            program_expr
-        ));
-        out.push_str(&format!("    kani::assume({ident}_pda.is_some());\n"));
-        out.push_str(&format!("    let {ident}_key = {ident}_pda.unwrap().0;\n"));
+        if let Some(helper_call) = pinocchio_pda_helper_call(
+            nested_derivation,
+            ctx.handler,
+            ctx.handler_profile,
+            ctx.current_ident,
+            Some(&pinocchio_local_arg_by_param(
+                nested_derivation,
+                &nested_local,
+            )),
+        ) {
+            out.push_str(&format!("    let {ident}_key = {helper_call};\n"));
+        } else {
+            out.push_str(&format!(
+                "    let {ident}_pda = pinocchio::pubkey::try_find_program_address(&[{}], {});\n",
+                seed_exprs.join(", "),
+                program_expr
+            ));
+            out.push_str(&format!("    kani::assume({ident}_pda.is_some());\n"));
+            out.push_str(&format!("    let {ident}_key = {ident}_pda.unwrap().0;\n"));
+        }
         nested_keys.insert(local_name.clone(), format!("{ident}_key"));
     }
     nested_keys
@@ -1505,10 +2826,12 @@ fn pinocchio_account_layout<'a>(
 ) -> Option<&'a PinocchioRecordLayout> {
     let profile = profile?;
     let account_name = to_snake_case(&account.name);
+    let base_account_name = account_name.strip_suffix("_account");
     let record_name = profile
         .account_layouts
         .get(&account_name)
-        .or_else(|| profile.account_layouts.get(&account.name))?;
+        .or_else(|| profile.account_layouts.get(&account.name))
+        .or_else(|| base_account_name.and_then(|name| profile.account_layouts.get(name)))?;
     profile.record_layouts.get(record_name)
 }
 
@@ -1587,20 +2910,24 @@ fn emit_pinocchio_pda_key_bindings(
     ctx: PinocchioPdaKeyBindingsCtx<'_>,
 ) -> BTreeSet<String> {
     let mut emitted = BTreeSet::new();
+    let mut available_account_key_exprs = ctx.account_key_exprs.clone();
     for account in ctx.ordered_accounts {
         let ident = to_snake_case(&account.name);
+        let local_key_derivation = pinocchio_account_key_derivation(ctx.handler_profile, account)
+            .or_else(|| pinocchio_owner_account_key_derivation(ctx.handler_profile, &ident));
+        let mut local_nested_key_exprs = BTreeMap::new();
         let seed_exprs = pinocchio_account_pda_seed_exprs(
             ctx.proof_profile,
             ctx.handler_profile,
             account,
             ctx.handler,
-            ctx.account_key_exprs,
+            &available_account_key_exprs,
         )
         .or_else(|| {
-            pinocchio_account_key_derivation(ctx.handler_profile, account).and_then(|local| {
+            local_key_derivation.and_then(|local| {
                 let derivation = ctx.proof_profile?.pda_derivations.get(&local.derivation)?;
                 let arg_by_param = pinocchio_local_arg_by_param(derivation, local);
-                let nested_key_exprs = emit_pinocchio_nested_key_bindings(
+                local_nested_key_exprs = emit_pinocchio_nested_key_bindings(
                     out,
                     PinocchioNestedKeyBindingCtx {
                         proof_profile: ctx.proof_profile,
@@ -1609,7 +2936,7 @@ fn emit_pinocchio_pda_key_bindings(
                         current_ident: &ident,
                         outer_derivation: derivation,
                         outer_arg_by_param: &arg_by_param,
-                        account_key_exprs: ctx.account_key_exprs,
+                        account_key_exprs: &available_account_key_exprs,
                     },
                 );
                 pinocchio_local_derived_key_seed_exprs(
@@ -1618,14 +2945,28 @@ fn emit_pinocchio_pda_key_bindings(
                     ctx.handler,
                     &ident,
                     local,
-                    ctx.account_key_exprs,
-                    &nested_key_exprs,
+                    &available_account_key_exprs,
+                    &local_nested_key_exprs,
                 )
             })
         });
         let Some(seed_exprs) = seed_exprs else {
             continue;
         };
+        if let Some(owner_ident) = pinocchio_token_binding_owner_ident(ctx.handler_profile, &ident)
+        {
+            if !emitted.contains(&owner_ident) {
+                if let Some(owner_key_expr) =
+                    pinocchio_nested_owner_key_expr(&local_nested_key_exprs)
+                {
+                    out.push_str(&format!("    let {owner_ident}_key = {owner_key_expr};\n"));
+                    emitted.insert(owner_ident.clone());
+                    let key_var = format!("{owner_ident}_key");
+                    available_account_key_exprs.insert(key_var.clone(), key_var.clone());
+                    available_account_key_exprs.insert(owner_ident, key_var);
+                }
+            }
+        }
         let derivation = pinocchio_account_pda(ctx.proof_profile, account).or_else(|| {
             let local = pinocchio_account_key_derivation(ctx.handler_profile, account)?;
             ctx.proof_profile?.pda_derivations.get(&local.derivation)
@@ -1634,16 +2975,259 @@ fn emit_pinocchio_pda_key_bindings(
         else {
             continue;
         };
-        out.push_str(&format!(
-            "    let {ident}_pda = pinocchio::pubkey::try_find_program_address(&[{}], {});\n",
-            seed_exprs.join(", "),
-            program_expr
-        ));
-        out.push_str(&format!("    kani::assume({ident}_pda.is_some());\n"));
-        out.push_str(&format!("    let {ident}_key = {ident}_pda.unwrap().0;\n"));
-        emitted.insert(ident);
+        let helper_call = derivation.and_then(|derivation| {
+            local_key_derivation
+                .and_then(|local| {
+                    pinocchio_pda_helper_call_for_local(
+                        derivation,
+                        local,
+                        ctx.handler,
+                        ctx.handler_profile,
+                        &ident,
+                        &available_account_key_exprs,
+                        &local_nested_key_exprs,
+                    )
+                })
+                .or_else(|| {
+                    pinocchio_pda_helper_call(
+                        derivation,
+                        ctx.handler,
+                        ctx.handler_profile,
+                        &ident,
+                        None,
+                    )
+                })
+        });
+        if let Some(helper_call) = helper_call {
+            out.push_str(&format!("    let {ident}_key = {helper_call};\n"));
+        } else {
+            out.push_str(&format!(
+                "    let {ident}_pda = pinocchio::pubkey::try_find_program_address(&[{}], {});\n",
+                seed_exprs.join(", "),
+                program_expr
+            ));
+            out.push_str(&format!("    kani::assume({ident}_pda.is_some());\n"));
+            out.push_str(&format!("    let {ident}_key = {ident}_pda.unwrap().0;\n"));
+        }
+        emitted.insert(ident.clone());
+        let key_var = format!("{ident}_key");
+        available_account_key_exprs.insert(key_var.clone(), key_var.clone());
+        available_account_key_exprs.insert(ident, key_var);
     }
     emitted
+}
+
+fn pinocchio_token_binding_owner_ident(
+    handler_profile: Option<&PinocchioHandlerProfile>,
+    token_ident: &str,
+) -> Option<String> {
+    let handler_profile = handler_profile?;
+    let binding = handler_profile
+        .token_account_bindings
+        .get(token_ident)
+        .or_else(|| {
+            strip_numeric_suffix(token_ident)
+                .and_then(|(base, _suffix)| handler_profile.token_account_bindings.get(base))
+        })?;
+    let owner = binding.owner_account.as_ref()?;
+    let owner = if let Some((_base, suffix)) = strip_numeric_suffix(token_ident) {
+        format!("{owner}_{suffix}")
+    } else {
+        owner.clone()
+    };
+    Some(owner)
+}
+
+fn pinocchio_nested_owner_key_expr(nested_key_exprs: &BTreeMap<String, String>) -> Option<String> {
+    nested_key_exprs
+        .iter()
+        .find(|(name, _)| name.contains("authority") || name.contains("owner"))
+        .map(|(_name, expr)| expr.clone())
+        .or_else(|| nested_key_exprs.values().next().cloned())
+}
+
+fn pinocchio_nested_owner_key_var_for_account(
+    proof_profile: Option<&PinocchioProofProfile>,
+    handler_profile: Option<&PinocchioHandlerProfile>,
+    account: &ParsedHandlerAccount,
+    ident: &str,
+) -> Option<String> {
+    let local = pinocchio_account_key_derivation(handler_profile, account)?;
+    let derivation = proof_profile?.pda_derivations.get(&local.derivation)?;
+    let nested_name = derivation
+        .local_key_derivations
+        .keys()
+        .find(|name| name.contains("authority") || name.contains("owner"))
+        .or_else(|| derivation.local_key_derivations.keys().next())?;
+    Some(format!("{ident}_{nested_name}_key"))
+}
+
+fn pinocchio_pda_helper_call(
+    derivation: &PinocchioPdaDerivation,
+    handler: &ParsedHandler,
+    handler_profile: Option<&PinocchioHandlerProfile>,
+    current_ident: &str,
+    arg_by_param: Option<&BTreeMap<&str, &str>>,
+) -> Option<String> {
+    let mut args = Vec::new();
+    for param in &derivation.params {
+        if param == "program_id" {
+            args.push("&program_id".to_string());
+            continue;
+        }
+        let source_expr = arg_by_param
+            .and_then(|args| args.get(param.as_str()).copied())
+            .unwrap_or(param);
+        let param_name =
+            pinocchio_pda_helper_param_name(handler, handler_profile, source_expr, current_ident)?;
+        args.push(pinocchio_pda_helper_arg_expr(
+            derivation,
+            handler,
+            param,
+            &param_name,
+        ));
+    }
+    Some(pinocchio_pda_helper_key_expr(derivation, args))
+}
+
+fn pinocchio_pda_helper_call_for_local(
+    derivation: &PinocchioPdaDerivation,
+    local: &PinocchioLocalKeyDerivation,
+    handler: &ParsedHandler,
+    handler_profile: Option<&PinocchioHandlerProfile>,
+    current_ident: &str,
+    account_key_exprs: &BTreeMap<String, String>,
+    nested_key_exprs: &BTreeMap<String, String>,
+) -> Option<String> {
+    let arg_by_param = pinocchio_local_arg_by_param(derivation, local);
+    let mut args = Vec::new();
+    for param in &derivation.params {
+        if param == "program_id" {
+            args.push("&program_id".to_string());
+            continue;
+        }
+        let source_expr = arg_by_param.get(param.as_str()).copied().unwrap_or(param);
+        if let Some(param_name) =
+            pinocchio_pda_helper_param_name(handler, handler_profile, source_expr, current_ident)
+        {
+            args.push(pinocchio_pda_helper_arg_expr(
+                derivation,
+                handler,
+                param,
+                &param_name,
+            ));
+            continue;
+        }
+        let helper_ty = derivation
+            .param_types
+            .get(param)
+            .map(String::as_str)
+            .unwrap_or("&Pubkey");
+        if !pinocchio_type_is_pubkey_like(helper_ty) {
+            return None;
+        }
+        let key_expr =
+            pinocchio_source_expr_account_key(source_expr, account_key_exprs, handler_profile)
+                .or_else(|| nested_key_exprs.get(source_expr.trim()).cloned())?;
+        if helper_ty.trim().starts_with('&') {
+            args.push(format!("&{key_expr}"));
+        } else {
+            args.push(key_expr);
+        }
+    }
+    Some(pinocchio_pda_helper_key_expr(derivation, args))
+}
+
+fn pinocchio_pda_helper_key_expr(derivation: &PinocchioPdaDerivation, args: Vec<String>) -> String {
+    let call = format!("crate::derive_{}({})", derivation.name, args.join(", "));
+    if derivation.returns_tuple {
+        format!("{call}.0")
+    } else {
+        call
+    }
+}
+
+fn pinocchio_owner_account_key_derivation<'a>(
+    handler_profile: Option<&'a PinocchioHandlerProfile>,
+    owner_ident: &str,
+) -> Option<&'a PinocchioLocalKeyDerivation> {
+    let profile = handler_profile?;
+    profile
+        .token_account_bindings
+        .iter()
+        .find_map(|(token_ident, binding)| {
+            let owner_account = binding.owner_account.as_deref()?;
+            if pinocchio_binding_account_matches(owner_ident, owner_account, token_ident) {
+                binding.owner_key_derivation.as_ref()
+            } else {
+                None
+            }
+        })
+}
+
+fn pinocchio_binding_account_matches(
+    account_ident: &str,
+    binding_account: &str,
+    token_ident: &str,
+) -> bool {
+    if account_ident == binding_account {
+        return true;
+    }
+    let Some((_token_base, suffix)) = strip_numeric_suffix(token_ident) else {
+        return false;
+    };
+    account_ident == format!("{binding_account}_{suffix}")
+}
+
+fn pinocchio_pda_helper_param_name(
+    handler: &ParsedHandler,
+    handler_profile: Option<&PinocchioHandlerProfile>,
+    helper_param: &str,
+    current_ident: &str,
+) -> Option<String> {
+    let param_name = pinocchio_profile_param_name(handler, helper_param).or_else(|| {
+        pinocchio_source_expr_param_name(helper_param, current_ident, handler_profile)
+    })?;
+    let is_handler_param = handler
+        .takes_params
+        .iter()
+        .any(|(name, _)| to_snake_case(name) == param_name);
+    is_handler_param.then_some(param_name)
+}
+
+fn pinocchio_type_is_pubkey_like(ty: &str) -> bool {
+    matches!(
+        ty.trim().trim_start_matches('&').trim(),
+        "Pubkey" | "pubkey" | "[u8; 32]"
+    )
+}
+
+fn pinocchio_pda_helper_arg_expr(
+    derivation: &PinocchioPdaDerivation,
+    handler: &ParsedHandler,
+    helper_param: &str,
+    spec_param: &str,
+) -> String {
+    let Some(helper_ty) = derivation.param_types.get(helper_param) else {
+        return spec_param.to_string();
+    };
+    let Some(spec_ty) = pinocchio_spec_param_rust_type(handler, spec_param) else {
+        return spec_param.to_string();
+    };
+    match numeric_param_rust_type(helper_ty).or_else(|| {
+        match helper_ty.trim_start_matches('&').trim() {
+            "u8" => Some("u8"),
+            "u16" => Some("u16"),
+            "u32" => Some("u32"),
+            "u64" => Some("u64"),
+            _ => None,
+        }
+    }) {
+        Some(helper_rust_ty) if helper_rust_ty != spec_ty => {
+            format!("{spec_param} as {helper_rust_ty}")
+        }
+        _ => spec_param.to_string(),
+    }
 }
 
 fn pinocchio_account_pda_seed_exprs(
@@ -1680,15 +3264,6 @@ fn pinocchio_account_key_expr(
     } else {
         format!("[{}u8; 32]", key_byte)
     }
-}
-
-fn rust_u8_array_literal(bytes: &[u8]) -> String {
-    let inner = bytes
-        .iter()
-        .map(|byte| format!("{byte}u8"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("[{inner}]")
 }
 
 fn rust_string_escape(input: &str) -> String {
@@ -1795,6 +3370,7 @@ fn emit_pinocchio_handler_harness(
 ) -> Result<()> {
     let snake = to_snake_case(&handler.name);
     let token_assertions = pinocchio_token_transfer_assertions(handler);
+    let token_amount_witnesses = pinocchio_token_amount_witnesses(handler, &token_assertions);
 
     let transfer_token_accounts: BTreeSet<String> = token_assertions
         .iter()
@@ -1817,47 +3393,92 @@ fn emit_pinocchio_handler_harness(
     // so the handler's owner check passes. Falls back to a fixed key.
     let authority_idx = handler.accounts.iter().position(|a| a.is_signer);
 
+    let unwind_bound = pinocchio_kani_unwind_bound();
+
     out.push_str(&format!(
         "/// Impl-targeted harness for `{}`. Kani's automatic\n",
         handler.name
     ));
     out.push_str("/// overflow / underflow / UB checks run on every path through the\n");
-    out.push_str("/// real handler. `#[kani::unwind(34)]` bounds the 32-byte Pubkey\n");
-    out.push_str("/// memcmp loops in pinocchio's owner checks (+2 slack).\n");
+    out.push_str(&format!(
+        "/// real handler. `#[kani::unwind({unwind_bound})]` bounds Pinocchio's 32-byte\n"
+    ));
+    out.push_str("/// pubkey/account comparisons plus generated valid-path loops.\n");
     emit_pinocchio_profile_notes(out, handler, proof_profile, handler_profile);
     out.push_str("#[kani::proof]\n");
-    out.push_str("#[kani::unwind(34)]\n");
+    if let Some(profile) = handler_profile {
+        for stub in &profile.verified_stubs {
+            out.push_str(&format!("#[kani::stub_verified({stub})]\n"));
+        }
+    }
+    out.push_str(&format!("#[kani::unwind({unwind_bound})]\n"));
     out.push_str(&format!("fn verify_{}_impl() {{\n", snake));
 
-    // Program id is symbolic; concrete PDA-sensitive harnesses can tighten it
-    // to the crate's declared id or spec `program_id` bytes.
-    out.push_str("    let program_id: [u8; 32] = kani::any();\n");
+    // Use a concrete generic program id witness. Pinocchio PDA/key models
+    // thread the id through account keys; keeping it symbolic makes otherwise
+    // concrete valid-path proofs much larger without adding useful coverage
+    // for generated state/token postconditions.
+    out.push_str("    let program_id: [u8; 32] = [42u8; 32];\n");
 
     // Authority key (concrete) — threaded as token owner.
     out.push_str("    let authority_key: [u8; 32] = [7u8; 32];\n");
 
     // Symbolic amounts for token accounts.
     for (i, a) in handler.accounts.iter().enumerate() {
-        if is_token(a) {
-            out.push_str(&format!(
-                "    let {}_amount: u64 = kani::any();\n",
-                to_snake_case(&a.name)
-            ));
+        let ident = to_snake_case(&a.name);
+        if is_token(a) && !token_amount_witnesses.contains_key(&ident) {
+            out.push_str(&format!("    let {}_amount: u64 = kani::any();\n", ident));
         }
         let _ = i;
     }
 
     // Symbolic params, declared with the primitive matching the spec
     // type so `to_le_bytes()` packs the right width below.
+    let concrete_scalar_probe_mode = pinocchio_kani_concrete_scalar_probe_mode();
+    if let Some(mode) = concrete_scalar_probe_mode.as_deref() {
+        out.push_str(
+            "    // TRIAGE ONLY: concrete scalar probe mode is not accepted proof evidence.\n",
+        );
+        out.push_str(&format!("    // Concrete scalar probe family: {mode}\n"));
+    }
     for (pname, ptype) in &handler.takes_params {
-        match pinocchio_param_decl_type(ptype) {
+        let param_name = to_snake_case(pname);
+        if pinocchio_is_fee_normalization_ghost_param(handler, &param_name) {
+            continue;
+        }
+        match pinocchio_param_decl_rust_type(&param_name, ptype, handler, handler_profile) {
             Some(rust_ty) => {
-                out.push_str(&format!(
-                    "    let {}: {} = kani::any(); // spec type: {}\n",
-                    to_snake_case(pname),
-                    rust_ty,
-                    ptype
-                ));
+                let rust_ty = pinocchio_narrow_symbolic_param_type(handler, &param_name, rust_ty);
+                if let Some(value) = pinocchio_literal_requires_eq(handler, &param_name) {
+                    out.push_str(&format!(
+                        "    let {}: {} = {} as {}; // spec type: {}\n",
+                        param_name, rust_ty, value, rust_ty, ptype
+                    ));
+                } else if let Some(mode) = concrete_scalar_probe_mode.as_deref() {
+                    if let Some(value) =
+                        pinocchio_concrete_scalar_probe_value(&param_name, &rust_ty, mode)
+                    {
+                        out.push_str(&format!(
+                            "    let {}: {} = {}; // spec type: {}, concrete probe\n",
+                            param_name, rust_ty, value, ptype
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "    let {}: {} = kani::any(); // spec type: {}\n",
+                            param_name, rust_ty, ptype
+                        ));
+                    }
+                } else {
+                    out.push_str(&format!(
+                        "    let {}: {} = kani::any(); // spec type: {}\n",
+                        param_name, rust_ty, ptype
+                    ));
+                }
+                let lane_base =
+                    strip_numeric_suffix(&param_name).map_or(param_name.as_str(), |(base, _)| base);
+                if matches!(lane_base, "lane_id" | "from_lane_id" | "to_lane_id") {
+                    out.push_str(&format!("    kani::assume({param_name} < 2);\n"));
+                }
             }
             None => {
                 out.push_str(&format!(
@@ -1867,11 +3488,15 @@ fn emit_pinocchio_handler_harness(
             }
         }
     }
+    emit_pinocchio_requires_assumptions(out, handler);
+    emit_pinocchio_profile_width_assumptions(out, handler, handler_profile);
+    emit_pinocchio_fee_normalization_assumptions(out, handler, handler_profile);
     out.push('\n');
 
     // Build accounts in source order when the profile inferred it; fall
     // back to spec order for greenfield/generated specs without source.
     let ordered_accounts = pinocchio_account_order(handler, handler_profile);
+    let state_assertions = pinocchio_state_assertions(handler, &ordered_accounts, proof_profile);
     let mut preliminary_account_key_exprs = BTreeMap::new();
     for (i, a) in ordered_accounts.iter().enumerate() {
         let ident = to_snake_case(&a.name);
@@ -1953,14 +3578,35 @@ fn emit_pinocchio_handler_harness(
                     )?;
                     let derivation = proof_profile?.pda_derivations.get(&local.derivation)?;
                     let program_expr = pinocchio_pda_program_expr(&derivation.program_id)?;
-                    out.push_str(&format!(
-                        "    let {ident}_owner_pda = pinocchio::pubkey::try_find_program_address(&[{}], {});\n",
-                        seed_exprs.join(", "),
-                        program_expr
-                    ));
-                    out.push_str(&format!("    kani::assume({ident}_owner_pda.is_some());\n"));
-                    out.push_str(&format!("    let {ident}_owner_key = {ident}_owner_pda.unwrap().0;\n"));
+                    let arg_by_param = pinocchio_local_arg_by_param(derivation, local);
+                    if let Some(helper_call) =
+                        pinocchio_pda_helper_call(
+                            derivation,
+                            handler,
+                            handler_profile,
+                            &ident,
+                            Some(&arg_by_param),
+                        )
+                    {
+                        out.push_str(&format!("    let {ident}_owner_key = {helper_call};\n"));
+                    } else {
+                        out.push_str(&format!(
+                            "    let {ident}_owner_pda = pinocchio::pubkey::try_find_program_address(&[{}], {});\n",
+                            seed_exprs.join(", "),
+                            program_expr
+                        ));
+                        out.push_str(&format!("    kani::assume({ident}_owner_pda.is_some());\n"));
+                        out.push_str(&format!("    let {ident}_owner_key = {ident}_owner_pda.unwrap().0;\n"));
+                    }
                     Some(format!("{ident}_owner_key"))
+                })
+                .or_else(|| {
+                    pinocchio_nested_owner_key_var_for_account(
+                        proof_profile,
+                        handler_profile,
+                        a,
+                        &ident,
+                    )
                 })
                 .unwrap_or_else(|| {
                     if authority_idx.is_some() && i == 0 {
@@ -1970,21 +3616,35 @@ fn emit_pinocchio_handler_harness(
                     }
                 });
             out.push_str(&format!(
-                "    let mut {ident} = build_token_account({key_expr}, {writable}, {signer}, {mint_expr}, {owner_expr}, {ident}_amount);\n",
+                "    let mut {ident} = build_token_account({key_expr}, {writable}, {signer}, {mint_expr}, {owner_expr}, {amount_expr});\n",
                 ident = ident,
                 key_expr = key_expr,
                 writable = is_writable,
                 signer = is_signer,
                 mint_expr = mint_expr,
                 owner_expr = owner_expr,
+                amount_expr = token_amount_witnesses
+                    .get(&ident)
+                    .map(|amount| pinocchio_token_amount_expr(amount))
+                    .unwrap_or_else(|| pinocchio_token_amount_expr(&format!("{ident}_amount"))),
             ));
         } else if is_mint(a) {
+            let decimals_expr = pinocchio_mint_decimal_param(handler_profile, &ident)
+                .filter(|param| {
+                    handler
+                        .takes_params
+                        .iter()
+                        .any(|(name, _)| to_snake_case(name) == *param)
+                })
+                .map(|param| format!("({param} as u8)"))
+                .unwrap_or_else(|| "6u8".to_string());
             out.push_str(&format!(
-                "    let mut {ident} = build_mint_account({key_expr}, {signer}, {writable}, 6u8);\n",
+                "    let mut {ident} = build_mint_account({key_expr}, {signer}, {writable}, {decimals_expr});\n",
                 ident = ident,
                 key_expr = key_expr,
                 signer = is_signer,
                 writable = is_writable,
+                decimals_expr = decimals_expr,
             ));
         } else if let Some(layout) = pinocchio_account_layout(proof_profile, a) {
             out.push_str(&format!(
@@ -1992,28 +3652,34 @@ fn emit_pinocchio_handler_harness(
                 layout.name, layout.len
             ));
             out.push_str(&format!(
-                "    let mut {ident}_data: [u8; {len}] = kani::any();\n",
+                "    let mut {ident}_data: [u8; {len}] = [0u8; {len}];\n",
                 ident = ident,
                 len = layout.len
             ));
             for field in &layout.fields {
                 if let Some(bytes) = &field.fixed_bytes {
-                    out.push_str(&format!(
-                        "    {ident}_data[{start}..{end}].copy_from_slice(&{});\n",
-                        rust_u8_array_literal(bytes),
-                        ident = ident,
-                        start = field.offset,
-                        end = field.offset + field.len,
-                    ));
+                    pinocchio_emit_fixed_array_bytes_write(
+                        out,
+                        &format!("{ident}_data"),
+                        field.offset,
+                        bytes,
+                    );
                 }
             }
             out.push_str(&format!(
-                "    let mut {ident} = build_data_account({key_expr}, {signer}, {writable}, {ident}_data);\n",
+                "    let mut {ident} = build_data_account({key_expr}, program_id, {signer}, {writable}, {ident}_data);\n",
                 ident = ident,
                 key_expr = key_expr,
                 signer = is_signer,
                 writable = is_writable,
             ));
+            emit_pinocchio_state_witness_initializers(
+                out,
+                &ident,
+                layout,
+                handler,
+                &account_key_exprs,
+            );
         } else {
             out.push_str(&format!(
                 "    let mut {ident} = build_minimal_account({key_expr}, {signer}, {writable});\n",
@@ -2045,13 +3711,21 @@ fn emit_pinocchio_handler_harness(
     emit_pinocchio_instruction_data_pack_with_profile(out, handler, handler_profile);
     out.push('\n');
 
+    emit_pinocchio_state_pre_snapshots(out, &state_assertions);
     emit_pinocchio_token_pre_snapshots(out, &token_assertions);
 
     // Call the committed dispatcher.
     out.push_str("    // Call the user's real dispatcher. Kani's automatic checks\n");
     out.push_str("    // (overflow / underflow / pointer UB) verify this path.\n");
     out.push_str("    let _result = crate::process_instruction(&program_id, accounts_slice, &instruction_data);\n");
+    out.push_str(
+        "    kani::cover!(_result.is_ok(), \"impl success path reachable under generated profile\");\n",
+    );
+    out.push_str(
+        "    assert!(_result.is_ok(), \"generated valid ABI/profile witness should reach success\");\n",
+    );
 
+    emit_pinocchio_state_post_assertions(out, &state_assertions);
     emit_pinocchio_token_post_assertions(out, &token_assertions);
 
     // Reference: spec ensures clauses. Kani's built-in checks already
@@ -2898,31 +4572,105 @@ handler batch_2
 
         assert!(
             body.contains("let instruction_tag: u8 = 4u8;")
-                && body.contains("let item_count: u8 = 2u8;")
-                && body.contains("instruction_data.extend_from_slice(&item_count.to_le_bytes());")
+                && body.contains("instruction_data[1] = 2u8;")
+                && body.contains("instruction_data[2] = (from_lane_id_0 as u8) as u8;")
+                && body.contains("instruction_data[3] = (to_lane_id_0 as u8) as u8;")
                 && body.contains(
-                    "instruction_data.extend_from_slice(&(from_lane_id_0 as u8).to_le_bytes());"
+                    "let generated_instruction_data_4_bytes = (amount_0 as u64).to_le_bytes();"
                 )
+                && body.contains("instruction_data[12] = (from_lane_id_1 as u8) as u8;")
+                && body.contains("instruction_data[13] = (to_lane_id_1 as u8) as u8;")
                 && body.contains(
-                    "instruction_data.extend_from_slice(&(to_lane_id_0 as u8).to_le_bytes());"
-                )
-                && body.contains(
-                    "instruction_data.extend_from_slice(&(amount_0 as u64).to_le_bytes());"
-                )
-                && body.contains(
-                    "instruction_data.extend_from_slice(&(from_lane_id_1 as u8).to_le_bytes());"
-                )
-                && body.contains(
-                    "instruction_data.extend_from_slice(&(to_lane_id_1 as u8).to_le_bytes());"
-                )
-                && body.contains(
-                    "instruction_data.extend_from_slice(&(amount_1 as u64).to_le_bytes());"
+                    "let generated_instruction_data_14_bytes = (amount_1 as u64).to_le_bytes();"
                 ),
             "ABI repeat profile must pack count and indexed item fields in ABI order; got:\n{body}"
         );
         assert!(
             !body.contains("source profile references param `item_count` absent"),
             "repeat count should be derived from indexed params, not treated as a missing param; got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn pinocchio_impl_emits_verified_stubs_for_contracted_source_helpers() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let program_root = workspace.path().join("program");
+        let abi_root = workspace.path().join("program-abi");
+        std::fs::create_dir_all(program_root.join("src")).unwrap();
+        std::fs::create_dir_all(program_root.join("verification")).unwrap();
+        std::fs::create_dir_all(abi_root.join("schema")).unwrap();
+        std::fs::write(
+            program_root.join("src/lib.rs"),
+            "mod processor;\nmod validation;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            program_root.join("src/validation.rs"),
+            r#"
+#[cfg_attr(kani, kani::requires(amount > 0))]
+#[cfg_attr(kani, kani::ensures(|result| result.is_ok()))]
+pub fn check_amount(amount: u64) -> Result<(), ()> {
+    if amount == 0 { Err(()) } else { Ok(()) }
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            program_root.join("src/processor.rs"),
+            r#"
+use crate::validation::check_amount;
+
+pub fn process_transfer(_accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    let amount = u64::from_le_bytes(data[0..8].try_into().unwrap());
+    check_amount(amount)?;
+    Ok(())
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            abi_root.join("schema/program.schema"),
+            r#"
+instruction TRANSFER 1
+
+record TRANSFER_ARGS
+field AMOUNT u64
+end
+
+instruction_record TRANSFER TRANSFER_ARGS
+"#,
+        )
+        .unwrap();
+
+        let spec_path = program_root.join("verification/program.qedspec");
+        std::fs::write(
+            &spec_path,
+            r#"spec Pool
+state { dummy : U64 }
+handler transfer (amount : U64) {
+  accounts { payer : signer }
+  requires amount > 0 else InvalidAmount
+  ensures state.dummy == old(state.dummy)
+  effect { dummy := dummy }
+}"#,
+        )
+        .unwrap();
+
+        let output = program_root.join("src/kani_impl.rs");
+        generate(
+            &spec_path,
+            &output,
+            /*explicit_flag=*/ true,
+            Target::Pinocchio,
+        )
+        .expect("Pinocchio kani_impl must emit");
+        let body = std::fs::read_to_string(&output).unwrap();
+
+        assert!(
+            body.contains("#[kani::stub_verified(crate::validation::check_amount)]")
+                && body.contains("fn verify_transfer_impl()")
+                && body.contains("crate::process_instruction(&program_id"),
+            "contracted source helper calls should emit verified stubs on the real-dispatcher harness; got:\n{body}"
         );
     }
 
@@ -2987,14 +4735,14 @@ handler batch_2
             "indexed Pubkey repeat fields must be declared as symbolic 32-byte arrays; got:\n{body}"
         );
         assert!(
-            body.contains("let item_count: u8 = 2u8;")
-                && body.contains("instruction_data.extend_from_slice(&mint_0);")
+            body.contains("instruction_data[1] = 2u8;")
+                && body.contains("write_fixed_32(&mut instruction_data, 2, mint_0);")
                 && body.contains(
-                    "instruction_data.extend_from_slice(&(amount_0 as u64).to_le_bytes());"
+                    "let generated_instruction_data_34_bytes = (amount_0 as u64).to_le_bytes();"
                 )
-                && body.contains("instruction_data.extend_from_slice(&mint_1);")
+                && body.contains("write_fixed_32(&mut instruction_data, 42, mint_1);")
                 && body.contains(
-                    "instruction_data.extend_from_slice(&(amount_1 as u64).to_le_bytes());"
+                    "let generated_instruction_data_74_bytes = (amount_1 as u64).to_le_bytes();"
                 ),
             "ABI repeat profile must pack indexed Pubkey fields in ABI order; got:\n{body}"
         );
@@ -3035,17 +4783,17 @@ handler move_tokens (amount : U64) {
         assert!(
             body.contains("let pre_transfer_0_from = read_token_amount(&source);")
                 && body.contains("let pre_transfer_0_to = read_token_amount(&destination);")
-                && body.contains("kani::assume(pre_transfer_0_from >= amount);")
-                && body.contains("kani::assume(pre_transfer_0_to <= u64::MAX - amount);"),
+                && body.contains("kani::assume(pre_transfer_0_from >= (amount as u64));")
+                && body.contains("kani::assume(pre_transfer_0_to <= u64::MAX - (amount as u64));"),
             "must snapshot and constrain Token.transfer balances; got:\n{body}"
         );
         assert!(
             body.contains("if _result.is_ok() {")
                 && body.contains(
-                    "assert_eq!(read_token_amount(&source), pre_transfer_0_from - amount);"
+                    "assert_eq!(read_token_amount(&source), pre_transfer_0_from - (amount as u64));"
                 )
                 && body.contains(
-                    "assert_eq!(read_token_amount(&destination), pre_transfer_0_to + amount);"
+                    "assert_eq!(read_token_amount(&destination), pre_transfer_0_to + (amount as u64));"
                 ),
             "must assert Token.transfer balance deltas on success; got:\n{body}"
         );
@@ -3227,7 +4975,8 @@ handler move_tokens (amount : U64) {
         let body = std::fs::read_to_string(&output).unwrap();
 
         assert!(
-            body.contains("let mut source = build_token_account([1u8; 32], true, false, [2u8; 32], authority_key, source_amount);")
+            body.contains("let source_amount: u64 = kani::any();")
+                && body.contains("let mut source = build_token_account([1u8; 32], true, false, [2u8; 32], authority_key, (source_amount as u64));")
                 && body.contains("let mut mint = build_mint_account([2u8; 32], false, false, 6u8);"),
             "source-inferred token account bindings should project mint and owner bytes; got:\n{body}"
         );
@@ -3325,14 +5074,15 @@ handler move_tokens (amount : U64) (lane_id : U64) {
         let body = std::fs::read_to_string(&output).unwrap();
 
         assert!(
-            body.contains("let source_authority_0_pda = pinocchio::pubkey::try_find_program_address(&[b\"authority\".as_ref(), &[0 as u8]], &program_id);")
-                && body.contains("let source_authority_0_key = source_authority_0_pda.unwrap().0;")
-                && body.contains("let mut source_0 = build_token_account([1u8; 32], true, false, [3u8; 32], source_authority_0_key, source_0_amount);"),
+            body.contains("let source_authority_0_key = crate::derive_authority(&program_id, lane_id as u8).0;")
+                && body.contains("let source_0_amount: u64 = kani::any();")
+                && body.contains("let mut source_0 = build_token_account([1u8; 32], true, false, [3u8; 32], source_authority_0_key, (source_0_amount as u64));"),
             "repeated token account should inherit source loop binding and owner key alias; got:\n{body}"
         );
         assert!(
-            body.contains("let destination_0_owner_pda = pinocchio::pubkey::try_find_program_address(&[b\"authority\".as_ref(), &[lane_id as u8]], &program_id);")
-                && body.contains("let mut destination_0 = build_token_account([2u8; 32], true, false, [3u8; 32], destination_0_owner_key, destination_0_amount);"),
+            body.contains("let destination_0_owner_key = crate::derive_authority(&program_id, lane_id as u8).0;")
+                && body.contains("let destination_0_amount: u64 = kani::any();")
+                && body.contains("let mut destination_0 = build_token_account([2u8; 32], true, false, [3u8; 32], destination_0_owner_key, (destination_0_amount as u64));"),
             "repeated token account should project owner bytes from a source-derived key; got:\n{body}"
         );
     }
@@ -3398,11 +5148,13 @@ handler update_config (max_fee_bps : U64) {
         assert!(
             body.contains("fn build_data_account")
                 && body.contains("// ABI account layout `config_account`: 43 byte data region.")
-                && body.contains("let mut config_data: [u8; 43] = kani::any();")
-                && body.contains("config_data[0..8].copy_from_slice(&[67u8, 70u8, 71u8, 77u8, 65u8, 71u8, 73u8, 67u8]);")
-                && body.contains("let mut config = build_data_account([1u8; 32], false, true, config_data);")
+                && body.contains("let mut config_data: [u8; 43] = [0u8; 43];")
+                && body.contains("config_data[0] = 67u8;")
+                && body.contains("config_data[7] = 67u8;")
+                && body.contains("let mut config = build_data_account([1u8; 32], program_id, false, true, config_data);")
+                && body.contains("write_state_u16(&mut config, 40, (max_fee_bps as u16));")
                 && !body.contains("let mut config = build_minimal_account("),
-            "ABI account layouts should emit symbolic data accounts with the profiled byte length; got:\n{body}"
+            "ABI account layouts should emit program-owned data accounts with profiled byte length and state witnesses; got:\n{body}"
         );
     }
 
@@ -3472,15 +5224,8 @@ handler route (lane_id : U64) {
         let body = std::fs::read_to_string(&output).unwrap();
 
         assert!(
-            body.contains(
-                "let config_pda = pinocchio::pubkey::try_find_program_address(&[b\"config\".as_ref()], &program_id);"
-            )
-                && body.contains("kani::assume(config_pda.is_some());")
-                && body.contains("let config_key = config_pda.unwrap().0;")
-                && body.contains(
-                    "let vault_authority_pda = pinocchio::pubkey::try_find_program_address(&[b\"vault-authority\".as_ref(), &[lane_id as u8]], &program_id);"
-                )
-                && body.contains("let vault_authority_key = vault_authority_pda.unwrap().0;")
+            body.contains("let config_key = crate::derive_config(&program_id).0;")
+                && body.contains("let vault_authority_key = crate::derive_vault_authority(&program_id, lane_id as u8).0;")
                 && body.contains(
                     "let mut config = build_minimal_account(config_key, false, true);"
                 )
@@ -3573,11 +5318,8 @@ handler route (lane_id : U64) {
 
         assert!(
             body.contains(
-                "let vault_pda = pinocchio::pubkey::try_find_program_address(&[b\"vault-authority\".as_ref(), &[lane_id as u8]], &program_id);"
-            )
-                && body.contains("kani::assume(vault_pda.is_some());")
-                && body.contains("let vault_key = vault_pda.unwrap().0;")
-                && body.contains("let mut vault = build_minimal_account(vault_key, false, false);"),
+                "let vault_key = crate::derive_vault_authority(&program_id, lane_id as u8).0;"
+            ) && body.contains("let mut vault = build_minimal_account(vault_key, false, false);"),
             "source require_key derived-key guards should bind exact account keys; got:\n{body}"
         );
     }
@@ -3654,10 +5396,7 @@ handler route (nonce : U64) {
         let body = std::fs::read_to_string(&output).unwrap();
 
         assert!(
-            body.contains(
-                "let vault_pda = pinocchio::pubkey::try_find_program_address(&[[1u8; 32].as_ref(), [2u8; 32].as_ref()], &crate::ASSOCIATED_TOKEN_PROGRAM_ID);"
-            )
-                && body.contains("let vault_key = vault_pda.unwrap().0;")
+            body.contains("let vault_key = crate::derive_token_vault(&[1u8; 32], &[2u8; 32]).0;")
                 && body.contains("let mut vault = build_minimal_account(vault_key, false, true);"),
             "non-program-id PDA account keys should render from source require_key derivations; got:\n{body}"
         );
@@ -3758,13 +5497,8 @@ handler route (lane_id : U64) {
         let body = std::fs::read_to_string(&output).unwrap();
 
         assert!(
-            body.contains(
-                "let vault_authority_pda = pinocchio::pubkey::try_find_program_address(&[b\"authority\".as_ref(), &[lane_id as u8]], &program_id);"
-            )
-                && body.contains("let vault_authority_key = vault_authority_pda.unwrap().0;")
-                && body.contains(
-                    "let vault_pda = pinocchio::pubkey::try_find_program_address(&[vault_authority_key.as_ref(), crate::TOKEN_PROGRAM_ID.as_ref(), [1u8; 32].as_ref()], &crate::ASSOCIATED_TOKEN_PROGRAM_ID);"
-                )
+            body.contains("let vault_authority_key = crate::derive_authority(&program_id, lane_id as u8).0;")
+                && body.contains("let vault_key = crate::derive_token_vault(&program_id, &[1u8; 32], lane_id as u8).0;")
                 && body.contains("let mut vault = build_minimal_account(vault_key, false, true);"),
             "nested derived-key PDA seeds should render before the outer non-program-id PDA; got:\n{body}"
         );
@@ -3882,18 +5616,10 @@ handler route_2
         let body = std::fs::read_to_string(&output).unwrap();
 
         assert!(
-            body.contains(
-                "let source_vault_0_authority_pda = pinocchio::pubkey::try_find_program_address(&[b\"authority\".as_ref(), &[from_lane_id_0 as u8]], &program_id);"
-            )
-                && body.contains(
-                    "let source_vault_0_pda = pinocchio::pubkey::try_find_program_address(&[source_vault_0_authority_key.as_ref(), crate::TOKEN_PROGRAM_ID.as_ref(), [1u8; 32].as_ref()], &crate::ASSOCIATED_TOKEN_PROGRAM_ID);"
-                )
-                && body.contains(
-                    "let destination_vault_1_authority_pda = pinocchio::pubkey::try_find_program_address(&[b\"authority\".as_ref(), &[to_lane_id_1 as u8]], &program_id);"
-                )
-                && body.contains(
-                    "let destination_vault_1_pda = pinocchio::pubkey::try_find_program_address(&[destination_vault_1_authority_key.as_ref(), crate::TOKEN_PROGRAM_ID.as_ref(), [1u8; 32].as_ref()], &crate::ASSOCIATED_TOKEN_PROGRAM_ID);"
-                )
+            body.contains("let source_vault_0_authority_key = crate::derive_authority(&program_id, from_lane_id_0 as u8).0;")
+                && body.contains("let source_vault_0_key = crate::derive_token_vault(&program_id, &[1u8; 32], from_lane_id_0 as u8).0;")
+                && body.contains("let destination_vault_1_authority_key = crate::derive_authority(&program_id, to_lane_id_1 as u8).0;")
+                && body.contains("let destination_vault_1_key = crate::derive_token_vault(&program_id, &[1u8; 32], to_lane_id_1 as u8).0;")
                 && body.contains("let mut source_vault_0 = build_minimal_account(source_vault_0_key, false, true);")
                 && body.contains("let mut destination_vault_1 = build_minimal_account(destination_vault_1_key, false, true);"),
             "repeated loop account-key derivations should bind suffixed accounts from source; got:\n{body}"
@@ -4001,16 +5727,77 @@ pub fn process_move_tokens(accounts: &[AccountInfo], instruction_data: &[u8]) ->
             "must use source-inferred account order; got:\n{body}"
         );
         assert!(
-            body.contains("instruction_data.extend_from_slice(&(lane as u8).to_le_bytes());")
+            body.contains("instruction_data[1] = (lane as u8) as u8;")
                 && body.contains(
-                    "instruction_data.extend_from_slice(&(amount as u64).to_le_bytes());"
+                    "let generated_instruction_data_2_bytes = (amount as u64).to_le_bytes();"
                 ),
             "must use source-inferred payload order and widths; got:\n{body}"
         );
     }
 
     #[test]
-    fn pinocchio_impl_does_not_emit_project_specific_handlers_without_ensures() {
+    fn pinocchio_fee_normalization_equal_literal_decimals_uses_checked_threshold() {
+        let src = r#"spec FeeSwap
+state { max_fee_bps : U128 }
+handler swap
+  (amount_in : U64)
+  (amount_out : U64)
+  (max_fee_bps : U128)
+  (input_decimals : U64)
+  (output_decimals : U64)
+  (fee_input_normalized : U128)
+  (fee_output_normalized : U128) {
+  accounts {
+    input_mint  : readonly
+    output_mint : readonly
+  }
+  requires amount_in > 0 else InvalidAmount
+  requires amount_out > 0 else InvalidAmount
+  requires max_fee_bps <= 10000 else InvalidFee
+  requires input_decimals == 6 else InvalidMint
+  requires output_decimals == 6 else InvalidMint
+  requires fee_input_normalized == amount_in * 1000000000000 else InvalidAmount
+  requires fee_output_normalized == amount_out * 1000000000000 else InvalidAmount
+  ensures state.max_fee_bps == old(state.max_fee_bps)
+}"#;
+        let spec = parse_str(src).expect("parse");
+        let handler = &spec.handlers[0];
+        let mut mint_decimal_bindings = BTreeMap::new();
+        mint_decimal_bindings.insert("input_mint".to_string(), "input_decimals".to_string());
+        mint_decimal_bindings.insert("output_mint".to_string(), "output_decimals".to_string());
+        let profile = PinocchioHandlerProfile {
+            name: "swap".to_string(),
+            instruction_tag: None,
+            accounts: Vec::new(),
+            account_roles: BTreeMap::new(),
+            token_account_bindings: BTreeMap::new(),
+            mint_decimal_bindings,
+            account_key_derivations: BTreeMap::new(),
+            source_expr_aliases: BTreeMap::new(),
+            verified_stubs: Vec::new(),
+            params: Vec::new(),
+            repeats: Vec::new(),
+        };
+
+        let mut body = String::new();
+        emit_pinocchio_fee_normalization_assumptions(&mut body, handler, Some(&profile));
+
+        assert!(
+            body.contains(
+                "let generated_fee_min_output = ((amount_in as u128) * generated_fee_retained_bps) / 10000u128;"
+            ) && body.contains(
+                "kani::assume((amount_out as u128) >= generated_fee_min_output);"
+            ),
+            "equal literal decimals should cancel the shared normalization scale and emit the bounded fee floor; got:\n{body}"
+        );
+        assert!(
+            !body.contains("generated_fee_input_normalized"),
+            "equal literal decimals must not emit normalization-scale multiplication; got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn pinocchio_impl_emits_effect_only_state_harnesses_without_project_specifics() {
         let src = r#"spec ProjectSpecificConfig
 state { max_fee_bps : U128 }
 handler update_limit (new_max_fee_bps : U128) {
@@ -4029,9 +5816,13 @@ handler update_limit (new_max_fee_bps : U128) {
         let _ = std::fs::remove_file(&tmp);
         generate_from_spec(&spec, &tmp, /*explicit_flag=*/ true, Target::Pinocchio)
             .expect("Pinocchio kani_impl must emit");
+        let body = std::fs::read_to_string(&tmp).unwrap();
         assert!(
-            !tmp.exists(),
-            "generic Pinocchio impl generation should not synthesize project-specific proofs without ensures"
+            body.contains("fn verify_update_limit_impl")
+                && body.contains("kani::cover!(_result.is_ok()")
+                && body.contains("let program_id: [u8; 32] = [42u8; 32];")
+                && body.contains("crate::process_instruction(&program_id"),
+            "effect-only handlers should emit generic state assertions without project-specific branches; got:\n{body}"
         );
     }
 

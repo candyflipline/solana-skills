@@ -29,8 +29,10 @@ pub(crate) struct PinocchioHandlerProfile {
     pub accounts: Vec<String>,
     pub account_roles: BTreeMap<String, PinocchioAccountRole>,
     pub token_account_bindings: BTreeMap<String, PinocchioTokenAccountBinding>,
+    pub mint_decimal_bindings: BTreeMap<String, String>,
     pub account_key_derivations: BTreeMap<String, PinocchioLocalKeyDerivation>,
     pub source_expr_aliases: BTreeMap<String, String>,
+    pub verified_stubs: Vec<String>,
     pub params: Vec<PinocchioParamField>,
     pub repeats: Vec<PinocchioRepeatField>,
 }
@@ -105,6 +107,7 @@ pub(crate) struct PinocchioPdaDerivation {
     pub local_key_derivations: BTreeMap<String, PinocchioLocalKeyDerivation>,
     pub seeds: Vec<PinocchioPdaSeed>,
     pub program_id: String,
+    pub returns_tuple: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,8 +165,10 @@ impl PinocchioProofProfile {
                         accounts: Vec::new(),
                         account_roles: BTreeMap::new(),
                         token_account_bindings: BTreeMap::new(),
+                        mint_decimal_bindings: BTreeMap::new(),
                         account_key_derivations: BTreeMap::new(),
                         source_expr_aliases: BTreeMap::new(),
+                        verified_stubs: Vec::new(),
                         params: Vec::new(),
                         repeats: Vec::new(),
                     });
@@ -179,11 +184,19 @@ impl PinocchioProofProfile {
             for (account, binding) in handler.token_account_bindings {
                 entry.token_account_bindings.insert(account, binding);
             }
+            for (account, param) in handler.mint_decimal_bindings {
+                entry.mint_decimal_bindings.insert(account, param);
+            }
             for (account, derivation) in handler.account_key_derivations {
                 entry.account_key_derivations.insert(account, derivation);
             }
             for (expr, alias) in handler.source_expr_aliases {
                 entry.source_expr_aliases.insert(expr, alias);
+            }
+            for stub in handler.verified_stubs {
+                if !entry.verified_stubs.contains(&stub) {
+                    entry.verified_stubs.push(stub);
+                }
             }
             if !handler.params.is_empty() || !handler.repeats.is_empty() {
                 entry.params = handler.params;
@@ -214,14 +227,14 @@ impl PinocchioProofProfile {
         }
 
         for (name, record) in &schema.records {
-            self.record_layouts.insert(
-                normalize_schema_name(name),
-                record.to_profile_layout(name, &schema.magics),
-            );
+            self.record_layouts
+                .entry(normalize_schema_name(name))
+                .or_insert_with(|| record.to_profile_layout(name, &schema.magics));
         }
         for (account, record) in schema.account_layouts() {
             self.account_layouts
-                .insert(account, normalize_schema_name(&record));
+                .entry(account)
+                .or_insert_with(|| normalize_schema_name(&record));
         }
 
         for (instruction, tag) in &schema.instructions {
@@ -235,8 +248,10 @@ impl PinocchioProofProfile {
                     accounts: Vec::new(),
                     account_roles: BTreeMap::new(),
                     token_account_bindings: BTreeMap::new(),
+                    mint_decimal_bindings: BTreeMap::new(),
                     account_key_derivations: BTreeMap::new(),
                     source_expr_aliases: BTreeMap::new(),
+                    verified_stubs: Vec::new(),
                     params: Vec::new(),
                     repeats: Vec::new(),
                 });
@@ -245,9 +260,13 @@ impl PinocchioProofProfile {
             if let Some(accounts) = schema.accounts.get(instruction) {
                 entry.accounts = accounts
                     .iter()
+                    .filter(|account| !abi_account_name_is_metadata(&account.name))
                     .map(|account| normalize_schema_name(&account.name))
                     .collect();
                 for account in accounts {
+                    if abi_account_name_is_metadata(&account.name) {
+                        continue;
+                    }
                     if !account.role.is_empty() {
                         entry
                             .account_roles
@@ -318,8 +337,11 @@ pub(crate) fn infer_from_context(
     output_src_dir: &Path,
     spec_path: Option<&Path>,
 ) -> Result<PinocchioProofProfile> {
-    let mut candidates = vec![(output_src_dir.to_path_buf(), false)];
-    if let Some(spec_path) = spec_path {
+    let cwd = std::env::current_dir()?;
+    let output_src_dir = absolutize_context_path(output_src_dir, &cwd);
+    let spec_path = spec_path.map(|path| absolutize_context_path(path, &cwd));
+    let mut candidates = vec![(output_src_dir, false)];
+    if let Some(spec_path) = spec_path.as_deref() {
         if let Some(parent) = spec_path.parent() {
             candidates.push((parent.join("src"), true));
             if let Some(program_root) = parent.parent() {
@@ -328,6 +350,14 @@ pub(crate) fn infer_from_context(
         }
     }
     infer_from_src_dirs(candidates)
+}
+
+fn absolutize_context_path(path: &Path, cwd: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    }
 }
 
 fn infer_from_src_dirs<I>(src_dirs: I) -> Result<PinocchioProofProfile>
@@ -342,6 +372,9 @@ where
     };
     let mut candidates = Vec::<(PathBuf, bool)>::new();
     for (src_dir, include_siblings) in src_dirs {
+        if !src_dir.is_dir() {
+            continue;
+        }
         if let Some((_, existing)) = candidates.iter_mut().find(|(path, _)| path == &src_dir) {
             *existing |= include_siblings;
         } else {
@@ -357,16 +390,47 @@ where
 
 fn infer_single_src_dir(src_dir: &Path, include_siblings: bool) -> Result<PinocchioProofProfile> {
     let mut files = Vec::new();
-    collect_rust_files(src_dir, &mut files)?;
+    collect_rust_files(src_dir, &mut files);
     files.sort();
 
     let mut handlers: BTreeMap<String, PinocchioHandlerProfile> = BTreeMap::new();
     let mut pda_derivations: BTreeMap<String, PinocchioPdaDerivation> = BTreeMap::new();
+    let mut parsed_files = Vec::new();
+    let mut contracted_fns = BTreeMap::new();
+    let mut call_graph = BTreeMap::new();
     for path in files {
         let Ok(source) = std::fs::read_to_string(&path) else {
             continue;
         };
         if let Ok(syntax) = syn::parse_file(&source) {
+            let fns = collect_item_fns(&syntax.items);
+            for item_fn in &fns {
+                call_graph.insert(
+                    item_fn.sig.ident.to_string(),
+                    infer_called_fn_names_from_block(&item_fn.block),
+                );
+                if item_fn_has_kani_contract(item_fn) {
+                    contracted_fns.insert(
+                        item_fn.sig.ident.to_string(),
+                        crate_fn_path(src_dir, &path, &item_fn.sig.ident.to_string()),
+                    );
+                }
+            }
+            parsed_files.push((path, source, syntax));
+        } else {
+            parsed_files.push((
+                path,
+                source,
+                syn::File {
+                    shebang: None,
+                    attrs: Vec::new(),
+                    items: Vec::new(),
+                },
+            ));
+        }
+    }
+    for (_path, source, syntax) in parsed_files {
+        if !syntax.items.is_empty() {
             let fns = collect_item_fns(&syntax.items);
             for item_fn in &fns {
                 let Some(name) = process_handler_name(item_fn) else {
@@ -388,6 +452,9 @@ fn infer_single_src_dir(src_dir: &Path, include_siblings: bool) -> Result<Pinocc
                 {
                     entry.account_roles.entry(account).or_default().merge(role);
                 }
+                for (account, param) in infer_mint_decimal_bindings_from_block(&item_fn.block) {
+                    entry.mint_decimal_bindings.insert(account, param);
+                }
                 let key_account_aliases = infer_key_account_aliases_from_block(&item_fn.block);
                 let local_key_derivations = infer_local_key_derivations_from_block(&item_fn.block);
                 for (account, binding) in infer_token_account_bindings_from_block(
@@ -404,6 +471,13 @@ fn infer_single_src_dir(src_dir: &Path, include_siblings: bool) -> Result<Pinocc
                 }
                 for (expr, alias) in infer_source_expr_aliases_from_block(&item_fn.block) {
                     entry.source_expr_aliases.insert(expr, alias);
+                }
+                for stub in
+                    infer_verified_stubs_from_block(&item_fn.block, &contracted_fns, &call_graph)
+                {
+                    if !entry.verified_stubs.contains(&stub) {
+                        entry.verified_stubs.push(stub);
+                    }
                 }
                 if entry.params.is_empty() {
                     entry.params = infer_params_from_block(&item_fn.block);
@@ -427,6 +501,9 @@ fn infer_single_src_dir(src_dir: &Path, include_siblings: bool) -> Result<Pinocc
                 for (account, role) in infer_account_roles(&body, &role_accounts) {
                     entry.account_roles.entry(account).or_default().merge(role);
                 }
+                for (account, param) in infer_mint_decimal_bindings(&body) {
+                    entry.mint_decimal_bindings.insert(account, param);
+                }
                 let key_account_aliases = infer_key_account_aliases(&body);
                 let local_key_derivations = infer_local_key_derivations(&body);
                 for (account, binding) in infer_token_account_bindings(
@@ -443,6 +520,11 @@ fn infer_single_src_dir(src_dir: &Path, include_siblings: bool) -> Result<Pinocc
                 }
                 for (expr, alias) in infer_source_expr_aliases(&body) {
                     entry.source_expr_aliases.insert(expr, alias);
+                }
+                for stub in infer_verified_stubs_from_body(&body, &contracted_fns, &call_graph) {
+                    if !entry.verified_stubs.contains(&stub) {
+                        entry.verified_stubs.push(stub);
+                    }
                 }
                 if entry.params.is_empty() {
                     entry.params = infer_params(&body);
@@ -472,8 +554,10 @@ fn empty_handler_profile(name: String) -> PinocchioHandlerProfile {
         accounts: Vec::new(),
         account_roles: BTreeMap::new(),
         token_account_bindings: BTreeMap::new(),
+        mint_decimal_bindings: BTreeMap::new(),
         account_key_derivations: BTreeMap::new(),
         source_expr_aliases: BTreeMap::new(),
+        verified_stubs: Vec::new(),
         params: Vec::new(),
         repeats: Vec::new(),
     }
@@ -598,11 +682,18 @@ fn load_nearby_abi_schemas(
     collect_schema_dir(&crate_root.join("schema"), &mut schema_dirs);
     if include_siblings {
         if let Some(workspace_dir) = crate_root.parent() {
-            for entry in std::fs::read_dir(workspace_dir)? {
-                let entry = entry?;
-                let path = entry.path();
-                if path.is_dir() && path != crate_root {
-                    collect_schema_dir(&path.join("schema"), &mut schema_dirs);
+            if looks_like_schema_workspace(workspace_dir) {
+                let Ok(entries) = std::fs::read_dir(workspace_dir) else {
+                    return Ok(Vec::new());
+                };
+                for entry in entries {
+                    let Ok(entry) = entry else {
+                        continue;
+                    };
+                    let path = entry.path();
+                    if path.is_dir() && path != crate_root {
+                        collect_schema_dir(&path.join("schema"), &mut schema_dirs);
+                    }
                 }
             }
         }
@@ -613,8 +704,13 @@ fn load_nearby_abi_schemas(
     let mut schemas = Vec::new();
     let mut candidates = Vec::new();
     for schema_dir in schema_dirs {
-        for entry in std::fs::read_dir(schema_dir)? {
-            let entry = entry?;
+        let Ok(entries) = std::fs::read_dir(schema_dir) else {
+            continue;
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                continue;
+            };
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) == Some("schema") {
                 candidates.push(path);
@@ -623,8 +719,9 @@ fn load_nearby_abi_schemas(
     }
     candidates.sort();
     for path in candidates {
-        let source = std::fs::read_to_string(path)?;
-        schemas.push(parse_abi_schema(&source));
+        if let Ok(source) = std::fs::read_to_string(path) {
+            schemas.push(parse_abi_schema(&source));
+        }
     }
     Ok(schemas)
 }
@@ -633,6 +730,24 @@ fn collect_schema_dir(path: &Path, out: &mut Vec<PathBuf>) {
     if path.is_dir() {
         out.push(path.to_path_buf());
     }
+}
+
+fn looks_like_schema_workspace(path: &Path) -> bool {
+    path.join("Cargo.toml").is_file()
+        || path
+            .parent()
+            .is_some_and(|parent| parent.join("Cargo.toml").is_file())
+        || direct_child_schema_dir_exists(path)
+}
+
+fn direct_child_schema_dir_exists(path: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return false;
+    };
+    entries.filter_map(Result::ok).any(|entry| {
+        let child = entry.path();
+        child.is_dir() && child.join("schema").is_dir()
+    })
 }
 
 fn parse_abi_schema(source: &str) -> PinocchioAbiSchema {
@@ -863,8 +978,17 @@ fn integer_rust_type(ty: &str) -> Option<&'static str> {
 fn abi_field_rust_type(ty: &str) -> Option<&'static str> {
     integer_rust_type(ty).or(match ty.to_ascii_lowercase().as_str() {
         "pubkey" => Some("pubkey"),
+        "bool" => Some("bool"),
         _ => None,
     })
+}
+
+fn abi_account_name_is_metadata(name: &str) -> bool {
+    let name = normalize_schema_name(name);
+    name.ends_with("_start")
+        || name.ends_with("_stride")
+        || name.ends_with("_relative")
+        || name.ends_with("_count")
 }
 
 fn abi_field_to_profile_param(field: &AbiField) -> Option<PinocchioParamField> {
@@ -894,25 +1018,29 @@ fn normalize_schema_name(name: &str) -> String {
     out
 }
 
-fn collect_rust_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+fn collect_rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     if !dir.is_dir() {
-        return Ok(());
+        return;
     }
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            continue;
+        };
         let path = entry.path();
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         if matches!(name, "target" | ".git" | "node_modules") {
             continue;
         }
         if path.is_dir() {
-            collect_rust_files(&path, out)?;
+            collect_rust_files(&path, out);
         } else if path.extension().and_then(|e| e.to_str()) == Some("rs") && name != "kani_impl.rs"
         {
             out.push(path);
         }
     }
-    Ok(())
 }
 
 fn collect_item_fns(items: &[Item]) -> Vec<&ItemFn> {
@@ -929,6 +1057,112 @@ fn collect_item_fns(items: &[Item]) -> Vec<&ItemFn> {
         }
     }
     out
+}
+
+fn item_fn_has_kani_contract(item_fn: &ItemFn) -> bool {
+    item_fn.attrs.iter().any(|attr| {
+        let path = attr.path();
+        if path.is_ident("requires") || path.is_ident("ensures") || path.is_ident("modifies") {
+            return true;
+        }
+        let tokens = attr.to_token_stream().to_string();
+        tokens.contains("kani :: requires")
+            || tokens.contains("kani::requires")
+            || tokens.contains("kani :: ensures")
+            || tokens.contains("kani::ensures")
+            || tokens.contains("kani :: modifies")
+            || tokens.contains("kani::modifies")
+    })
+}
+
+fn crate_fn_path(src_dir: &Path, file_path: &Path, fn_name: &str) -> String {
+    let rel = file_path.strip_prefix(src_dir).unwrap_or(file_path);
+    let mut modules = Vec::new();
+    for component in rel.components() {
+        let Some(part) = component.as_os_str().to_str() else {
+            continue;
+        };
+        let part = part.trim_end_matches(".rs");
+        if matches!(part, "lib" | "main" | "mod") {
+            continue;
+        }
+        modules.push(part.replace('-', "_"));
+    }
+    if modules.is_empty() {
+        format!("crate::{fn_name}")
+    } else {
+        format!("crate::{}::{fn_name}", modules.join("::"))
+    }
+}
+
+fn infer_verified_stubs_from_block(
+    block: &syn::Block,
+    contracted_fns: &BTreeMap<String, String>,
+    call_graph: &BTreeMap<String, Vec<String>>,
+) -> Vec<String> {
+    verified_stubs_for_calls(
+        infer_called_fn_names_from_stmts(&block.stmts),
+        contracted_fns,
+        call_graph,
+    )
+}
+
+fn infer_verified_stubs_from_body(
+    body: &str,
+    contracted_fns: &BTreeMap<String, String>,
+    call_graph: &BTreeMap<String, Vec<String>>,
+) -> Vec<String> {
+    let calls: Vec<_> = contracted_fns
+        .iter()
+        .filter(|(name, _path)| !call_arguments(body, name).is_empty())
+        .map(|(name, _path)| name.clone())
+        .collect();
+    verified_stubs_for_calls(calls, contracted_fns, call_graph)
+}
+
+fn infer_called_fn_names_from_block(block: &syn::Block) -> Vec<String> {
+    infer_called_fn_names_from_stmts(&block.stmts)
+}
+
+fn infer_called_fn_names_from_stmts(stmts: &[Stmt]) -> Vec<String> {
+    let mut calls = Vec::new();
+    walk_exprs_in_stmts(stmts, &mut |expr| {
+        let Expr::Call(call) = expr else {
+            return;
+        };
+        let Some(name) = call_name(&call.func) else {
+            return;
+        };
+        if !calls.contains(&name) {
+            calls.push(name);
+        }
+    });
+    calls
+}
+
+fn verified_stubs_for_calls(
+    calls: Vec<String>,
+    contracted_fns: &BTreeMap<String, String>,
+    call_graph: &BTreeMap<String, Vec<String>>,
+) -> Vec<String> {
+    let mut stubs = Vec::new();
+    let mut stack = calls;
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some(name) = stack.pop() {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        if let Some(path) = contracted_fns.get(&name) {
+            if !stubs.contains(path) {
+                stubs.push(path.clone());
+            }
+        }
+        if let Some(callees) = call_graph.get(&name) {
+            stack.extend(callees.iter().cloned());
+        }
+    }
+    stubs.sort();
+    stubs
 }
 
 fn process_handler_name(item_fn: &ItemFn) -> Option<String> {
@@ -1195,7 +1429,7 @@ fn infer_token_account_bindings_from_block(
                     },
                 );
             }
-            "require_matching_token_mint" if args.len() == 2 => {
+            "require_matching_token_mint" | "require_token_mint" if args.len() == 2 => {
                 let (Some(account), Some(mint)) = (expr_ident(args[0]), expr_key_receiver(args[1]))
                 else {
                     return;
@@ -1213,6 +1447,44 @@ fn infer_token_account_bindings_from_block(
         }
     });
     bindings
+}
+
+fn infer_mint_decimal_bindings_from_block(block: &syn::Block) -> BTreeMap<String, String> {
+    let mut bindings = BTreeMap::new();
+    for stmt in &block.stmts {
+        let Stmt::Local(local) = stmt else {
+            continue;
+        };
+        let Some(param) = simple_pat_ident(&local.pat).map(|name| normalize_schema_name(&name))
+        else {
+            continue;
+        };
+        let Some(init) = &local.init else {
+            continue;
+        };
+        let Some(account) = read_mint_decimals_arg(&init.expr) else {
+            continue;
+        };
+        bindings.insert(account, param);
+    }
+    bindings
+}
+
+fn read_mint_decimals_arg(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Try(expr_try) => read_mint_decimals_arg(&expr_try.expr),
+        Expr::Call(call) => {
+            let fn_name = call_name(&call.func)?;
+            if fn_name != "read_mint_decimals" {
+                return None;
+            }
+            call.args
+                .first()
+                .and_then(expr_ident)
+                .map(|name| normalize_schema_name(&name))
+        }
+        _ => None,
+    }
 }
 
 fn infer_source_expr_aliases_from_block(block: &syn::Block) -> BTreeMap<String, String> {
@@ -1357,9 +1629,17 @@ fn infer_pda_derivations_from_fns(
                     })
                     .collect(),
                 program_id,
+                returns_tuple: pda_derivation_returns_tuple(item_fn),
             },
         );
     }
+}
+
+fn pda_derivation_returns_tuple(item_fn: &ItemFn) -> bool {
+    matches!(
+        &item_fn.sig.output,
+        syn::ReturnType::Type(_, ty) if matches!(ty.as_ref(), syn::Type::Tuple(_))
+    )
 }
 
 fn stmt_expr(stmt: &Stmt) -> Option<&Expr> {
@@ -2164,7 +2444,7 @@ fn infer_token_account_bindings(
     }
 
     let re = Regex::new(
-        r"require_matching_token_mint\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*,\s*([A-Za-z_][A-Za-z0-9_]*)\.key\(\)\s*\)",
+        r"require_(?:matching_token_mint|token_mint)\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*,\s*([A-Za-z_][A-Za-z0-9_]*)\.key\(\)\s*\)",
     )
     .unwrap();
     for cap in re.captures_iter(body) {
@@ -2178,6 +2458,21 @@ fn infer_token_account_bindings(
             .mint_account = Some(normalize_schema_name(&cap[2]));
     }
 
+    bindings
+}
+
+fn infer_mint_decimal_bindings(body: &str) -> BTreeMap<String, String> {
+    let mut bindings = BTreeMap::new();
+    let re = Regex::new(
+        r"let\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*read_mint_decimals\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)\s*\?",
+    )
+    .unwrap();
+    for cap in re.captures_iter(body) {
+        bindings.insert(
+            normalize_schema_name(&cap[2]),
+            normalize_schema_name(&cap[1]),
+        );
+    }
     bindings
 }
 
@@ -2328,8 +2623,10 @@ fn infer_dispatch_tags(source: &str, handlers: &mut BTreeMap<String, PinocchioHa
                 accounts: Vec::new(),
                 account_roles: BTreeMap::new(),
                 token_account_bindings: BTreeMap::new(),
+                mint_decimal_bindings: BTreeMap::new(),
                 account_key_derivations: BTreeMap::new(),
                 source_expr_aliases: BTreeMap::new(),
+                verified_stubs: Vec::new(),
                 params: Vec::new(),
                 repeats: Vec::new(),
             });
@@ -2338,7 +2635,7 @@ fn infer_dispatch_tags(source: &str, handlers: &mut BTreeMap<String, PinocchioHa
 }
 
 fn infer_pda_derivations(source: &str, derivations: &mut BTreeMap<String, PinocchioPdaDerivation>) {
-    for (name, params, body) in derive_fn_bodies(source) {
+    for (name, params, returns_tuple, body) in derive_fn_bodies(source) {
         let Some((seeds, program_id)) = first_find_program_address_call(&body) else {
             continue;
         };
@@ -2363,15 +2660,17 @@ fn infer_pda_derivations(source: &str, derivations: &mut BTreeMap<String, Pinocc
                     })
                     .collect(),
                 program_id,
+                returns_tuple,
             },
         );
     }
 }
 
-type DeriveFnBody = (String, Vec<(String, String)>, String);
+type DeriveFnBody = (String, Vec<(String, String)>, bool, String);
 
 fn derive_fn_bodies(source: &str) -> Vec<DeriveFnBody> {
-    let re = Regex::new(r"pub\s+fn\s+derive_([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)").unwrap();
+    let re = Regex::new(r"pub\s+fn\s+derive_([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)\s*(->[^{]+)?")
+        .unwrap();
     let mut out = Vec::new();
     for cap in re.captures_iter(source) {
         let Some(mat) = cap.get(0) else {
@@ -2387,6 +2686,7 @@ fn derive_fn_bodies(source: &str) -> Vec<DeriveFnBody> {
         out.push((
             cap[1].to_string(),
             parse_fn_params(&cap[2]),
+            cap.get(3).is_some_and(|ret| ret.as_str().contains('(')),
             source[open + 1..close].to_string(),
         ));
     }
@@ -2779,6 +3079,7 @@ seed VAULT_AUTHORITY_SEED vault-authority
                     literal: Some("config".to_string()),
                 }],
                 program_id: "program_id".to_string(),
+                returns_tuple: true,
             })
         );
         assert_eq!(
@@ -2802,6 +3103,7 @@ seed VAULT_AUTHORITY_SEED vault-authority
                     },
                 ],
                 program_id: "program_id".to_string(),
+                returns_tuple: true,
             })
         );
     }
@@ -2863,6 +3165,7 @@ fn process_route(accounts: &[AccountInfo]) -> ProgramResult {
                     },
                 ],
                 program_id: "ASSOCIATED_TOKEN_PROGRAM_ID".to_string(),
+                returns_tuple: true,
             })
         );
     }
@@ -3195,8 +3498,10 @@ instruction_record TRANSFER TRANSFER_ARGS
                 accounts: Vec::new(),
                 account_roles: BTreeMap::new(),
                 token_account_bindings: BTreeMap::new(),
+                mint_decimal_bindings: BTreeMap::new(),
                 account_key_derivations: BTreeMap::new(),
                 source_expr_aliases: BTreeMap::new(),
+                verified_stubs: Vec::new(),
                 params: Vec::new(),
                 repeats: Vec::new(),
             },
@@ -3274,6 +3579,172 @@ instruction_record TRANSFER TRANSFER_ARGS
                 start: 0,
                 end: 8
             }]
+        );
+    }
+
+    #[test]
+    fn infers_verified_stubs_from_contracted_helper_calls() {
+        let dir = tempfile::tempdir().expect("src tempdir");
+        let src = dir.path();
+        std::fs::write(src.join("lib.rs"), "mod processor;\nmod validation;\n").unwrap();
+        std::fs::write(
+            src.join("validation.rs"),
+            r#"
+#[cfg_attr(kani, kani::requires(amount > 0))]
+#[cfg_attr(kani, kani::ensures(|result| result.is_ok()))]
+pub fn check_amount_inner(amount: u64) -> Result<(), ()> {
+    if amount == 0 { Err(()) } else { Ok(()) }
+}
+
+pub fn check_amount(amount: u64) -> Result<(), ()> {
+    check_amount_inner(amount)
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("processor.rs"),
+            r#"
+use crate::validation::check_amount;
+
+pub fn process_transfer(accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    let amount = u64::from_le_bytes(data[0..8].try_into().unwrap());
+    check_amount(amount)?;
+    Ok(())
+}
+"#,
+        )
+        .unwrap();
+
+        let profile = infer_from_src_dir(src).expect("profile");
+        let transfer = profile.handler("transfer").expect("transfer profile");
+
+        assert_eq!(
+            transfer.verified_stubs,
+            ["crate::validation::check_amount_inner".to_string()]
+        );
+    }
+
+    #[test]
+    fn infers_verified_stubs_from_contracted_bool_guard_helpers() {
+        let dir = tempfile::tempdir().expect("src tempdir");
+        let src = dir.path();
+        std::fs::write(src.join("lib.rs"), "mod processor;\nmod validation;\n").unwrap();
+        std::fs::write(
+            src.join("validation.rs"),
+            r#"
+#[cfg(kani)]
+#[cfg_attr(kani, kani::requires(amount <= 100))]
+#[cfg_attr(kani, kani::ensures(|result| *result))]
+pub(crate) fn amount_in_envelope_kani(amount: u64) -> bool {
+    amount <= 100
+}
+
+pub fn check_amount(amount: u64) -> Result<(), ()> {
+    #[cfg(kani)]
+    {
+        if !amount_in_envelope_kani(amount) {
+            return Err(());
+        }
+        return Ok(());
+    }
+
+    #[cfg(not(kani))]
+    {
+        if amount <= 100 { Ok(()) } else { Err(()) }
+    }
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("processor.rs"),
+            r#"
+use crate::validation::check_amount;
+
+pub fn process_transfer(accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    let amount = u64::from_le_bytes(data[0..8].try_into().unwrap());
+    check_amount(amount)?;
+    Ok(())
+}
+"#,
+        )
+        .unwrap();
+
+        let profile = infer_from_src_dir(src).expect("profile");
+        let transfer = profile.handler("transfer").expect("transfer profile");
+
+        assert_eq!(
+            transfer.verified_stubs,
+            ["crate::validation::amount_in_envelope_kani".to_string()]
+        );
+    }
+
+    #[test]
+    fn infers_verified_stubs_from_cfg_kani_and_not_kani_helper_branches() {
+        let dir = tempfile::tempdir().expect("src tempdir");
+        let src = dir.path();
+        std::fs::write(src.join("lib.rs"), "mod processor;\nmod validation;\n").unwrap();
+        std::fs::write(
+            src.join("validation.rs"),
+            r#"
+#[cfg(kani)]
+#[cfg_attr(kani, kani::requires(amount <= 100))]
+#[cfg_attr(kani, kani::ensures(|result| *result))]
+pub(crate) fn amount_in_envelope_kani(amount: u64) -> bool {
+    amount <= 100
+}
+
+#[cfg(kani)]
+#[cfg_attr(kani, kani::requires(amount <= 100))]
+#[cfg_attr(kani, kani::ensures(|result| *result))]
+pub(crate) fn amount_threshold_kani(amount: u64) -> bool {
+    amount <= 100
+}
+
+pub fn check_amount(amount: u64) -> Result<(), ()> {
+    #[cfg(kani)]
+    {
+        if !amount_in_envelope_kani(amount) {
+            return Err(());
+        }
+        return Ok(());
+    }
+
+    #[cfg(not(kani))]
+    {
+        if !amount_threshold_kani(amount) {
+            return Err(());
+        }
+        Ok(())
+    }
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("processor.rs"),
+            r#"
+use crate::validation::check_amount;
+
+pub fn process_transfer(accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    let amount = u64::from_le_bytes(data[0..8].try_into().unwrap());
+    check_amount(amount)?;
+    Ok(())
+}
+"#,
+        )
+        .unwrap();
+
+        let profile = infer_from_src_dir(src).expect("profile");
+        let transfer = profile.handler("transfer").expect("transfer profile");
+
+        assert_eq!(
+            transfer.verified_stubs,
+            [
+                "crate::validation::amount_in_envelope_kani".to_string(),
+                "crate::validation::amount_threshold_kani".to_string(),
+            ]
         );
     }
 }

@@ -16,7 +16,7 @@ The non-generic parts need a different source of truth. For Pinocchio programs, 
 
 ## Current Behavior
 
-For each Pinocchio handler with `ensures`, QEDGen emits one implementation-targeted proof. The proof constructs stack-resident `AccountInfo` values using a Pinocchio layout mirror, creates SPL Token-shaped account data for non-program accounts declared as token accounts, creates SPL Mint-shaped account data for accounts declared or inferred as mints, creates symbolic non-token account data when an ABI account layout is available, packs a dispatcher instruction tag, appends numeric parameters, and calls the real `process_instruction`.
+For each Pinocchio handler with `ensures` or concrete state effects, QEDGen emits one implementation-targeted proof. The proof constructs stack-resident `AccountInfo` values using a Pinocchio layout mirror, creates SPL Token-shaped account data for non-program accounts declared as token accounts, creates SPL Mint-shaped account data for accounts declared or inferred as mints, creates symbolic non-token account data when an ABI account layout is available, packs a dispatcher instruction tag, appends numeric parameters, and calls the real `process_instruction`.
 
 When the output path is next to an existing Pinocchio `src/` tree, `pinocchio_profile.rs` parses Rust files with `syn` and infers a proof profile from the syntax tree. The parser-backed path extracts dispatcher tags from `process_instruction` match arms, handler bodies from `process_*` functions, account order from `let [a, b, ..] = accounts` destructuring or sequential `next_account_info` reads, source-side role checks such as `account.is_signer()` and `account.is_writable()`, SPL token program identity checks, mint-decoding calls, token-account decoding calls, token account mint/owner bindings from helpers such as `require_token_account(account, mint.key(), owner.key())`, simple wrapper and struct-field aliases, local key variables assigned from `derive_*` calls, direct `require_key(account, &derive_*(...))` account-key checks, `require_key(account, &local_derived_key)` alias checks, numeric payload fields from `instruction_data.get(start..end)` parsing, and simple `derive_*` PDA seed lists from `find_program_address` calls. A conservative string-based extractor remains only as a fallback when a Rust file cannot be parsed. The profile also imports nearby line-oriented ABI schemas from `schema/*.schema` when present, including sibling workspace crates with schema directories. The ABI parser uses `instruction`, `account`, `record`, `field`, `repeat`, `instruction_record`, `account_record`, `magic`, and `seed` declarations to recover instruction tags, account order, optional account role metadata, scalar argument offsets, scalar widths, record layouts, account-to-record bindings, repeated-record count fields, repeated item fields, fixed byte literals, and literal seed bytes. The Kani emitter consumes the instruction-packing, account-role, account-layout, and PDA-seed facts when present and falls back to spec-declared order or placeholder keys when source or ABI evidence is missing.
 
@@ -46,7 +46,9 @@ The Kani emitter should keep consuming that profile without knowing the program 
 
 QEDGen now has several Kani proof shapes with different claims. The spec-model `--kani` backend proves consistency of the spec-translated transition model; it does not call the program implementation. The implementation-targeted `--kani-impl` backend calls the real dispatcher with symbolic accounts and instruction data; it can catch implementation paths that violate the modeled setup or trigger Kani overflow, underflow, or pointer checks.
 
-The Pinocchio token delta proof is narrower than full CPI semantics. It currently proves byte-level SPL Token account amount deltas for successful dispatcher calls when the profile can construct the relevant token account bytes and the spec contains a `Token.transfer` call. It does not yet prove full account-state conservation, arbitrary CPI semantics, or all helper behavior outside the recovered source/ABI profile.
+The Pinocchio token delta proof is narrower than full CPI semantics. It currently proves byte-level SPL Token account amount deltas for successful dispatcher calls when the profile can construct the relevant token account bytes and the spec contains a `Token.transfer` call. For ABI-backed state accounts, the proof can also snapshot scalar fields before dispatch and assert concrete post-state effects plus unchanged fields when the spec states them. It does not yet prove arbitrary CPI semantics or all helper behavior outside the recovered source/ABI profile.
+
+Every generated Pinocchio impl harness asserts that the generated ABI/profile witness reaches `Ok` from the real dispatcher. `kani::cover!(_result.is_ok(), ...)` remains useful reachability evidence, but it is supplemental only. A harness should be admitted to proof-completion gates only when it also asserts concrete post-state facts, such as token account debits and credits or ABI-backed state-field equality.
 
 Generated `TODO` comments mark conservative fallback paths. A proof function that still contains placeholder packing, declaration, or repeat-count TODOs should be treated as partial generation requiring more profile evidence before it is presented as a concrete implementation proof for those facts.
 
@@ -60,17 +62,46 @@ The focused repository check was run after removing the program-specific branch:
 cargo test -p qedgen-solana-skills kani_impl -- --nocapture
 ```
 
-It passed with 36 focused Kani-emitter tests. Additional profile tests cover parser-backed source-derived dispatcher/account/role/parameter extraction, account-order inference from sequential `next_account_info` reads, SPL token evidence from the source, direct account-key derivation from `require_key(account, &derive_*(...).0)`, context lookup for source-derived account-key derivations, multiline token account bindings through derived key aliases, nearby ABI schema import for tags/accounts/roles/scalar fields, sibling schema discovery from a spec-derived program path, record offset calculation, account-to-record layout binding, fixed byte extraction from ABI magic literals, repeated-record length calculation, repeated item-field exposure, generated `kani_impl.rs` exclusion, simple source-derived PDA seed extraction with ABI seed literal resolution, and numeric arity suffix lookup.
+It passed with 38 focused Kani-emitter tests. Additional profile tests cover parser-backed source-derived dispatcher/account/role/parameter extraction, account-order inference from sequential `next_account_info` reads, SPL token evidence from the source, direct account-key derivation from `require_key(account, &derive_*(...).0)`, context lookup for source-derived account-key derivations, multiline token account bindings through derived key aliases, nearby ABI schema import for tags/accounts/roles/scalar fields, sibling schema discovery from a spec-derived program path, record offset calculation, account-to-record layout binding, fixed byte extraction from ABI magic literals, repeated-record length calculation, repeated item-field exposure, generated `kani_impl.rs` exclusion, simple source-derived PDA seed extraction with ABI seed literal resolution, and numeric arity suffix lookup.
 
 The updated Kani emitter tests assert that generic Pinocchio token-transfer balance deltas still emit. They also cover source-derived dispatcher tags, account order, payload widths, direct and repeated `Pubkey` parameter packing, token account mint/owner bytes, owner PDA variables from known `derive_*` seed profiles, account-key binding from direct and alias-based source `require_key` derivation guards, non-`program_id` PDA programs with direct and one-level nested account-key seeds, repeated loop account-key derivations through ABI item fields, ABI account-role projection for token accounts and mints, ABI data account byte lengths with fixed byte ranges, exact account-key binding from profiled PDA derivations, ABI repeated-record packing, arity-suffixed handler lookup, repeated token account binding through numeric suffixes, writable non-token account handling, runtime-neutral ABI packing, and project-shaped handlers without custom proof bodies.
 
-The generated implementation harness smoke is intentionally opt-in because it
+The generated implementation proof gate is intentionally opt-in because it
 requires `cargo kani`:
 
 ```sh
 QEDGEN_RUN_CARGO_KANI_SMOKE=1 cargo test -p qedgen-solana-skills --test codegen_smoke generated_pinocchio_kani_impl_proves_with_cargo_kani -- --ignored --nocapture
 ```
 
-That smoke generates a generic Pinocchio fixture, writes `src/kani_impl.rs`,
+That gate generates a generic Pinocchio fixture, writes `src/kani_impl.rs`,
 checks that the green proof path has no generated `TODO:` placeholders, and
 then proves `verify_ping_impl` with Kani.
+
+The richer generic proof-lab fixture lives under
+`crates/qedgen/tests/fixtures/pinocchio-fixtures/kani-profile-diversity`.
+It is a compileable Pinocchio crate with source plus ABI schema. The fast test
+asserts that emitted proofs use the expected source and ABI facts. The opt-in
+Kani proof-lab gate proves selected generated harnesses with real `cargo kani`:
+
+```sh
+QEDGEN_RUN_CARGO_KANI_SMOKE=1 cargo test -p qedgen-solana-skills --test codegen_smoke generated_pinocchio_profile_diversity_kani_impl_proves_with_cargo_kani -- --ignored --nocapture
+```
+
+That proof-lab gate has two explicit layers. The non-ignored fixture test is an
+emitter/profile regression check only: it verifies source and ABI facts such as
+repeated-record packing, ABI magic-byte account layout, and non-`program_id` PDA
+derivation. It is not proof-completion evidence.
+
+The ignored proof-completion gate runs real `cargo kani` only for generated
+harnesses that call the real dispatcher, assert `_result.is_ok()`, and assert
+concrete post-state facts. The current proof-completion list covers basic token
+byte deltas, fee-limit state writes, pause-flag state writes, a stable no-fee
+two-leg router swap, withdraw token deltas, a one-transfer rebalance batch, and
+a two-transfer router-style rebalance pair with indexed token delta assertions.
+Layout-only and PDA-reachability-only harnesses remain regression checks until
+they have concrete post-state assertions.
+
+Downstream programs can validate their own generated `--kani-impl` proofs from
+their qedspec, source, and ABI profile without adding program-specific branches
+to QEDGen. If larger downstream cases hit solver limits, those limits should be
+reported as proof-splitting or solver-scaling work, not as passed proof evidence.
