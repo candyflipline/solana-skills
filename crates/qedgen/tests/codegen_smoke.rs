@@ -312,6 +312,12 @@ fn compact_rust(body: &str) -> String {
 }
 
 fn smoke_pinocchio_kani_profile_diversity() {
+    let body = render_pinocchio_kani_profile_diversity_impl();
+
+    assert_pinocchio_kani_profile_diversity_contract(&body);
+}
+
+fn render_pinocchio_kani_profile_diversity_impl() -> String {
     let temp = tempfile::tempdir().expect("tempdir");
     let fixture_root = repo_root()
         .join("crates/qedgen/tests/fixtures/pinocchio-fixtures")
@@ -335,8 +341,10 @@ fn smoke_pinocchio_kani_profile_diversity() {
         .arg(&kani_impl)
         .current_dir(temp.path()));
 
-    let body = std::fs::read_to_string(&kani_impl).expect("read generated kani_impl.rs");
+    std::fs::read_to_string(&kani_impl).expect("read generated kani_impl.rs")
+}
 
+fn assert_pinocchio_kani_profile_diversity_contract(body: &str) {
     assert!(
         body.contains("fn verify_move_tokens_impl"),
         "missing move_tokens impl harness:\n{body}"
@@ -440,6 +448,76 @@ fn smoke_pinocchio_kani_profile_diversity() {
         !body.contains("TODO: concrete account layout from source/ABI profile"),
         "profile-backed green proof paths should not carry placeholder TODOs:\n{body}"
     );
+}
+
+fn codegen_smoke_snapshots_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("snapshots")
+}
+
+fn assert_or_update_codegen_smoke_snapshot(snapshot_name: &str, rendered: &str) {
+    let snapshot_path = codegen_smoke_snapshots_dir().join(snapshot_name);
+    let update = std::env::var("UPDATE_SNAPSHOTS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    if update {
+        std::fs::create_dir_all(codegen_smoke_snapshots_dir()).expect("create snapshots dir");
+        std::fs::write(&snapshot_path, rendered)
+            .unwrap_or_else(|e| panic!("write {}: {e}", snapshot_path.display()));
+        eprintln!("UPDATE_SNAPSHOTS=1: wrote {}", snapshot_path.display());
+        return;
+    }
+
+    let expected = std::fs::read_to_string(&snapshot_path).unwrap_or_else(|e| {
+        panic!(
+            "missing snapshot {}: {e}\n\
+             Run with UPDATE_SNAPSHOTS=1 to seed it.",
+            snapshot_path.display()
+        )
+    });
+
+    if expected != rendered {
+        let diff = diff_unified(&expected, rendered);
+        panic!(
+            "{snapshot_name}: Pinocchio Kani impl snapshot drift detected.\n\
+             Snapshot: {}\n\
+             Re-run with UPDATE_SNAPSHOTS=1 to refresh (then inspect the diff before \
+             committing).\n\
+             {diff}",
+            snapshot_path.display()
+        );
+    }
+}
+
+fn diff_unified(expected: &str, actual: &str) -> String {
+    let exp_lines: Vec<&str> = expected.lines().collect();
+    let act_lines: Vec<&str> = actual.lines().collect();
+    let mut out = String::new();
+    out.push_str("--- snapshot\n+++ rendered\n");
+    let max = exp_lines.len().max(act_lines.len());
+    let mut printed = 0usize;
+    let max_lines = 80usize;
+    for i in 0..max {
+        let e = exp_lines.get(i).copied().unwrap_or("");
+        let a = act_lines.get(i).copied().unwrap_or("");
+        if e != a {
+            if printed >= max_lines {
+                out.push_str("... (diff truncated)\n");
+                break;
+            }
+            out.push_str(&format!("@@ line {} @@\n", i + 1));
+            if !e.is_empty() || i < exp_lines.len() {
+                out.push_str(&format!("-{}\n", e));
+            }
+            if !a.is_empty() || i < act_lines.len() {
+                out.push_str(&format!("+{}\n", a));
+            }
+            printed += 1;
+        }
+    }
+    out
 }
 
 fn proof_completion_pinocchio_kani_profile_diversity_with_cargo_kani() {
@@ -736,6 +814,13 @@ fn generated_pinocchio_kani_impl_proves_with_cargo_kani() {
 #[test]
 fn pinocchio_kani_profile_diversity_fixture_generates_expected_proofs() {
     smoke_pinocchio_kani_profile_diversity();
+}
+
+#[test]
+fn pinocchio_kani_profile_diversity_impl_snapshot_matches() {
+    let body = render_pinocchio_kani_profile_diversity_impl();
+    assert_pinocchio_kani_profile_diversity_contract(&body);
+    assert_or_update_codegen_smoke_snapshot("kani-profile-diversity.kani_impl.rs", &body);
 }
 
 #[test]

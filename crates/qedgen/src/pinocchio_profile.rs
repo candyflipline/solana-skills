@@ -994,7 +994,9 @@ fn abi_account_name_is_metadata(name: &str) -> bool {
 fn abi_field_to_profile_param(field: &AbiField) -> Option<PinocchioParamField> {
     Some(PinocchioParamField {
         name: normalize_schema_name(&field.name),
-        rust_type: abi_field_rust_type(&field.ty)?.to_string(),
+        rust_type: abi_field_rust_type(&field.ty)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("unsupported:{}", field.ty)),
         start: field.offset,
         end: field.offset + field.len,
     })
@@ -3482,6 +3484,12 @@ instruction_record TRANSFER TRANSFER_ARGS
                     rust_type: "u64".to_string(),
                     start: 1,
                     end: 9
+                },
+                PinocchioParamField {
+                    name: "memo".to_string(),
+                    rust_type: "unsupported:bytes8".to_string(),
+                    start: 9,
+                    end: 17
                 }
             ]
         );

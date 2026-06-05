@@ -242,7 +242,7 @@ fn snapshot_percolator() {
 fn snapshot_kani_cpi_account_bindings() {
     assert_or_update_snapshot(
         "kani-cpi-account-bindings",
-        "examples/rust/kani-cpi-account-bindings",
+        "crates/qedgen/tests/fixtures/kani-cpi-account-bindings",
         "config.qedspec",
     );
 }

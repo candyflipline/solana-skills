@@ -930,19 +930,6 @@ fn normalized_fee_decimal_scale(decimals: u64) -> u128 {
 }
 "#;
 
-/// Normalize a spec handler name into `(module, fn_name)`.
-///
-/// Kept for generated-scaffold compatibility docs and tests: older
-/// Pinocchio harnesses called `crate::instructions::<module>::<fn_name>`.
-/// Current committed-crate harnesses call the public `process_instruction`
-/// dispatcher instead.
-fn _pinocchio_call_path(handler_name: &str) -> (String, String) {
-    let snake = to_snake_case(handler_name);
-    let base = snake.strip_prefix("process_").unwrap_or(&snake).to_string();
-    let fn_name = format!("process_{}", base);
-    (base, fn_name)
-}
-
 /// Instruction tag constant expected in the committed Pinocchio crate.
 ///
 /// For arity-specialized spec models such as `batch_16`, strip the numeric
@@ -984,7 +971,15 @@ fn pinocchio_param_decl_type(dsl_type: &str) -> Option<&'static str> {
 }
 
 fn pinocchio_emit_profile_field_pack(out: &mut String, field: &PinocchioParamField, ident: &str) {
-    if field.rust_type.eq_ignore_ascii_case("pubkey") {
+    if pinocchio_profile_field_is_unsupported(field) {
+        out.push_str(&format!(
+            "    // TODO: unsupported instruction field `{}` type `{}` at offset {}..{}; use absolute-offset packing before treating this as proof evidence\n",
+            field.name,
+            pinocchio_unsupported_profile_type(field),
+            field.start,
+            field.end
+        ));
+    } else if field.rust_type.eq_ignore_ascii_case("pubkey") {
         out.push_str(&format!(
             "    instruction_data.extend_from_slice(&{});\n",
             ident
@@ -1008,7 +1003,15 @@ fn pinocchio_emit_profile_field_write(
     ident: &str,
     offset: usize,
 ) {
-    if field.rust_type.eq_ignore_ascii_case("pubkey") {
+    if pinocchio_profile_field_is_unsupported(field) {
+        out.push_str(&format!(
+            "    // TODO: unsupported instruction field `{}` type `{}` at offset {}..{}; leaving bytes symbolic/zeroed until profile support is added\n",
+            field.name,
+            pinocchio_unsupported_profile_type(field),
+            offset,
+            offset + (field.end - field.start)
+        ));
+    } else if field.rust_type.eq_ignore_ascii_case("pubkey") {
         out.push_str(&format!(
             "    write_fixed_32(&mut instruction_data, {offset}, {});\n",
             ident
@@ -1027,6 +1030,17 @@ fn pinocchio_emit_profile_field_write(
             field.end - field.start,
         );
     }
+}
+
+fn pinocchio_profile_field_is_unsupported(field: &PinocchioParamField) -> bool {
+    field.rust_type.starts_with("unsupported:")
+}
+
+fn pinocchio_unsupported_profile_type(field: &PinocchioParamField) -> &str {
+    field
+        .rust_type
+        .strip_prefix("unsupported:")
+        .unwrap_or(&field.rust_type)
 }
 
 fn pinocchio_emit_numeric_array_write(
@@ -1079,7 +1093,9 @@ fn pinocchio_profile_instruction_data_len(
 ) -> Option<usize> {
     let mut len = 1usize;
     for param in &profile.params {
-        if pinocchio_profile_param_name(handler, &param.name).is_some() {
+        if pinocchio_profile_param_name(handler, &param.name).is_some()
+            || pinocchio_profile_field_is_unsupported(param)
+        {
             len = len.max(1 + param.end);
         }
     }
@@ -1109,7 +1125,9 @@ fn emit_pinocchio_instruction_data_fixed_with_profile(
     ));
 
     for param in &profile.params {
-        if let Some(param_name) = pinocchio_profile_param_name(handler, &param.name) {
+        if pinocchio_profile_field_is_unsupported(param) {
+            pinocchio_emit_profile_field_write(out, param, &param.name, 1 + param.start);
+        } else if let Some(param_name) = pinocchio_profile_param_name(handler, &param.name) {
             pinocchio_emit_profile_field_write(out, param, &param_name, 1 + param.start);
         } else {
             out.push_str(&format!(
@@ -1128,16 +1146,20 @@ fn emit_pinocchio_instruction_data_fixed_with_profile(
         ));
         for index in 0..count {
             for field in &repeat.item_fields {
-                let Some(param_name) = repeat_item_param_name(handler, &field.name, index, count)
-                else {
+                let param_name = repeat_item_param_name(handler, &field.name, index, count);
+                if param_name.is_none() && !pinocchio_profile_field_is_unsupported(field) {
                     out.push_str(&format!(
                         "    // Profile note: repeat field `{}` item {} absent from the spec handler\n",
                         field.name, index
                     ));
                     continue;
-                };
+                }
                 let offset = 1 + repeat.offset + (index * repeat.item_len) + field.start;
-                pinocchio_emit_profile_field_write(out, field, &to_snake_case(&param_name), offset);
+                let ident = param_name
+                    .as_deref()
+                    .map(to_snake_case)
+                    .unwrap_or_else(|| format!("unsupported_{}_{}", field.name, index));
+                pinocchio_emit_profile_field_write(out, field, &ident, offset);
             }
         }
     }
@@ -1185,7 +1207,10 @@ fn emit_pinocchio_instruction_data_pack_with_profile(
     if let Some(profile) = profile {
         if !profile.params.is_empty() || !profile.repeats.is_empty() {
             for param in &profile.params {
-                if let Some(param_name) = pinocchio_profile_param_name(handler, &param.name) {
+                if pinocchio_profile_field_is_unsupported(param) {
+                    pinocchio_emit_profile_field_pack(out, param, &param.name);
+                } else if let Some(param_name) = pinocchio_profile_param_name(handler, &param.name)
+                {
                     pinocchio_emit_profile_field_pack(out, param, &param_name);
                 } else {
                     out.push_str(&format!(
@@ -1323,6 +1348,9 @@ fn emit_pinocchio_profile_width_assumptions(
         return;
     };
     for param in &profile.params {
+        if pinocchio_profile_field_is_unsupported(param) {
+            continue;
+        }
         let Some(param_name) = pinocchio_profile_param_name(handler, &param.name) else {
             continue;
         };
@@ -1334,6 +1362,9 @@ fn emit_pinocchio_profile_width_assumptions(
         };
         for index in 0..count {
             for item in &repeat.item_fields {
+                if pinocchio_profile_field_is_unsupported(item) {
+                    continue;
+                }
                 let Some(item_name) = repeat_item_param_name(handler, &item.name, index, count)
                 else {
                     continue;
@@ -1780,6 +1811,12 @@ fn emit_pinocchio_token_pre_snapshots(
     if assertions.is_empty() {
         return;
     }
+    if !pinocchio_transfer_accounts_are_unique(assertions) {
+        out.push_str(
+            "    // Profile note: token transfer delta assertions skipped because transfer accounts alias or chain; aggregate net-delta support required\n\n",
+        );
+        return;
+    }
 
     out.push_str("    // Pre-token snapshots for generated Token.transfer assertions.\n");
     for (index, assertion) in assertions.iter().enumerate() {
@@ -1808,6 +1845,9 @@ fn emit_pinocchio_token_post_assertions(
     assertions: &[PinocchioTokenTransferAssertion],
 ) {
     if assertions.is_empty() {
+        return;
+    }
+    if !pinocchio_transfer_accounts_are_unique(assertions) {
         return;
     }
 
@@ -2257,17 +2297,45 @@ fn pinocchio_account_order<'a>(
 
     let mut ordered = Vec::with_capacity(handler.accounts.len());
     for name in &profile.accounts {
-        let Some(account) = handler.accounts.iter().find(|acct| acct.name == *name) else {
+        let normalized_profile_name = normalize_pinocchio_profile_name(name);
+        let Some(account) = handler
+            .accounts
+            .iter()
+            .find(|acct| normalize_pinocchio_profile_name(&acct.name) == normalized_profile_name)
+        else {
             return handler.accounts.iter().collect();
         };
         ordered.push(account);
     }
     for account in &handler.accounts {
-        if !profile.accounts.iter().any(|name| name == &account.name) {
+        let normalized_account_name = normalize_pinocchio_profile_name(&account.name);
+        if !profile
+            .accounts
+            .iter()
+            .any(|name| normalize_pinocchio_profile_name(name) == normalized_account_name)
+        {
             ordered.push(account);
         }
     }
     ordered
+}
+
+fn pinocchio_unmatched_profile_account<'a>(
+    handler: &ParsedHandler,
+    profile: &'a PinocchioHandlerProfile,
+) -> Option<&'a str> {
+    profile.accounts.iter().find_map(|name| {
+        let normalized_profile_name = normalize_pinocchio_profile_name(name);
+        let matched = handler
+            .accounts
+            .iter()
+            .any(|acct| normalize_pinocchio_profile_name(&acct.name) == normalized_profile_name);
+        (!matched).then_some(name.as_str())
+    })
+}
+
+fn normalize_pinocchio_profile_name(name: &str) -> String {
+    to_snake_case(name)
 }
 
 fn pinocchio_account_role<'a>(
@@ -2379,6 +2447,10 @@ fn pinocchio_param_decl_rust_type<'a>(
     let Some(profile_type) = pinocchio_param_rust_type(name, handler, handler_profile) else {
         return spec_rust_type;
     };
+
+    if pinocchio_profile_rust_type_is_unsupported(profile_type) {
+        return spec_rust_type;
+    }
 
     if profile_type == "bool" || pinocchio_param_has_mixed_arithmetic_requires(handler, name) {
         return spec_rust_type;
@@ -2494,7 +2566,10 @@ fn pinocchio_param_rust_type<'a>(
                         || pinocchio_profile_param_name(handler, &param.name).as_deref()
                             == Some(name)
                 })
-                .map(|param| param.rust_type.as_str())
+                .and_then(|param| {
+                    (!pinocchio_profile_field_is_unsupported(param))
+                        .then_some(param.rust_type.as_str())
+                })
         })
         .or_else(|| {
             handler
@@ -2503,6 +2578,10 @@ fn pinocchio_param_rust_type<'a>(
                 .find(|(param_name, _)| to_snake_case(param_name) == name)
                 .and_then(|(_name, param_type)| numeric_param_rust_type(param_type))
         })
+}
+
+fn pinocchio_profile_rust_type_is_unsupported(rust_type: &str) -> bool {
+    rust_type.starts_with("unsupported:")
 }
 
 fn pinocchio_resolve_source_expr_alias<'a>(
@@ -3280,6 +3359,11 @@ fn emit_pinocchio_profile_notes(
     if let Some(profile) = handler_profile {
         if profile.accounts.is_empty() {
             out.push_str("/// - source account order: not inferred; using spec order\n");
+        } else if let Some(unmatched) = pinocchio_unmatched_profile_account(handler, profile) {
+            out.push_str(&format!(
+                "/// - source account order: inferred order unusable; profile account `{}` did not match spec accounts; using spec order\n",
+                rust_string_escape(unmatched)
+            ));
         } else {
             out.push_str(&format!(
                 "/// - source account order: {}\n",
@@ -5732,6 +5816,182 @@ pub fn process_move_tokens(accounts: &[AccountInfo], instruction_data: &[u8]) ->
                     "let generated_instruction_data_2_bytes = (amount as u64).to_le_bytes();"
                 ),
             "must use source-inferred payload order and widths; got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn pinocchio_impl_keeps_non_trailing_unsupported_abi_fields_visible() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let program_root = workspace.path().join("program");
+        let abi_root = workspace.path().join("program-abi");
+        std::fs::create_dir_all(program_root.join("src")).unwrap();
+        std::fs::create_dir_all(program_root.join("verification")).unwrap();
+        std::fs::create_dir_all(abi_root.join("schema")).unwrap();
+        std::fs::write(program_root.join("src/lib.rs"), "").unwrap();
+        std::fs::write(
+            abi_root.join("schema/program.schema"),
+            r#"
+instruction UPLOAD 12
+
+record UPLOAD_ARGS
+field MEMO bytes8
+field AMOUNT u64
+end
+
+instruction_record UPLOAD UPLOAD_ARGS
+"#,
+        )
+        .unwrap();
+
+        let spec_path = program_root.join("verification/program.qedspec");
+        std::fs::write(
+            &spec_path,
+            r#"spec Upload
+state { total : U64 }
+handler upload (amount : U64) {
+  accounts { payer : signer }
+  ensures state.total == old(state.total)
+  effect { total := total }
+}"#,
+        )
+        .unwrap();
+
+        let output = program_root.join("src/kani_impl.rs");
+        generate(
+            &spec_path,
+            &output,
+            /*explicit_flag=*/ true,
+            Target::Pinocchio,
+        )
+        .expect("Pinocchio kani_impl must emit");
+        let body = std::fs::read_to_string(&output).unwrap();
+
+        assert!(
+            body.contains("let mut instruction_data = [0u8; 17];")
+                && body.contains(
+                    "TODO: unsupported instruction field `memo` type `bytes8` at offset 1..9"
+                )
+                && body.contains(
+                    "let generated_instruction_data_9_bytes = (amount as u64).to_le_bytes();"
+                ),
+            "non-trailing unsupported ABI fields must keep absolute layout visible and pack later fields at the right offset; got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn pinocchio_token_delta_assertions_skip_aliasing_transfers() {
+        let chained = vec![
+            PinocchioTokenTransferAssertion {
+                from: "account_a".to_string(),
+                to: "account_b".to_string(),
+                amount: "amount_0".to_string(),
+            },
+            PinocchioTokenTransferAssertion {
+                from: "account_b".to_string(),
+                to: "account_c".to_string(),
+                amount: "amount_1".to_string(),
+            },
+        ];
+        let mut body = String::new();
+        emit_pinocchio_token_pre_snapshots(&mut body, &chained);
+        emit_pinocchio_token_post_assertions(&mut body, &chained);
+        assert!(
+            body.contains("token transfer delta assertions skipped")
+                && !body.contains("assert_eq!(read_token_amount"),
+            "chained transfers should not emit independent per-transfer final assertions; got:\n{body}"
+        );
+
+        let self_transfer = vec![PinocchioTokenTransferAssertion {
+            from: "account_a".to_string(),
+            to: "account_a".to_string(),
+            amount: "amount".to_string(),
+        }];
+        let mut body = String::new();
+        emit_pinocchio_token_pre_snapshots(&mut body, &self_transfer);
+        emit_pinocchio_token_post_assertions(&mut body, &self_transfer);
+        assert!(
+            body.contains("token transfer delta assertions skipped")
+                && !body.contains("assert_eq!(read_token_amount"),
+            "self-transfer aliases should not emit independent debit/credit assertions; got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn pinocchio_account_order_matches_normalized_names() {
+        let src = r#"spec AccountOrder
+state { total : U64 }
+handler route {
+  accounts {
+    user_vault : signer
+    token_program : program
+    output_mint : readonly
+  }
+  ensures state.total == old(state.total)
+  effect { total := total }
+}"#;
+        let spec = parse_str(src).expect("parse");
+        let handler = &spec.handlers[0];
+        let profile = PinocchioHandlerProfile {
+            name: "route".to_string(),
+            instruction_tag: None,
+            accounts: vec![
+                "outputMint".to_string(),
+                "tokenProgram".to_string(),
+                "userVault".to_string(),
+            ],
+            account_roles: BTreeMap::new(),
+            token_account_bindings: BTreeMap::new(),
+            mint_decimal_bindings: BTreeMap::new(),
+            account_key_derivations: BTreeMap::new(),
+            source_expr_aliases: BTreeMap::new(),
+            verified_stubs: Vec::new(),
+            params: Vec::new(),
+            repeats: Vec::new(),
+        };
+
+        let ordered = pinocchio_account_order(handler, Some(&profile));
+        let names: Vec<_> = ordered
+            .iter()
+            .map(|account| account.name.as_str())
+            .collect();
+        assert_eq!(names, ["output_mint", "token_program", "user_vault"]);
+    }
+
+    #[test]
+    fn pinocchio_profile_notes_explain_unusable_account_order() {
+        let src = r#"spec AccountOrder
+state { total : U64 }
+handler route {
+  accounts {
+    user_vault : signer
+    token_program : program
+  }
+  ensures state.total == old(state.total)
+  effect { total := total }
+}"#;
+        let spec = parse_str(src).expect("parse");
+        let handler = &spec.handlers[0];
+        let profile = PinocchioHandlerProfile {
+            name: "route".to_string(),
+            instruction_tag: None,
+            accounts: vec!["userVault".to_string(), "tokenProgramExtra".to_string()],
+            account_roles: BTreeMap::new(),
+            token_account_bindings: BTreeMap::new(),
+            mint_decimal_bindings: BTreeMap::new(),
+            account_key_derivations: BTreeMap::new(),
+            source_expr_aliases: BTreeMap::new(),
+            verified_stubs: Vec::new(),
+            params: Vec::new(),
+            repeats: Vec::new(),
+        };
+
+        let mut notes = String::new();
+        emit_pinocchio_profile_notes(&mut notes, handler, None, Some(&profile));
+        assert!(
+            notes.contains(
+                "source account order: inferred order unusable; profile account `tokenProgramExtra` did not match spec accounts; using spec order"
+            ),
+            "unusable inferred order should leave a generated breadcrumb; got:\n{notes}"
         );
     }
 

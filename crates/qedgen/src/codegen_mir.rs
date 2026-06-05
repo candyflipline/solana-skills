@@ -1527,9 +1527,6 @@ mod tests {
         assert!(!mir.state.variants.is_empty(), "escrow has state variants");
     }
 
-    /// Pinocchio has no `#[event]` macro — `emit_events` must emit a plain
-    /// `#[derive(Clone)]` data struct, not panic (the slice-6 milestone-2
-    /// `unreachable!()` shipped a crash on any Pinocchio spec with `emits`).
     /// CI regression: a spec that declares `type Account = { … }`
     /// (percolator) lands a `pub struct Account` in `crate::state`, which
     /// — glob-imported alongside `anchor_lang::prelude::*` in the Anchor
