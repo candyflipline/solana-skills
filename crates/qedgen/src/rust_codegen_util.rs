@@ -434,53 +434,80 @@ fn kani_operand_is_pubkey(operand: &str, op: &ParsedHandler, spec: &ParsedSpec) 
         return true;
     }
 
+    // `pubkey_eq` takes `&[u8; 32]`, so it only applies to a *scalar*
+    // pubkey operand: a `Pubkey` field, or an indexed element of a
+    // pubkey collection (`members[i]`). A bare reference to a whole
+    // collection (`s.members: [[u8; 32]; 32]`) must stay on `==`
+    // (derived array `PartialEq`) or it won't typecheck under Kani.
+    let indexed = operand.contains('[');
+
     for prefix in ["s.", "pre.", "post."] {
         if let Some(field) = operand.strip_prefix(prefix) {
-            return spec_field_is_pubkey(field, spec);
+            return spec_field_is_scalar_pubkey(field, spec, indexed);
         }
     }
 
     if let Some(field) = operand.strip_prefix("pre_") {
-        return spec_field_is_pubkey(field, spec);
+        return spec_field_is_scalar_pubkey(field, spec, indexed);
     }
 
     if op
         .takes_params
         .iter()
         .chain(op.abstract_binders.iter())
-        .any(|(name, ty)| name == operand && type_is_or_contains_pubkey(ty))
+        .any(|(name, ty)| name == operand && type_is_scalar_pubkey(ty))
     {
         return true;
     }
 
-    spec_field_is_pubkey(operand, spec)
+    spec_field_is_scalar_pubkey(operand, spec, indexed)
 }
 
-fn spec_field_is_pubkey(field: &str, spec: &ParsedSpec) -> bool {
+/// Resolve the declared spec type of a (possibly variant-prefixed,
+/// possibly subscripted) field path.
+fn spec_field_type<'a>(field: &str, spec: &'a ParsedSpec) -> Option<&'a str> {
     let field = strip_variant_prefix_for_flat_state(field, spec);
-    let field = effect_target_base(field.as_str());
-    if spec
-        .state_fields
-        .iter()
-        .any(|(name, ty)| name == field && type_is_or_contains_pubkey(ty))
-    {
-        return true;
+    let base = effect_target_base(field.as_str()).to_string();
+    if let Some((_, ty)) = spec.state_fields.iter().find(|(name, _)| *name == base) {
+        return Some(ty.as_str());
     }
-    spec.account_types.iter().any(|acct| {
-        acct.fields
-            .iter()
-            .any(|(name, ty)| name == field && type_is_or_contains_pubkey(ty))
-            || acct.variants.iter().any(|variant| {
-                variant
-                    .fields
-                    .iter()
-                    .any(|(name, ty)| name == field && type_is_or_contains_pubkey(ty))
-            })
-    })
+    for acct in &spec.account_types {
+        if let Some((_, ty)) = acct.fields.iter().find(|(name, _)| *name == base) {
+            return Some(ty.as_str());
+        }
+        for variant in &acct.variants {
+            if let Some((_, ty)) = variant.fields.iter().find(|(name, _)| *name == base) {
+                return Some(ty.as_str());
+            }
+        }
+    }
+    None
+}
+
+/// True when the operand denotes a single `[u8; 32]` pubkey value —
+/// eligible for the `pubkey_eq`/`pubkey_ne` rewrite. A pubkey
+/// *collection* qualifies only when the operand indexes into it.
+fn spec_field_is_scalar_pubkey(field: &str, spec: &ParsedSpec, indexed: bool) -> bool {
+    match spec_field_type(field, spec) {
+        Some(ty) => type_is_scalar_pubkey(ty) || (indexed && type_is_or_contains_pubkey(ty)),
+        None => false,
+    }
 }
 
 fn type_is_or_contains_pubkey(ty: &str) -> bool {
     ty.contains("Pubkey")
+}
+
+/// A single `Pubkey`, as opposed to a collection of them
+/// (`Map[N] Pubkey`, `[Pubkey; N]`, `Vec<Pubkey>`, …). Only scalar
+/// pubkeys lower to `[u8; 32]` and can be compared with `pubkey_eq`.
+fn type_is_scalar_pubkey(ty: &str) -> bool {
+    type_is_or_contains_pubkey(ty) && !type_is_pubkey_collection(ty)
+}
+
+fn type_is_pubkey_collection(ty: &str) -> bool {
+    let ty = ty.trim();
+    ty.contains('[') || ty.contains("Map") || ty.contains("Vec") || ty.contains("Array")
 }
 
 pub fn is_account_pubkey_ref(expr: &str, accounts: &[crate::check::ParsedHandlerAccount]) -> bool {

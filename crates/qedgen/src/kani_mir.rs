@@ -880,27 +880,30 @@ fn emit_guard_rejection_harness(out: &mut String, ctx: GuardRejectionHarness<'_>
     for binding in bindings {
         out.push_str(&format!("    {binding}\n"));
     }
+    // Assume the (i-th) guard component is violated. For the per-term split
+    // path the prefix terms were already assumed true above, so violating
+    // this single term is sufficient to drive the full guard false.
     if direct_negated_assume {
         if let Some(negated) = util::negate_simple_top_level_comparison(&violated_expr) {
             out.push_str(&format!("    kani::assume({negated});\n"));
         } else {
             out.push_str(&format!("    kani::assume(!({violated_expr}));\n"));
         }
-        out.push_str(&format!("    assert!(!({violated_expr}),\n"));
-        out.push_str(&format!(
-            "        \"{} guard term must be false when violated\");\n",
-            op.name
-        ));
     } else {
         out.push_str(&format!("    kani::assume(!({violated_expr}));\n"));
-
-        let args = transition_call_args(
-            op,
-            util::handler_needs_account_env(op).then_some("accounts"),
-        );
-        out.push_str(&format!("    assert!(!{}(&mut s{}),\n", op.name, args));
-        out.push_str(&format!("        \"{assert_message}\");\n"));
     }
+
+    // With the guard violated, the generated transition must reject: it
+    // returns `false` and applies none of its effects. Asserting the
+    // negated term back (instead of calling the handler) would be a
+    // tautology that proves nothing — the handler call is what gives the
+    // harness teeth.
+    let args = transition_call_args(
+        op,
+        util::handler_needs_account_env(op).then_some("accounts"),
+    );
+    out.push_str(&format!("    assert!(!{}(&mut s{}),\n", op.name, args));
+    out.push_str(&format!("        \"{assert_message}\");\n"));
     out.push_str("}\n\n");
 
     Ok(())
@@ -2511,7 +2514,8 @@ mod tests {
 
     #[test]
     fn render_splits_large_guard_rejection_harnesses() {
-        let (mir, parsed) = lower_fixture("examples/rust/kani-cpi-account-bindings/config.qedspec");
+        let (mir, parsed) =
+            lower_fixture("crates/qedgen/tests/fixtures/kani-cpi-account-bindings/config.qedspec");
         let out = render(&mir, &parsed);
         assert!(
             !out.contains("fn verify_stable_swap_large_guard_rejects_invalid()"),
@@ -2533,11 +2537,20 @@ mod tests {
             out.contains("let __qed_bps_floor_1 = mul_bps_floor_u128(amount_in, fee_bps);\n    kani::assume(__qed_bps_floor_1 > amount_in);"),
             "split term should bind and negate fee arithmetic by itself:\n{out}"
         );
+        // Each split harness must call the handler and prove it rejects —
+        // asserting the negated term back would be a vacuous tautology
+        // (`assume P; assert P`) that never exercises the transition.
         assert!(
             out.contains(
+                "assert!(!stable_swap_large_guard(&mut s, &accounts, amount_in, min_out, fee_bps, lane, input_mint, output_mint),\n        \"stable_swap_large_guard must reject when guard term is violated\");"
+            ),
+            "split term should prove the handler rejects when the guard term is violated:\n{out}"
+        );
+        assert!(
+            !out.contains(
                 "assert!(!(__qed_bps_floor_1 <= amount_in),\n        \"stable_swap_large_guard guard term must be false when violated\");"
             ),
-            "split term should prove the violated guard term directly:\n{out}"
+            "split harness must not assert the negated term back (vacuous tautology):\n{out}"
         );
         assert!(
             out.contains("kani::assume(pubkey_eq(&accounts.admin.pubkey, &s.admin_key));\n    kani::assume(amount_in > 0);"),

@@ -695,7 +695,7 @@ fn verify_create_vault_effect_threshold() {
     if create_vault(&mut s, threshold, member_count) {
         assert!(s.threshold == threshold, "threshold must equal threshold");
         assert!(pubkey_eq(&s.creator, &pre_creator), "creator must not change");
-        assert!(pubkey_eq(&s.members, &pre_members), "members must not change");
+        assert!(s.members == pre_members, "members must not change");
         assert!(s.voted == pre_voted, "voted must not change");
     }
 }
@@ -725,7 +725,7 @@ fn verify_create_vault_effect_member_count() {
     if create_vault(&mut s, threshold, member_count) {
         assert!(s.member_count == member_count, "member_count must equal member_count");
         assert!(pubkey_eq(&s.creator, &pre_creator), "creator must not change");
-        assert!(pubkey_eq(&s.members, &pre_members), "members must not change");
+        assert!(s.members == pre_members, "members must not change");
         assert!(s.voted == pre_voted, "voted must not change");
     }
 }
@@ -755,7 +755,7 @@ fn verify_create_vault_effect_approval_count() {
     if create_vault(&mut s, threshold, member_count) {
         assert!(s.approval_count == 0, "approval_count must equal 0");
         assert!(pubkey_eq(&s.creator, &pre_creator), "creator must not change");
-        assert!(pubkey_eq(&s.members, &pre_members), "members must not change");
+        assert!(s.members == pre_members, "members must not change");
         assert!(s.voted == pre_voted, "voted must not change");
     }
 }
@@ -785,7 +785,7 @@ fn verify_create_vault_effect_rejection_count() {
     if create_vault(&mut s, threshold, member_count) {
         assert!(s.rejection_count == 0, "rejection_count must equal 0");
         assert!(pubkey_eq(&s.creator, &pre_creator), "creator must not change");
-        assert!(pubkey_eq(&s.members, &pre_members), "members must not change");
+        assert!(s.members == pre_members, "members must not change");
         assert!(s.voted == pre_voted, "voted must not change");
     }
 }
@@ -817,7 +817,7 @@ fn verify_propose_effect_approval_count() {
         assert!(pubkey_eq(&s.creator, &pre_creator), "creator must not change");
         assert!(s.threshold == pre_threshold, "threshold must not change");
         assert!(s.member_count == pre_member_count, "member_count must not change");
-        assert!(pubkey_eq(&s.members, &pre_members), "members must not change");
+        assert!(s.members == pre_members, "members must not change");
         assert!(s.voted == pre_voted, "voted must not change");
     }
 }
@@ -849,7 +849,7 @@ fn verify_propose_effect_rejection_count() {
         assert!(pubkey_eq(&s.creator, &pre_creator), "creator must not change");
         assert!(s.threshold == pre_threshold, "threshold must not change");
         assert!(s.member_count == pre_member_count, "member_count must not change");
-        assert!(pubkey_eq(&s.members, &pre_members), "members must not change");
+        assert!(s.members == pre_members, "members must not change");
         assert!(s.voted == pre_voted, "voted must not change");
     }
 }
@@ -883,7 +883,7 @@ fn verify_approve_effect_approval_count() {
         assert!(pubkey_eq(&s.creator, &pre_creator), "creator must not change");
         assert!(s.threshold == pre_threshold, "threshold must not change");
         assert!(s.member_count == pre_member_count, "member_count must not change");
-        assert!(pubkey_eq(&s.members, &pre_members), "members must not change");
+        assert!(s.members == pre_members, "members must not change");
         assert!(s.voted == pre_voted, "voted must not change");
         assert!(s.rejection_count == pre_rejection_count, "rejection_count must not change");
     }
@@ -918,7 +918,7 @@ fn verify_approve_effect_voted_member_index() {
         assert!(pubkey_eq(&s.creator, &pre_creator), "creator must not change");
         assert!(s.threshold == pre_threshold, "threshold must not change");
         assert!(s.member_count == pre_member_count, "member_count must not change");
-        assert!(pubkey_eq(&s.members, &pre_members), "members must not change");
+        assert!(s.members == pre_members, "members must not change");
         assert!(s.voted == pre_voted, "voted must not change");
         assert!(s.rejection_count == pre_rejection_count, "rejection_count must not change");
     }
@@ -954,7 +954,7 @@ fn verify_reject_effect_rejection_count() {
         assert!(pubkey_eq(&s.creator, &pre_creator), "creator must not change");
         assert!(s.threshold == pre_threshold, "threshold must not change");
         assert!(s.member_count == pre_member_count, "member_count must not change");
-        assert!(pubkey_eq(&s.members, &pre_members), "members must not change");
+        assert!(s.members == pre_members, "members must not change");
         assert!(s.voted == pre_voted, "voted must not change");
         assert!(s.approval_count == pre_approval_count, "approval_count must not change");
     }
@@ -990,7 +990,7 @@ fn verify_reject_effect_voted_member_index() {
         assert!(pubkey_eq(&s.creator, &pre_creator), "creator must not change");
         assert!(s.threshold == pre_threshold, "threshold must not change");
         assert!(s.member_count == pre_member_count, "member_count must not change");
-        assert!(pubkey_eq(&s.members, &pre_members), "members must not change");
+        assert!(s.members == pre_members, "members must not change");
         assert!(s.voted == pre_voted, "voted must not change");
         assert!(s.approval_count == pre_approval_count, "approval_count must not change");
     }
@@ -1024,7 +1024,7 @@ fn verify_execute_effect_approval_count() {
         assert!(pubkey_eq(&s.creator, &pre_creator), "creator must not change");
         assert!(s.threshold == pre_threshold, "threshold must not change");
         assert!(s.member_count == pre_member_count, "member_count must not change");
-        assert!(pubkey_eq(&s.members, &pre_members), "members must not change");
+        assert!(s.members == pre_members, "members must not change");
         assert!(s.voted == pre_voted, "voted must not change");
     }
 }
@@ -1057,7 +1057,7 @@ fn verify_execute_effect_rejection_count() {
         assert!(pubkey_eq(&s.creator, &pre_creator), "creator must not change");
         assert!(s.threshold == pre_threshold, "threshold must not change");
         assert!(s.member_count == pre_member_count, "member_count must not change");
-        assert!(pubkey_eq(&s.members, &pre_members), "members must not change");
+        assert!(s.members == pre_members, "members must not change");
         assert!(s.voted == pre_voted, "voted must not change");
     }
 }
@@ -1089,7 +1089,7 @@ fn verify_cancel_proposal_effect_approval_count() {
         assert!(pubkey_eq(&s.creator, &pre_creator), "creator must not change");
         assert!(s.threshold == pre_threshold, "threshold must not change");
         assert!(s.member_count == pre_member_count, "member_count must not change");
-        assert!(pubkey_eq(&s.members, &pre_members), "members must not change");
+        assert!(s.members == pre_members, "members must not change");
         assert!(s.voted == pre_voted, "voted must not change");
     }
 }
@@ -1121,7 +1121,7 @@ fn verify_cancel_proposal_effect_rejection_count() {
         assert!(pubkey_eq(&s.creator, &pre_creator), "creator must not change");
         assert!(s.threshold == pre_threshold, "threshold must not change");
         assert!(s.member_count == pre_member_count, "member_count must not change");
-        assert!(pubkey_eq(&s.members, &pre_members), "members must not change");
+        assert!(s.members == pre_members, "members must not change");
         assert!(s.voted == pre_voted, "voted must not change");
     }
 }
@@ -1156,7 +1156,7 @@ fn verify_add_member_effect_members_member_index() {
         assert!(pubkey_eq(&s.creator, &pre_creator), "creator must not change");
         assert!(s.threshold == pre_threshold, "threshold must not change");
         assert!(s.member_count == pre_member_count, "member_count must not change");
-        assert!(pubkey_eq(&s.members, &pre_members), "members must not change");
+        assert!(s.members == pre_members, "members must not change");
         assert!(s.voted == pre_voted, "voted must not change");
         assert!(s.approval_count == pre_approval_count, "approval_count must not change");
         assert!(s.rejection_count == pre_rejection_count, "rejection_count must not change");
@@ -1190,7 +1190,7 @@ fn verify_remove_member_effect_member_count() {
         assert!(s.member_count == pre_member_count.wrapping_sub(1), "member_count must decrement by 1");
         assert!(pubkey_eq(&s.creator, &pre_creator), "creator must not change");
         assert!(s.threshold == pre_threshold, "threshold must not change");
-        assert!(pubkey_eq(&s.members, &pre_members), "members must not change");
+        assert!(s.members == pre_members, "members must not change");
         assert!(s.voted == pre_voted, "voted must not change");
         assert!(s.approval_count == pre_approval_count, "approval_count must not change");
         assert!(s.rejection_count == pre_rejection_count, "rejection_count must not change");
