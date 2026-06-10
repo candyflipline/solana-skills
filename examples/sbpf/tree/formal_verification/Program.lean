@@ -2,11 +2,11 @@
 -- DO NOT EDIT — regenerate with: qedgen asm2lean --input tree.s
 -- source-hash: sha256:a680a3d76b7a3094e9813c09b6a5214a4a44d1355a1cfd90068fb393ee935180
 
-import QEDGen.Solana.SBPF
+import SVM.SBPF
 
 namespace TreeProg
 
-open QEDGen.Solana.SBPF
+open SVM.SBPF
 
 /-! ## .equ constants -/
 
@@ -177,7 +177,7 @@ abbrev TREE_NODE_COLOR_OFF : Int := 28
 
 section EffectiveAddr
 
-open QEDGen.Solana.SBPF.Memory
+open SVM.SBPF.Memory
 
 @[simp] theorem ea_IB_N_ACCOUNTS_OFF (b : Nat) : effectiveAddr b IB_N_ACCOUNTS_OFF = b := by
   unfold effectiveAddr IB_N_ACCOUNTS_OFF; omega
@@ -384,7 +384,7 @@ end EffectiveAddr
 
 /-! ## Program (chunked lookup for O(1) simp) -/
 
-def progAt_0 : Nat → Option QEDGen.Solana.SBPF.Insn
+def progAt_0 : Nat → Option SVM.SBPF.Insn
   | 0 => some (.ldx .dword .r9 .r2 (-SIZE_OF_U64))  -- 0: entrypoint
   | 1 => some (.ldx .dword .r8 .r1 IB_N_ACCOUNTS_OFF)  -- 1
   | 2 => some (.ldx .byte .r7 .r2 OFFSET_ZERO)  -- 2
@@ -487,7 +487,7 @@ def progAt_0 : Nat → Option QEDGen.Solana.SBPF.Insn
   | 99 => some (.stx .dword .r10 SF_INIT_INSN_DATA_OFF .r4)  -- 99
   | _ => none
 
-def progAt_1 : Nat → Option QEDGen.Solana.SBPF.Insn
+def progAt_1 : Nat → Option SVM.SBPF.Insn
   | 100 => some (.add64 .r4 (.imm SF_INIT_INSN_DATA_TO_SIGNER_SEEDS_REL_OFF_IMM))  -- 100
   | 101 => some (.stx .dword .r10 SF_INIT_SIGNERS_SEEDS_ADDR_OFF .r4)  -- 101
   | 102 => some (.add64 .r4 (.imm SF_INIT_SIGNER_SEEDS_TO_SIGNERS_SEEDS_REL_OFF_IMM))  -- 102
@@ -590,7 +590,7 @@ def progAt_1 : Nat → Option QEDGen.Solana.SBPF.Insn
   | 199 => some (.ja 202)  -- 199
   | _ => none
 
-def progAt_2 : Nat → Option QEDGen.Solana.SBPF.Insn
+def progAt_2 : Nat → Option SVM.SBPF.Insn
   | 200 => some (.ldx .dword .r8 .r9 OFFSET_ZERO)  -- 200: insert_pop
   | 201 => some (.stx .dword .r1 IB_TREE_DATA_TOP_OFF .r8)  -- 201
   | 202 => some (.ldx .word .r4 .r2 INSN_INSERT_KEY_OFF)  -- 202: insert_store_key_value_pair
@@ -693,7 +693,7 @@ def progAt_2 : Nat → Option QEDGen.Solana.SBPF.Insn
   | 299 => some (.stx .dword .r8 TREE_NODE_PARENT_OFF .r3)  -- 299
   | _ => none
 
-def progAt_3 : Nat → Option QEDGen.Solana.SBPF.Insn
+def progAt_3 : Nat → Option SVM.SBPF.Insn
   | 300 => some (.stx .dword .r2 TREE_NODE_CHILD_L_OFF .r3)  -- 300: insert_fixup_case_6_dir_r_skip
   | 301 => some (.stx .dword .r2 TREE_NODE_PARENT_OFF .r4)  -- 301
   | 302 => some (.stx .dword .r3 TREE_NODE_PARENT_OFF .r2)  -- 302
@@ -796,7 +796,7 @@ def progAt_3 : Nat → Option QEDGen.Solana.SBPF.Insn
   | 399 => some (.st .dword .r3 TREE_NODE_CHILD_L_OFF NULL)  -- 399
   | _ => none
 
-def progAt_4 : Nat → Option QEDGen.Solana.SBPF.Insn
+def progAt_4 : Nat → Option SVM.SBPF.Insn
   | 400 => some (.st .dword .r3 TREE_NODE_CHILD_R_OFF NULL)  -- 400
   | 401 => some (.ldx .dword .r4 .r1 IB_TREE_DATA_TOP_OFF)  -- 401
   | 402 => some (.stx .dword .r3 TREE_NODE_PARENT_OFF .r4)  -- 402
@@ -897,7 +897,7 @@ def progAt_4 : Nat → Option QEDGen.Solana.SBPF.Insn
   | 497 => some (.exit)  -- 497
   | _ => none
 
-def progAt (n : Nat) : Option QEDGen.Solana.SBPF.Insn :=
+def progAt (n : Nat) : Option SVM.SBPF.Insn :=
   if n < 100 then progAt_0 n
   else
   if n < 200 then progAt_1 n

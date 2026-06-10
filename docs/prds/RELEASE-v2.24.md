@@ -152,7 +152,7 @@ percolator-scale specs.
   free variables for now. v2.25 candidate.
 - **Bundled-example migration**: only `escrow-split` migrated to
   the new syntax this release. The other bundled multi-variant
-  ADT examples (multisig, lending, percolator, roaster_v2) are
+  ADT examples (multisig, lending, percolator) are
   all Quasar target — they take the legacy flat-struct fallback
   path and aren't affected by v2.24's Anchor-side changes.
 

@@ -1,0 +1,33 @@
+# Releasing QEDGen
+
+Pre-release checklist. Run before cutting a new release or tag. (Moved out of `CLAUDE.md` so it isn't loaded into every session — it only matters at release time.)
+
+1. **Bump version** in BOTH `crates/qedgen/Cargo.toml` AND `package.json` — `install.sh` derives its version from Cargo.toml; the `check-version-consistency.sh` CI gate fails the build if the two drift (v2.28.0 shipped with this exact mismatch; v2.28.1 hotfixed it). Run `bash scripts/check-version-consistency.sh` after bumping to confirm.
+
+1a. **Re-stamp the version-pinned generated artifacts** — codegen stamps `qedgen-macros = { …, tag = "v<version>" }` into every generated `Cargo.toml`, so a version bump drifts BOTH the codegen snapshots AND the committed bundled examples. After bumping, run (rebuild `bin/qedgen` first): `UPDATE_SNAPSHOTS=1 cargo test --test codegen_snapshot` (refresh the 6 codegen fixtures) AND `qedgen check --regen-drift --write` (re-stamp the 8 `examples/rust/*/**/Cargo.toml` pins). Skipping this fails the `Run tests` (codegen_snapshot) + `Check example codegen drift` CI steps — v2.31 hit both in sequence. Verify each diff is *only* the tag line, then `cargo test` / `qedgen check --regen-drift` should be clean.
+
+2. **`cargo fmt --check`** — matches the CI gate; `cargo test` does NOT run fmt, so this is an easy miss if skipped
+
+3. **`cargo clippy -- -D warnings`** — matches the CI gate (plain `cargo clippy` is too lenient)
+
+4. **`cargo test`** — all tests must pass
+
+5. **`bash scripts/check-readme-drift.sh`** — CI runs this; catches undocumented CLI commands
+
+6. **`bash scripts/check-lake-build.sh --strict`** — runs `lake build` in every `examples/*/formal_verification/` (rust + sBPF) and exits 1 on any failure. `--strict` also fails on missing `.lake/`/manifests (cold checkout); drop `--strict` for a non-release sanity check. v2.11.2 shipped two examples with broken `Spec.lean` because this gate didn't exist — earlier `qedgen check --regen-drift` and `cargo check` only verify the Rust scaffold, not Lean.
+
+7. **Zero `sorry`** — `grep -r '\bsorry\b' examples/**/*.lean` must return nothing. v2.26 (Slice 4a) closes the v2.8 G3 carve-out for Tier-1/2 CPI theorems: those now apply `<Iface>.<handler>.ensures_axiom_<idx>` and no longer carry `by sorry`. Only Tier-0 callees (interfaces with no declared `ensures`) keep the `by sorry` shape — the P1 lint `cpi_no_callee_ensures` surfaces them at check time. Filter via `grep -rL "ensures @ \`" examples/**/*.lean | xargs grep '\bsorry\b'` to surface only unintended sorry; Tier-0 carve-outs still match the `ensures @ \`` marker.
+
+8. **`qedgen check --frozen` against bundled examples** — every `examples/rust/*/qed.lock` must be current. Stale locks fail the frozen check. Run for each spec dir that has a `qed.toml`: `qedgen check --frozen --spec examples/rust/escrow-split/`.
+
+8a. **`old(...)` preservation harnesses (v2.23+)** — for every bundled spec whose `property` body contains `old(...)` (`grep -rl '\bold(' examples crates/qedgen/tests/fixtures --include='*.qedspec'`), regen and confirm `tests/proptest.rs` emits the binary signature (`fn <prop>(pre: &State, post: &State) -> bool`) and the per-handler harness captures `let pre = s.clone(); let mut post = s;` before the handler call. Pre-v2.23 this lowered to a structural tautology silently. Bundled coverage today: `crates/qedgen/tests/fixtures/regressions/issue-8/pool.qedspec` is the canonical pre/post test corpus; `examples/rust/percolator/percolator.qedspec`'s `old(...)` is in `ensures` and goes through the transition-fn assume path, unchanged by v2.23.
+
+8b. **Supply-chain gate** — `cargo audit --deny warnings` (with the ignores below) and `cargo deny check` must both exit 0. CI's `supply-chain` job runs both on every push and PR. Install once with `cargo install --locked cargo-audit cargo-deny`. New RustSec advisories on transitive deps are the actionable signal; the ignored IDs are documented in `deny.toml`'s `[advisories].ignore` array — keep the CI command, README, and `deny.toml` ignore lists in sync. Currently ignored: `RUSTSEC-2024-0436` (`paste` unmaintained), `RUSTSEC-2024-0388` (`derivative` unmaintained), `RUSTSEC-2025-0141` (`bincode` unmaintained — Anza migrating to 2.x), `RUSTSEC-2025-0161` (`libsecp256k1` unmaintained — pulled by `agave-syscalls`), `RUSTSEC-2026-0097` (`rand` unsoundness with custom logger — doesn't fire in our usage). License allowlist + registry / git-source pin live in `deny.toml`.
+
+9. **Doc/code drift sweep** — README, SKILL.md, CLAUDE.md, `references/`, `docs/design/`, this file, `docs/prds/RELEASE-v<version>.md`, and module `//!` docstrings all have to match shipped reality. The `check-readme-drift.sh` script only covers top-level command coverage in README; everything else needs an explicit pass. Concretely:
+   - Every `Subcommand` arm in `crates/qedgen/src/main.rs` has a section in `references/cli.md`, with every flag in its `#[arg]` set documented.
+   - No `references/`, README, SKILL.md, `.claude/rules/`, or `docs/prds/RELEASE-v<version>.md` page references symbols / files / flags that no longer exist (`grep` for the names of just-removed modules, types, fns, CLI flags).
+   - No mention in user-facing docs of features the release doesn't ship (the RELEASE notes are the worst offender — bring the "What's in" list in line with the actual shipped commits).
+   - `feedback_no_anchor_v2_mentions.md` policy: don't name external codebases as the **source of audit findings** (anchor-v2, named protocols like Marinade/Squads/Drift/Raydium/Jito) in SKILL.md, references/, RELEASE-v<version>.md, or `clap` help text — present findings as qedgen's own taxonomy. This does NOT cover frameworks we **actively integrate** as codegen / audit targets: Anchor, Quasar, and Pinocchio are first-class `--target` / `--runtime` values, so naming them (incl. `quasar_lang` / "Blueshift Quasar" in target help text) is correct and necessary. Internal-only (test fixtures, private comments) is fine.
+   - `CLAUDE.md` and the lowercase `claude.md` mirror are byte-identical, and both stay slim (deep content lives in `references/` and `docs/design/`, not in CLAUDE.md).
+   - Module-level `//!` docstrings on files you touched in the release reflect current behavior — not the behavior pre-fix.

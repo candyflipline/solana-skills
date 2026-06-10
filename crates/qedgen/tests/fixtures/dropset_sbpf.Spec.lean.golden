@@ -5,8 +5,8 @@
 import QEDGen
 import DropsetProg
 
-open QEDGen.Solana.SBPF
-open QEDGen.Solana.SBPF.Memory
+open SVM.SBPF
+open SVM.SBPF.Memory
 
 -- Global constants (from prog module, not re-declared):
 --   DISC_REGISTER_MARKET = 0
@@ -87,242 +87,317 @@ abbrev DISCRIMINANT : Int := 0
 -- Hypotheses derived from checks + layout. Fill proofs with wp_exec.
 
 theorem rejects_invalid_discriminant
-    (inputAddr insnAddr : Nat) (mem : Mem)
+    (inputAddr insnAddr : Nat) (mem : Mem) (rt : RegionTable)
     (discriminant : Nat)
     (h_discriminant_val : readU8 mem insnAddr = discriminant)
+    (h_rt_discriminant : rt.containsRange insnAddr 1 = true)
     (h_discriminant_ne : discriminant ≠ DISC_REGISTER_MARKET)
     :
-    (executeFn DropsetProg.progAt (initState2 inputAddr insnAddr mem 24) 8).exitCode
+    (executeFn DropsetProg.progAt (initState2 inputAddr insnAddr mem rt 24) 8).exitCode
       = some E_INVALID_DISCRIMINANT := sorry
 
 theorem rejects_invalid_account_count
-    (inputAddr insnAddr : Nat) (mem : Mem)
+    (inputAddr insnAddr : Nat) (mem : Mem) (rt : RegionTable)
     (h_discriminant : readU8 mem insnAddr = DISC_REGISTER_MARKET)
+    (h_rt_discriminant : rt.containsRange insnAddr 1 = true)
     (nAccounts : Nat)
     (h_nAccounts_val : readU64 mem inputAddr = nAccounts)
+    (h_rt_nAccounts : rt.containsRange inputAddr 8 = true)
     (h_nAccounts_lt : nAccounts < ACCOUNTS_REQUIRED)
     :
-    (executeFn DropsetProg.progAt (initState2 inputAddr insnAddr mem 24) 10).exitCode
+    (executeFn DropsetProg.progAt (initState2 inputAddr insnAddr mem rt 24) 10).exitCode
       = some E_INVALID_NUMBER_OF_ACCOUNTS := sorry
 
 theorem rejects_invalid_instruction_length
-    (inputAddr insnAddr : Nat) (mem : Mem)
+    (inputAddr insnAddr : Nat) (mem : Mem) (rt : RegionTable)
     (h_discriminant : readU8 mem insnAddr = DISC_REGISTER_MARKET)
+    (h_rt_discriminant : rt.containsRange insnAddr 1 = true)
     (nAccounts : Nat)
     (h_nAccounts_val : readU64 mem inputAddr = nAccounts)
+    (h_rt_nAccounts : rt.containsRange inputAddr 8 = true)
     (h_nAccounts_ge : ¬(nAccounts < ACCOUNTS_REQUIRED))
     (insnLen : Nat)
     (h_insnLen_val : readU64 mem (insnAddr - 8) = insnLen)
+    (h_rt_insnLen : rt.containsRange (insnAddr - 8) 8 = true)
     (h_insnLen_ne : insnLen ≠ INSTRUCTION_DATA_LEN)
     :
-    (executeFn DropsetProg.progAt (initState2 inputAddr insnAddr mem 24) 12).exitCode
+    (executeFn DropsetProg.progAt (initState2 inputAddr insnAddr mem rt 24) 12).exitCode
       = some E_INVALID_INSTRUCTION_LENGTH := sorry
 
 theorem rejects_user_has_data
-    (inputAddr insnAddr : Nat) (mem : Mem)
+    (inputAddr insnAddr : Nat) (mem : Mem) (rt : RegionTable)
     (h_discriminant : readU8 mem insnAddr = DISC_REGISTER_MARKET)
+    (h_rt_discriminant : rt.containsRange insnAddr 1 = true)
     (nAccounts : Nat)
     (h_nAccounts_val : readU64 mem inputAddr = nAccounts)
+    (h_rt_nAccounts : rt.containsRange inputAddr 8 = true)
     (h_nAccounts_ge : ¬(nAccounts < ACCOUNTS_REQUIRED))
     (h_insnLen : readU64 mem (insnAddr - 8) = INSTRUCTION_DATA_LEN)
+    (h_rt_insnLen : rt.containsRange (insnAddr - 8) 8 = true)
     (userDataLen : Nat)
     (h_userDataLen_val : readU64 mem (inputAddr + 88) = userDataLen)
+    (h_rt_userDataLen : rt.containsRange (inputAddr + 88) 8 = true)
     (h_userDataLen_ne : userDataLen ≠ DATA_LEN_ZERO)
     :
-    (executeFn DropsetProg.progAt (initState2 inputAddr insnAddr mem 24) 14).exitCode
+    (executeFn DropsetProg.progAt (initState2 inputAddr insnAddr mem rt 24) 14).exitCode
       = some E_USER_HAS_DATA := sorry
 
 theorem rejects_market_duplicate
-    (inputAddr insnAddr : Nat) (mem : Mem)
+    (inputAddr insnAddr : Nat) (mem : Mem) (rt : RegionTable)
     (h_discriminant : readU8 mem insnAddr = DISC_REGISTER_MARKET)
+    (h_rt_discriminant : rt.containsRange insnAddr 1 = true)
     (nAccounts : Nat)
     (h_nAccounts_val : readU64 mem inputAddr = nAccounts)
+    (h_rt_nAccounts : rt.containsRange inputAddr 8 = true)
     (h_nAccounts_ge : ¬(nAccounts < ACCOUNTS_REQUIRED))
     (h_insnLen : readU64 mem (insnAddr - 8) = INSTRUCTION_DATA_LEN)
+    (h_rt_insnLen : rt.containsRange (insnAddr - 8) 8 = true)
     (h_userDataLen : readU64 mem (inputAddr + 88) = DATA_LEN_ZERO)
+    (h_rt_userDataLen : rt.containsRange (inputAddr + 88) 8 = true)
     (marketDup : Nat)
     (h_marketDup_val : readU8 mem (inputAddr + 10344) = marketDup)
+    (h_rt_marketDup : rt.containsRange (inputAddr + 10344) 1 = true)
     (h_marketDup_ne : marketDup ≠ ACCT_NON_DUP_MARKER)
     :
-    (executeFn DropsetProg.progAt (initState2 inputAddr insnAddr mem 24) 16).exitCode
+    (executeFn DropsetProg.progAt (initState2 inputAddr insnAddr mem rt 24) 16).exitCode
       = some E_MARKET_ACCOUNT_IS_DUPLICATE := sorry
 
 theorem rejects_market_has_data
-    (inputAddr insnAddr : Nat) (mem : Mem)
+    (inputAddr insnAddr : Nat) (mem : Mem) (rt : RegionTable)
     (h_discriminant : readU8 mem insnAddr = DISC_REGISTER_MARKET)
+    (h_rt_discriminant : rt.containsRange insnAddr 1 = true)
     (nAccounts : Nat)
     (h_nAccounts_val : readU64 mem inputAddr = nAccounts)
+    (h_rt_nAccounts : rt.containsRange inputAddr 8 = true)
     (h_nAccounts_ge : ¬(nAccounts < ACCOUNTS_REQUIRED))
     (h_insnLen : readU64 mem (insnAddr - 8) = INSTRUCTION_DATA_LEN)
+    (h_rt_insnLen : rt.containsRange (insnAddr - 8) 8 = true)
     (h_userDataLen : readU64 mem (inputAddr + 88) = DATA_LEN_ZERO)
+    (h_rt_userDataLen : rt.containsRange (inputAddr + 88) 8 = true)
     (h_marketDup : readU8 mem (inputAddr + 10344) = ACCT_NON_DUP_MARKER)
+    (h_rt_marketDup : rt.containsRange (inputAddr + 10344) 1 = true)
     (marketDataLen : Nat)
     (h_marketDataLen_val : readU64 mem (inputAddr + 10424) = marketDataLen)
+    (h_rt_marketDataLen : rt.containsRange (inputAddr + 10424) 8 = true)
     (h_marketDataLen_ne : marketDataLen ≠ DATA_LEN_ZERO)
     :
-    (executeFn DropsetProg.progAt (initState2 inputAddr insnAddr mem 24) 18).exitCode
+    (executeFn DropsetProg.progAt (initState2 inputAddr insnAddr mem rt 24) 18).exitCode
       = some E_MARKET_HAS_DATA := sorry
 
 theorem rejects_base_mint_duplicate
-    (inputAddr insnAddr : Nat) (mem : Mem)
+    (inputAddr insnAddr : Nat) (mem : Mem) (rt : RegionTable)
     (h_discriminant : readU8 mem insnAddr = DISC_REGISTER_MARKET)
+    (h_rt_discriminant : rt.containsRange insnAddr 1 = true)
     (nAccounts : Nat)
     (h_nAccounts_val : readU64 mem inputAddr = nAccounts)
+    (h_rt_nAccounts : rt.containsRange inputAddr 8 = true)
     (h_nAccounts_ge : ¬(nAccounts < ACCOUNTS_REQUIRED))
     (h_insnLen : readU64 mem (insnAddr - 8) = INSTRUCTION_DATA_LEN)
+    (h_rt_insnLen : rt.containsRange (insnAddr - 8) 8 = true)
     (h_userDataLen : readU64 mem (inputAddr + 88) = DATA_LEN_ZERO)
+    (h_rt_userDataLen : rt.containsRange (inputAddr + 88) 8 = true)
     (h_marketDup : readU8 mem (inputAddr + 10344) = ACCT_NON_DUP_MARKER)
+    (h_rt_marketDup : rt.containsRange (inputAddr + 10344) 1 = true)
     (h_marketDataLen : readU64 mem (inputAddr + 10424) = DATA_LEN_ZERO)
+    (h_rt_marketDataLen : rt.containsRange (inputAddr + 10424) 8 = true)
     (baseMintDup : Nat)
     (h_baseMintDup_val : readU8 mem (inputAddr + 20680) = baseMintDup)
+    (h_rt_baseMintDup : rt.containsRange (inputAddr + 20680) 1 = true)
     (h_baseMintDup_ne : baseMintDup ≠ ACCT_NON_DUP_MARKER)
     :
-    (executeFn DropsetProg.progAt (initState2 inputAddr insnAddr mem 24) 20).exitCode
+    (executeFn DropsetProg.progAt (initState2 inputAddr insnAddr mem rt 24) 20).exitCode
       = some E_BASE_MINT_IS_DUPLICATE := sorry
 
 theorem rejects_quote_mint_duplicate
-    (inputAddr insnAddr : Nat) (mem : Mem)
+    (inputAddr insnAddr : Nat) (mem : Mem) (rt : RegionTable)
     (h_discriminant : readU8 mem insnAddr = DISC_REGISTER_MARKET)
+    (h_rt_discriminant : rt.containsRange insnAddr 1 = true)
     (nAccounts : Nat)
     (h_nAccounts_val : readU64 mem inputAddr = nAccounts)
+    (h_rt_nAccounts : rt.containsRange inputAddr 8 = true)
     (h_nAccounts_ge : ¬(nAccounts < ACCOUNTS_REQUIRED))
     (h_insnLen : readU64 mem (insnAddr - 8) = INSTRUCTION_DATA_LEN)
+    (h_rt_insnLen : rt.containsRange (insnAddr - 8) 8 = true)
     (h_userDataLen : readU64 mem (inputAddr + 88) = DATA_LEN_ZERO)
+    (h_rt_userDataLen : rt.containsRange (inputAddr + 88) 8 = true)
     (h_marketDup : readU8 mem (inputAddr + 10344) = ACCT_NON_DUP_MARKER)
+    (h_rt_marketDup : rt.containsRange (inputAddr + 10344) 1 = true)
     (h_marketDataLen : readU64 mem (inputAddr + 10424) = DATA_LEN_ZERO)
+    (h_rt_marketDataLen : rt.containsRange (inputAddr + 10424) 8 = true)
     (h_baseMintDup : readU8 mem (inputAddr + 20680) = ACCT_NON_DUP_MARKER)
+    (h_rt_baseMintDup : rt.containsRange (inputAddr + 20680) 1 = true)
     -- TODO: add guard-specific hypotheses
     :
-    (executeFn DropsetProg.progAt (initState2 inputAddr insnAddr mem 24) 30).exitCode
+    (executeFn DropsetProg.progAt (initState2 inputAddr insnAddr mem rt 24) 30).exitCode
       = some E_QUOTE_MINT_IS_DUPLICATE := sorry
 
 theorem rejects_invalid_market_pubkey
-    (inputAddr insnAddr : Nat) (mem : Mem)
+    (inputAddr insnAddr : Nat) (mem : Mem) (rt : RegionTable)
     (h_discriminant : readU8 mem insnAddr = DISC_REGISTER_MARKET)
+    (h_rt_discriminant : rt.containsRange insnAddr 1 = true)
     (nAccounts : Nat)
     (h_nAccounts_val : readU64 mem inputAddr = nAccounts)
+    (h_rt_nAccounts : rt.containsRange inputAddr 8 = true)
     (h_nAccounts_ge : ¬(nAccounts < ACCOUNTS_REQUIRED))
     (h_insnLen : readU64 mem (insnAddr - 8) = INSTRUCTION_DATA_LEN)
+    (h_rt_insnLen : rt.containsRange (insnAddr - 8) 8 = true)
     (h_userDataLen : readU64 mem (inputAddr + 88) = DATA_LEN_ZERO)
+    (h_rt_userDataLen : rt.containsRange (inputAddr + 88) 8 = true)
     (h_marketDup : readU8 mem (inputAddr + 10344) = ACCT_NON_DUP_MARKER)
+    (h_rt_marketDup : rt.containsRange (inputAddr + 10344) 1 = true)
     (h_marketDataLen : readU64 mem (inputAddr + 10424) = DATA_LEN_ZERO)
+    (h_rt_marketDataLen : rt.containsRange (inputAddr + 10424) 8 = true)
     (h_baseMintDup : readU8 mem (inputAddr + 20680) = ACCT_NON_DUP_MARKER)
+    (h_rt_baseMintDup : rt.containsRange (inputAddr + 20680) 1 = true)
     (marketPubkey : Nat)
     (h_marketPubkey_val : readU64 mem (inputAddr + 10352) = marketPubkey)
+    (h_rt_marketPubkey : rt.containsRange (inputAddr + 10352) 8 = true)
     (h_marketPubkey_ne : marketPubkey ≠ derived_pda)
     :
-    (executeFn DropsetProg.progAt (initState2 inputAddr insnAddr mem 24) 61).exitCode
+    (executeFn DropsetProg.progAt (initState2 inputAddr insnAddr mem rt 24) 61).exitCode
       = some E_INVALID_MARKET_PUBKEY := sorry
 
 theorem rejects_system_program_duplicate
-    (inputAddr insnAddr : Nat) (mem : Mem)
+    (inputAddr insnAddr : Nat) (mem : Mem) (rt : RegionTable)
     (h_discriminant : readU8 mem insnAddr = DISC_REGISTER_MARKET)
+    (h_rt_discriminant : rt.containsRange insnAddr 1 = true)
     (nAccounts : Nat)
     (h_nAccounts_val : readU64 mem inputAddr = nAccounts)
+    (h_rt_nAccounts : rt.containsRange inputAddr 8 = true)
     (h_nAccounts_ge : ¬(nAccounts < ACCOUNTS_REQUIRED))
     (h_insnLen : readU64 mem (insnAddr - 8) = INSTRUCTION_DATA_LEN)
+    (h_rt_insnLen : rt.containsRange (insnAddr - 8) 8 = true)
     (h_userDataLen : readU64 mem (inputAddr + 88) = DATA_LEN_ZERO)
+    (h_rt_userDataLen : rt.containsRange (inputAddr + 88) 8 = true)
     (h_marketDup : readU8 mem (inputAddr + 10344) = ACCT_NON_DUP_MARKER)
+    (h_rt_marketDup : rt.containsRange (inputAddr + 10344) 1 = true)
     (h_marketDataLen : readU64 mem (inputAddr + 10424) = DATA_LEN_ZERO)
+    (h_rt_marketDataLen : rt.containsRange (inputAddr + 10424) 8 = true)
     (h_baseMintDup : readU8 mem (inputAddr + 20680) = ACCT_NON_DUP_MARKER)
+    (h_rt_baseMintDup : rt.containsRange (inputAddr + 20680) 1 = true)
     (h_marketPubkey : readU64 mem (inputAddr + 10352) = derived_pda)
+    (h_rt_marketPubkey : rt.containsRange (inputAddr + 10352) 8 = true)
     -- TODO: add guard-specific hypotheses
     :
-    (executeFn DropsetProg.progAt (initState2 inputAddr insnAddr mem 24) 74).exitCode
+    (executeFn DropsetProg.progAt (initState2 inputAddr insnAddr mem rt 24) 74).exitCode
       = some E_SYSTEM_PROGRAM_IS_DUPLICATE := sorry
 
 theorem rejects_invalid_system_program_pubkey
-    (inputAddr insnAddr : Nat) (mem : Mem)
+    (inputAddr insnAddr : Nat) (mem : Mem) (rt : RegionTable)
     (h_discriminant : readU8 mem insnAddr = DISC_REGISTER_MARKET)
+    (h_rt_discriminant : rt.containsRange insnAddr 1 = true)
     (nAccounts : Nat)
     (h_nAccounts_val : readU64 mem inputAddr = nAccounts)
+    (h_rt_nAccounts : rt.containsRange inputAddr 8 = true)
     (h_nAccounts_ge : ¬(nAccounts < ACCOUNTS_REQUIRED))
     (h_insnLen : readU64 mem (insnAddr - 8) = INSTRUCTION_DATA_LEN)
+    (h_rt_insnLen : rt.containsRange (insnAddr - 8) 8 = true)
     (h_userDataLen : readU64 mem (inputAddr + 88) = DATA_LEN_ZERO)
+    (h_rt_userDataLen : rt.containsRange (inputAddr + 88) 8 = true)
     (h_marketDup : readU8 mem (inputAddr + 10344) = ACCT_NON_DUP_MARKER)
+    (h_rt_marketDup : rt.containsRange (inputAddr + 10344) 1 = true)
     (h_marketDataLen : readU64 mem (inputAddr + 10424) = DATA_LEN_ZERO)
+    (h_rt_marketDataLen : rt.containsRange (inputAddr + 10424) 8 = true)
     (h_baseMintDup : readU8 mem (inputAddr + 20680) = ACCT_NON_DUP_MARKER)
+    (h_rt_baseMintDup : rt.containsRange (inputAddr + 20680) 1 = true)
     (h_marketPubkey : readU64 mem (inputAddr + 10352) = derived_pda)
+    (h_rt_marketPubkey : rt.containsRange (inputAddr + 10352) 8 = true)
     -- TODO: add guard-specific hypotheses
     :
-    (executeFn DropsetProg.progAt (initState2 inputAddr insnAddr mem 24) 86).exitCode
+    (executeFn DropsetProg.progAt (initState2 inputAddr insnAddr mem rt 24) 86).exitCode
       = some E_INVALID_SYSTEM_PROGRAM_PUBKEY := sorry
 
 theorem rejects_rent_sysvar_duplicate
-    (inputAddr insnAddr : Nat) (mem : Mem)
+    (inputAddr insnAddr : Nat) (mem : Mem) (rt : RegionTable)
     (h_discriminant : readU8 mem insnAddr = DISC_REGISTER_MARKET)
+    (h_rt_discriminant : rt.containsRange insnAddr 1 = true)
     (nAccounts : Nat)
     (h_nAccounts_val : readU64 mem inputAddr = nAccounts)
+    (h_rt_nAccounts : rt.containsRange inputAddr 8 = true)
     (h_nAccounts_ge : ¬(nAccounts < ACCOUNTS_REQUIRED))
     (h_insnLen : readU64 mem (insnAddr - 8) = INSTRUCTION_DATA_LEN)
+    (h_rt_insnLen : rt.containsRange (insnAddr - 8) 8 = true)
     (h_userDataLen : readU64 mem (inputAddr + 88) = DATA_LEN_ZERO)
+    (h_rt_userDataLen : rt.containsRange (inputAddr + 88) 8 = true)
     (h_marketDup : readU8 mem (inputAddr + 10344) = ACCT_NON_DUP_MARKER)
+    (h_rt_marketDup : rt.containsRange (inputAddr + 10344) 1 = true)
     (h_marketDataLen : readU64 mem (inputAddr + 10424) = DATA_LEN_ZERO)
+    (h_rt_marketDataLen : rt.containsRange (inputAddr + 10424) 8 = true)
     (h_baseMintDup : readU8 mem (inputAddr + 20680) = ACCT_NON_DUP_MARKER)
+    (h_rt_baseMintDup : rt.containsRange (inputAddr + 20680) 1 = true)
     (h_marketPubkey : readU64 mem (inputAddr + 10352) = derived_pda)
+    (h_rt_marketPubkey : rt.containsRange (inputAddr + 10352) 8 = true)
     -- TODO: add guard-specific hypotheses
     :
-    (executeFn DropsetProg.progAt (initState2 inputAddr insnAddr mem 24) 96).exitCode
+    (executeFn DropsetProg.progAt (initState2 inputAddr insnAddr mem rt 24) 96).exitCode
       = some E_RENT_SYSVAR_IS_DUPLICATE := sorry
 
 theorem rejects_invalid_rent_sysvar_pubkey
-    (inputAddr insnAddr : Nat) (mem : Mem)
+    (inputAddr insnAddr : Nat) (mem : Mem) (rt : RegionTable)
     (h_discriminant : readU8 mem insnAddr = DISC_REGISTER_MARKET)
+    (h_rt_discriminant : rt.containsRange insnAddr 1 = true)
     (nAccounts : Nat)
     (h_nAccounts_val : readU64 mem inputAddr = nAccounts)
+    (h_rt_nAccounts : rt.containsRange inputAddr 8 = true)
     (h_nAccounts_ge : ¬(nAccounts < ACCOUNTS_REQUIRED))
     (h_insnLen : readU64 mem (insnAddr - 8) = INSTRUCTION_DATA_LEN)
+    (h_rt_insnLen : rt.containsRange (insnAddr - 8) 8 = true)
     (h_userDataLen : readU64 mem (inputAddr + 88) = DATA_LEN_ZERO)
+    (h_rt_userDataLen : rt.containsRange (inputAddr + 88) 8 = true)
     (h_marketDup : readU8 mem (inputAddr + 10344) = ACCT_NON_DUP_MARKER)
+    (h_rt_marketDup : rt.containsRange (inputAddr + 10344) 1 = true)
     (h_marketDataLen : readU64 mem (inputAddr + 10424) = DATA_LEN_ZERO)
+    (h_rt_marketDataLen : rt.containsRange (inputAddr + 10424) 8 = true)
     (h_baseMintDup : readU8 mem (inputAddr + 20680) = ACCT_NON_DUP_MARKER)
+    (h_rt_baseMintDup : rt.containsRange (inputAddr + 20680) 1 = true)
     (h_marketPubkey : readU64 mem (inputAddr + 10352) = derived_pda)
+    (h_rt_marketPubkey : rt.containsRange (inputAddr + 10352) 8 = true)
     -- TODO: derive hypotheses for checks: rent_pubkey == RENT
     :
-    (executeFn DropsetProg.progAt (initState2 inputAddr insnAddr mem 24) 108).exitCode
+    (executeFn DropsetProg.progAt (initState2 inputAddr insnAddr mem rt 24) 108).exitCode
       = some E_INVALID_RENT_SYSVAR_PUBKEY := sorry
 
 -- Completeness structure: fill all fields to prove every guard is covered
 structure Spec (progAt : Nat → Option Insn) where
   rejects_invalid_discriminant :
-    ∀ (inputAddr insnAddr : Nat) (mem : Mem) (discriminant : Nat) (_h_discriminant_val : readU8 mem insnAddr = discriminant) (_h_discriminant_ne : discriminant ≠ DISC_REGISTER_MARKET),
-    (executeFn progAt (initState2 inputAddr insnAddr mem 24) 8).exitCode = some E_INVALID_DISCRIMINANT
+    ∀ (inputAddr insnAddr : Nat) (mem : Mem) (rt : RegionTable) (discriminant : Nat) (_h_discriminant_val : readU8 mem insnAddr = discriminant) (_h_rt_discriminant : rt.containsRange insnAddr 1 = true) (_h_discriminant_ne : discriminant ≠ DISC_REGISTER_MARKET),
+    (executeFn progAt (initState2 inputAddr insnAddr mem rt 24) 8).exitCode = some E_INVALID_DISCRIMINANT
   rejects_invalid_account_count :
-    ∀ (inputAddr insnAddr : Nat) (mem : Mem) (_h_discriminant : readU8 mem insnAddr = DISC_REGISTER_MARKET) (nAccounts : Nat) (_h_nAccounts_val : readU64 mem inputAddr = nAccounts) (_h_nAccounts_lt : nAccounts < ACCOUNTS_REQUIRED),
-    (executeFn progAt (initState2 inputAddr insnAddr mem 24) 10).exitCode = some E_INVALID_NUMBER_OF_ACCOUNTS
+    ∀ (inputAddr insnAddr : Nat) (mem : Mem) (rt : RegionTable) (_h_discriminant : readU8 mem insnAddr = DISC_REGISTER_MARKET) (_h_rt_discriminant : rt.containsRange insnAddr 1 = true) (nAccounts : Nat) (_h_nAccounts_val : readU64 mem inputAddr = nAccounts) (_h_rt_nAccounts : rt.containsRange inputAddr 8 = true) (_h_nAccounts_lt : nAccounts < ACCOUNTS_REQUIRED),
+    (executeFn progAt (initState2 inputAddr insnAddr mem rt 24) 10).exitCode = some E_INVALID_NUMBER_OF_ACCOUNTS
   rejects_invalid_instruction_length :
-    ∀ (inputAddr insnAddr : Nat) (mem : Mem) (_h_discriminant : readU8 mem insnAddr = DISC_REGISTER_MARKET) (nAccounts : Nat) (_h_nAccounts_val : readU64 mem inputAddr = nAccounts) (_h_nAccounts_ge : ¬(nAccounts < ACCOUNTS_REQUIRED)) (insnLen : Nat) (_h_insnLen_val : readU64 mem (insnAddr - 8) = insnLen) (_h_insnLen_ne : insnLen ≠ INSTRUCTION_DATA_LEN),
-    (executeFn progAt (initState2 inputAddr insnAddr mem 24) 12).exitCode = some E_INVALID_INSTRUCTION_LENGTH
+    ∀ (inputAddr insnAddr : Nat) (mem : Mem) (rt : RegionTable) (_h_discriminant : readU8 mem insnAddr = DISC_REGISTER_MARKET) (_h_rt_discriminant : rt.containsRange insnAddr 1 = true) (nAccounts : Nat) (_h_nAccounts_val : readU64 mem inputAddr = nAccounts) (_h_rt_nAccounts : rt.containsRange inputAddr 8 = true) (_h_nAccounts_ge : ¬(nAccounts < ACCOUNTS_REQUIRED)) (insnLen : Nat) (_h_insnLen_val : readU64 mem (insnAddr - 8) = insnLen) (_h_rt_insnLen : rt.containsRange (insnAddr - 8) 8 = true) (_h_insnLen_ne : insnLen ≠ INSTRUCTION_DATA_LEN),
+    (executeFn progAt (initState2 inputAddr insnAddr mem rt 24) 12).exitCode = some E_INVALID_INSTRUCTION_LENGTH
   rejects_user_has_data :
-    ∀ (inputAddr insnAddr : Nat) (mem : Mem) (_h_discriminant : readU8 mem insnAddr = DISC_REGISTER_MARKET) (nAccounts : Nat) (_h_nAccounts_val : readU64 mem inputAddr = nAccounts) (_h_nAccounts_ge : ¬(nAccounts < ACCOUNTS_REQUIRED)) (_h_insnLen : readU64 mem (insnAddr - 8) = INSTRUCTION_DATA_LEN) (userDataLen : Nat) (_h_userDataLen_val : readU64 mem (inputAddr + 88) = userDataLen) (_h_userDataLen_ne : userDataLen ≠ DATA_LEN_ZERO),
-    (executeFn progAt (initState2 inputAddr insnAddr mem 24) 14).exitCode = some E_USER_HAS_DATA
+    ∀ (inputAddr insnAddr : Nat) (mem : Mem) (rt : RegionTable) (_h_discriminant : readU8 mem insnAddr = DISC_REGISTER_MARKET) (_h_rt_discriminant : rt.containsRange insnAddr 1 = true) (nAccounts : Nat) (_h_nAccounts_val : readU64 mem inputAddr = nAccounts) (_h_rt_nAccounts : rt.containsRange inputAddr 8 = true) (_h_nAccounts_ge : ¬(nAccounts < ACCOUNTS_REQUIRED)) (_h_insnLen : readU64 mem (insnAddr - 8) = INSTRUCTION_DATA_LEN) (_h_rt_insnLen : rt.containsRange (insnAddr - 8) 8 = true) (userDataLen : Nat) (_h_userDataLen_val : readU64 mem (inputAddr + 88) = userDataLen) (_h_rt_userDataLen : rt.containsRange (inputAddr + 88) 8 = true) (_h_userDataLen_ne : userDataLen ≠ DATA_LEN_ZERO),
+    (executeFn progAt (initState2 inputAddr insnAddr mem rt 24) 14).exitCode = some E_USER_HAS_DATA
   rejects_market_duplicate :
-    ∀ (inputAddr insnAddr : Nat) (mem : Mem) (_h_discriminant : readU8 mem insnAddr = DISC_REGISTER_MARKET) (nAccounts : Nat) (_h_nAccounts_val : readU64 mem inputAddr = nAccounts) (_h_nAccounts_ge : ¬(nAccounts < ACCOUNTS_REQUIRED)) (_h_insnLen : readU64 mem (insnAddr - 8) = INSTRUCTION_DATA_LEN) (_h_userDataLen : readU64 mem (inputAddr + 88) = DATA_LEN_ZERO) (marketDup : Nat) (_h_marketDup_val : readU8 mem (inputAddr + 10344) = marketDup) (_h_marketDup_ne : marketDup ≠ ACCT_NON_DUP_MARKER),
-    (executeFn progAt (initState2 inputAddr insnAddr mem 24) 16).exitCode = some E_MARKET_ACCOUNT_IS_DUPLICATE
+    ∀ (inputAddr insnAddr : Nat) (mem : Mem) (rt : RegionTable) (_h_discriminant : readU8 mem insnAddr = DISC_REGISTER_MARKET) (_h_rt_discriminant : rt.containsRange insnAddr 1 = true) (nAccounts : Nat) (_h_nAccounts_val : readU64 mem inputAddr = nAccounts) (_h_rt_nAccounts : rt.containsRange inputAddr 8 = true) (_h_nAccounts_ge : ¬(nAccounts < ACCOUNTS_REQUIRED)) (_h_insnLen : readU64 mem (insnAddr - 8) = INSTRUCTION_DATA_LEN) (_h_rt_insnLen : rt.containsRange (insnAddr - 8) 8 = true) (_h_userDataLen : readU64 mem (inputAddr + 88) = DATA_LEN_ZERO) (_h_rt_userDataLen : rt.containsRange (inputAddr + 88) 8 = true) (marketDup : Nat) (_h_marketDup_val : readU8 mem (inputAddr + 10344) = marketDup) (_h_rt_marketDup : rt.containsRange (inputAddr + 10344) 1 = true) (_h_marketDup_ne : marketDup ≠ ACCT_NON_DUP_MARKER),
+    (executeFn progAt (initState2 inputAddr insnAddr mem rt 24) 16).exitCode = some E_MARKET_ACCOUNT_IS_DUPLICATE
   rejects_market_has_data :
-    ∀ (inputAddr insnAddr : Nat) (mem : Mem) (_h_discriminant : readU8 mem insnAddr = DISC_REGISTER_MARKET) (nAccounts : Nat) (_h_nAccounts_val : readU64 mem inputAddr = nAccounts) (_h_nAccounts_ge : ¬(nAccounts < ACCOUNTS_REQUIRED)) (_h_insnLen : readU64 mem (insnAddr - 8) = INSTRUCTION_DATA_LEN) (_h_userDataLen : readU64 mem (inputAddr + 88) = DATA_LEN_ZERO) (_h_marketDup : readU8 mem (inputAddr + 10344) = ACCT_NON_DUP_MARKER) (marketDataLen : Nat) (_h_marketDataLen_val : readU64 mem (inputAddr + 10424) = marketDataLen) (_h_marketDataLen_ne : marketDataLen ≠ DATA_LEN_ZERO),
-    (executeFn progAt (initState2 inputAddr insnAddr mem 24) 18).exitCode = some E_MARKET_HAS_DATA
+    ∀ (inputAddr insnAddr : Nat) (mem : Mem) (rt : RegionTable) (_h_discriminant : readU8 mem insnAddr = DISC_REGISTER_MARKET) (_h_rt_discriminant : rt.containsRange insnAddr 1 = true) (nAccounts : Nat) (_h_nAccounts_val : readU64 mem inputAddr = nAccounts) (_h_rt_nAccounts : rt.containsRange inputAddr 8 = true) (_h_nAccounts_ge : ¬(nAccounts < ACCOUNTS_REQUIRED)) (_h_insnLen : readU64 mem (insnAddr - 8) = INSTRUCTION_DATA_LEN) (_h_rt_insnLen : rt.containsRange (insnAddr - 8) 8 = true) (_h_userDataLen : readU64 mem (inputAddr + 88) = DATA_LEN_ZERO) (_h_rt_userDataLen : rt.containsRange (inputAddr + 88) 8 = true) (_h_marketDup : readU8 mem (inputAddr + 10344) = ACCT_NON_DUP_MARKER) (_h_rt_marketDup : rt.containsRange (inputAddr + 10344) 1 = true) (marketDataLen : Nat) (_h_marketDataLen_val : readU64 mem (inputAddr + 10424) = marketDataLen) (_h_rt_marketDataLen : rt.containsRange (inputAddr + 10424) 8 = true) (_h_marketDataLen_ne : marketDataLen ≠ DATA_LEN_ZERO),
+    (executeFn progAt (initState2 inputAddr insnAddr mem rt 24) 18).exitCode = some E_MARKET_HAS_DATA
   rejects_base_mint_duplicate :
-    ∀ (inputAddr insnAddr : Nat) (mem : Mem) (_h_discriminant : readU8 mem insnAddr = DISC_REGISTER_MARKET) (nAccounts : Nat) (_h_nAccounts_val : readU64 mem inputAddr = nAccounts) (_h_nAccounts_ge : ¬(nAccounts < ACCOUNTS_REQUIRED)) (_h_insnLen : readU64 mem (insnAddr - 8) = INSTRUCTION_DATA_LEN) (_h_userDataLen : readU64 mem (inputAddr + 88) = DATA_LEN_ZERO) (_h_marketDup : readU8 mem (inputAddr + 10344) = ACCT_NON_DUP_MARKER) (_h_marketDataLen : readU64 mem (inputAddr + 10424) = DATA_LEN_ZERO) (baseMintDup : Nat) (_h_baseMintDup_val : readU8 mem (inputAddr + 20680) = baseMintDup) (_h_baseMintDup_ne : baseMintDup ≠ ACCT_NON_DUP_MARKER),
-    (executeFn progAt (initState2 inputAddr insnAddr mem 24) 20).exitCode = some E_BASE_MINT_IS_DUPLICATE
+    ∀ (inputAddr insnAddr : Nat) (mem : Mem) (rt : RegionTable) (_h_discriminant : readU8 mem insnAddr = DISC_REGISTER_MARKET) (_h_rt_discriminant : rt.containsRange insnAddr 1 = true) (nAccounts : Nat) (_h_nAccounts_val : readU64 mem inputAddr = nAccounts) (_h_rt_nAccounts : rt.containsRange inputAddr 8 = true) (_h_nAccounts_ge : ¬(nAccounts < ACCOUNTS_REQUIRED)) (_h_insnLen : readU64 mem (insnAddr - 8) = INSTRUCTION_DATA_LEN) (_h_rt_insnLen : rt.containsRange (insnAddr - 8) 8 = true) (_h_userDataLen : readU64 mem (inputAddr + 88) = DATA_LEN_ZERO) (_h_rt_userDataLen : rt.containsRange (inputAddr + 88) 8 = true) (_h_marketDup : readU8 mem (inputAddr + 10344) = ACCT_NON_DUP_MARKER) (_h_rt_marketDup : rt.containsRange (inputAddr + 10344) 1 = true) (_h_marketDataLen : readU64 mem (inputAddr + 10424) = DATA_LEN_ZERO) (_h_rt_marketDataLen : rt.containsRange (inputAddr + 10424) 8 = true) (baseMintDup : Nat) (_h_baseMintDup_val : readU8 mem (inputAddr + 20680) = baseMintDup) (_h_rt_baseMintDup : rt.containsRange (inputAddr + 20680) 1 = true) (_h_baseMintDup_ne : baseMintDup ≠ ACCT_NON_DUP_MARKER),
+    (executeFn progAt (initState2 inputAddr insnAddr mem rt 24) 20).exitCode = some E_BASE_MINT_IS_DUPLICATE
   rejects_quote_mint_duplicate :
-    ∀ (inputAddr insnAddr : Nat) (mem : Mem) (_h_discriminant : readU8 mem insnAddr = DISC_REGISTER_MARKET) (nAccounts : Nat) (_h_nAccounts_val : readU64 mem inputAddr = nAccounts) (_h_nAccounts_ge : ¬(nAccounts < ACCOUNTS_REQUIRED)) (_h_insnLen : readU64 mem (insnAddr - 8) = INSTRUCTION_DATA_LEN) (_h_userDataLen : readU64 mem (inputAddr + 88) = DATA_LEN_ZERO) (_h_marketDup : readU8 mem (inputAddr + 10344) = ACCT_NON_DUP_MARKER) (_h_marketDataLen : readU64 mem (inputAddr + 10424) = DATA_LEN_ZERO) (_h_baseMintDup : readU8 mem (inputAddr + 20680) = ACCT_NON_DUP_MARKER),
-    (executeFn progAt (initState2 inputAddr insnAddr mem 24) 30).exitCode = some E_QUOTE_MINT_IS_DUPLICATE
+    ∀ (inputAddr insnAddr : Nat) (mem : Mem) (rt : RegionTable) (_h_discriminant : readU8 mem insnAddr = DISC_REGISTER_MARKET) (_h_rt_discriminant : rt.containsRange insnAddr 1 = true) (nAccounts : Nat) (_h_nAccounts_val : readU64 mem inputAddr = nAccounts) (_h_rt_nAccounts : rt.containsRange inputAddr 8 = true) (_h_nAccounts_ge : ¬(nAccounts < ACCOUNTS_REQUIRED)) (_h_insnLen : readU64 mem (insnAddr - 8) = INSTRUCTION_DATA_LEN) (_h_rt_insnLen : rt.containsRange (insnAddr - 8) 8 = true) (_h_userDataLen : readU64 mem (inputAddr + 88) = DATA_LEN_ZERO) (_h_rt_userDataLen : rt.containsRange (inputAddr + 88) 8 = true) (_h_marketDup : readU8 mem (inputAddr + 10344) = ACCT_NON_DUP_MARKER) (_h_rt_marketDup : rt.containsRange (inputAddr + 10344) 1 = true) (_h_marketDataLen : readU64 mem (inputAddr + 10424) = DATA_LEN_ZERO) (_h_rt_marketDataLen : rt.containsRange (inputAddr + 10424) 8 = true) (_h_baseMintDup : readU8 mem (inputAddr + 20680) = ACCT_NON_DUP_MARKER) (_h_rt_baseMintDup : rt.containsRange (inputAddr + 20680) 1 = true),
+    (executeFn progAt (initState2 inputAddr insnAddr mem rt 24) 30).exitCode = some E_QUOTE_MINT_IS_DUPLICATE
   rejects_invalid_market_pubkey :
-    ∀ (inputAddr insnAddr : Nat) (mem : Mem) (_h_discriminant : readU8 mem insnAddr = DISC_REGISTER_MARKET) (nAccounts : Nat) (_h_nAccounts_val : readU64 mem inputAddr = nAccounts) (_h_nAccounts_ge : ¬(nAccounts < ACCOUNTS_REQUIRED)) (_h_insnLen : readU64 mem (insnAddr - 8) = INSTRUCTION_DATA_LEN) (_h_userDataLen : readU64 mem (inputAddr + 88) = DATA_LEN_ZERO) (_h_marketDup : readU8 mem (inputAddr + 10344) = ACCT_NON_DUP_MARKER) (_h_marketDataLen : readU64 mem (inputAddr + 10424) = DATA_LEN_ZERO) (_h_baseMintDup : readU8 mem (inputAddr + 20680) = ACCT_NON_DUP_MARKER) (marketPubkey : Nat) (_h_marketPubkey_val : readU64 mem (inputAddr + 10352) = marketPubkey) (_h_marketPubkey_ne : marketPubkey ≠ derived_pda),
-    (executeFn progAt (initState2 inputAddr insnAddr mem 24) 61).exitCode = some E_INVALID_MARKET_PUBKEY
+    ∀ (inputAddr insnAddr : Nat) (mem : Mem) (rt : RegionTable) (_h_discriminant : readU8 mem insnAddr = DISC_REGISTER_MARKET) (_h_rt_discriminant : rt.containsRange insnAddr 1 = true) (nAccounts : Nat) (_h_nAccounts_val : readU64 mem inputAddr = nAccounts) (_h_rt_nAccounts : rt.containsRange inputAddr 8 = true) (_h_nAccounts_ge : ¬(nAccounts < ACCOUNTS_REQUIRED)) (_h_insnLen : readU64 mem (insnAddr - 8) = INSTRUCTION_DATA_LEN) (_h_rt_insnLen : rt.containsRange (insnAddr - 8) 8 = true) (_h_userDataLen : readU64 mem (inputAddr + 88) = DATA_LEN_ZERO) (_h_rt_userDataLen : rt.containsRange (inputAddr + 88) 8 = true) (_h_marketDup : readU8 mem (inputAddr + 10344) = ACCT_NON_DUP_MARKER) (_h_rt_marketDup : rt.containsRange (inputAddr + 10344) 1 = true) (_h_marketDataLen : readU64 mem (inputAddr + 10424) = DATA_LEN_ZERO) (_h_rt_marketDataLen : rt.containsRange (inputAddr + 10424) 8 = true) (_h_baseMintDup : readU8 mem (inputAddr + 20680) = ACCT_NON_DUP_MARKER) (_h_rt_baseMintDup : rt.containsRange (inputAddr + 20680) 1 = true) (marketPubkey : Nat) (_h_marketPubkey_val : readU64 mem (inputAddr + 10352) = marketPubkey) (_h_rt_marketPubkey : rt.containsRange (inputAddr + 10352) 8 = true) (_h_marketPubkey_ne : marketPubkey ≠ derived_pda),
+    (executeFn progAt (initState2 inputAddr insnAddr mem rt 24) 61).exitCode = some E_INVALID_MARKET_PUBKEY
   rejects_system_program_duplicate :
-    ∀ (inputAddr insnAddr : Nat) (mem : Mem) (_h_discriminant : readU8 mem insnAddr = DISC_REGISTER_MARKET) (nAccounts : Nat) (_h_nAccounts_val : readU64 mem inputAddr = nAccounts) (_h_nAccounts_ge : ¬(nAccounts < ACCOUNTS_REQUIRED)) (_h_insnLen : readU64 mem (insnAddr - 8) = INSTRUCTION_DATA_LEN) (_h_userDataLen : readU64 mem (inputAddr + 88) = DATA_LEN_ZERO) (_h_marketDup : readU8 mem (inputAddr + 10344) = ACCT_NON_DUP_MARKER) (_h_marketDataLen : readU64 mem (inputAddr + 10424) = DATA_LEN_ZERO) (_h_baseMintDup : readU8 mem (inputAddr + 20680) = ACCT_NON_DUP_MARKER) (_h_marketPubkey : readU64 mem (inputAddr + 10352) = derived_pda),
-    (executeFn progAt (initState2 inputAddr insnAddr mem 24) 74).exitCode = some E_SYSTEM_PROGRAM_IS_DUPLICATE
+    ∀ (inputAddr insnAddr : Nat) (mem : Mem) (rt : RegionTable) (_h_discriminant : readU8 mem insnAddr = DISC_REGISTER_MARKET) (_h_rt_discriminant : rt.containsRange insnAddr 1 = true) (nAccounts : Nat) (_h_nAccounts_val : readU64 mem inputAddr = nAccounts) (_h_rt_nAccounts : rt.containsRange inputAddr 8 = true) (_h_nAccounts_ge : ¬(nAccounts < ACCOUNTS_REQUIRED)) (_h_insnLen : readU64 mem (insnAddr - 8) = INSTRUCTION_DATA_LEN) (_h_rt_insnLen : rt.containsRange (insnAddr - 8) 8 = true) (_h_userDataLen : readU64 mem (inputAddr + 88) = DATA_LEN_ZERO) (_h_rt_userDataLen : rt.containsRange (inputAddr + 88) 8 = true) (_h_marketDup : readU8 mem (inputAddr + 10344) = ACCT_NON_DUP_MARKER) (_h_rt_marketDup : rt.containsRange (inputAddr + 10344) 1 = true) (_h_marketDataLen : readU64 mem (inputAddr + 10424) = DATA_LEN_ZERO) (_h_rt_marketDataLen : rt.containsRange (inputAddr + 10424) 8 = true) (_h_baseMintDup : readU8 mem (inputAddr + 20680) = ACCT_NON_DUP_MARKER) (_h_rt_baseMintDup : rt.containsRange (inputAddr + 20680) 1 = true) (_h_marketPubkey : readU64 mem (inputAddr + 10352) = derived_pda) (_h_rt_marketPubkey : rt.containsRange (inputAddr + 10352) 8 = true),
+    (executeFn progAt (initState2 inputAddr insnAddr mem rt 24) 74).exitCode = some E_SYSTEM_PROGRAM_IS_DUPLICATE
   rejects_invalid_system_program_pubkey :
-    ∀ (inputAddr insnAddr : Nat) (mem : Mem) (_h_discriminant : readU8 mem insnAddr = DISC_REGISTER_MARKET) (nAccounts : Nat) (_h_nAccounts_val : readU64 mem inputAddr = nAccounts) (_h_nAccounts_ge : ¬(nAccounts < ACCOUNTS_REQUIRED)) (_h_insnLen : readU64 mem (insnAddr - 8) = INSTRUCTION_DATA_LEN) (_h_userDataLen : readU64 mem (inputAddr + 88) = DATA_LEN_ZERO) (_h_marketDup : readU8 mem (inputAddr + 10344) = ACCT_NON_DUP_MARKER) (_h_marketDataLen : readU64 mem (inputAddr + 10424) = DATA_LEN_ZERO) (_h_baseMintDup : readU8 mem (inputAddr + 20680) = ACCT_NON_DUP_MARKER) (_h_marketPubkey : readU64 mem (inputAddr + 10352) = derived_pda),
-    (executeFn progAt (initState2 inputAddr insnAddr mem 24) 86).exitCode = some E_INVALID_SYSTEM_PROGRAM_PUBKEY
+    ∀ (inputAddr insnAddr : Nat) (mem : Mem) (rt : RegionTable) (_h_discriminant : readU8 mem insnAddr = DISC_REGISTER_MARKET) (_h_rt_discriminant : rt.containsRange insnAddr 1 = true) (nAccounts : Nat) (_h_nAccounts_val : readU64 mem inputAddr = nAccounts) (_h_rt_nAccounts : rt.containsRange inputAddr 8 = true) (_h_nAccounts_ge : ¬(nAccounts < ACCOUNTS_REQUIRED)) (_h_insnLen : readU64 mem (insnAddr - 8) = INSTRUCTION_DATA_LEN) (_h_rt_insnLen : rt.containsRange (insnAddr - 8) 8 = true) (_h_userDataLen : readU64 mem (inputAddr + 88) = DATA_LEN_ZERO) (_h_rt_userDataLen : rt.containsRange (inputAddr + 88) 8 = true) (_h_marketDup : readU8 mem (inputAddr + 10344) = ACCT_NON_DUP_MARKER) (_h_rt_marketDup : rt.containsRange (inputAddr + 10344) 1 = true) (_h_marketDataLen : readU64 mem (inputAddr + 10424) = DATA_LEN_ZERO) (_h_rt_marketDataLen : rt.containsRange (inputAddr + 10424) 8 = true) (_h_baseMintDup : readU8 mem (inputAddr + 20680) = ACCT_NON_DUP_MARKER) (_h_rt_baseMintDup : rt.containsRange (inputAddr + 20680) 1 = true) (_h_marketPubkey : readU64 mem (inputAddr + 10352) = derived_pda) (_h_rt_marketPubkey : rt.containsRange (inputAddr + 10352) 8 = true),
+    (executeFn progAt (initState2 inputAddr insnAddr mem rt 24) 86).exitCode = some E_INVALID_SYSTEM_PROGRAM_PUBKEY
   rejects_rent_sysvar_duplicate :
-    ∀ (inputAddr insnAddr : Nat) (mem : Mem) (_h_discriminant : readU8 mem insnAddr = DISC_REGISTER_MARKET) (nAccounts : Nat) (_h_nAccounts_val : readU64 mem inputAddr = nAccounts) (_h_nAccounts_ge : ¬(nAccounts < ACCOUNTS_REQUIRED)) (_h_insnLen : readU64 mem (insnAddr - 8) = INSTRUCTION_DATA_LEN) (_h_userDataLen : readU64 mem (inputAddr + 88) = DATA_LEN_ZERO) (_h_marketDup : readU8 mem (inputAddr + 10344) = ACCT_NON_DUP_MARKER) (_h_marketDataLen : readU64 mem (inputAddr + 10424) = DATA_LEN_ZERO) (_h_baseMintDup : readU8 mem (inputAddr + 20680) = ACCT_NON_DUP_MARKER) (_h_marketPubkey : readU64 mem (inputAddr + 10352) = derived_pda),
-    (executeFn progAt (initState2 inputAddr insnAddr mem 24) 96).exitCode = some E_RENT_SYSVAR_IS_DUPLICATE
+    ∀ (inputAddr insnAddr : Nat) (mem : Mem) (rt : RegionTable) (_h_discriminant : readU8 mem insnAddr = DISC_REGISTER_MARKET) (_h_rt_discriminant : rt.containsRange insnAddr 1 = true) (nAccounts : Nat) (_h_nAccounts_val : readU64 mem inputAddr = nAccounts) (_h_rt_nAccounts : rt.containsRange inputAddr 8 = true) (_h_nAccounts_ge : ¬(nAccounts < ACCOUNTS_REQUIRED)) (_h_insnLen : readU64 mem (insnAddr - 8) = INSTRUCTION_DATA_LEN) (_h_rt_insnLen : rt.containsRange (insnAddr - 8) 8 = true) (_h_userDataLen : readU64 mem (inputAddr + 88) = DATA_LEN_ZERO) (_h_rt_userDataLen : rt.containsRange (inputAddr + 88) 8 = true) (_h_marketDup : readU8 mem (inputAddr + 10344) = ACCT_NON_DUP_MARKER) (_h_rt_marketDup : rt.containsRange (inputAddr + 10344) 1 = true) (_h_marketDataLen : readU64 mem (inputAddr + 10424) = DATA_LEN_ZERO) (_h_rt_marketDataLen : rt.containsRange (inputAddr + 10424) 8 = true) (_h_baseMintDup : readU8 mem (inputAddr + 20680) = ACCT_NON_DUP_MARKER) (_h_rt_baseMintDup : rt.containsRange (inputAddr + 20680) 1 = true) (_h_marketPubkey : readU64 mem (inputAddr + 10352) = derived_pda) (_h_rt_marketPubkey : rt.containsRange (inputAddr + 10352) 8 = true),
+    (executeFn progAt (initState2 inputAddr insnAddr mem rt 24) 96).exitCode = some E_RENT_SYSVAR_IS_DUPLICATE
   rejects_invalid_rent_sysvar_pubkey :
-    ∀ (inputAddr insnAddr : Nat) (mem : Mem) (_h_discriminant : readU8 mem insnAddr = DISC_REGISTER_MARKET) (nAccounts : Nat) (_h_nAccounts_val : readU64 mem inputAddr = nAccounts) (_h_nAccounts_ge : ¬(nAccounts < ACCOUNTS_REQUIRED)) (_h_insnLen : readU64 mem (insnAddr - 8) = INSTRUCTION_DATA_LEN) (_h_userDataLen : readU64 mem (inputAddr + 88) = DATA_LEN_ZERO) (_h_marketDup : readU8 mem (inputAddr + 10344) = ACCT_NON_DUP_MARKER) (_h_marketDataLen : readU64 mem (inputAddr + 10424) = DATA_LEN_ZERO) (_h_baseMintDup : readU8 mem (inputAddr + 20680) = ACCT_NON_DUP_MARKER) (_h_marketPubkey : readU64 mem (inputAddr + 10352) = derived_pda),
-    (executeFn progAt (initState2 inputAddr insnAddr mem 24) 108).exitCode = some E_INVALID_RENT_SYSVAR_PUBKEY
+    ∀ (inputAddr insnAddr : Nat) (mem : Mem) (rt : RegionTable) (_h_discriminant : readU8 mem insnAddr = DISC_REGISTER_MARKET) (_h_rt_discriminant : rt.containsRange insnAddr 1 = true) (nAccounts : Nat) (_h_nAccounts_val : readU64 mem inputAddr = nAccounts) (_h_rt_nAccounts : rt.containsRange inputAddr 8 = true) (_h_nAccounts_ge : ¬(nAccounts < ACCOUNTS_REQUIRED)) (_h_insnLen : readU64 mem (insnAddr - 8) = INSTRUCTION_DATA_LEN) (_h_rt_insnLen : rt.containsRange (insnAddr - 8) 8 = true) (_h_userDataLen : readU64 mem (inputAddr + 88) = DATA_LEN_ZERO) (_h_rt_userDataLen : rt.containsRange (inputAddr + 88) 8 = true) (_h_marketDup : readU8 mem (inputAddr + 10344) = ACCT_NON_DUP_MARKER) (_h_rt_marketDup : rt.containsRange (inputAddr + 10344) 1 = true) (_h_marketDataLen : readU64 mem (inputAddr + 10424) = DATA_LEN_ZERO) (_h_rt_marketDataLen : rt.containsRange (inputAddr + 10424) 8 = true) (_h_baseMintDup : readU8 mem (inputAddr + 20680) = ACCT_NON_DUP_MARKER) (_h_rt_baseMintDup : rt.containsRange (inputAddr + 20680) 1 = true) (_h_marketPubkey : readU64 mem (inputAddr + 10352) = derived_pda) (_h_rt_marketPubkey : rt.containsRange (inputAddr + 10352) 8 = true),
+    (executeFn progAt (initState2 inputAddr insnAddr mem rt 24) 108).exitCode = some E_INVALID_RENT_SYSVAR_PUBKEY
 
 -- Property theorem stubs
 

@@ -2,7 +2,7 @@
 
 > **Lean-mandatory by construction.** sBPF is the one place in qedgen
 > where Lean is required, not optional — the SVM interpreter lives in
-> the Lean support library (`QEDGen.Solana.SBPF`), so bytecode
+> the Lean support library (`SVM.SBPF`), so bytecode
 > verification has no Kani substitute. If you're verifying an sBPF
 > program, you're in Phase 2. For Rust programs, Phase 1 (spec +
 > proptest + Kani) is usually the finish line.
@@ -53,7 +53,7 @@ This generates:
 
 ## SBPF support library API
 
-After `import QEDGen.Solana.SBPF` and `open QEDGen.Solana.SBPF`:
+After `import SVM.SBPF` and `open SVM.SBPF`:
 
 ### Types
 
@@ -77,7 +77,7 @@ After `import QEDGen.Solana.SBPF` and `open QEDGen.Solana.SBPF`:
 - `step (insn : Insn) (s : State) : State` — single-instruction semantics
 - `resolveSrc (rf : RegFile) (src : Src) : Nat` — register or immediate to unsigned
 
-### Memory (`open QEDGen.Solana.SBPF.Memory`)
+### Memory (`open SVM.SBPF.Memory`)
 
 - `effectiveAddr (base : Nat) (off : Int) : Nat`
 - `readU8`, `readU16`, `readU32`, `readU64` — little-endian reads
@@ -124,7 +124,7 @@ After `import QEDGen.Solana.SBPF` and `open QEDGen.Solana.SBPF`:
 **Chain frame (reads survive a list of stack writes):**
 - `readU64_writeU64Chain_frame`, `readU32_writeU64Chain_frame`, `readU8_writeU64Chain_frame`
 
-### Pubkey predicates (`open QEDGen.Solana.SBPF.Pubkey`)
+### Pubkey predicates (`open SVM.SBPF.Pubkey`)
 
 - `pubkeyAt mem base pk` — four U64 chunks at consecutive 8-byte addresses
 - `readPubkey mem base` — functional read of four chunks
@@ -182,7 +182,7 @@ Rewrite with memory hypotheses then apply region frame reasoning. `solve_read` i
 
 ## Library patterns (reusable instruction sequences)
 
-From `QEDGen.Solana.SBPF.Patterns`:
+From `SVM.SBPF.Patterns`:
 
 | Pattern | Steps | Sequence | Conclusion |
 |---|---|---|---|

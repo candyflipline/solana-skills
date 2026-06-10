@@ -636,8 +636,8 @@ fn render_sbpf(spec: &crate::check::ParsedSpec) -> String {
     out.push_str("import QEDGen\n");
     out.push_str(&format!("import {}\n\n", prog_module));
 
-    out.push_str("open QEDGen.Solana.SBPF\n");
-    out.push_str("open QEDGen.Solana.SBPF.Memory\n\n");
+    out.push_str("open SVM.SBPF\n");
+    out.push_str("open SVM.SBPF.Memory\n\n");
 
     // ── Global constants ─────────────────────────────────────────────────
     if !spec.constants.is_empty() {
@@ -741,10 +741,15 @@ fn render_sbpf(spec: &crate::check::ParsedSpec) -> String {
         // Entry point
         let entry = instr.entry.unwrap_or(0);
         let has_insn_reg = !instr.insn_layout.is_empty();
+        // qedsvm's initState takes a RegionTable; accesses outside it trap
+        // to ERR_ACCESS_VIOLATION. Obligations bind `rt` and carry one
+        // coverage hypothesis per derived read (`rt.containsRange ... = true`,
+        // the SVM.SBPF.Patterns idiom) — with a symbolic inputAddr the check
+        // cannot reduce by decidability, only by hypothesis rewrite.
         let init_expr = if has_insn_reg {
-            format!("initState2 inputAddr insnAddr mem {}", entry)
+            format!("initState2 inputAddr insnAddr mem rt {}", entry)
         } else {
-            "initState inputAddr mem".to_string()
+            "initState inputAddr mem rt".to_string()
         };
 
         // Guard theorem stubs
@@ -767,9 +772,9 @@ fn render_sbpf(spec: &crate::check::ParsedSpec) -> String {
                 out.push_str(&format!("theorem {}\n", guard.name));
 
                 if has_insn_reg {
-                    out.push_str("    (inputAddr insnAddr : Nat) (mem : Mem)\n");
+                    out.push_str("    (inputAddr insnAddr : Nat) (mem : Mem) (rt : RegionTable)\n");
                 } else {
-                    out.push_str("    (inputAddr : Nat) (mem : Mem)\n");
+                    out.push_str("    (inputAddr : Nat) (mem : Mem) (rt : RegionTable)\n");
                 }
 
                 for (var_decl, _) in &accumulated_after {
@@ -811,11 +816,11 @@ fn render_sbpf(spec: &crate::check::ParsedSpec) -> String {
                 let mut binders = Vec::new();
                 if has_insn_reg {
                     binders.push("(inputAddr insnAddr : Nat)".to_string());
-                    binders.push("(mem : Mem)".to_string());
                 } else {
                     binders.push("(inputAddr : Nat)".to_string());
-                    binders.push("(mem : Mem)".to_string());
                 }
+                binders.push("(mem : Mem)".to_string());
+                binders.push("(rt : RegionTable)".to_string());
                 for ah in &acc_after_for_spec {
                     binders.push(prefix_unused_binder(ah));
                 }
@@ -868,6 +873,22 @@ struct DerivedHypotheses {
     bindings: Vec<String>,
     /// After-hypotheses for the next guard (what becomes true if this guard passes)
     after: Option<Vec<String>>,
+}
+
+/// Region-coverage hypothesis for one derived read: under qedsvm semantics
+/// the `ldx` at this address traps unless `rt` maps it, and with a symbolic
+/// base address the check only closes by hypothesis rewrite.
+fn region_hyp(var_name: &str, read_fn: &str, addr_expr: &str) -> String {
+    let width = match read_fn {
+        "readU8" => 1,
+        "readU16" => 2,
+        "readU32" => 4,
+        _ => 8,
+    };
+    format!(
+        "(h_rt_{} : rt.containsRange {} {} = true)",
+        var_name, addr_expr, width
+    )
 }
 
 /// Derive guard hypotheses from checks expression + input/insn layout.
@@ -947,6 +968,7 @@ fn derive_guard_hypotheses(
                         "(h_{}_val : {} mem {} = {})",
                         rhs_vname, rhs_read, rhs_addr, rhs_vname
                     ),
+                    region_hyp(&rhs_vname, rhs_read, &rhs_addr),
                 ];
                 (rhs_vname, binds)
             } else {
@@ -962,16 +984,22 @@ fn derive_guard_hypotheses(
                             "(h_{}_val : {} mem {} = {})",
                             var_name, read_fn, addr_expr, var_name
                         ),
+                        region_hyp(&var_name, read_fn, &addr_expr),
                     ];
                     bindings.extend(rhs_bindings.clone());
                     bindings.push(format!(
                         "(h_{}_ne : {} \u{2260} {})",
                         var_name, var_name, rhs_var
                     ));
-                    let after = Some(vec![format!(
-                        "(h_{} : {} mem {} = {})",
-                        var_name, read_fn, addr_expr, rhs_var
-                    )]);
+                    // Later guards re-execute through this access: carry the
+                    // pass-condition AND its region coverage forward.
+                    let after = Some(vec![
+                        format!(
+                            "(h_{} : {} mem {} = {})",
+                            var_name, read_fn, addr_expr, rhs_var
+                        ),
+                        region_hyp(&var_name, read_fn, &addr_expr),
+                    ]);
                     DerivedHypotheses { bindings, after }
                 }
                 ">=" => {
@@ -981,6 +1009,7 @@ fn derive_guard_hypotheses(
                             "(h_{}_val : {} mem {} = {})",
                             var_name, read_fn, addr_expr, var_name
                         ),
+                        region_hyp(&var_name, read_fn, &addr_expr),
                     ];
                     bindings.extend(rhs_bindings.clone());
                     bindings.push(format!("(h_{}_lt : {} < {})", var_name, var_name, rhs_var));
@@ -990,6 +1019,7 @@ fn derive_guard_hypotheses(
                             "(h_{}_val : {} mem {} = {})",
                             var_name, read_fn, addr_expr, var_name
                         ),
+                        region_hyp(&var_name, read_fn, &addr_expr),
                     ];
                     after_binds.extend(rhs_bindings);
                     after_binds.push(format!(
@@ -2636,23 +2666,32 @@ fn emit_handler_transition(out: &mut String, mir: &Mir, h: &crate::mir::HandlerM
                 if is_account_pubkey_ref(&rhs.rust) {
                     continue;
                 }
+                // Re-qualify the RHS: a bare state-field ref (e.g.
+                // `reserved := state.cap`, which upstream strips to `cap`)
+                // must render as `s.cap`, while handler params and literals
+                // pass through unchanged. The indexed-state path already
+                // routes through this helper; the flat path used to emit
+                // `rhs.lean` verbatim, producing `reserved := cap`
+                // (unknown identifier `cap`) — issue #79 Bug A.
                 with_parts.push(format!(
                     "{} := {}",
                     safe_name(&path_field_name(path)),
-                    rhs.lean
+                    effect_value_to_lean_mir(&rhs.lean, &h.params)
                 ));
             }
             Stmt::CheckedAdd { path, delta, .. }
             | Stmt::WrapAdd { path, delta }
             | Stmt::SatAdd { path, delta } => {
                 let f = safe_name(&path_field_name(path));
-                with_parts.push(format!("{} := s.{} + {}", f, f, delta.lean));
+                let d = effect_value_to_lean_mir(&delta.lean, &h.params);
+                with_parts.push(format!("{} := s.{} + {}", f, f, d));
             }
             Stmt::CheckedSub { path, delta, .. }
             | Stmt::WrapSub { path, delta }
             | Stmt::SatSub { path, delta } => {
                 let f = safe_name(&path_field_name(path));
-                with_parts.push(format!("{} := s.{} - {}", f, f, delta.lean));
+                let d = effect_value_to_lean_mir(&delta.lean, &h.params);
+                with_parts.push(format!("{} := s.{} - {}", f, f, d));
             }
             _ => {}
         }
@@ -2751,7 +2790,8 @@ fn build_guard_cond_parts(mir: &Mir, h: &crate::mir::HandlerMir) -> Vec<String> 
             .map(|(_, t)| t.clone())
         {
             if ty_max_const(&ty).is_some() {
-                conds.push(format!("{} \u{2264} s.{}", delta.lean, safe_name(&field)));
+                let d = effect_value_to_lean_mir(&delta.lean, &h.params);
+                conds.push(format!("{} \u{2264} s.{}", d, safe_name(&field)));
             }
         }
     }
@@ -5657,6 +5697,51 @@ mod tests {
         assert!(
             adt_lean.contains("inductive State where"),
             "pragma state_repr = adt must route to render_single_account_adt"
+        );
+    }
+
+    #[test]
+    fn flat_effect_rhs_field_ref_is_qualified() {
+        // Issue #79 Bug A: a `set` effect copying one state field into
+        // another (`reserved := state.cap`) is stored bare (`cap`) by the
+        // adapter. The flat-state transition emitter used to emit it
+        // verbatim — `reserved := cap` — which is an unknown identifier in
+        // Lean. It must re-qualify to `s.cap` (as the indexed path and the
+        // proptest backend already do), while a handler param stays bare.
+        let src = "spec BudgetRepro\n\
+            type State\n\
+            \x20 | Uninitialized\n\
+            \x20 | Active of { cap : U64, used : U64, reserved : U64 }\n\
+            type Error\n\
+            \x20 | Zero\n\
+            handler open (c : U64) : State.Uninitialized -> State.Active {\n\
+            \x20 permissionless\n\
+            \x20 accounts { payer : signer, writable }\n\
+            \x20 requires c > 0 else Zero\n\
+            \x20 effect { cap := c\n\
+            \x20          used := 0\n\
+            \x20          reserved := 0 }\n\
+            }\n\
+            handler reset : State.Active -> State.Active {\n\
+            \x20 permissionless\n\
+            \x20 accounts { caller : signer }\n\
+            \x20 effect { used := 0\n\
+            \x20          reserved := state.cap }\n\
+            }\n";
+        let parsed = crate::chumsky_adapter::parse_str(src).expect("parse budget spec");
+        let out = render(&crate::mir::lower(&parsed));
+        assert!(
+            out.contains("reserved := s.cap"),
+            "state-field RHS must render qualified `s.cap`:\n{out}"
+        );
+        assert!(
+            !out.contains("reserved := cap,") && !out.contains("reserved := cap "),
+            "bare `cap` (unknown identifier) must not appear:\n{out}"
+        );
+        // A handler param assigned to a field stays bare (it IS in scope).
+        assert!(
+            out.contains("cap := c"),
+            "handler-param RHS must stay bare `c`:\n{out}"
         );
     }
 

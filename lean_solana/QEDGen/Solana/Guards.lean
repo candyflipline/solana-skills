@@ -1,5 +1,5 @@
 import QEDGen.Solana.CommandBuilders
-import QEDGen.Solana.SBPF
+import SVM.SBPF
 import Lean.Elab.Command
 
 /-!
@@ -274,15 +274,20 @@ def elabQedguards : CommandElab := fun stx => do
 
   -- Build initExpr and params
   let entryStr := s!"{entryPc}"
+  -- qedsvm's initState takes a RegionTable (accesses outside it trap to
+  -- ERR_ACCESS_VIOLATION). Obligations bind `rt` and authors supply
+  -- per-access coverage hypotheses (`rt.containsRange ... = true`) in the
+  -- hypothesis block, mirroring SVM.SBPF.Patterns — with a symbolic r1 the
+  -- check cannot reduce by decidability, so it must rewrite via hypothesis.
   let initExpr := if hasR2 then
-    s!"initState2 {r1Name} {r2Name} mem {entryStr}"
+    s!"initState2 {r1Name} {r2Name} mem rt {entryStr}"
   else
-    s!"initState {r1Name} mem"
+    s!"initState {r1Name} mem rt"
 
   let params := if hasR2 then
-    s!"({r1Name} {r2Name} : Nat) (mem : Mem)"
+    s!"({r1Name} {r2Name} : Nat) (mem : Mem) (rt : RegionTable)"
   else
-    s!"({r1Name} : Nat) (mem : Mem)"
+    s!"({r1Name} : Nat) (mem : Mem) (rt : RegionTable)"
 
   -- Optional chunks (index 9)
   let chunksStx := stx[9]
@@ -395,15 +400,15 @@ def elabQedguards : CommandElab := fun stx => do
 
   cmds := cmds.push (mkNamespace name)
   cmds := cmds.push (mkOpen "QEDGen.Solana")
-  cmds := cmds.push (mkOpen "QEDGen.Solana.SBPF")
-  cmds := cmds.push (mkOpen "QEDGen.Solana.SBPF.Memory")
+  cmds := cmds.push (mkOpen "SVM.SBPF")
+  cmds := cmds.push (mkOpen "SVM.SBPF.Memory")
 
   -- Error code constants
   for (eName, eVal) in errorDecls do
     cmds := cmds.push (mkAbbrev eName "Nat" s!"{eVal}")
 
   -- Build structure with one field per guard (proof obligations)
-  let mut structStr := s!"structure Spec ({progName} : Nat → Option QEDGen.Solana.SBPF.Insn) where"
+  let mut structStr := s!"structure Spec ({progName} : Nat → Option SVM.SBPF.Insn) where"
   let mut accumulated : Array String := #[]
 
   -- Also collect proof commands (auto + phased)
