@@ -118,9 +118,16 @@ qedspec Escrow where
 
 All theorem stubs contain `sorry` — agents fill them, `lake build` enforces completeness.
 
-### QEDGen.Solana.SBPF
+### sBPF semantics (`SVM.SBPF`, from the qedsvm package)
 
-Low-level sBPF virtual machine model for binary-level verification. Submodules: ISA, Memory, Execute, Tactic, WPTactic, Pubkey, Patterns, Region. See SKILL.md for sBPF proof workflow.
+The low-level sBPF virtual machine model and both binary-proof engines
+(SL/lift and WP/fuel) come from the qedsvm package — `require qedsvm`
+in `lakefile.lean`, pinned to an exact tag. The former vendored copy at
+`QEDGen/Solana/SBPF/` was deleted when qedsvm tagged a stable surface
+(solana-skills#86). Key modules: `SVM.SBPF.{ISA, Machine, Memory,
+Execute, Tactic.WP, Tactic.SL, Tactic.Discharge, Patterns}`. See
+qedsvm's docs/API.md for the frozen surface and SKILL.md for the sBPF
+proof workflow.
 
 ## Trust Boundary
 

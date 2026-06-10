@@ -4,8 +4,8 @@
 import QEDGen
 
 open QEDGen.Solana
-open QEDGen.Solana.SBPF
-open QEDGen.Solana.SBPF.Memory
+open SVM.SBPF
+open SVM.SBPF.Memory
 
 -- ============================================================================
 -- Constants (matching DropsetProg.lean)
@@ -160,12 +160,12 @@ qedguards RegisterMarket where
   guard rejects_system_program_duplicate fuel 74 error E_SYSTEM_PROGRAM_IS_DUPLICATE
     hyps
       "(sysDup : Nat)"
-      "(h_sdup : readU8 mem ((executeFn progAt (initState2 inputAddr insnAddr mem 24) 47).regs.r9) = sysDup)"
+      "(h_sdup : readU8 mem ((executeFn progAt (initState2 inputAddr insnAddr mem rt 24) 47).regs.r9) = sysDup)"
       "(h_sdup_ne : sysDup ≠ ACCT_NON_DUP_MARKER)"
-      "(h_r9_sep : (executeFn progAt (initState2 inputAddr insnAddr mem 24) 47).regs.r9 < STACK_START)"
+      "(h_r9_sep : (executeFn progAt (initState2 inputAddr insnAddr mem rt 24) 47).regs.r9 < STACK_START)"
     after
-      "(h_sdup : readU8 mem ((executeFn progAt (initState2 inputAddr insnAddr mem 24) 47).regs.r9) = ACCT_NON_DUP_MARKER)"
-      "(h_r9_sep : (executeFn progAt (initState2 inputAddr insnAddr mem 24) 47).regs.r9 + 40 < STACK_START)"
+      "(h_sdup : readU8 mem ((executeFn progAt (initState2 inputAddr insnAddr mem rt 24) 47).regs.r9) = ACCT_NON_DUP_MARKER)"
+      "(h_r9_sep : (executeFn progAt (initState2 inputAddr insnAddr mem rt 24) 47).regs.r9 + 40 < STACK_START)"
 
   -- ── P11: Invalid system program pubkey (stack vs r9 chunks) ───────────
   guard rejects_invalid_system_program_pubkey fuel 86 error E_INVALID_SYSTEM_PROGRAM_PUBKEY
@@ -176,10 +176,10 @@ qedguards RegisterMarket where
       "(h_sys_c1 : readU64 mem (STACK_START + 0x1000 - 576) = sys_c1)"
       "(h_sys_c2 : readU64 mem (STACK_START + 0x1000 - 568) = sys_c2)"
       "(h_sys_c3 : readU64 mem (STACK_START + 0x1000 - 560) = sys_c3)"
-      "(h_acct_c0 : readU64 mem ((executeFn progAt (initState2 inputAddr insnAddr mem 24) 47).regs.r9 + 8) = acct_c0)"
-      "(h_acct_c1 : readU64 mem ((executeFn progAt (initState2 inputAddr insnAddr mem 24) 47).regs.r9 + 16) = acct_c1)"
-      "(h_acct_c2 : readU64 mem ((executeFn progAt (initState2 inputAddr insnAddr mem 24) 47).regs.r9 + 24) = acct_c2)"
-      "(h_acct_c3 : readU64 mem ((executeFn progAt (initState2 inputAddr insnAddr mem 24) 47).regs.r9 + 32) = acct_c3)"
+      "(h_acct_c0 : readU64 mem ((executeFn progAt (initState2 inputAddr insnAddr mem rt 24) 47).regs.r9 + 8) = acct_c0)"
+      "(h_acct_c1 : readU64 mem ((executeFn progAt (initState2 inputAddr insnAddr mem rt 24) 47).regs.r9 + 16) = acct_c1)"
+      "(h_acct_c2 : readU64 mem ((executeFn progAt (initState2 inputAddr insnAddr mem rt 24) 47).regs.r9 + 24) = acct_c2)"
+      "(h_acct_c3 : readU64 mem ((executeFn progAt (initState2 inputAddr insnAddr mem rt 24) 47).regs.r9 + 32) = acct_c3)"
       "(h_ne : acct_c0 ≠ sys_c0 ∨ acct_c1 ≠ sys_c1 ∨ acct_c2 ≠ sys_c2 ∨ acct_c3 ≠ sys_c3)"
     after
       -- Pass: shared vars (sys_c0..c3) bind both stack and account reads
@@ -188,30 +188,30 @@ qedguards RegisterMarket where
       "(h_sys_c1 : readU64 mem (STACK_START + 0x1000 - 576) = sys_c1)"
       "(h_sys_c2 : readU64 mem (STACK_START + 0x1000 - 568) = sys_c2)"
       "(h_sys_c3 : readU64 mem (STACK_START + 0x1000 - 560) = sys_c3)"
-      "(h_acct_c0 : readU64 mem ((executeFn progAt (initState2 inputAddr insnAddr mem 24) 47).regs.r9 + 8) = sys_c0)"
-      "(h_acct_c1 : readU64 mem ((executeFn progAt (initState2 inputAddr insnAddr mem 24) 47).regs.r9 + 16) = sys_c1)"
-      "(h_acct_c2 : readU64 mem ((executeFn progAt (initState2 inputAddr insnAddr mem 24) 47).regs.r9 + 24) = sys_c2)"
-      "(h_acct_c3 : readU64 mem ((executeFn progAt (initState2 inputAddr insnAddr mem 24) 47).regs.r9 + 32) = sys_c3)"
+      "(h_acct_c0 : readU64 mem ((executeFn progAt (initState2 inputAddr insnAddr mem rt 24) 47).regs.r9 + 8) = sys_c0)"
+      "(h_acct_c1 : readU64 mem ((executeFn progAt (initState2 inputAddr insnAddr mem rt 24) 47).regs.r9 + 16) = sys_c1)"
+      "(h_acct_c2 : readU64 mem ((executeFn progAt (initState2 inputAddr insnAddr mem rt 24) 47).regs.r9 + 24) = sys_c2)"
+      "(h_acct_c3 : readU64 mem ((executeFn progAt (initState2 inputAddr insnAddr mem rt 24) 47).regs.r9 + 32) = sys_c3)"
 
   -- ── P12: Rent sysvar is duplicate (r9 at step 92) ────────────────────
   guard rejects_rent_sysvar_duplicate fuel 96 error E_RENT_SYSVAR_IS_DUPLICATE
     hyps
       "(rentDup : Nat)"
-      "(h_rdup : readU8 mem ((executeFn progAt (initState2 inputAddr insnAddr mem 24) 92).regs.r9) = rentDup)"
+      "(h_rdup : readU8 mem ((executeFn progAt (initState2 inputAddr insnAddr mem rt 24) 92).regs.r9) = rentDup)"
       "(h_rdup_ne : rentDup ≠ ACCT_NON_DUP_MARKER)"
-      "(h_r9_rent_sep : (executeFn progAt (initState2 inputAddr insnAddr mem 24) 92).regs.r9 < STACK_START)"
+      "(h_r9_rent_sep : (executeFn progAt (initState2 inputAddr insnAddr mem rt 24) 92).regs.r9 < STACK_START)"
     after
-      "(h_rdup : readU8 mem ((executeFn progAt (initState2 inputAddr insnAddr mem 24) 92).regs.r9) = ACCT_NON_DUP_MARKER)"
-      "(h_r9_rent_sep : (executeFn progAt (initState2 inputAddr insnAddr mem 24) 92).regs.r9 + 40 < STACK_START)"
+      "(h_rdup : readU8 mem ((executeFn progAt (initState2 inputAddr insnAddr mem rt 24) 92).regs.r9) = ACCT_NON_DUP_MARKER)"
+      "(h_r9_rent_sep : (executeFn progAt (initState2 inputAddr insnAddr mem rt 24) 92).regs.r9 + 40 < STACK_START)"
 
   -- ── P13: Invalid rent sysvar pubkey (r9 chunks vs known pubkey) ───────
   guard rejects_invalid_rent_sysvar_pubkey fuel 108 error E_INVALID_RENT_SYSVAR_PUBKEY
     hyps
       "(rent_c0 rent_c1 rent_c2 rent_c3 : Nat)"
-      "(h_rent_c0 : readU64 mem ((executeFn progAt (initState2 inputAddr insnAddr mem 24) 92).regs.r9 + 8) = rent_c0)"
-      "(h_rent_c1 : readU64 mem ((executeFn progAt (initState2 inputAddr insnAddr mem 24) 92).regs.r9 + 16) = rent_c1)"
-      "(h_rent_c2 : readU64 mem ((executeFn progAt (initState2 inputAddr insnAddr mem 24) 92).regs.r9 + 24) = rent_c2)"
-      "(h_rent_c3 : readU64 mem ((executeFn progAt (initState2 inputAddr insnAddr mem 24) 92).regs.r9 + 32) = rent_c3)"
+      "(h_rent_c0 : readU64 mem ((executeFn progAt (initState2 inputAddr insnAddr mem rt 24) 92).regs.r9 + 8) = rent_c0)"
+      "(h_rent_c1 : readU64 mem ((executeFn progAt (initState2 inputAddr insnAddr mem rt 24) 92).regs.r9 + 16) = rent_c1)"
+      "(h_rent_c2 : readU64 mem ((executeFn progAt (initState2 inputAddr insnAddr mem rt 24) 92).regs.r9 + 24) = rent_c2)"
+      "(h_rent_c3 : readU64 mem ((executeFn progAt (initState2 inputAddr insnAddr mem rt 24) 92).regs.r9 + 32) = rent_c3)"
       "(h_ne : rent_c0 ≠ PUBKEY_RENT_CHUNK_0 ∨ rent_c1 ≠ PUBKEY_RENT_CHUNK_1 ∨ rent_c2 ≠ PUBKEY_RENT_CHUNK_2 ∨ rent_c3 ≠ PUBKEY_RENT_CHUNK_3)"
 
 -- ============================================================================

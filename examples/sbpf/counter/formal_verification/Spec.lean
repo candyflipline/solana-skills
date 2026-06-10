@@ -12,13 +12,13 @@
 --   3. rfl closes the halted-state residual
 -- Each step is O(1) kernel depth.
 
-import QEDGen.Solana.SBPF
+import SVM.SBPF
 import Program
 
 namespace CounterProofs
 
-open QEDGen.Solana.SBPF
-open QEDGen.Solana.SBPF.Memory
+open SVM.SBPF
+open SVM.SBPF.Memory
 open CounterProg
 
 /-! ## Proof helpers: effectiveAddr with named Int offsets -/
@@ -39,15 +39,16 @@ private theorem ea_10344 (b : Nat) : effectiveAddr b PDA_NON_DUP_MARKER_OFF = b 
 
 set_option maxHeartbeats 800000 in
 theorem rejects_wrong_account_count
-    (inputAddr : Nat) (mem : Mem)
+    (inputAddr : Nat) (mem : Mem) (rt : RegionTable)
     (numAccounts : Nat)
+    (h_rt_num : rt.containsRange inputAddr 8 = true)
     (h_num : readU64 mem inputAddr = numAccounts)
     (h_ne2 : numAccounts ≠ N_ACCOUNTS_INCREMENT)
     (h_ne3 : numAccounts ≠ N_ACCOUNTS_INIT) :
-    (executeFn progAt (initState inputAddr mem) 8).exitCode = some E_N_ACCOUNTS := by
+    (executeFn progAt (initState inputAddr mem rt) 8).exitCode = some E_N_ACCOUNTS := by
   have h1 : ¬(readU64 mem inputAddr = N_ACCOUNTS_INCREMENT) := by rw [h_num]; exact h_ne2
   have h2 : ¬(readU64 mem inputAddr = N_ACCOUNTS_INIT) := by rw [h_num]; exact h_ne3
-  wp_exec [progAt, progAt_0, progAt_1] [ea_0]
+  wp_exec [progAt, progAt_0, progAt_1] [ea_0, Width.bytes]
 
 /-! ## P2: user data length nonzero (initialize) → error 2
 
@@ -56,15 +57,17 @@ theorem rejects_wrong_account_count
 
 set_option maxHeartbeats 800000 in
 theorem init_rejects_user_data_len
-    (inputAddr : Nat) (mem : Mem)
+    (inputAddr : Nat) (mem : Mem) (rt : RegionTable)
     (userDataLen : Nat)
+    (h_rt_num : rt.containsRange inputAddr 8 = true)
+    (h_rt_udl : rt.containsRange (inputAddr + 88) 8 = true)
     (h_num : readU64 mem inputAddr = N_ACCOUNTS_INIT)
     (h_udl : readU64 mem (inputAddr + 88) = userDataLen)
     (h_ne  : userDataLen ≠ DATA_LEN_ZERO) :
-    (executeFn progAt (initState inputAddr mem) 10).exitCode = some E_USER_DATA_LEN := by
+    (executeFn progAt (initState inputAddr mem rt) 10).exitCode = some E_USER_DATA_LEN := by
   have h_ne2 : ¬(readU64 mem inputAddr = N_ACCOUNTS_INCREMENT) := by rw [h_num]; decide
   have h_ne_dl : ¬(readU64 mem (inputAddr + 88) = DATA_LEN_ZERO) := by rw [h_udl]; exact h_ne
-  wp_exec [progAt, progAt_0, progAt_1] [ea_0, ea_88, U32_MODULUS]
+  wp_exec [progAt, progAt_0, progAt_1] [ea_0, ea_88, U32_MODULUS, Width.bytes]
 
 /-! ## P3: PDA duplicate (initialize) → error 5
 
@@ -73,15 +76,18 @@ theorem init_rejects_user_data_len
 
 set_option maxHeartbeats 800000 in
 theorem init_rejects_pda_duplicate
-    (inputAddr : Nat) (mem : Mem)
+    (inputAddr : Nat) (mem : Mem) (rt : RegionTable)
     (pdaDupMarker : Nat)
+    (h_rt_num  : rt.containsRange inputAddr 8 = true)
+    (h_rt_udl  : rt.containsRange (inputAddr + 88) 8 = true)
+    (h_rt_pdup : rt.containsRange (inputAddr + 10344) 1 = true)
     (h_num  : readU64 mem inputAddr = N_ACCOUNTS_INIT)
     (h_udl  : readU64 mem (inputAddr + 88) = DATA_LEN_ZERO)
     (h_pdup : readU8  mem (inputAddr + 10344) = pdaDupMarker)
     (h_dup  : pdaDupMarker ≠ NON_DUP_MARKER) :
-    (executeFn progAt (initState inputAddr mem) 12).exitCode = some E_PDA_DUPLICATE := by
+    (executeFn progAt (initState inputAddr mem rt) 12).exitCode = some E_PDA_DUPLICATE := by
   have h_ne2 : ¬(readU64 mem inputAddr = N_ACCOUNTS_INCREMENT) := by rw [h_num]; decide
   have h_ne_dup : ¬(readU8 mem (inputAddr + 10344) = NON_DUP_MARKER) := by rw [h_pdup]; exact h_dup
-  wp_exec [progAt, progAt_0, progAt_1] [ea_0, ea_88, ea_10344, U32_MODULUS]
+  wp_exec [progAt, progAt_0, progAt_1] [ea_0, ea_88, ea_10344, U32_MODULUS, Width.bytes]
 
 end CounterProofs

@@ -76,7 +76,7 @@ Per [[feedback-mir-is-bug-reduction]] and the conversation that produced this sk
 
 - The `runMir` Lean-side operational semantics is **parked**. It was the Lean object every codegen would target; without it, codegens interpret MIR independently and lifestyle predicates live in qedsvm's `Svm/Solana/` library. Adding `runMir` later is purely additive.
 - No `applyOp ≡ runMir` equivalence lemma. No `encodeState` / `decodeState` schema. No cross-repo migration of MIR-adjacent Lean primitives into qedsvm.
-- qedsvm stays vendored at `lean_solana/QEDGen/Solana/SBPF/` until qedsvm tags a stable release. The `lake require` flip is deferred.
+- ~~qedsvm stays vendored at `lean_solana/QEDGen/Solana/SBPF/` until qedsvm tags a stable release.~~ Done: qedsvm v0.3.0 tagged a stable surface and the vendored tree was deleted — `lean_solana` now does `require qedsvm` and everything imports `SVM.SBPF.*` (solana-skills#86).
 - qedbridge codegen (Phase 5 in the original proposal) is also deferred until qedsvm stabilizes. The MIR's design doesn't depend on it.
 
 ## Shape

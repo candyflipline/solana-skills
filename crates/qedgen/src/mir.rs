@@ -46,9 +46,11 @@
 //!    quorum. See [[feedback-mir-is-bug-reduction]] for the framing.
 //!
 //! 4. **qedgen-local scope.** No `runMir` Lean-side operational semantics
-//!    (parked). No `applyOp ≡ runMir` equivalence lemma. No cross-repo
-//!    qedsvm migration. qedsvm stays vendored at
-//!    `lean_solana/QEDGen/Solana/SBPF/` until it tags stable.
+//!    (parked). No `applyOp ≡ runMir` equivalence lemma. The sBPF
+//!    semantics + binary-proof engines come from the qedsvm package
+//!    (`require qedsvm`, `SVM.SBPF.*`); the former vendored copy at
+//!    `lean_solana/QEDGen/Solana/SBPF/` was deleted when qedsvm tagged
+//!    v0.3.0 (solana-skills#86).
 //!
 //! ## Lowering source — ParsedSpec types we read from
 //!

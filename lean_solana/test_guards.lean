@@ -4,8 +4,8 @@
 import QEDGen
 
 open QEDGen.Solana
-open QEDGen.Solana.SBPF
-open QEDGen.Solana.SBPF.Memory
+open SVM.SBPF
+open SVM.SBPF.Memory
 
 -- ============================================================================
 -- Test 1: Single-register, 2-guard chain, numeric error codes

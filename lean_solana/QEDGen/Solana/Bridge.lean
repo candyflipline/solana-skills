@@ -1,6 +1,6 @@
 import QEDGen.Solana.CommandBuilders
 import QEDGen.Solana.Spec
-import QEDGen.Solana.SBPF
+import SVM.SBPF
 import Lean.Elab.Command
 
 /-!
@@ -158,8 +158,8 @@ def elabQedbridge : CommandElab := fun stx => do
 
   cmds := cmds.push (mkNamespace s!"{specName}.Bridge")
   cmds := cmds.push (mkOpen "QEDGen.Solana")
-  cmds := cmds.push (mkOpen "QEDGen.Solana.SBPF")
-  cmds := cmds.push (mkOpen "QEDGen.Solana.SBPF.Memory")
+  cmds := cmds.push (mkOpen "SVM.SBPF")
+  cmds := cmds.push (mkOpen "SVM.SBPF.Memory")
 
   -- 1. Offset constants
   for (fname, _, foffset) in fields do
@@ -254,19 +254,19 @@ def elabQedbridge : CommandElab := fun stx => do
       hyps := hyps ++ s!"    (h_disc : readU8 mem insnAddr = {disc})" ++ nl
 
     let initExpr := if hasInsn then
-      s!"{initFn} inputAddr insnAddr mem {entryStr}"
+      s!"{initFn} inputAddr insnAddr mem rt {entryStr}"
     else
-      s!"{initFn} inputAddr mem"
+      s!"{initFn} inputAddr mem rt"
 
     let addrParams := if hasInsn then
-      "(inputAddr insnAddr : Nat)"
+      "(inputAddr insnAddr : Nat) (rt : RegionTable)"
     else
-      "(inputAddr : Nat)"
+      "(inputAddr : Nat) (rt : RegionTable)"
 
     -- Success: guards hold → exits 0 → final memory encodes updated state
     -- Uses (s' : State) + hypothesis instead of .get! to avoid Inhabited requirement
     cmds := cmds.push (
-      s!"theorem {qOp}.refines (progAt : Nat → Option QEDGen.Solana.SBPF.Insn)" ++ nl ++
+      s!"theorem {qOp}.refines (progAt : Nat → Option SVM.SBPF.Insn)" ++ nl ++
       s!"    {addrParams} (mem : Mem) (s s' : {specName}.State) (signer : Pubkey){paramSig}" ++ nl ++
       hyps ++
       s!"    (h_guard : {transName} s signer{paramArgs} = some s') :" ++ nl ++
@@ -276,7 +276,7 @@ def elabQedbridge : CommandElab := fun stx => do
 
     -- Rejection: guards fail → exits nonzero
     cmds := cmds.push (
-      s!"theorem {qOp}.rejects (progAt : Nat → Option QEDGen.Solana.SBPF.Insn)" ++ nl ++
+      s!"theorem {qOp}.rejects (progAt : Nat → Option SVM.SBPF.Insn)" ++ nl ++
       s!"    {addrParams} (mem : Mem) (s : {specName}.State) (signer : Pubkey){paramSig}" ++ nl ++
       hyps ++
       s!"    (h_fail : {transName} s signer{paramArgs} = none) :" ++ nl ++

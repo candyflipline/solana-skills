@@ -657,9 +657,9 @@ pub fn generate(source: &str, namespace: &str, input_filename: &str) -> Result<S
         input_filename
     )?;
     writeln!(out, "-- source-hash: sha256:{}\n", hash)?;
-    writeln!(out, "import QEDGen.Solana.SBPF\n")?;
+    writeln!(out, "import SVM.SBPF\n")?;
     writeln!(out, "namespace {}\n", namespace)?;
-    writeln!(out, "open QEDGen.Solana.SBPF\n")?;
+    writeln!(out, "open SVM.SBPF\n")?;
 
     // .equ constants
     if !prog.equates.is_empty() {
@@ -688,7 +688,7 @@ pub fn generate(source: &str, namespace: &str, input_filename: &str) -> Result<S
         if !offset_names.is_empty() {
             writeln!(out, "/-! ## effectiveAddr lemmas -/\n")?;
             writeln!(out, "section EffectiveAddr\n")?;
-            writeln!(out, "open QEDGen.Solana.SBPF.Memory\n")?;
+            writeln!(out, "open SVM.SBPF.Memory\n")?;
             for name in &offset_names {
                 if let Some(&val) = equates_map.get(name.as_str()) {
                     let rhs = if val == 0 {
@@ -762,7 +762,7 @@ pub fn generate(source: &str, namespace: &str, input_filename: &str) -> Result<S
 
             writeln!(
                 out,
-                "def progAt_{} : Nat → Option QEDGen.Solana.SBPF.Insn",
+                "def progAt_{} : Nat → Option SVM.SBPF.Insn",
                 chunk_idx
             )?;
 
@@ -782,7 +782,7 @@ pub fn generate(source: &str, namespace: &str, input_filename: &str) -> Result<S
         // Emit top-level dispatch
         writeln!(
             out,
-            "def progAt (n : Nat) : Option QEDGen.Solana.SBPF.Insn :="
+            "def progAt (n : Nat) : Option SVM.SBPF.Insn :="
         )?;
         for chunk_idx in 0..n_chunks {
             let upper = (chunk_idx + 1) * CHUNK_SIZE;
@@ -829,6 +829,15 @@ pub fn generate(source: &str, namespace: &str, input_filename: &str) -> Result<S
         }
 
         writeln!(out, "]\n")?;
+
+        // Flat match-based fetch — the fetch-cache theorems below and the
+        // wp_exec dsimp lists in proof files both reference `progAt`.
+        writeln!(out, "@[simp] def progAt : Nat → Option SVM.SBPF.Insn")?;
+        for (idx, insn) in prog.instructions.iter().enumerate() {
+            let lean = emit_insn(insn, &equates_map, &prog.labels, &prog.offset_symbols)?;
+            writeln!(out, "  | {} => some ({})", idx, lean)?;
+        }
+        writeln!(out, "  | _ => none\n")?;
     }
 
     // progAt instruction fetch cache: pre-computed theorems for each PC.

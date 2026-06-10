@@ -5,13 +5,13 @@
 --
 -- We verify the validation prefix: 7 input checks + balance check.
 
-import QEDGen.Solana.SBPF
+import SVM.SBPF
 import Program
 
 namespace TransferProofs
 
-open QEDGen.Solana.SBPF
-open QEDGen.Solana.SBPF.Memory
+open SVM.SBPF
+open SVM.SBPF.Memory
 open TransferProg
 
 /-! ## effectiveAddr lemmas -/
@@ -39,13 +39,14 @@ private theorem ea_31040 (b : Nat) : effectiveAddr b INSTRUCTION_DATA_OFFSET = b
 
 set_option maxHeartbeats 800000 in
 theorem rejects_wrong_account_count
-    (inputAddr : Nat) (mem : Mem)
+    (inputAddr : Nat) (mem : Mem) (rt : RegionTable)
     (numAccounts : Nat)
+    (h_rt_num : rt.containsRange inputAddr 8 = true)
     (h_num : readU64 mem inputAddr = numAccounts)
     (h_ne : numAccounts ≠ N_ACCOUNTS_EXPECTED) :
-    (executeFn progAt (initState inputAddr mem) 6).exitCode = some E_N_ACCOUNTS := by
+    (executeFn progAt (initState inputAddr mem rt) 6).exitCode = some E_N_ACCOUNTS := by
   have h_ne3 : ¬(readU64 mem inputAddr = N_ACCOUNTS_EXPECTED) := by rw [h_num]; exact h_ne
-  wp_exec [progAt] [ea_0, ea_88, ea_10344, ea_10424, ea_20680, ea_31032, ea_31040, ea_80]
+  wp_exec [progAt] [ea_0, ea_88, ea_10344, ea_10424, ea_20680, ea_31032, ea_31040, ea_80, Width.bytes]
 
 /-! ## P2: insufficient lamports → error 7
 
@@ -53,8 +54,16 @@ theorem rejects_wrong_account_count
 
 set_option maxHeartbeats 16000000 in
 theorem rejects_insufficient_lamports
-    (inputAddr : Nat) (mem : Mem)
+    (inputAddr : Nat) (mem : Mem) (rt : RegionTable)
     (amount senderLamports : Nat)
+    (h_rt_num  : rt.containsRange inputAddr 8 = true)
+    (h_rt_sdl  : rt.containsRange (inputAddr + 88) 8 = true)
+    (h_rt_rdup : rt.containsRange (inputAddr + 10344) 1 = true)
+    (h_rt_rdl  : rt.containsRange (inputAddr + 10424) 8 = true)
+    (h_rt_sdup : rt.containsRange (inputAddr + 20680) 1 = true)
+    (h_rt_idl  : rt.containsRange (inputAddr + 31032) 8 = true)
+    (h_rt_amt  : rt.containsRange (inputAddr + 31040) 8 = true)
+    (h_rt_bal  : rt.containsRange (inputAddr + 80) 8 = true)
     (h_num   : readU64 mem inputAddr = N_ACCOUNTS_EXPECTED)
     (h_sdl   : readU64 mem (inputAddr + 88) = DATA_LENGTH_ZERO)
     (h_rdup  : readU8  mem (inputAddr + 10344) = NON_DUP_MARKER)
@@ -64,8 +73,8 @@ theorem rejects_insufficient_lamports
     (h_amt   : readU64 mem (inputAddr + 31040) = amount)
     (h_bal   : readU64 mem (inputAddr + 80) = senderLamports)
     (h_insuf : senderLamports < amount) :
-    (executeFn progAt (initState inputAddr mem) 20).exitCode = some E_INSUFFICIENT_LAMPORTS := by
-  wp_exec [progAt] [ea_0, ea_88, ea_10344, ea_10424, ea_20680, ea_31032, ea_31040, ea_80]
+    (executeFn progAt (initState inputAddr mem rt) 20).exitCode = some E_INSUFFICIENT_LAMPORTS := by
+  wp_exec [progAt] [ea_0, ea_88, ea_10344, ea_10424, ea_20680, ea_31032, ea_31040, ea_80, Width.bytes]
 
 /-! ## P3: happy path → exit 0
 
@@ -74,8 +83,16 @@ theorem rejects_insufficient_lamports
 
 set_option maxHeartbeats 16000000 in
 theorem accepts_valid_transfer
-    (inputAddr : Nat) (mem : Mem)
+    (inputAddr : Nat) (mem : Mem) (rt : RegionTable)
     (amount senderLamports : Nat)
+    (h_rt_num  : rt.containsRange inputAddr 8 = true)
+    (h_rt_sdl  : rt.containsRange (inputAddr + 88) 8 = true)
+    (h_rt_rdup : rt.containsRange (inputAddr + 10344) 1 = true)
+    (h_rt_rdl  : rt.containsRange (inputAddr + 10424) 8 = true)
+    (h_rt_sdup : rt.containsRange (inputAddr + 20680) 1 = true)
+    (h_rt_idl  : rt.containsRange (inputAddr + 31032) 8 = true)
+    (h_rt_amt  : rt.containsRange (inputAddr + 31040) 8 = true)
+    (h_rt_bal  : rt.containsRange (inputAddr + 80) 8 = true)
     (h_num   : readU64 mem inputAddr = N_ACCOUNTS_EXPECTED)
     (h_sdl   : readU64 mem (inputAddr + 88) = DATA_LENGTH_ZERO)
     (h_rdup  : readU8  mem (inputAddr + 10344) = NON_DUP_MARKER)
@@ -85,8 +102,8 @@ theorem accepts_valid_transfer
     (h_amt   : readU64 mem (inputAddr + 31040) = amount)
     (h_bal   : readU64 mem (inputAddr + 80) = senderLamports)
     (h_suf   : senderLamports ≥ amount) :
-    (executeFn progAt (initState inputAddr mem) 20).exitCode = some 0 := by
+    (executeFn progAt (initState inputAddr mem rt) 20).exitCode = some 0 := by
   have h_not_lt : ¬(senderLamports < amount) := by omega
-  wp_exec [progAt] [ea_0, ea_88, ea_10344, ea_10424, ea_20680, ea_31032, ea_31040, ea_80]
+  wp_exec [progAt] [ea_0, ea_88, ea_10344, ea_10424, ea_20680, ea_31032, ea_31040, ea_80, Width.bytes]
 
 end TransferProofs
