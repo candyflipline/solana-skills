@@ -760,11 +760,7 @@ pub fn generate(source: &str, namespace: &str, input_filename: &str) -> Result<S
             let start = chunk_idx * CHUNK_SIZE;
             let end = std::cmp::min(start + CHUNK_SIZE, n_insns);
 
-            writeln!(
-                out,
-                "def progAt_{} : Nat → Option SVM.SBPF.Insn",
-                chunk_idx
-            )?;
+            writeln!(out, "def progAt_{} : Nat → Option SVM.SBPF.Insn", chunk_idx)?;
 
             for idx in start..end {
                 let insn = &prog.instructions[idx];
@@ -780,10 +776,7 @@ pub fn generate(source: &str, namespace: &str, input_filename: &str) -> Result<S
         }
 
         // Emit top-level dispatch
-        writeln!(
-            out,
-            "def progAt (n : Nat) : Option SVM.SBPF.Insn :="
-        )?;
+        writeln!(out, "def progAt (n : Nat) : Option SVM.SBPF.Insn :=")?;
         for chunk_idx in 0..n_chunks {
             let upper = (chunk_idx + 1) * CHUNK_SIZE;
             if chunk_idx + 1 < n_chunks {
