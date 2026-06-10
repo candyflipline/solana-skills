@@ -110,6 +110,7 @@ fn verify_init_pool_rejects_invalid() {
     kani::assume(s.status == Status::Uninitialized);
     let rate: u64 = kani::any();
     kani::assume(!((rate > 0)));
+    kani::cover!(true, "guard-violation domain is satisfiable");
     assert!(!init_pool(&mut s, rate),
         "init_pool must reject when guard is violated");
 }
@@ -128,6 +129,7 @@ fn verify_deposit_rejects_invalid() {
     kani::assume(s.status == Status::Active);
     let amount: u64 = kani::any();
     kani::assume(!((amount > 0)));
+    kani::cover!(true, "guard-violation domain is satisfiable");
     assert!(!deposit(&mut s, amount),
         "deposit must reject when guard is violated");
 }
@@ -373,6 +375,7 @@ fn verify_borrow_rejects_invalid() {
     let amount: u64 = kani::any();
     let collateral: u64 = kani::any();
     kani::assume(!(((amount > 0) && (collateral > 0))));
+    kani::cover!(true, "guard-violation domain is satisfiable");
     assert!(!borrow(&mut s, amount, collateral),
         "borrow must reject when guard is violated");
 }
@@ -390,6 +393,7 @@ fn verify_liquidate_rejects_invalid() {
     };
     kani::assume(s.status == Status::Active);
     kani::assume(!((s.amount > s.collateral)));
+    kani::cover!(true, "guard-violation domain is satisfiable");
     assert!(!liquidate(&mut s),
         "liquidate must reject when guard is violated");
 }

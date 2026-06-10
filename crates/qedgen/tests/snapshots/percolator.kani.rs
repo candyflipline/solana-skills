@@ -358,6 +358,7 @@ fn verify_add_user_rejects_invalid() {
     kani::assume(s.status == Status::Active);
     let i: usize = kani::any();
     kani::assume(!((s.accounts[(i) as usize].active == 0) && (((((s.accounts[(i) as usize].capital) as i128) + ((s.accounts[(i) as usize].pnl) as i128)) as i128) >= ((0) as i128))));
+    kani::cover!(true, "guard-violation domain is satisfiable");
     assert!(!add_user(&mut s, i),
         "add_user must reject when guard is violated");
 }
@@ -377,6 +378,7 @@ fn verify_add_lp_rejects_invalid() {
     kani::assume(s.status == Status::Active);
     let i: usize = kani::any();
     kani::assume(!((s.accounts[(i) as usize].active == 0) && (((((s.accounts[(i) as usize].capital) as i128) + ((s.accounts[(i) as usize].pnl) as i128)) as i128) >= ((0) as i128))));
+    kani::cover!(true, "guard-violation domain is satisfiable");
     assert!(!add_lp(&mut s, i),
         "add_lp must reject when guard is violated");
 }
@@ -396,6 +398,7 @@ fn verify_reclaim_empty_account_rejects_invalid() {
     kani::assume(s.status == Status::Active);
     let i: usize = kani::any();
     kani::assume(!((s.accounts[(i) as usize].active == 1) && (s.accounts[(i) as usize].capital == 0) && (s.accounts[(i) as usize].reserved_pnl == 0) && (s.accounts[(i) as usize].fee_credits == 0)));
+    kani::cover!(true, "guard-violation domain is satisfiable");
     assert!(!reclaim_empty_account(&mut s, i),
         "reclaim_empty_account must reject when guard is violated");
 }
@@ -415,6 +418,7 @@ fn verify_close_account_rejects_invalid() {
     kani::assume(s.status == Status::Active);
     let i: usize = kani::any();
     kani::assume(!((s.accounts[(i) as usize].active == 1) && (s.V >= s.accounts[(i) as usize].capital)));
+    kani::cover!(true, "guard-violation domain is satisfiable");
     assert!(!close_account(&mut s, i),
         "close_account must reject when guard is violated");
 }
@@ -435,6 +439,7 @@ fn verify_deposit_rejects_invalid() {
     let i: usize = kani::any();
     let amount: u128 = kani::any();
     kani::assume(!((s.accounts[(i) as usize].active == 1) && (s.V + amount <= 10000000000000000)));
+    kani::cover!(true, "guard-violation domain is satisfiable");
     assert!(!deposit(&mut s, i, amount),
         "deposit must reject when guard is violated");
 }
@@ -455,6 +460,7 @@ fn verify_withdraw_rejects_invalid() {
     let i: usize = kani::any();
     let amount: u128 = kani::any();
     kani::assume(!((s.accounts[(i) as usize].active == 1) && (s.accounts[(i) as usize].capital >= amount) && (((((s.accounts[(i) as usize].capital) as i128) + ((s.accounts[(i) as usize].pnl) as i128)) as i128) >= ((amount) as i128))));
+    kani::cover!(true, "guard-violation domain is satisfiable");
     assert!(!withdraw(&mut s, i, amount),
         "withdraw must reject when guard is violated");
 }
@@ -474,6 +480,7 @@ fn verify_top_up_insurance_rejects_invalid() {
     kani::assume(s.status == Status::Active);
     let amount: u128 = kani::any();
     kani::assume(!((s.V + amount <= 10000000000000000)));
+    kani::cover!(true, "guard-violation domain is satisfiable");
     assert!(!top_up_insurance(&mut s, amount),
         "top_up_insurance must reject when guard is violated");
 }
@@ -494,6 +501,7 @@ fn verify_deposit_fee_credits_rejects_invalid() {
     let i: usize = kani::any();
     let amount: u128 = kani::any();
     kani::assume(!((s.accounts[(i) as usize].active == 1) && (s.V + amount <= 10000000000000000)));
+    kani::cover!(true, "guard-violation domain is satisfiable");
     assert!(!deposit_fee_credits(&mut s, i, amount),
         "deposit_fee_credits must reject when guard is violated");
 }
@@ -514,6 +522,7 @@ fn verify_convert_released_pnl_rejects_invalid() {
     let i: usize = kani::any();
     let x: u128 = kani::any();
     kani::assume(!((s.accounts[(i) as usize].active == 1) && (s.accounts[(i) as usize].reserved_pnl >= x) && (s.V >= x)));
+    kani::cover!(true, "guard-violation domain is satisfiable");
     assert!(!convert_released_pnl(&mut s, i, x),
         "convert_released_pnl must reject when guard is violated");
 }
@@ -536,6 +545,7 @@ fn verify_execute_trade_rejects_invalid() {
     let size_q: i128 = kani::any();
     let exec_price: u64 = kani::any();
     kani::assume(!((s.accounts[(a) as usize].active == 1) && (s.accounts[(b) as usize].active == 1) && (a != b) && (mul_div_floor_u128(((size_q) as u128), ((exec_price) as u128), ((1000000) as u128)) <= 100000000000000000000)));
+    kani::cover!(true, "guard-violation domain is satisfiable");
     assert!(!execute_trade(&mut s, a, b, size_q, exec_price),
         "execute_trade must reject when guard is violated");
 }
@@ -555,6 +565,7 @@ fn verify_liquidate_case_0_rejects_invalid() {
     kani::assume(s.status == Status::Active);
     let i: usize = kani::any();
     kani::assume(!((s.accounts[(i) as usize].active == 1) && (((((s.accounts[(i) as usize].capital) as i128) + ((s.accounts[(i) as usize].pnl) as i128)) as i128) >= ((0) as i128)) && (false)));
+    kani::cover!(true, "guard-violation domain is satisfiable");
     assert!(!liquidate_case_0(&mut s, i),
         "liquidate_case_0 must reject when guard is violated");
 }
@@ -574,6 +585,7 @@ fn verify_liquidate_case_1_rejects_invalid() {
     kani::assume(s.status == Status::Active);
     let i: usize = kani::any();
     kani::assume(!((s.accounts[(i) as usize].active == 1) && (!(((((s.accounts[(i) as usize].capital) as i128) + ((s.accounts[(i) as usize].pnl) as i128)) as i128) >= ((0) as i128))) && (((((((s.accounts[(i) as usize].capital) as i128) + ((s.accounts[(i) as usize].pnl) as i128)) as i128) + ((s.I) as i128)) as i128) >= ((0) as i128))));
+    kani::cover!(true, "guard-violation domain is satisfiable");
     assert!(!liquidate_case_1(&mut s, i),
         "liquidate_case_1 must reject when guard is violated");
 }
@@ -593,6 +605,7 @@ fn verify_liquidate_otherwise_rejects_invalid() {
     kani::assume(s.status == Status::Active);
     let i: usize = kani::any();
     kani::assume(!((s.accounts[(i) as usize].active == 1) && (!(((((s.accounts[(i) as usize].capital) as i128) + ((s.accounts[(i) as usize].pnl) as i128)) as i128) >= ((0) as i128))) && (!(((((((s.accounts[(i) as usize].capital) as i128) + ((s.accounts[(i) as usize].pnl) as i128)) as i128) + ((s.I) as i128)) as i128) >= ((0) as i128))) && (false)));
+    kani::cover!(true, "guard-violation domain is satisfiable");
     assert!(!liquidate_otherwise(&mut s, i),
         "liquidate_otherwise must reject when guard is violated");
 }
@@ -612,6 +625,7 @@ fn verify_settle_account_rejects_invalid() {
     kani::assume(s.status == Status::Active);
     let i: usize = kani::any();
     kani::assume(!((s.accounts[(i) as usize].active == 1)));
+    kani::cover!(true, "guard-violation domain is satisfiable");
     assert!(!settle_account(&mut s, i),
         "settle_account must reject when guard is violated");
 }

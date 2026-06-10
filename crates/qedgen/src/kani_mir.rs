@@ -893,6 +893,13 @@ fn emit_guard_rejection_harness(out: &mut String, ctx: GuardRejectionHarness<'_>
         out.push_str(&format!("    kani::assume(!({violated_expr}));\n"));
     }
 
+    // Per-arm vacuity guard: when term i is implied by the prefix terms,
+    // this arm's assumption set is UNSAT and the assertion below is
+    // unreachable — Kani would report SUCCESSFUL while proving nothing for
+    // this arm. The cover makes that loud (an unsatisfied cover fails the
+    // run) and doubles as a spec signal that the guard term is redundant.
+    out.push_str("    kani::cover!(true, \"guard-violation domain is satisfiable\");\n");
+
     // With the guard violated, the generated transition must reject: it
     // returns `false` and applies none of its effects. Asserting the
     // negated term back (instead of calling the handler) would be a
@@ -2555,6 +2562,13 @@ mod tests {
         assert!(
             out.contains("kani::assume(pubkey_eq(&accounts.admin.pubkey, &s.admin_key));\n    kani::assume(amount_in > 0);"),
             "later split terms should assume earlier terms true, partitioning by first failed guard:\n{out}"
+        );
+        // An arm whose term is implied by its prefix has UNSAT assumptions —
+        // the rejection assert is then unreachable and Kani reports SUCCESSFUL
+        // while proving nothing for that arm. The cover makes that loud.
+        assert!(
+            out.contains("kani::cover!(true, \"guard-violation domain is satisfiable\");"),
+            "each split arm needs a satisfiability cover so a vacuous arm fails instead of passing silently:\n{out}"
         );
     }
 

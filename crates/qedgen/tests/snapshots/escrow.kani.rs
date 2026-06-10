@@ -154,6 +154,7 @@ fn verify_initialize_rejects_invalid() {
         system_program: KaniAccount { pubkey: kani::any() },
     };
     kani::assume(!(((deposit_amount > 0) && (receive_amount > 0))));
+    kani::cover!(true, "guard-violation domain is satisfiable");
     assert!(!initialize(&mut s, &accounts, deposit_amount, receive_amount),
         "initialize must reject when guard is violated");
 }
@@ -181,6 +182,7 @@ fn verify_exchange_rejects_invalid() {
         token_program: KaniAccount { pubkey: kani::any() },
     };
     kani::assume(!((pubkey_eq(&accounts.initializer_ta.pubkey, &s.initializer_token_account))));
+    kani::cover!(true, "guard-violation domain is satisfiable");
     assert!(!exchange(&mut s, &accounts),
         "exchange must reject when guard is violated");
 }
@@ -207,6 +209,7 @@ fn verify_cancel_rejects_invalid() {
         token_program: KaniAccount { pubkey: kani::any() },
     };
     kani::assume(!((pubkey_eq(&accounts.initializer_ta.pubkey, &s.initializer_token_account))));
+    kani::cover!(true, "guard-violation domain is satisfiable");
     assert!(!cancel(&mut s, &accounts),
         "cancel must reject when guard is violated");
 }

@@ -195,6 +195,7 @@ fn verify_unbound_transfer_rejects_invalid() {
         token_program: KaniAccount { pubkey: kani::any() },
     };
     kani::assume(!((pubkey_eq(&accounts.admin.pubkey, &s.admin_key)) && (amount > 0)));
+    kani::cover!(true, "guard-violation domain is satisfiable");
     assert!(!unbound_transfer(&mut s, &accounts, amount),
         "unbound_transfer must reject when guard is violated");
 }
@@ -218,6 +219,7 @@ fn verify_bound_transfer_rejects_invalid() {
         token_program: KaniAccount { pubkey: kani::any() },
     };
     kani::assume(!((pubkey_eq(&accounts.admin.pubkey, &s.admin_key)) && (amount > 0)));
+    kani::cover!(true, "guard-violation domain is satisfiable");
     assert!(!bound_transfer(&mut s, &accounts, amount),
         "bound_transfer must reject when guard is violated");
 }
@@ -246,6 +248,7 @@ fn verify_stable_swap_large_guard_rejects_invalid_1_pubkey_eq_accounts_admin_pub
         token_program: KaniAccount { pubkey: kani::any() },
     };
     kani::assume(!(pubkey_eq(&accounts.admin.pubkey, &s.admin_key)));
+    kani::cover!(true, "guard-violation domain is satisfiable");
     assert!(!stable_swap_large_guard(&mut s, &accounts, amount_in, min_out, fee_bps, lane, input_mint, output_mint),
         "stable_swap_large_guard must reject when guard term is violated");
 }
@@ -275,6 +278,7 @@ fn verify_stable_swap_large_guard_rejects_invalid_2_amount_in_0() {
     };
     kani::assume(pubkey_eq(&accounts.admin.pubkey, &s.admin_key));
     kani::assume(amount_in <= 0);
+    kani::cover!(true, "guard-violation domain is satisfiable");
     assert!(!stable_swap_large_guard(&mut s, &accounts, amount_in, min_out, fee_bps, lane, input_mint, output_mint),
         "stable_swap_large_guard must reject when guard term is violated");
 }
@@ -305,6 +309,7 @@ fn verify_stable_swap_large_guard_rejects_invalid_3_min_out_0() {
     kani::assume(pubkey_eq(&accounts.admin.pubkey, &s.admin_key));
     kani::assume(amount_in > 0);
     kani::assume(min_out <= 0);
+    kani::cover!(true, "guard-violation domain is satisfiable");
     assert!(!stable_swap_large_guard(&mut s, &accounts, amount_in, min_out, fee_bps, lane, input_mint, output_mint),
         "stable_swap_large_guard must reject when guard term is violated");
 }
@@ -336,6 +341,7 @@ fn verify_stable_swap_large_guard_rejects_invalid_4_fee_bps_10000() {
     kani::assume(amount_in > 0);
     kani::assume(min_out > 0);
     kani::assume(fee_bps > 10000);
+    kani::cover!(true, "guard-violation domain is satisfiable");
     assert!(!stable_swap_large_guard(&mut s, &accounts, amount_in, min_out, fee_bps, lane, input_mint, output_mint),
         "stable_swap_large_guard must reject when guard term is violated");
 }
@@ -368,6 +374,7 @@ fn verify_stable_swap_large_guard_rejects_invalid_5_lane_32() {
     kani::assume(min_out > 0);
     kani::assume(fee_bps <= 10000);
     kani::assume(lane >= 32);
+    kani::cover!(true, "guard-violation domain is satisfiable");
     assert!(!stable_swap_large_guard(&mut s, &accounts, amount_in, min_out, fee_bps, lane, input_mint, output_mint),
         "stable_swap_large_guard must reject when guard term is violated");
 }
@@ -401,6 +408,7 @@ fn verify_stable_swap_large_guard_rejects_invalid_6_pubkey_ne_input_mint_output_
     kani::assume(fee_bps <= 10000);
     kani::assume(lane < 32);
     kani::assume(!(pubkey_ne(&input_mint, &output_mint)));
+    kani::cover!(true, "guard-violation domain is satisfiable");
     assert!(!stable_swap_large_guard(&mut s, &accounts, amount_in, min_out, fee_bps, lane, input_mint, output_mint),
         "stable_swap_large_guard must reject when guard term is violated");
 }
@@ -435,6 +443,7 @@ fn verify_stable_swap_large_guard_rejects_invalid_7_pubkey_eq_input_mint_output_
     kani::assume(lane < 32);
     kani::assume(pubkey_ne(&input_mint, &output_mint));
     kani::assume(!(((pubkey_eq(&input_mint, &output_mint)) || (amount_in >= min_out))));
+    kani::cover!(true, "guard-violation domain is satisfiable");
     assert!(!stable_swap_large_guard(&mut s, &accounts, amount_in, min_out, fee_bps, lane, input_mint, output_mint),
         "stable_swap_large_guard must reject when guard term is violated");
 }
@@ -471,6 +480,7 @@ fn verify_stable_swap_large_guard_rejects_invalid_8_mul_bps_floor_u128_amount_in
     kani::assume(((pubkey_eq(&input_mint, &output_mint)) || (amount_in >= min_out)));
     let __qed_bps_floor_1 = mul_bps_floor_u128(amount_in, fee_bps);
     kani::assume(__qed_bps_floor_1 > amount_in);
+    kani::cover!(true, "guard-violation domain is satisfiable");
     assert!(!stable_swap_large_guard(&mut s, &accounts, amount_in, min_out, fee_bps, lane, input_mint, output_mint),
         "stable_swap_large_guard must reject when guard term is violated");
 }
@@ -508,6 +518,7 @@ fn verify_stable_swap_large_guard_rejects_invalid_9_amount_in_min_out() {
     let __qed_bps_floor_1 = mul_bps_floor_u128(amount_in, fee_bps);
     kani::assume(__qed_bps_floor_1 <= amount_in);
     kani::assume(amount_in < min_out);
+    kani::cover!(true, "guard-violation domain is satisfiable");
     assert!(!stable_swap_large_guard(&mut s, &accounts, amount_in, min_out, fee_bps, lane, input_mint, output_mint),
         "stable_swap_large_guard must reject when guard term is violated");
 }
@@ -546,6 +557,7 @@ fn verify_stable_swap_large_guard_rejects_invalid_10_amount_in_1000000000000000(
     kani::assume(__qed_bps_floor_1 <= amount_in);
     kani::assume(amount_in >= min_out);
     kani::assume(amount_in > 1000000000000000);
+    kani::cover!(true, "guard-violation domain is satisfiable");
     assert!(!stable_swap_large_guard(&mut s, &accounts, amount_in, min_out, fee_bps, lane, input_mint, output_mint),
         "stable_swap_large_guard must reject when guard term is violated");
 }

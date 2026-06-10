@@ -2135,6 +2135,22 @@ fn pinocchio_concrete_scalar_probe_value(name: &str, rust_ty: &str, mode: &str) 
     Some(format!("{value} as {rust_ty}"))
 }
 
+/// True when `pattern` occurs in `compact` as a complete comparison — i.e.
+/// followed by end-of-expression or a boolean connective. A bare substring
+/// test misclassifies conservation ensures: `post.fee_pool==pre.fee_pool+fee`
+/// contains `post.fee_pool==pre.fee_pool`, but the field is *not* unchanged,
+/// and the resulting equality assertion fails on a correct implementation.
+fn contains_anchored_comparison(compact: &str, pattern: &str) -> bool {
+    let mut search = compact;
+    while let Some(pos) = search.find(pattern) {
+        match search[pos + pattern.len()..].chars().next() {
+            None | Some('&') | Some('|') | Some(')') => return true,
+            _ => search = &search[pos + pattern.len()..],
+        }
+    }
+    false
+}
+
 fn pinocchio_unchanged_ensures_fields(expr: &str) -> Vec<String> {
     let compact: String = expr.chars().filter(|ch| !ch.is_whitespace()).collect();
     let mut fields = BTreeSet::new();
@@ -2150,7 +2166,9 @@ fn pinocchio_unchanged_ensures_fields(expr: &str) -> Vec<String> {
         }
         let pattern_a = format!("post.{field}==pre.{field}");
         let pattern_b = format!("pre.{field}==post.{field}");
-        if compact.contains(&pattern_a) || compact.contains(&pattern_b) {
+        if contains_anchored_comparison(&compact, &pattern_a)
+            || contains_anchored_comparison(&compact, &pattern_b)
+        {
             fields.insert(to_snake_case(&field));
         }
     }
@@ -4311,6 +4329,33 @@ fn rewrite_pre_post_paths(expr: &str) -> String {
 mod tests {
     use super::*;
     use crate::chumsky_adapter::parse_str;
+
+    /// A conservation ensures (`post.X == pre.X + delta`) must NOT classify
+    /// `X` as unchanged: the rendered string contains `post.X==pre.X` as a
+    /// substring, and an unanchored match emits an equality assertion that
+    /// fails on a correct implementation.
+    #[test]
+    fn unchanged_fields_exclude_pre_plus_delta_ensures() {
+        assert_eq!(
+            pinocchio_unchanged_ensures_fields(
+                "post.fee_pool == pre.fee_pool + fee && post.admin == pre.admin"
+            ),
+            vec!["admin".to_string()],
+        );
+        // Reversed orientation continues the same way.
+        assert_eq!(
+            pinocchio_unchanged_ensures_fields("pre.fee_pool == post.fee_pool - fee"),
+            Vec::<String>::new(),
+        );
+        // Genuinely-unchanged claims still match at every anchored position:
+        // end of expression, before `&&`, and inside parens.
+        assert_eq!(
+            pinocchio_unchanged_ensures_fields(
+                "(post.vault == pre.vault) && post.total == pre.total"
+            ),
+            vec!["total".to_string(), "vault".to_string()],
+        );
+    }
 
     /// Auto-trigger fires when a handler has `modifies` listing a field
     /// that's absent from the effect block's LHS set (the LP-deposit

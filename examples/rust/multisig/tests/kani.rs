@@ -202,6 +202,7 @@ fn verify_create_vault_rejects_invalid() {
     let threshold: u8 = kani::any();
     let member_count: u8 = kani::any();
     kani::assume(!(((threshold > 0) && (threshold <= member_count)) && (member_count <= 32)));
+    kani::cover!(true, "guard-violation domain is satisfiable");
     assert!(!create_vault(&mut s, threshold, member_count),
         "create_vault must reject when guard is violated");
 }
@@ -223,6 +224,7 @@ fn verify_approve_rejects_invalid() {
     kani::assume(s.status == Status::HasProposal);
     let member_index: u8 = kani::any();
     kani::assume(!((member_index < s.member_count) && (s.members[(member_index) as usize] == approver) && (s.voted[(member_index) as usize] == 0)));
+    kani::cover!(true, "guard-violation domain is satisfiable");
     assert!(!approve(&mut s, member_index),
         "approve must reject when guard is violated");
 }
@@ -244,6 +246,7 @@ fn verify_reject_rejects_invalid() {
     kani::assume(s.status == Status::HasProposal);
     let member_index: u8 = kani::any();
     kani::assume(!((member_index < s.member_count) && (s.members[(member_index) as usize] == rejecter) && (s.voted[(member_index) as usize] == 0)));
+    kani::cover!(true, "guard-violation domain is satisfiable");
     assert!(!reject(&mut s, member_index),
         "reject must reject when guard is violated");
 }
@@ -265,6 +268,7 @@ fn verify_execute_rejects_invalid() {
     kani::assume(s.status == Status::HasProposal);
     let member_index: u8 = kani::any();
     kani::assume(!((member_index < s.member_count) && (s.members[(member_index) as usize] == executor) && (s.approval_count >= s.threshold)));
+    kani::cover!(true, "guard-violation domain is satisfiable");
     assert!(!execute(&mut s, member_index),
         "execute must reject when guard is violated");
 }
@@ -285,6 +289,7 @@ fn verify_cancel_proposal_rejects_invalid() {
     };
     kani::assume(s.status == Status::HasProposal);
     kani::assume(!((s.member_count - s.rejection_count < s.threshold)));
+    kani::cover!(true, "guard-violation domain is satisfiable");
     assert!(!cancel_proposal(&mut s),
         "cancel_proposal must reject when guard is violated");
 }
@@ -307,6 +312,7 @@ fn verify_add_member_rejects_invalid() {
     let member_index: u8 = kani::any();
     let member_pubkey: [u8; 32] = kani::any();
     kani::assume(!((member_index < s.member_count)));
+    kani::cover!(true, "guard-violation domain is satisfiable");
     assert!(!add_member(&mut s, member_index, member_pubkey),
         "add_member must reject when guard is violated");
 }
@@ -327,6 +333,7 @@ fn verify_remove_member_rejects_invalid() {
     };
     kani::assume(s.status == Status::Active);
     kani::assume(!((s.member_count > s.threshold) && ((s.approval_count == 0) && (s.rejection_count == 0))));
+    kani::cover!(true, "guard-violation domain is satisfiable");
     assert!(!remove_member(&mut s),
         "remove_member must reject when guard is violated");
 }

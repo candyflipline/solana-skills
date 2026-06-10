@@ -101,6 +101,7 @@ fn verify_initialize_rejects_invalid() {
     let deposit_amount: u64 = kani::any();
     let receive_amount: u64 = kani::any();
     kani::assume(!(((deposit_amount > 0) && (receive_amount > 0))));
+    kani::cover!(true, "guard-violation domain is satisfiable");
     assert!(!initialize(&mut s, deposit_amount, receive_amount),
         "initialize must reject when guard is violated");
 }
