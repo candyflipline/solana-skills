@@ -20,7 +20,8 @@ const SBPF_SORRY_FILL_SYSTEM_PROMPT: &str =
 
 /// Check if a prompt or code references sBPF types
 fn is_sbpf_content(content: &str) -> bool {
-    content.contains("QEDGen.Solana.SBPF")
+    content.contains("SVM.SBPF")
+        || content.contains("QEDGen.Solana.SBPF") // pre-un-vendor generated proofs
         || content.contains("execute_step")
         || content.contains("Program := #[")
         || content.contains("initState")

@@ -218,7 +218,7 @@ After `import QEDGen.Solana` and `open QEDGen.Solana`:
 
 ### sBPF Assembly
 
-After `import QEDGen.Solana.SBPF` and `open QEDGen.Solana.SBPF`:
+After `import SVM.SBPF` and `open SVM.SBPF` (from the qedsvm package):
 
 **Types:** `Reg` (.r0 to .r10), `Src` (.reg/.imm), `Width` (.byte/.half/.word/.dword), `Insn` (all sBPF instructions), `Program` (Array Insn), `State` (regs, mem, pc, exitCode), `Mem` (Nat to Nat)
 

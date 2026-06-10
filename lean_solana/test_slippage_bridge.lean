@@ -8,8 +8,8 @@
 import QEDGen
 
 open QEDGen.Solana
-open QEDGen.Solana.SBPF
-open QEDGen.Solana.SBPF.Memory
+open SVM.SBPF
+open SVM.SBPF.Memory
 
 -- ============================================================================
 -- Step 1: Inline minimal program (mimics slippage guard)
@@ -27,7 +27,7 @@ namespace TestProg
 abbrev TOKEN_BALANCE_OFF : Int := 0xa0
 abbrev MIN_BALANCE_OFF : Int := 0x2918
 
-@[simp] def progAt : Nat → Option QEDGen.Solana.SBPF.Insn
+@[simp] def progAt : Nat → Option SVM.SBPF.Insn
   | 0 => some (.ldx .dword .r3 .r1 MIN_BALANCE_OFF)
   | 1 => some (.ldx .dword .r4 .r1 TOKEN_BALANCE_OFF)
   | 2 => some (.jge .r3 (.reg .r4) 4)

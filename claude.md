@@ -54,7 +54,7 @@ Snapshot suites (`tests/{mir,kani,codegen,proptest}_snapshot.rs`) gate every fix
 - `asm2lean.rs` — sBPF `.s` → Lean program module
 - supporting: `api.rs` (Mistral), `aristotle.rs`, `drift.rs`, `idl.rs` / `idl2spec.rs`, `fingerprint.rs`, `validate.rs`, `deps.rs`, `project.rs`, `consolidate.rs`, `unit_test.rs`, `integration_test.rs`
 
-**`lean_solana/`** — Solana axiom library (`QEDGen.Solana.{Account,Cpi,State,Valid,SBPF}`).
+**`lean_solana/`** — Solana axiom library (`QEDGen.Solana.{Account,Cpi,State,Valid}`); sBPF semantics + binary-proof engines come from the `qedsvm` package (`require qedsvm`, `SVM.SBPF.*`, pinned tag).
 
 Codegen/MIR architecture rationale (cross-cutting transforms, CPI composition, divergence) lives in [`docs/design/`](docs/design/).
 

@@ -10,6 +10,12 @@ open Lake DSL
 -- need it depend on that one, which transitively pulls this.
 package qedgenSupport
 
+-- sBPF semantics + both binary-proof engines (SL/lift and WP/fuel)
+-- come from qedsvm's frozen `SVM` surface (see qedsvm docs/API.md).
+-- Pin an exact tag pre-1.0.
+require qedsvm from git
+  "https://github.com/QEDGen/qedsvm.git" @ "v0.3.0"
+
 @[default_target]
 lean_lib QEDGen where
   roots := #[`QEDGen]
